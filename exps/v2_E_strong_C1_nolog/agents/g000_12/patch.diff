@@ -1,0 +1,266 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..a374d65 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,9 +4,12 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import time
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from prompts.workflow_prompts import SOLVE_PROMPT, STRESS_PROMPT, REPAIR_PROMPT, REVIEW_PROMPT
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -137,9 +140,110 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def run_verification(self):
++        """
++        Run the samples, the stress test and the max-size timing check via subprocess.
++        Returns the raw combined output (no parsing of errors).
++        """
++        sections = []
++        cwd = self.git_tempdir
++
++        def run(cmd, timeout):
++            try:
++                p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
++                                   timeout=timeout, stdin=subprocess.DEVNULL)
++                return f"$ {' '.join(cmd)}\n[exit code {p.returncode}]\n{p.stdout}{p.stderr}"
++            except subprocess.TimeoutExpired as e:
++                out = e.stdout if isinstance(e.stdout, str) else ''
++                err = e.stderr if isinstance(e.stderr, str) else ''
++                return f"$ {' '.join(cmd)}\n[TIMEOUT after {timeout}s]\n{out}{err}"
++            except Exception as e:
++                return f"$ {' '.join(cmd)}\n[error running command: {e}]"
++
++        # 1. Samples
++        try:
++            if os.path.exists(os.path.join(cwd, 'check_samples.py')):
++                # Solution-class task: the harness calls the method directly
++                sections.append(run(['python3', 'check_samples.py'], 60))
++            samples_dir = os.path.join(cwd, 'samples')
++            if not os.path.exists(os.path.join(cwd, 'check_samples.py')) and os.path.isdir(samples_dir):
++                for fname in sorted(os.listdir(samples_dir)):
++                    if not fname.endswith('.in'):
++                        continue
++                    base = fname[:-3]
++                    in_path = os.path.join(samples_dir, fname)
++                    out_path = os.path.join(samples_dir, base + '.out')
++                    if not os.path.exists(out_path):
++                        continue
++                    with open(in_path) as f:
++                        inp = f.read()
++                    try:
++                        p = subprocess.run(['python3', 'solution.py'], cwd=cwd, input=inp,
++                                           capture_output=True, text=True, timeout=10)
++                        with open(out_path) as f:
++                            expected = f.read()
++                        ok = p.returncode == 0 and p.stdout.split() == expected.split()
++                        sections.append(
++                            f"Sample {fname}: {'PASS' if ok else 'FAIL'}\n"
++                            f"input:\n{inp}\nexpected:\n{expected}\nactual:\n{p.stdout}\nstderr:\n{p.stderr}")
++                    except subprocess.TimeoutExpired:
++                        sections.append(f"Sample {fname}: FAIL (timeout)\ninput:\n{inp}")
++                    except Exception as e:
++                        sections.append(f"Sample {fname}: FAIL (error: {e})")
++        except Exception as e:
++            sections.append(f"Sample check error: {e}")
++
++        # 2. Stress test (about 300 cases)
++        try:
++            if os.path.exists(os.path.join(cwd, 'stress.py')):
++                sections.append(run(['python3', 'stress.py', '300'], 900))
++        except Exception as e:
++            sections.append(f"Stress check error: {e}")
++
++        # 3. Max-size timing
++        try:
++            if os.path.exists(os.path.join(cwd, 'gen_max.py')):
++                gen = subprocess.run(['python3', 'gen_max.py'], cwd=cwd, capture_output=True,
++                                     text=True, timeout=60)
++                max_path = os.path.join(cwd, 'max_input.txt')
++                with open(max_path, 'w') as f:
++                    f.write(gen.stdout)
++                start = time.time()
++                try:
++                    with open(max_path) as fin:
++                        p = subprocess.run(['python3', 'solution.py'], cwd=cwd, stdin=fin,
++                                           capture_output=True, text=True, timeout=10)
++                    elapsed = time.time() - start
++                    sections.append(f"Max-size timing: {elapsed:.2f}s, exit code {p.returncode}\n"
++                                    f"stderr:\n{p.stderr[-2000:]}")
++                except subprocess.TimeoutExpired:
++                    sections.append("Max-size timing: TIMEOUT after 10s")
++        except Exception as e:
++            sections.append(f"Timing check error: {e}")
++
++        if not sections:
++            return "No verification files found (samples/, check_samples.py, stress.py, gen_max.py)."
++        combined = "\n\n".join(sections)
++        # Keep the raw output but avoid blowing up the context window
++        if len(combined) > 20000:
++            combined = combined[:10000] + "\n... <clipped> ...\n" + combined[-10000:]
++        return combined
++
++    @staticmethod
++    def has_failure(output):
++        """
++        Only decides whether another repair round is needed; the raw output is what the
++        agent sees. Looks for the FAIL/TIMEOUT markers written by run_verification and
++        stress.py, tracebacks, and nonzero exit codes.
++        """
++        if 'FAIL' in output or 'TIMEOUT' in output or 'Traceback' in output:
++            return True
++        return re.search(r"exit code [1-9]", output) is not None
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Phases: solve -> stress -> bounded repair loop -> independent review.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -148,16 +252,50 @@ class AgenticSystem:
+ </problem_description>
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++
++All work must happen in {self.git_tempdir}. The final solution.py there is what gets graded.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = []
++
++        # Phase 1: solve
++        try:
++            msg_history = chat_with_agent(
++                f"{task}\n\n{SOLVE_PROMPT}", model=self.code_model,
++                msg_history=msg_history, logging=safe_log)
++        except Exception as e:
++            safe_log(f"Solve phase failed: {e}")
++
++        # Phase 2: stress test harness
++        try:
++            msg_history = chat_with_agent(
++                f"{task}\n\n{STRESS_PROMPT}", model=self.code_model,
++                msg_history=msg_history, logging=safe_log)
++        except Exception as e:
++            safe_log(f"Stress phase failed: {e}")
++
++        # Phase 3: bounded repair loop
++        for round_idx in range(3):
++            try:
++                output = self.run_verification()
++            except Exception as e:
++                output = f"Verification failed to run: {e}"
++            safe_log(f"Verification round {round_idx + 1}:\n{output}")
++            if not self.has_failure(output):
++                break
++            try:
++                msg_history = chat_with_agent(
++                    f"{task}\n\n{REPAIR_PROMPT}\n{output}", model=self.code_model,
++                    msg_history=msg_history, logging=safe_log)
++            except Exception as e:
++                safe_log(f"Repair round {round_idx + 1} failed: {e}")
++
++        # Phase 4: independent review with a fresh history
++        try:
++            chat_with_agent(
++                f"{task}\n\n{REVIEW_PROMPT}", model=self.code_model,
++                msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"Review phase failed: {e}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/prompts/workflow_prompts.py b/prompts/workflow_prompts.py
+new file mode 100644
+index 0000000..b530af5
+--- /dev/null
++++ b/prompts/workflow_prompts.py
+@@ -0,0 +1,72 @@
++"""
++Phase prompts for the multi-phase solve / stress / repair / review workflow used by
++AgenticSystem.forward() in coding_agent.py.
++
++The working directory and the problem statement are prepended by the caller, so these
++constants are plain text and never need string formatting.
++"""
++
++TIPS_BLOCK = """Practical Python tips:
++- Fast I/O: use `import sys` and `data = sys.stdin.read().split()` or `input = sys.stdin.readline` for large inputs. Write output once with `sys.stdout.write("\\n".join(out) + "\\n")`.
++- Deep recursion: call `sys.setrecursionlimit(10**6)` or, better, use an iterative DFS/BFS with an explicit stack.
++- Avoid O(n^2) work when n can be about 1e5; prefer sorting, prefix sums, dicts, heaps, two pointers, or binary search.
++- For a `Solution` class task, start the file with `from typing import *` plus any other imports, put all logic inside the class method, and do NOT print anything from the class (no debug prints).
++- Keep helper files (brute.py, gen.py, stress.py, tests) in the repository directory; only solution.py is graded."""
++
++SOLVE_PROMPT = """PHASE 1 - SOLVE.
++
++1. Read the problem statement carefully. Identify the exact input and output format, the constraints, and whether the task is a stdin/stdout program or a method of a given `Solution` class (look for a class/method signature in the statement or in an existing file of the repo).
++2. State the constraints and the intended complexity. Choose an algorithm whose complexity fits the limits (Python does roughly 10^7 simple operations per second).
++3. Write the optimized solution to `solution.py` in the repository directory using the editor tool. For stdin programs it must read from stdin and write to stdout. For `Solution` tasks keep the exact class and method name and signature.
++4. Extract the sample test cases from the statement and save them as `samples/01.in`, `samples/01.out`, `samples/02.in`, `samples/02.out`, and so on (two-digit numbering). For `Solution` tasks, write the sample input in the same stdin form you use in `check_samples.py` (see below) and save the expected output as the corresponding `.out` file. Keep the outputs exact.
++5. Write `brute.py`: a naive, obviously-correct, independent implementation of the same task. It must NOT import or copy `solution.py`; derive it directly from the statement. It can be slow; it only needs to be correct on small inputs. For `Solution` tasks, `brute.py` defines the same class name and method with a brute-force body.
++6. For `Solution` tasks only, write `check_samples.py` that imports the class from `solution.py`, calls the method on each sample's arguments, and compares with the expected output. It must exit with a nonzero status on any mismatch and print the failing sample, expected and actual values.
++7. Run `solution.py` on every sample and check the output matches exactly (for stdin tasks: `python3 solution.py < samples/01.in`). Fix any discrepancy before finishing this phase.
++
++""" + TIPS_BLOCK
++
++STRESS_PROMPT = """PHASE 2 - STRESS TEST.
++
++1. Write `gen.py`: a random generator of SMALL valid inputs that follows the input format exactly. It must take a seed as its command-line argument (`python3 gen.py SEED`), use `random.seed(seed)`, and print one input to stdout. Vary sizes randomly but keep them small (for example n up to 8, values in a small range). Include edge cases with some probability: minimum sizes (n=1), all-equal values, duplicates, zeros, negatives (if allowed), and the largest allowed values scaled down.
++2. Write `stress.py`: a runner that, for seeds 0..N-1 (N = `sys.argv[1]` if given, default 300), does the following:
++   - runs `python3 gen.py SEED` with `subprocess.run(..., capture_output=True, text=True, timeout=10)` to get the input;
++   - runs `solution.py` and `brute.py` on that input, each with a per-run timeout (for example 10 seconds);
++   - compares the two outputs token by token (whitespace-normalized, and handle floats with a tolerance if the statement requires it);
++   - on the FIRST mismatch (or a crash, or a timeout), prints a line starting with `FAIL`, then the seed, the input, the expected output (from brute.py) and the actual output (from solution.py) and the stderr of solution.py, then exits with status 1 immediately. If all cases pass, print a short success message and exit with status 0.
++   For `Solution`-class tasks, `stress.py` must import the class from `solution.py` (and from `brute.py`, renaming it to avoid a clash, e.g. by loading brute.py with importlib under another name) and call the method directly with the generated arguments; generate the arguments in `gen.py` in a form that is easy to parse (for example a JSON line) and use `json.loads` in the runner. Guard the in-process calls with a timeout (for example by running each case via a subprocess of a tiny driver script), so that an infinite loop cannot hang the runner.
++3. Run `python3 stress.py 300` and fix every mismatch you find. When a mismatch appears, first decide whether solution.py or brute.py is wrong by reasoning from the statement, then fix the wrong one.
++4. Write `gen_max.py`: prints one valid input of maximum size (worst case for the constraints), to stdout, with no arguments needed. Run `python3 gen_max.py > max_input.txt` and time `python3 solution.py < max_input.txt`. It must finish well under 2 seconds; if it does not, optimize the algorithm (not just the constants).
++
++""" + TIPS_BLOCK
++
++REPAIR_PROMPT = """PHASE 3 - REPAIR.
++
++The verification step below was run automatically on the repository (samples, stress test about 300 cases, and max-size timing if gen_max.py exists). Its raw output is included. Do not assume it is complete; read it yourself.
++
++Find the root cause of every failure, reasoning from the problem statement:
++- If solution.py gives a wrong answer, fix solution.py.
++- If brute.py disagrees with the statement, fix brute.py (brute.py must stay independent of solution.py).
++- If the failure is a timeout or too slow, improve the algorithm in solution.py.
++- If the failure is a crash, fix the exception.
++- If the problem is in the test harness (check_samples.py, stress.py, gen.py), fix the harness.
++Re-run the failing check after your fix and keep iterating until it passes. Keep the required class/method signature or the stdin/stdout format of solution.py unchanged.
++
++Raw verification output:
++"""
++
++REVIEW_PROMPT = """PHASE 4 - INDEPENDENT REVIEW.
++
++You are a skeptical reviewer. Read the statement and solution.py. List likely edge cases (minimum sizes, duplicates, negatives, large values, recursion depth, output format, method signature). Write tests for them, run them against both brute.py and solution.py, and fix solution.py if wrong. Keep the same class/method signature, or the stdin/stdout format.
++
++Specifically consider:
++- minimum sizes such as n=1 or empty-looking inputs, and the smallest allowed values;
++- duplicates, all-equal elements, already sorted and reverse sorted inputs;
++- negatives and zeros, if the constraints allow them;
++- maximum values, and whether intermediate results could overflow the expected range (Python ints do not overflow, but floats do lose precision);
++- recursion depth on long chains (use an iterative approach or raise the recursion limit);
++- exact output format: spacing, newlines, YES/NO capitalization, trailing whitespace, float precision;
++- for `Solution` tasks: the exact class name and method signature, return type, and that nothing is printed to stdout.
++
++Write the tests in a file such as `review_tests.py`, run them, and fix any bug in solution.py. Do not weaken brute.py to match a wrong solution. Finish by re-running `python3 check_samples.py` or the sample comparison and `python3 stress.py 300` to confirm everything still passes.
++
++""" + TIPS_BLOCK

@@ -1,0 +1,151 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0713b5b..77b7fad 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -95,6 +95,20 @@ def safe_log(message, level=logging.INFO):
+ 
+ MAX_PREVIOUS_ATTEMPT_CHARS = 8000
+ 
++def run_with_one_retry(call, phase_name):
++    """
++    Run `call()` once; if it raises, log the exception and run it once more.
++    The second failure propagates to the caller. `call` must be re-runnable from the
++    same inputs (the caller's last good state), so the retry does not repeat completed work.
++    """
++    for try_idx in range(2):
++        try:
++            return call()
++        except Exception as e:
++            if try_idx == 1:
++                raise
++            safe_log(f"=== Exception during {phase_name}: {e!r}. Retrying {phase_name} once from the last good state ===")
++
+ def _content_to_text(content):
+     """Extract plain text from a message content (str, or list of text blocks)."""
+     if isinstance(content, str):
+@@ -240,8 +254,11 @@ Please carefully analyze the problem description and the repository:
+ 3. Determine whether the task is a complete program reading stdin / writing stdout, or a method of a given `Solution` class, and where the expected entry point is.
+ 4. Write a concrete, numbered implementation plan. For each step, state what to change and why. Include a step to write tests (e.g. small examples from the problem statement plus edge cases), a step to run them, and a step to refine the solution if tests fail.
+ Finish by outputting the full plan as your final response."""
+-        analysis_history = chat_with_agent(
+-            analysis_instruction, model=self.code_model, msg_history=[], logging=safe_log
++        analysis_history = run_with_one_retry(
++            lambda: chat_with_agent(
++                analysis_instruction, model=self.code_model, msg_history=[], logging=safe_log
++            ),
++            phase_name="analysis",
+         )
+ 
+         # Phase 2: implementation call that follows the plan from phase 1
+@@ -256,8 +273,11 @@ Follow your plan step by step:
+ 5. Final review: re-read the original <problem_description> from start to finish. Check that the solution matches every requirement, the input/output format exactly (including the entry point: a stdin/stdout program or a method of the given `Solution` class), and the constraints. Check edge cases such as minimum and maximum input sizes, empty or single-element inputs, duplicates, negative values, large values that may overflow or be slow, and output formatting. Add tests for any edge case not yet covered, run them, and fix any problem you find.
+ 6. Make sure the final code is clean and that no unnecessary files are left behind.
+ When you are done, summarize the changes you made. Your final summary MUST include the exact test commands you ran, their output (pass/fail and any error messages), the results of the final review, and the remaining known issues."""
+-        implementation_history = chat_with_agent(
+-            implementation_instruction, model=self.code_model, msg_history=analysis_history, logging=safe_log
++        implementation_history = run_with_one_retry(
++            lambda: chat_with_agent(
++                implementation_instruction, model=self.code_model, msg_history=analysis_history, logging=safe_log
++            ),
++            phase_name="implementation",
+         )
+ 
+         return {
+diff --git a/tests/test_coding_agent_retry.py b/tests/test_coding_agent_retry.py
+index a273054..127ed0a 100644
+--- a/tests/test_coding_agent_retry.py
++++ b/tests/test_coding_agent_retry.py
+@@ -144,3 +144,93 @@ def test_analysis_prompt_has_no_max_size_timing_step(fake_env):
+     make, calls = fake_env
+     make().forward()
+     assert "Max-size timing check" not in calls["chat"][0]["msg"]
++
++
++# ---- retry of a phase once from the last good state ----
++
++@pytest.fixture
++def flaky_env(monkeypatch, tmp_path):
++    """Fake chat that raises on the call indices listed in `fail_on` (1-based)."""
++    calls = {"chat": [], "reset": [], "diff": 0, "fail_on": set()}
++
++    def fake_chat(msg, model=None, msg_history=None, logging=print):
++        calls["chat"].append({"msg": msg, "history": list(msg_history or [])})
++        n = len(calls["chat"])
++        if n in calls["fail_on"]:
++            raise RuntimeError(f"boom-{n}")
++        return list(msg_history or []) + [
++            {"role": "user", "content": [{"type": "text", "text": msg}]},
++            {"role": "assistant", "content": [{"type": "text", "text": f"reply-{n}"}]},
++        ]
++
++    def fake_reset(git_dname, commit):
++        calls["reset"].append((git_dname, commit))
++
++    def fake_diff(git_dname, commit):
++        calls["diff"] += 1
++        return f"diff-{calls['diff']}"
++
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake_chat)
++    monkeypatch.setattr(coding_agent, "reset_to_commit", fake_reset)
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", fake_diff)
++
++    def make():
++        return AgenticSystem(
++            problem_statement="Sum two numbers.",
++            git_tempdir=str(tmp_path / "repo"),
++            base_commit="abc123",
++            chat_history_file=str(tmp_path / "chat.md"),
++        )
++    return make, calls
++
++
++def test_analysis_failure_retried_once_from_empty_history(flaky_env):
++    make, calls = flaky_env
++    calls["fail_on"] = {1}
++    records = make().forward()
++    assert len(calls["chat"]) == 3          # failed analysis, retried analysis, implementation
++    assert calls["chat"][0]["history"] == calls["chat"][1]["history"] == []
++    assert "Previous attempts" not in calls["chat"][1]["msg"]
++    assert len(records) == 1 and "reply-3" in records[0]["summary"]
++
++
++def test_implementation_failure_retried_from_analysis_history(flaky_env):
++    make, calls = flaky_env
++    calls["fail_on"] = {2}
++    records = make().forward()
++    assert len(calls["chat"]) == 3
++    analysis_hist = calls["chat"][2]["history"]  # history passed to the retried impl call
++    assert len(analysis_hist) == 2                # exactly the analysis turn (user + assistant)
++    assert analysis_hist[-1]["content"][0]["text"] == "reply-1"
++    assert calls["chat"][1]["history"] == calls["chat"][2]["history"]
++    assert "reply-3" in records[0]["summary"]
++
++
++def test_phase_failing_twice_propagates(flaky_env):
++    make, calls = flaky_env
++    calls["fail_on"] = {1, 2}
++    with pytest.raises(RuntimeError, match="boom-2"):
++        make().forward()
++    assert len(calls["chat"]) == 2  # no third attempt at the same phase
++
++
++def test_retry_does_not_repeat_completed_implementation(flaky_env):
++    make, calls = flaky_env
++    calls["fail_on"] = {2}  # attempt 1 implementation fails once
++    make().forward(max_attempts=2)
++    # attempt 1: analysis(1), impl fails(2), impl retry(3); attempt 2: analysis(4), impl(5)
++    assert len(calls["chat"]) == 5
++    assert calls["reset"] == [(str(make().git_tempdir), "abc123")]
++
++
++def test_run_with_one_retry_helper_logs_and_returns():
++    attempts = []
++
++    def call():
++        attempts.append(1)
++        if len(attempts) == 1:
++            raise ValueError("transient")
++        return "ok"
++
++    assert coding_agent.run_with_one_retry(call, "analysis") == "ok"
++    assert len(attempts) == 2

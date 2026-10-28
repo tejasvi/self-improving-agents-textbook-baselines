@@ -1,0 +1,235 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5fe226b..d69247a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -156,6 +156,43 @@ def _history_status(msg_history):
+             final_text = '\n'.join(texts)
+     return has_tool_use, final_text
+ 
++def _is_empty_response(msg_history):
++    """
++    True if the final assistant message has no non-whitespace text and no
++    tool_use/function_call blocks (i.e. the model replied with nothing actionable).
++    """
++    last = None
++    for msg in msg_history or []:
++        role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++        if role == 'assistant' or (not isinstance(msg, dict) and getattr(msg, 'type', None) == 'message'):
++            last = msg
++        elif not isinstance(msg, dict) and getattr(msg, 'output', None) is not None:
++            last = msg
++    if last is None:
++        return True
++    if isinstance(last, dict):
++        content = last.get('content', [])
++    else:
++        content = getattr(last, 'content', None)
++        if content is None:
++            content = getattr(last, 'output', None) or []
++    if isinstance(content, str):
++        return not content.strip()
++    has_text = False
++    for block in content or []:
++        btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++        if btype in ('tool_use', 'function_call'):
++            return False
++        if btype == 'text':
++            text = block.get('text') if isinstance(block, dict) else getattr(block, 'text', None)
++            if text and text.strip():
++                has_text = True
++        if btype == 'output_text':
++            text = block.get('text') if isinstance(block, dict) else getattr(block, 'text', None)
++            if text and text.strip():
++                has_text = True
++    return not has_text
++
+ def _extract_code_block(text):
+     """
+     Return the content of the first fenced code block in `text`, or None.
+@@ -281,29 +318,102 @@ Follow this step-by-step workflow:
+ 5) For tricky or hard problems, also write a brute-force implementation and stress-test the solution against it on many small random inputs; fix any differences.
+ 6) Never end your turn with only text. Replying without writing the solution file to disk counts as FAILURE. Only finish after the solution file has been written and verified.
+ """
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log(f"[attempt 0] initial chat finished; source patch present: {self._has_source_patch()}")
+-
+-        for attempt in range(3):
+-            if self._has_source_patch():
+-                safe_log(f"[retry {attempt}] source patch detected; stopping retries.")
++        history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"[attempt 0] initial chat finished; empty={_is_empty_response(history)}; "
++                 f"source patch present: {self._has_source_patch()}")
++
++        # Retry 1: continue the same conversation with a nudge (no history reset)
++        if not self._has_source_patch():
++            nudge = ("Your last reply was empty. Call the editor tool now and create solution.py "
++                     "with your full solution.")
++            safe_log("[retry 1] no source change; continuing conversation with nudge.")
++            history = chat_with_agent(nudge, model=self.code_model, msg_history=history, logging=safe_log)
++            safe_log(f"[retry 1] chat finished; empty={_is_empty_response(history)}; "
++                     f"source patch present: {self._has_source_patch()}")
++
++        # Retry 2: restart with a minimal prompt containing only the problem statement
++        if not self._has_source_patch():
++            minimal = (f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                       "Write the complete solution to solution.py using the editor tool")
++            safe_log("[retry 2] still no source change; restarting with minimal prompt.")
++            history = chat_with_agent(minimal, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"[retry 2] chat finished; empty={_is_empty_response(history)}; "
++                     f"source patch present: {self._has_source_patch()}")
++
++        # Fallback: tool-free generation with sample verification
++        if not self._has_source_patch():
++            safe_log("[fallback] no source change after retries; running tool-free fallback.")
++            self._fallback_generate()
++            safe_log(f"[fallback] finished; source patch present: {self._has_source_patch()}")
++
++    def _fallback_generate(self):
++        """
++        Tool-free fallback: ask the LLM for a complete Python program, write it to the
++        target file, run it on the samples, and repair up to MAX_FALLBACK_REPAIRS times.
++        """
++        statement = self.problem_statement or ''
++        match = re.search(r'`([^`\s]+\.py)`', statement)
++        target_name = match.group(1) if match else FALLBACK_TARGET
++        target_path = os.path.join(self.git_tempdir, target_name)
++
++        samples = _parse_samples(statement)
++        safe_log(f"[fallback] target={target_name}; parsed {len(samples)} sample(s).")
++
++        prompt = (
++            f"<problem_description>\n{statement}\n</problem_description>\n\n"
++            "Solve the problem above. Respond with ONLY a complete Python program that reads standard "
++            "input and writes standard output, inside a single ```python code block. No other text."
++        )
++        code = _extract_code_block(chat_no_tools(prompt, model=self.code_model, logging=safe_log))
++        if not code:
++            safe_log("[fallback] no code block returned by LLM; giving up.")
++            return False
++
++        for repair in range(MAX_FALLBACK_REPAIRS + 1):
++            with open(target_path, 'w') as f:
++                f.write(code)
++            safe_log(f"[fallback] wrote {target_path} (round {repair}).")
++
++            failure = None
++            for idx, (inp, expected) in enumerate(samples):
++                try:
++                    run = subprocess.run(
++                        [sys.executable, target_path],
++                        input=inp, capture_output=True, text=True,
++                        timeout=SAMPLE_TIMEOUT_SECONDS, cwd=self.git_tempdir,
++                    )
++                except subprocess.TimeoutExpired:
++                    failure = (idx, inp, expected, f"TIMEOUT after {SAMPLE_TIMEOUT_SECONDS}s")
++                    break
++                if run.returncode != 0:
++                    failure = (idx, inp, expected, run.stderr)
++                    break
++                if not _outputs_match(run.stdout, expected):
++                    failure = (idx, inp, expected, run.stdout)
++                    break
++
++            if failure is None:
++                safe_log(f"[fallback] all {len(samples)} sample(s) passed.")
++                return True
++            if repair == MAX_FALLBACK_REPAIRS:
+                 break
+-            current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-            changed = self._changed_files()
+-            safe_log(f"[retry {attempt + 1}] no non-test source change. changed files: {changed}")
+-            retry_msg = f"""{task}
+-
+-The current state of the repository has NO source change: the diff is empty or only touches test files.
+-
+-Changed files so far: {changed if changed else '(none)'}
+ 
+-Current diff:
+-{current_diff if current_diff.strip() else '(empty)'}
+-
+-This is a strict instruction: immediately use the editor tool (`create` or `edit`) to write the solution file for the problem to disk, then verify it by running it with bash on all sample inputs. Do not reply with text only. Do not only edit test files.
+-"""
+-            retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[retry {attempt + 1}] chat finished; source patch present: {self._has_source_patch()}")
++            idx, inp, expected, actual = failure
++            safe_log(f"[fallback] sample {idx} failed in round {repair}; requesting repair.")
++            repair_prompt = (
++                f"<problem_description>\n{statement}\n</problem_description>\n\n"
++                f"Current program:\n```python\n{code}\n```\n\n"
++                f"It fails on this input:\n{inp}\n"
++                f"Expected output:\n{expected}\n"
++                f"Actual output or traceback:\n{actual}\n\n"
++                "Respond with ONLY a corrected complete Python program inside a single ```python code block."
++            )
++            new_code = _extract_code_block(chat_no_tools(repair_prompt, model=self.code_model, logging=safe_log))
++            if not new_code:
++                safe_log("[fallback] repair returned no code block; stopping repairs.")
++                break
++            code = new_code
++        return False
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 3c13f3f..980ab27 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -409,6 +409,58 @@ def chat_with_agent_claude(
+ 
+         # Get final response
+         final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
++        # If the model returned an empty turn (no text, no tool call), nudge it a bounded number of times
++        for _ in range(2):
++            if (final_response or '').strip():
++                break
++            logging("Empty model turn; nudging model to continue with a tool call.")
++            new_msg_history.append({
++                "role": "assistant",
++                "content": response.content,
++            })
++            new_msg_history.append({
++                "role": "user",
++                "content": [
++                    {
++                        "type": "text",
++                        "text": "Please continue by calling a tool",
++                    }
++                ],
++            })
++            response = get_response_withtools(
++                client=client,
++                model=client_model,
++                messages=msg_history + new_msg_history,
++                tool_choice={"type": "auto"},
++                tools=tools,
++                logging=logging,
++            )
++            tool_use = check_for_tool_use(response, model=client_model)
++            while tool_use:
++                tool_name = tool_use['tool_name']
++                tool_input = tool_use['tool_input']
++                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++                new_msg_history.append({"role": "assistant", "content": response.content})
++                new_msg_history.append({
++                    "role": "user",
++                    "content": [
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": tool_use['tool_id'],
++                            "content": tool_result,
++                        }
++                    ],
++                })
++                response = get_response_withtools(
++                    client=client,
++                    model=client_model,
++                    messages=msg_history + new_msg_history,
++                    tool_choice={"type": "auto"},
++                    tools=tools,
++                    logging=logging,
++                )
++                tool_use = check_for_tool_use(response, model=client_model)
++            final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
+         new_msg_history.append({
+             "role": "assistant",
+             "content": [

@@ -1,0 +1,853 @@
+Every failed run ended with an empty patch. The logs show the agent stopped before writing anything, so I fixed the plumbing that made it stop and gave it a clear solving workflow. None of this has been run.
+
+**Why the runs failed**
+1. **Responses cut off at the output limit.** Runs 2–5 end with an empty assistant message, and run 1 ends mid-sentence. The most likely cause is the 4096-token output limit: a long reasoning message, or a half-finished file-writing tool call, gets cut. A cut-off response has `stop_reason == "max_tokens"`, which the agent took as "finished", so it stopped.
+2. **The bash tool hung in run 1.** `cat $(find ... | head -1)` with no match runs a bare `cat`, which waited on the shell's input pipe. The tool then timed out after 120 seconds and wasted a turn.
+3. **Other fragile spots.**
+   - Several tool calls in one response were only half-handled, which breaks the API call.
+   - API errors were silently swallowed.
+   - Tool outputs were never truncated, so they could flood the context.
+   - Nothing retried when no solution had been written.
+
+**What I changed**
+- **`llm_withtools.py`:**
+  - Raised `max_tokens` to 8192.
+  - When a response is cut off, the cut-off tool call is dropped and the agent is told to continue in smaller pieces.
+  - All tool calls in a response are now executed.
+  - Message history is stored as plain dicts with no empty text blocks.
+  - Tool output is truncated, there is a cap on the number of steps, and errors are logged instead of swallowed.
+- **`tools/bash.py`:** each command runs in a fresh shell with input from `/dev/null`, so nothing can block waiting for input.
+  - The default timeout is 120 seconds, and the agent can raise it up to 900.
+  - On timeout the whole process group is killed.
+  - Output is truncated and the exit code is reported.
+  - The `BashSession` class is kept because the existing tests import it.
+- **`tools/edit.py`:** added a `str_replace` command so small fixes don't need a full file rewrite.
+- **`coding_agent.py`:** a detailed prompt walks the agent through:
+  - reading the starter code;
+  - working out the target complexity from the constraints;
+  - writing a first version early;
+  - checking all samples;
+  - stress-testing against a brute force;
+  - timing worst-case inputs;
+  - keeping only the solution file changed in the repo.
+
+  If the repo is still unchanged after a round, it retries (at most 3 rounds) with a fresh context that includes the current `solution.py`.
+
+<file path="llm_withtools.py">
+import ast
+import json
+import re
+import anthropic
+import backoff
+import openai
+import copy
+
+from llm import create_client, get_response_from_llm
+from prompts.tooluse_prompt import get_tooluse_prompt
+from tools import load_all_tools
+
+CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+
+CLAUDE_MAX_TOKENS = 8192
+MAX_TOOL_ROUNDS = 80
+MAX_TOOL_RESULT_CHARS = 20000
+
+TRUNCATION_MSG = (
+    "Your previous response was cut off because it exceeded the output length limit "
+    "(any partially written tool call was discarded and NOT executed). Continue from where you left off. "
+    "Keep each response shorter: reason concisely, and make sure every tool call fits completely. "
+    "If a file is long, write it in smaller pieces (e.g. create a first part, then extend it with str_replace)."
+)
+
+
+def truncate_text(text, max_chars=MAX_TOOL_RESULT_CHARS):
+    text = str(text)
+    if len(text) <= max_chars:
+        return text
+    head = max_chars * 2 // 3
+    tail = max_chars - head
+    return text[:head] + f"\n... <{len(text) - max_chars} characters truncated> ...\n" + text[-tail:]
+
+
+def process_tool_call(tools_dict, tool_name, tool_input):
+    try:
+        if tool_name in tools_dict:
+            return tools_dict[tool_name]['function'](**tool_input)
+        else:
+            return f"Error: Tool '{tool_name}' not found"
+    except Exception as e:
+        return f"Error executing tool '{tool_name}': {str(e)}"
+
+@backoff.on_exception(
+    backoff.expo,
+    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+    max_time=600,
+    max_value=60,
+)
+def get_response_withtools(
+    client, model, messages, tools, tool_choice,
+    logging=None, max_retry=3
+):
+    try:
+        if 'claude' in model:
+            response = client.messages.create(
+                model=model,
+                messages=messages,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                tool_choice=tool_choice,
+                tools=tools,
+            )
+        elif model.startswith('o3-'):
+            response = client.responses.create(
+                model=model,
+                input=messages,
+                tool_choice=tool_choice,
+                tools=tools,
+                parallel_tool_calls=False
+            )
+            response = response
+        else:
+            raise ValueError(f"Unsupported model: {model}")
+        return response
+    except Exception as e:
+        if logging:
+            logging(f"Error in get_response_withtools: {str(e)}")
+        if 'Input is too long' in str(e) or 'prompt is too long' in str(e):
+            raise
+        if max_retry > 0:
+            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+        raise  # Re-raise the exception after logging
+
+def check_for_tool_use(response, model=''):
+    """
+    Checks if the response contains a tool call.
+    """
+    if 'claude' in model:
+        # Claude, check for stop_reason in response
+        if response.stop_reason == "tool_use":
+            tool_use_block = next(block for block in response.content if block.type == "tool_use")
+            return {
+                'tool_id': tool_use_block.id,
+                'tool_name': tool_use_block.name,
+                'tool_input': tool_use_block.input,
+            }
+
+    elif model.startswith('o3-'):
+        # OpenAI, check for tool_calls in response
+        tool_call = None
+        for tc in response.output:
+            if tc.type == "function_call":
+                tool_call = tc
+                break
+
+        if tool_call:
+            return {
+                'tool_id': tool_call.call_id,
+                'tool_name': tool_call.name,
+                'tool_input': json.loads(tool_call.arguments),
+            }
+
+    else:
+        # Any other LLM, response is str, check for <tool_use> tag in response
+        pattern = r'<tool_use>(.*?)</tool_use>'
+        match = re.search(pattern, response, re.DOTALL)
+        if match:
+            tool_use_str = match.group(1).strip()
+            try:
+                tool_use_dict = ast.literal_eval(tool_use_str)
+                if isinstance(tool_use_dict, dict) and 'tool_name' in tool_use_dict and 'tool_input' in tool_use_dict:
+                    return tool_use_dict
+            except Exception:
+                pass
+
+    # No tool use found
+    return None
+
+def convert_tool_info(tool_info, model=None):
+    """
+    Converts tool_info from Claude format to the given model's format.
+    """
+    if 'claude' in model:
+        # should have no change
+        return {
+            'name': tool_info['name'],
+            'description': tool_info['description'],
+            'input_schema': tool_info['input_schema'],
+        }
+    elif model.startswith('o3-'):
+        def add_additional_properties(d):
+            if isinstance(d, dict):
+                if 'properties' in d:
+                    d['additionalProperties'] = False
+                for k, v in d.items():
+                    add_additional_properties(v)
+        add_additional_properties(tool_info['input_schema'])
+        for p in tool_info['input_schema']['properties'].keys():
+            if not p in tool_info['input_schema']['required']:
+                tool_info['input_schema']['required'].append(p)
+                t = copy.deepcopy(tool_info['input_schema']['properties'][p]["type"])
+                if isinstance(t, str):
+                    tool_info['input_schema']['properties'][p]["type"] = [t, "null"]
+                elif isinstance(t, list):
+                    tool_info['input_schema']['properties'][p]["type"] = t + ["null"]
+                
+        return {
+            'type': 'function',
+            'name': tool_info['name'],
+            'description': tool_info['description'],
+            'parameters': tool_info['input_schema'],
+            "strict": True,
+        }
+    else:
+        return tool_info
+
+def convert_block_claude(block):
+    """
+    Convert a single block of content from Claude into a standard format.
+    """
+    if isinstance(block, dict):
+        block_type = block.get('type')
+        text = block.get('text')
+        tool_name = block.get('name')
+        tool_input = block.get('input')
+        tool_result = block.get('content')
+    else:
+        block_type = getattr(block, 'type', None)
+        text = getattr(block, 'text', None)
+        tool_name = getattr(block, 'name', None)
+        tool_input = getattr(block, 'input', None)
+        tool_result = getattr(block, 'content', None)
+
+    text = text or ""
+
+    if block_type == "text":
+        return {
+            "type": "text",
+            "text": text
+        }
+    elif block_type == "tool_use":
+        # Convert to the manual tool calling format
+        return {
+            "type": "text",
+            "text": f"<tool_use>\n{{'tool_name': {tool_name}, 'tool_input': {tool_input}}}\n</tool_use>"
+        }
+    elif block_type == "tool_result":
+        return {
+            "type": "text",
+            "text": f"Tool Result: {tool_result}"
+        }
+    else:
+        # Fallback if we ever encounter an unknown block type
+        return {
+            "type": "text",
+            "text": str(block)
+        }
+
+def convert_msg_history_claude(msg_history):
+    """
+    Convert Claude-style message history into a generic format.
+    """
+    new_msg_history = []
+
+    for msg in msg_history:
+        role = msg.get('role', '')
+        content_blocks = msg.get('content', [])
+        new_content = []
+
+        if isinstance(content_blocks, str):
+            content_blocks = [{"type": "text", "text": content_blocks}]
+        for block in content_blocks:
+            new_content.append(convert_block_claude(block))
+
+        new_msg_history.append({
+            "role": role,
+            "content": new_content
+        })
+
+    return new_msg_history
+
+def convert_msg_history_openai(msg_history):
+    """
+    Convert OpenAI-style message history into a generic format.
+    """
+    new_msg_history = []
+
+    for msg in msg_history:
+        if isinstance(msg, dict):
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+
+            if role == 'tool':
+                new_msg = {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Tool Result: {content}",
+                        }
+                    ],
+                }
+            else:
+                new_msg = {
+                    "role": role,
+                    "content": content,
+                }
+        else:
+            role = getattr(msg, 'role', None)
+            content = getattr(msg, 'content', None)
+            tool_calls = getattr(msg, 'tool_calls', None)
+
+            if tool_calls:
+                tool_call = tool_calls[0]
+                function_name = getattr(tool_call.function, 'name', '')
+                function_args = getattr(tool_call.function, 'arguments', '')
+                # Convert to the manual tool calling format
+                new_msg = {
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"<tool_use>\n{{'tool_name': {function_name}, 'tool_input': {function_args}}}\n</tool_use>",
+                        }
+                    ],
+                }
+            else:
+                new_msg = {
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": content,
+                        }
+                    ],
+                }
+
+        new_msg_history.append(new_msg)
+
+    return new_msg_history
+
+def convert_msg_history(msg_history, model=None):
+    """
+    Convert message history from the model-specific format to a generic format.
+    """
+    if 'claude' in model:
+        return convert_msg_history_claude(msg_history)
+    elif model.startswith('o3-'):
+        return convert_msg_history_openai(msg_history)
+    else:
+        return msg_history
+
+def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+    # Construct message
+    if msg_history is None:
+        msg_history = []
+    system_message = f'You are a coding agent.\n\n{get_tooluse_prompt()}'
+    new_msg_history = msg_history
+
+    try:
+        # Load all tools
+        all_tools = load_all_tools(logging=logging)
+        tools_dict = {tool['info']['name']: tool for tool in all_tools}
+        
+        # Create client
+        client, client_model = create_client(model)
+
+        # Call API
+        logging(f"Input: {msg}")
+        response, new_msg_history = get_response_from_llm(
+            msg=msg,
+            client=client,
+            model=client_model,
+            system_message=system_message,
+            print_debug=False,
+            msg_history=new_msg_history,
+        )
+        logging(f"Output: {response}")
+
+        # Tool use
+        tool_use = check_for_tool_use(response, model=client_model)
+        rounds = 0
+        while tool_use and rounds < MAX_TOOL_ROUNDS:
+            rounds += 1
+            # Process tool call
+            tool_name = tool_use['tool_name']
+            tool_input = tool_use['tool_input']
+            tool_result = truncate_text(process_tool_call(tools_dict, tool_name, tool_input))
+
+            # Get tool response
+            tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
+            logging(tool_msg)
+            response, new_msg_history = get_response_from_llm(
+                msg=tool_msg,
+                client=client,
+                model=client_model,
+                system_message=system_message,
+                print_debug=False,
+                msg_history=new_msg_history,
+            )
+            logging(f"Output: {response}")
+
+            # Check for next tool use
+            tool_use = check_for_tool_use(response, model=client_model)
+
+    except Exception as e:
+        logging(f"Error in chat_with_agent_manualtools: {e}")
+
+    return new_msg_history
+
+
+def _claude_block_to_dict(block):
+    """Convert a Claude response content block into a plain dict usable in later requests."""
+    if isinstance(block, dict):
+        btype = block.get('type')
+        if btype == 'text':
+            return {"type": "text", "text": block.get('text') or ""}
+        if btype == 'tool_use':
+            return {"type": "tool_use", "id": block.get('id'), "name": block.get('name'), "input": block.get('input') or {}}
+        return None
+    btype = getattr(block, 'type', None)
+    if btype == 'text':
+        return {"type": "text", "text": getattr(block, 'text', "") or ""}
+    if btype == 'tool_use':
+        return {
+            "type": "tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": block.input if block.input is not None else {},
+        }
+    return None
+
+
+def chat_with_agent_claude(
+        msg,
+        model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+        msg_history=None,
+        logging=print,
+    ):
+    # Construct message
+    if msg_history is None:
+        msg_history = []
+    new_msg_history = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": msg,
+                }
+            ],
+        }
+    ]
+
+    try:
+        # Create client
+        client, client_model = create_client(model)
+
+        # Load all tools
+        all_tools = load_all_tools(logging=logging)
+        tools_dict = {tool['info']['name']: tool for tool in all_tools}
+        tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+
+        for step in range(MAX_TOOL_ROUNDS):
+            response = get_response_withtools(
+                client=client,
+                model=client_model,
+                messages=msg_history + new_msg_history,
+                tool_choice={"type": "auto"},
+                tools=tools,
+                logging=logging,
+            )
+
+            content = []
+            for b in response.content:
+                d = _claude_block_to_dict(b)
+                if d is None:
+                    continue
+                if d['type'] == 'text' and not d['text'].strip():
+                    continue
+                content.append(d)
+
+            for d in content:
+                if d['type'] == 'text':
+                    logging(f"[Assistant] {d['text']}")
+
+            stop_reason = getattr(response, 'stop_reason', None)
+            tool_uses = [d for d in content if d['type'] == 'tool_use']
+
+            if stop_reason == "tool_use" and tool_uses:
+                new_msg_history.append({"role": "assistant", "content": content})
+                results = []
+                for tu in tool_uses:
+                    logging(f"[Tool call] {tu['name']}: {tu['input']}")
+                    tool_input = tu['input'] if isinstance(tu['input'], dict) else {}
+                    res = truncate_text(process_tool_call(tools_dict, tu['name'], tool_input))
+                    if not res.strip():
+                        res = "(no output)"
+                    logging(f"[Tool result] {res}")
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu['id'],
+                        "content": res,
+                    })
+                new_msg_history.append({"role": "user", "content": results})
+                continue
+
+            if stop_reason == "max_tokens":
+                # Drop (possibly incomplete) tool calls, keep text, and ask to continue.
+                kept = [d for d in content if d['type'] == 'text']
+                if not kept:
+                    kept = [{"type": "text", "text": "(my previous response was truncated)"}]
+                new_msg_history.append({"role": "assistant", "content": kept})
+                new_msg_history.append({"role": "user", "content": [{"type": "text", "text": TRUNCATION_MSG}]})
+                logging("[System] Response truncated by max_tokens; asking the model to continue.")
+                continue
+
+            # end_turn (or anything else): done
+            final_content = [d for d in content if d['type'] == 'text']
+            if not final_content:
+                final_content = [{"type": "text", "text": "(no response)"}]
+            new_msg_history.append({"role": "assistant", "content": final_content})
+            break
+
+    except Exception as e:
+        logging(f"Error in chat_with_agent_claude: {e}")
+
+    return new_msg_history
+
+def chat_with_agent_openai(
+        msg,
+        model='o3-mini-2025-01-31',
+        msg_history=None,
+        logging=print,
+    ):
+    # Construct message
+    if msg_history is None:
+        msg_history = []
+    new_msg_history = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": msg,
+                }
+            ],
+        }
+    ]
+    separator = '=' * 10
+    logging(f"\n{separator} User Instruction {separator}\n{msg}")
+    try:
+        # Create client
+        client, client_model = create_client(model)
+
+        # Load all tools
+        all_tools = load_all_tools(logging=logging)
+        tools_dict = {tool['info']['name']: tool for tool in all_tools}
+        tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+
+        # Call API
+        response = get_response_withtools(
+            client=client,
+            model=client_model,
+            messages=msg_history + new_msg_history,
+            tool_choice="auto",
+            tools=tools,
+            logging=logging,
+        )
+        logging(f"\n{separator} Agent Response {separator}\n{response}")
+
+        # Check for tool use
+        tool_use = check_for_tool_use(response, model=client_model)
+        logging(tool_use)
+        rounds = 0
+        while tool_use and rounds < MAX_TOOL_ROUNDS:
+            rounds += 1
+            # Process tool call
+            tool_name = tool_use['tool_name']
+            tool_input = tool_use['tool_input']
+            tool_result = truncate_text(process_tool_call(tools_dict, tool_name, tool_input))
+
+            logging(f"Tool Used: {tool_name}")
+            logging(f"Tool Input: {tool_input}")
+            logging(f"Tool Result: {tool_result}")
+
+            # Get tool response
+            for tool_call in response.output:
+                if tool_call.type == "function_call":
+                    break
+            new_msg_history.append(tool_call)
+            new_msg_history.append({
+                "type": "function_call_output",
+                "call_id": tool_use['tool_id'],
+                "output": tool_result,
+            })
+            response = get_response_withtools(
+                client=client,
+                model=client_model,
+                messages=msg_history + new_msg_history,
+                tool_choice="auto",
+                tools=tools,
+                logging=logging,
+            )
+
+            # Check for next tool use
+            tool_use = check_for_tool_use(response, model=client_model)
+
+            logging(f"Tool Response: {response}")
+
+        # Get final response
+        new_msg_history.append(response)
+
+    except Exception as e:
+        logging(f"Error in chat_with_agent_openai: {e}")
+
+    return new_msg_history
+
+def chat_with_agent(
+    msg,
+    model=CLAUDE_MODEL,
+    msg_history=None,
+    logging=print,
+    convert=False,  # Convert the message history to a generic format, so that msg_history can be used across models
+):
+    if msg_history is None:
+        msg_history = []
+
+    if 'claude' in model:
+        # Claude models
+        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging)
+        conv_msg_history = convert_msg_history(new_msg_history, model=model)
+        logging(conv_msg_history)
+        if convert:
+            new_msg_history = conv_msg_history
+        new_msg_history = msg_history + new_msg_history
+
+    elif model.startswith('o3-'):
+        # OpenAI models
+        new_msg_history = chat_with_agent_openai(msg, model=model, msg_history=msg_history, logging=logging)
+        new_msg_history = msg_history + new_msg_history
+
+    else:
+        # Models without in-built tool calling
+        new_msg_history = chat_with_agent_manualtools(msg, model=model, msg_history=msg_history, logging=logging)
+        conv_msg_history = convert_msg_history(new_msg_history, model=model)
+        if convert:
+            new_msg_history = conv_msg_history
+
+    return new_msg_history
+
+
+if __name__ == "__main__":
+    # Test the tool calling functionality
+    msg = "hello!"
+    chat_with_agent(msg)
+</file>
+
+<file path="tools/bash.py">
+import os
+import signal
+import subprocess
+
+DEFAULT_TIMEOUT = 120
+MAX_TIMEOUT = 900
+MAX_OUTPUT_CHARS = 15000
+
+
+def tool_info():
+    return {
+        "name": "bash",
+        "description": """Run a command in a bash shell.\n
+* Each call runs in a FRESH, non-interactive bash process: `cd`, shell variables and other state do NOT persist between calls. Use absolute paths or chain commands, e.g. `cd /dir && python3 x.py`.\n
+* Standard input is /dev/null, so commands never wait for interactive input. To feed input to a program, redirect from a file: `python3 solution.py < /tmp/in.txt`, or use a heredoc.\n
+* The command is killed after `timeout` seconds (default 120, max 900). Use `timeout N cmd` inside the command for finer control of individual programs.\n
+* Long output is truncated; avoid commands that print huge amounts of text.\n
+* stderr is reported after 'Error:' and a non-zero exit code is reported.\n
+* You don't have access to the internet.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to run."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Optional timeout in seconds for the whole command (default 120, max 900)."
+                }
+            },
+            "required": ["command"]
+        }
+    }
+
+
+class BashSession:
+    """Kept for backward compatibility; each command now runs in its own process."""
+    def __init__(self):
+        self._timeout = DEFAULT_TIMEOUT
+
+    def run(self, command, timeout=None):
+        return _run(command, timeout or self._timeout)
+
+
+def _truncate(text, max_chars=MAX_OUTPUT_CHARS):
+    if len(text) <= max_chars:
+        return text
+    head = max_chars * 2 // 3
+    tail = max_chars - head
+    return text[:head] + f"\n... <{len(text) - max_chars} characters truncated> ...\n" + text[-tail:]
+
+
+def _run(command, timeout):
+    proc = subprocess.Popen(
+        ["/bin/bash", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        env=os.environ.copy(),
+    )
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            out, err = proc.communicate(timeout=10)
+        except Exception:
+            out, err = b"", b""
+    out = (out or b"").decode(errors="replace")
+    err = (err or b"").decode(errors="replace")
+    return out, err, proc.returncode, timed_out
+
+
+def tool_function(command, timeout=None):
+    try:
+        try:
+            t = int(timeout) if timeout is not None else DEFAULT_TIMEOUT
+        except Exception:
+            t = DEFAULT_TIMEOUT
+        t = max(1, min(t, MAX_TIMEOUT))
+        out, err, code, timed_out = _run(command, t)
+        result = ""
+        if out.strip():
+            result += _truncate(out.strip())
+        if err.strip():
+            result += "\nError:\n" + _truncate(err.strip())
+        if timed_out:
+            result += f"\nError: command timed out after {t} seconds and was killed."
+        elif code not in (0, None):
+            result += f"\n(exit code {code})"
+        result = result.strip()
+        return result if result else "(no output)"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python bash.py '<command>'")
+    else:
+        print(tool_function(' '.join(sys.argv[1:])))
+</file>
+
+<file path="tools/edit.py">
+from pathlib import Path
+import subprocess
+
+def tool_info():
+    return {
+        "name": "editor",
+        "description": """Custom editing tool for viewing, creating, and editing files\n
+* If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+* The `create` command cannot be used if the specified `path` already exists as a file.\n
+* If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+* The `edit` command overwrites the entire file with the provided `file_text`.\n
+* The `str_replace` command replaces exactly one occurrence of `old_str` with `new_str` in the file (old_str must be unique in the file).""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["view", "create", "edit", "str_replace"],
+                    "description": "The command to run: `view`, `create`, `edit`, or `str_replace`."
+                },
+                "path": {
+                    "description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.",
+                    "type": "string"
+                },
+                "file_text": {
+                    "description": "Required parameter of `create` or `edit` command, containing the content for the entire file.",
+                    "type": "string"
+                },
+                "old_str": {
+                    "description": "Required parameter of `str_replace`: the exact text to replace (must occur exactly once).",
+                    "type": "string"
+                },
+                "new_str": {
+                    "description": "Required parameter of `str_replace`: the replacement text (may be empty).",
+                    "type": "string"
+                }
+            },
+            "required": ["command", "path"]
+        }
+    }
+
+def maybe_truncate(content: str, max_length: int = 10000) -> str:
+    """Truncate long content and add marker."""
+    if len(content) > max_length:
+        return content[:max_length] + "\n<response clipped>"
+    return content
+
+def validate_path(path: str, command: str) -> Path:
+    path_obj = Path(path)
+
+    if not path_obj.is_absolute():
+        raise ValueError(
+            f"The path {path} is not an absolute path (must start with '/')."
+        )
+
+    if command == "view":
+        if not path_obj.exists():
+            raise ValueError(f"The path {path} does not exist.")
+    elif command == "create":
+        if path_obj.exists():
+            raise ValueError(f"Cannot create new file; {path} already exists.")
+    elif command in ("edit", "str_replace"):
+        if not path_obj.exists():
+            raise ValueError(f"The file {path} does not exist.")
+        if path_obj.is_dir():
+            raise ValueError(f"{path} is a directory and cannot be edited as a file.")
+    else:
+        raise ValueError(f"Unknown or unsupported command: {command}")
+
+    return path_obj
+
+def format_output(content: str, path: str, init_line: int = 1) -> str:
+    """Format output with line numbers (for file content)."""
+    content = maybe_truncate(content)
+    content = content.expandtabs()
+    numbered_lines = [
+        f"{i + init_line:6}\t{line}"
+        for i, line in enumerate(content.split("\n"))
+    ]
+    return f"Here's the result of running `cat -n` on {path}:\n" + "\n".join(numbered_lines) + "\n"
+
+def read_file(path: Path) -> str:
+    try:
+        return path.read_text()
+    except Exception as e:
+        raise ValueError(f"Failed to read file: {e}")
+
+def write_file(path: Path, content: str):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)

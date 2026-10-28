@@ -1,0 +1,535 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 8b74674..1a2351e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,8 +5,10 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import ast
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm import create_client
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -170,15 +172,131 @@ class AgenticSystem:
+ 
+     def _patch_status(self):
+         """
+-        Classify the current repo edits as 'empty', 'test_only' or 'ok'.
++        Classify the current repo edits as 'empty', 'test_only', 'invalid' or 'ok'.
++        'invalid' means the target solution file fails _validate_target().
+         """
+         files = self._changed_files()
+         if not files:
+             return 'empty'
+         if all(self._is_test_file(f) for f in files):
+             return 'test_only'
++        ok, reason = self._validate_target()
++        if not ok:
++            safe_log(f"[validate] target invalid: {reason}", level=logging.WARNING)
++            return 'invalid'
+         return 'ok'
+ 
++    def _target_path(self):
++        filename = self._output_filename()
++        if not filename:
++            return None
++        return os.path.join(self.git_tempdir, filename)
++
++    def _starter_methods(self, filename):
++        """
++        Names of methods of class Solution in the starter (base commit) version of filename.
++        Falls back to the current file when the base version is unavailable.
++        """
++        text = self._starter_text(filename)
++        if 'class Solution' not in text:
++            path = os.path.join(self.git_tempdir, filename)
++            try:
++                with open(path) as f:
++                    text = f.read()
++            except OSError:
++                return []
++        try:
++            tree = ast.parse(text)
++        except SyntaxError:
++            return []
++        for node in tree.body:
++            if isinstance(node, ast.ClassDef) and node.name == 'Solution':
++                return [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
++        return []
++
++    @staticmethod
++    def _is_trivial_body(fn):
++        body = list(fn.body)
++        if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], 'value', None), ast.Constant) \
++                and isinstance(body[0].value.value, str):
++            body = body[1:]
++        if not body:
++            return True
++        return all(isinstance(s, ast.Pass) for s in body)
++
++    def _validate_target(self):
++        """
++        Check the target file. Returns (ok, reason).
++        - The file must compile.
++        - Method-style (file defines class Solution): the starter's method names must still exist
++          in Solution, with non-trivial bodies.
++        - Program-style: must print/write output and must not contain the stub marker.
++        """
++        filename = self._output_filename()
++        path = self._target_path()
++        if not filename or not path or not os.path.isfile(path):
++            return True, 'no target file to validate'
++        try:
++            with open(path) as f:
++                text = f.read()
++        except OSError as e:
++            return False, f'cannot read {filename}: {e}'
++        try:
++            compile(text, filename, 'exec')
++        except SyntaxError as e:
++            return False, f'{filename} does not compile: {e}'
++        try:
++            tree = ast.parse(text)
++        except SyntaxError as e:
++            return False, f'{filename} does not parse: {e}'
++
++        if self._is_method_task(filename):
++            classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Solution']
++            if not classes:
++                return False, f'{filename} no longer defines class Solution'
++            methods = {n.name: n for n in classes[0].body if isinstance(n, ast.FunctionDef)}
++            for name in self._starter_methods(filename):
++                if name not in methods:
++                    return False, f'Solution.{name} is missing from {filename}'
++                if self._is_trivial_body(methods[name]):
++                    return False, f'Solution.{name} in {filename} has an empty body'
++            if not self._starter_methods(filename) and all(self._is_trivial_body(m) for m in methods.values()):
++                return False, f'Solution in {filename} has no implemented method'
++            return True, 'method-style target looks valid'
++
++        if 'TODO: replace with a real solution' in text:
++            return False, f'{filename} still contains the stub marker'
++        if 'print(' not in text and 'sys.stdout' not in text:
++            return False, f'{filename} never writes output (no print/sys.stdout)'
++        return True, 'program-style target looks valid'
++
++    def _starter_text(self, filename):
++        result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:{filename}"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        return result.stdout.decode(errors='replace') if result.returncode == 0 else ''
++
++    def _is_method_task(self, filename):
++        """True if the starter file (base commit) or the current file defines class Solution."""
++        if 'class Solution' in self._starter_text(filename):
++            return True
++        path = os.path.join(self.git_tempdir, filename)
++        try:
++            with open(path) as f:
++                return 'class Solution' in f.read()
++        except OSError:
++            return False
++
++    def _ensure_typing_import(self, path):
++        """Prepend 'from typing import *' to a method-style file only if it is missing."""
++        with open(path) as f:
++            text = f.read()
++        if 'from typing import *' in text:
++            return
++        with open(path, 'w') as f:
++            f.write('from typing import *\n' + text)
++
+     def _block_has_text(self, block):
+         if isinstance(block, dict):
+             btype, text = block.get('type'), block.get('text')
+@@ -247,6 +365,10 @@ class AgenticSystem:
+             new_history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+             if new_history is None:
+                 raise ValueError("chat_with_agent returned None")
++            if new_history and self._is_degenerate_assistant(new_history[-1]):
++                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent", level=logging.WARNING)
++            elif len(new_history) <= len(history):
++                safe_log("[safe_chat] chat_with_agent added no messages", level=logging.WARNING)
+             return new_history
+         except Exception as e:
+             safe_log(f"[safe_chat] exception from chat_with_agent: {type(e).__name__}: {e}", level=logging.ERROR)
+@@ -357,6 +479,27 @@ class AgenticSystem:
+             return None
+         return self._sample_report_failed(report), report
+ 
++    def _direct_example_check(self):
++        """
++        For problems without 'Sample Input N' blocks: check the Solution method against the
++        'Input:' / 'Output:' examples with tools/run_examples. Returns (failed, report) or None.
++        """
++        path = self._target_path()
++        if not path or not self.problem_statement or not os.path.isfile(path):
++            return None
++        if not self._is_method_task(self._output_filename()):
++            return None
++        try:
++            from tools.run_examples import tool_function as run_examples
++            report = run_examples(path, self.problem_statement)
++        except Exception as e:
++            safe_log(f"[forward] direct example check failed: {type(e).__name__}: {e}", level=logging.WARNING)
++            return None
++        if 'No "Input:"' in report:
++            return None
++        failed = 'DIFFER' in report or 'MISMATCH' in report or 'ERROR' in report
++        return failed, report
++
+     def _current_verification(self, msg_history):
+         """
+         Authoritative state: the direct sample run on the file if possible, otherwise the
+@@ -366,26 +509,115 @@ class AgenticSystem:
+         if direct is not None:
+             failed, report = direct
+             return failed, report[-1500:]
++        ok, reason = self._validate_target()
++        if not ok:
++            return True, reason
++        example = self._direct_example_check()
++        if example is not None:
++            failed, report = example
++            return failed, report[-1500:]
+         return self._last_verification_failed(msg_history)
+ 
+     def _output_filename(self):
+-        match = re.search(r'`([\w./-]+\.py)`', self.problem_statement)
+-        return match.group(1) if match else None
+-
+-    def _write_stub(self, filename):
+-        stub = (
+-            "import sys\n\n\n"
+-            "def main():\n"
+-            "    data = sys.stdin.read()\n"
+-            "    # TODO: replace with a real solution\n\n\n"
+-            "if __name__ == '__main__':\n"
+-            "    main()\n"
++        """
++        The target file named in the problem statement (`file.py`). Falls back to the first
++        .py file in the repo that defines class Solution.
++        """
++        match = re.search(r'`([\w./-]+\.py)`', self.problem_statement or '')
++        if match:
++            return match.group(1)
++        for root, dirs, files in os.walk(self.git_tempdir):
++            dirs[:] = [d for d in dirs if not d.startswith('.')]
++            for name in sorted(files):
++                if not name.endswith('.py'):
++                    continue
++                full = os.path.join(root, name)
++                try:
++                    with open(full, errors='replace') as f:
++                        if 'class Solution' in f.read():
++                            return os.path.relpath(full, self.git_tempdir)
++                except OSError:
++                    continue
++        return None
++
++    def _plain_llm_text(self, client, model, system_message, prompt):
++        """One tool-less completion. Returns the reply text."""
++        if 'claude' in model:
++            resp = client.messages.create(
++                model=model,
++                max_tokens=8192,
++                system=system_message,
++                messages=[{"role": "user", "content": prompt}],
++            )
++            return ''.join(getattr(b, 'text', '') or '' for b in resp.content)
++        resp = client.chat.completions.create(
++            model=model,
++            messages=[
++                {"role": "system", "content": system_message},
++                {"role": "user", "content": prompt},
++            ],
+         )
+-        path = os.path.join(self.git_tempdir, filename)
+-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+-        with open(path, 'w') as f:
+-            f.write(stub)
+-        safe_log(f"[forward] wrote stub program to {filename}")
++        return resp.choices[0].message.content or ''
++
++    def _direct_completion_fallback(self, task, max_attempts=3):
++        """
++        Non-agentic fallback: a tool-less LLM call that returns the complete target file in one
++        ```python block. The block is written to the target path and re-validated. At most
++        max_attempts bounded attempts; validation errors are fed back to the model.
++        Returns True if the target validates afterwards.
++        """
++        path = self._target_path()
++        filename = self._output_filename()
++        if not path or not filename:
++            safe_log("[fallback] no target filename; direct completion skipped", level=logging.WARNING)
++            return False
++        try:
++            client, client_model = create_client(self.code_model)
++        except Exception as e:
++            safe_log(f"[fallback] cannot create client: {type(e).__name__}: {e}", level=logging.ERROR)
++            return False
++
++        system_message = "You write complete, correct Python source files. Reply with the full file only."
++        error_feedback = ''
++        for attempt in range(1, max_attempts + 1):
++            current = ''
++            if os.path.isfile(path):
++                with open(path) as f:
++                    current = f.read()
++            prompt = (
++                f"Problem statement:\n{self.problem_statement}\n\n"
++                f"Target file: {filename}\n"
++                f"Current file content:\n```python\n{current}\n```\n\n"
++                "Write the complete final content of the target file so that it solves the problem. "
++                "If the file defines class Solution, keep the class and the method signatures exactly as they are "
++                "and implement the method bodies. If the problem reads stdin and writes stdout, write a complete "
++                "program that does so. Put the complete file in a single ```python code block and nothing else."
++            )
++            if error_feedback:
++                prompt += f"\n\nYour previous attempt was rejected: {error_feedback}\nFix this and return the complete file."
++            try:
++                content = self._plain_llm_text(client, client_model, system_message, prompt)
++            except Exception as e:
++                error_feedback = f'LLM call failed: {type(e).__name__}: {e}'
++                safe_log(f"[fallback] attempt {attempt}: {error_feedback}", level=logging.ERROR)
++                continue
++            match = re.search(r"```python\s*\n(.*?)```", content or '', re.DOTALL)
++            if not match:
++                error_feedback = 'the reply contained no ```python code block'
++                safe_log(f"[fallback] attempt {attempt}: {error_feedback}", level=logging.WARNING)
++                continue
++            code = match.group(1)
++            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++            with open(path, 'w') as f:
++                f.write(code)
++            if self._is_method_task(filename):
++                self._ensure_typing_import(path)
++            ok, reason = self._validate_target()
++            safe_log(f"[fallback] attempt {attempt}: validation ok={ok}: {reason}")
++            if ok:
++                return True
++            error_feedback = reason
++        return False
+ 
+     def _verify_and_repair(self, msg_history, task, max_rounds=5):
+         """
+@@ -434,21 +666,14 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         workflow = """
+ Follow this workflow:
+ 1. Explore the repository: look at the relevant files, the existing tests and the sample inputs/outputs in the problem statement.
+-2. Write the brute force first (a simple, obviously-correct reference), and design the algorithm with a short correctness argument before coding it. Then write a first implementation early, using the editor tool. Do not wait until you have a perfect understanding.
++2. Work out a brute force (a simple, obviously-correct reference) and a correct algorithm with a short correctness argument. Then write a first implementation early with the editor tool, and refine it.
+ 3. Run the implementation on ALL sample inputs with bash and compare with the expected outputs.
+-4. Write a stress test that compares your implementation against the brute force on many small random inputs. If the brute force disagrees with your solution, you must fix the solution rather than stop.
++4. Write a stress test that compares your implementation against the brute force on many small random inputs. If they disagree, fix the solution.
+ 5. Check performance on maximum-size inputs (time limits matter). Optimize if needed.
+ 6. Fix any discrepancies and re-verify everything from steps 3-5.
+-7. After writing the solution, call run_samples with the problem statement. Any sample mismatch is a failure, even if your output is a different valid answer, because the hidden grader may compare exactly. When multiple answers are valid, adjust your construction (ordering, tie-breaking, basis/free-variable choice, bit order, scaling) until all sample outputs are reproduced exactly; if infeasible, explain why and prefer the variant matching the most samples.
+-
+-Your very first action must be an editor tool call that writes a draft implementation to the target file; refine it afterwards. If the stub file already exists, view it first and then use the editor `edit` command (not `create`) to overwrite it.
+-Never end your turn after announcing a next step; always perform the tool call. Only stop once the stress test shows zero mismatches and the samples pass.
++7. After writing the solution, call run_samples with the problem statement (or run_examples if the problem has only Input/Output examples). Any sample mismatch is a failure, even if your output is a different valid answer, because the hidden grader may compare exactly. When multiple answers are valid, adjust your construction until the sample outputs are reproduced exactly.
+ 
+-Important rules:
+-- Ending your turn without editing a file is a failure.
+-- If the task names an output file (e.g. solution.py), that file must exist and contain a complete program.
+-- If the task asks for a method of a given Solution class, implement that method in the source file.
+-- Make sure the final changes are in non-test source files.
++Keep the required output file complete: a program file must read stdin and write stdout, and a method-style file must keep the `Solution` class and its method signatures. Put your work in the non-test source file.
+ """
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.\n{workflow}"
+ 
+@@ -462,16 +687,18 @@ Important rules:
+                 break
+             msg_history = self._sanitize_history(msg_history)
+             if status == 'test_only':
+-                short = ("You only modified test files. Change the non-test source file(s) now: "
+-                         "use the editor tool to write the solution implementation.")
++                short = "You only changed test files. Edit the solution file itself with the editor tool."
++            elif status == 'invalid':
++                short = ("The solution file is no longer valid (it fails to compile, lost the Solution class or "
++                         "method, or still contains a stub). Restore it with the editor tool so it is a complete, "
++                         "working solution.")
+             else:
+-                short = ("You have not edited any file. Immediately call the editor tool to write "
+-                         "your best current solution to the required file, then refine it.")
++                short = "No file has been edited yet. Use the editor tool to write your solution now."
++            # Retries use a short, simple prompt: long prompts seem to correlate with empty replies.
+             if attempt == 1:
+                 corrective = short
+             else:
+-                corrective = (f"{short}\n\nRestated task:\n{task}\n"
+-                              "Your first action must be an editor tool call that writes the full solution file.")
++                corrective = f"{short}\n\nTask: {self.problem_statement}"
+             safe_log(f"[forward] retry {attempt} due to status '{status}'")
+             msg_history = self._safe_chat(corrective, msg_history)
+             status = self._patch_status()
+@@ -481,21 +708,13 @@ Important rules:
+             self._verify_and_repair(msg_history, task)
+             return
+ 
+-        safe_log(f"[forward] status '{status}' after retries; starting a fresh conversation")
+-        fresh = ("Write the simplest correct solution to the required file now. Your first action must be "
+-                 "a tool call (editor) that creates that file with a complete program. Then refine it "
+-                 "by testing against the sample inputs.\n\n" + task)
+-        self._safe_chat(fresh, [])
+-        status = self._patch_status()
+-        safe_log(f"[forward] fresh-conversation patch status: {status}")
++        safe_log(f"[forward] status '{status}' after retries; trying the direct completion fallback")
++        if self._direct_completion_fallback(task):
++            safe_log("[forward] direct completion produced a valid target")
++            self._verify_and_repair(self._sanitize_history([]), task)
++            return
+ 
+-        if status == 'empty':
+-            filename = self._output_filename()
+-            if filename:
+-                self._write_stub(filename)
+-                safe_log(f"[forward] patch status after stub: {self._patch_status()}")
+-            else:
+-                safe_log("[forward] no output filename detected; cannot write stub", level=logging.WARNING)
++        safe_log(f"[forward] direct completion failed; status '{self._patch_status()}'", level=logging.WARNING)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/run_examples.py b/tools/run_examples.py
+new file mode 100644
+index 0000000..0f7b8b2
+--- /dev/null
++++ b/tools/run_examples.py
+@@ -0,0 +1,131 @@
++import ast
++import importlib.util
++import inspect
++import re
++import traceback
++
++# Matches "Input: ..." followed by "Output: ..." (both may span lines until the next keyword).
++EXAMPLE_RE = re.compile(
++    r'Input:\s*(.*?)\s*\n\s*Output:\s*(.*?)(?=\n\s*(?:Input:|Explanation:|Constraints:|Follow[- ]?up:)|\Z)',
++    re.DOTALL,
++)
++
++
++def tool_info():
++    return {
++        'name': 'run_examples',
++        'description': (
++            'Check a method-style solution (a `Solution` class method) against the examples written as '
++            '"Input: a = ..., b = ..." / "Output: ..." pairs in the problem statement. The module is imported, '
++            'Solution().<method>(**kwargs) is called for each example, and PASS or MISMATCH is reported per '
++            'example with a final summary. Any mismatch is a failure.'
++        ),
++        'input_schema': {
++            'type': 'object',
++            'properties': {
++                'module_path': {
++                    'type': 'string',
++                    'description': 'Path to the Python file that defines the Solution class.',
++                },
++                'problem_text': {
++                    'type': 'string',
++                    'description': 'The full problem statement containing "Input:" / "Output:" example pairs.',
++                },
++                'class_name': {
++                    'type': 'string',
++                    'description': 'Name of the class to instantiate. Defaults to "Solution".',
++                },
++                'method_name': {
++                    'type': 'string',
++                    'description': 'Name of the method to call. If omitted, the single public method of the class is used.',
++                },
++            },
++            'required': ['module_path', 'problem_text'],
++        },
++    }
++
++
++def _parse_examples(problem_text):
++    """Return a list of (input_text, output_text) pairs found in the problem statement."""
++    return [(i.strip(), o.strip()) for i, o in EXAMPLE_RE.findall(problem_text or '')]
++
++
++def _parse_kwargs(input_text):
++    """
++    Parse 'a = 1, b = [2, 3]' into ({'a': 1, 'b': [2, 3]}, []).
++    Arguments are evaluated with ast.literal_eval. Positional args are returned separately.
++    """
++    call = ast.parse(f"_f({input_text})", mode='eval').body
++    kwargs = {}
++    for kw in call.keywords:
++        kwargs[kw.arg] = ast.literal_eval(kw.value)
++    args = [ast.literal_eval(a) for a in call.args]
++    return kwargs, args
++
++
++def _load_class(module_path, class_name):
++    spec = importlib.util.spec_from_file_location('candidate_solution_module', module_path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return getattr(module, class_name)
++
++
++def _pick_method(cls, method_name):
++    if method_name:
++        return method_name
++    methods = [
++        name for name, member in inspect.getmembers(cls, predicate=inspect.isfunction)
++        if not name.startswith('_')
++    ]
++    if len(methods) == 1:
++        return methods[0]
++    raise ValueError(f'cannot infer method name, candidates: {methods}')
++
++
++def _same(got, expected_text):
++    try:
++        expected = ast.literal_eval(expected_text)
++    except Exception:
++        return str(got).strip() == expected_text.strip()
++    return got == expected
++
++
++def tool_function(module_path, problem_text, class_name=None, method_name=None):
++    class_name = class_name or 'Solution'
++    examples = _parse_examples(problem_text)
++    if not examples:
++        return 'No "Input:" / "Output:" example pairs found in problem_text.'
++
++    try:
++        cls = _load_class(module_path, class_name)
++        method = _pick_method(cls, method_name)
++    except Exception as e:
++        return f'ERROR: could not load {class_name} from {module_path}: {type(e).__name__}: {e}'
++
++    lines = []
++    failures = 0
++    for idx, (inp, expected) in enumerate(examples, 1):
++        try:
++            kwargs, args = _parse_kwargs(inp)
++            got = getattr(cls(), method)(*args, **kwargs)
++        except Exception:
++            lines.append(f'Example {idx}: MISMATCH (runtime error)')
++            lines.append(f'input: {inp}')
++            lines.append(f'expected: {expected}')
++            lines.append(f'traceback: {traceback.format_exc()[-800:]}')
++            failures += 1
++            continue
++        if _same(got, expected):
++            lines.append(f'Example {idx}: PASS')
++        else:
++            lines.append(f'Example {idx}: MISMATCH')
++            lines.append(f'input: {inp}')
++            lines.append(f'expected: {expected}')
++            lines.append(f'got: {got!r}')
++            failures += 1
++
++    if failures == 0:
++        lines.append('ALL EXAMPLES EXACT MATCH')
++    else:
++        lines.append(f'{failures} EXAMPLE(S) DIFFER')
++    return '\n'.join(lines)

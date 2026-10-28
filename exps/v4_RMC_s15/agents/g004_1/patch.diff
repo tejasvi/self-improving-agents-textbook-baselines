@@ -1,0 +1,226 @@
+diff --git a/llm.py b/llm.py
+index d6b4da1..7d0df58 100644
+--- a/llm.py
++++ b/llm.py
+@@ -4,9 +4,10 @@ import os
+ import re
+ 
+ import anthropic
+-import backoff
+ import openai
+ 
++from utils.api_retry import retry_api_call
++
+ MAX_OUTPUT_TOKENS = 4096
+ AVAILABLE_LLMS = [
+     # Anthropic models
+@@ -85,7 +86,7 @@ def create_client(model: str):
+         raise ValueError(f"Model {model} not supported.")
+ 
+ # Get N responses from a single message, used for ensembling.
+-@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
++@retry_api_call()
+ def get_batch_responses_from_llm(
+         msg,
+         client,
+@@ -164,11 +165,7 @@ def get_batch_responses_from_llm(
+ 
+     return content, new_msg_history
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=120,
+-)
++@retry_api_call()
+ def get_response_from_llm(
+         msg,
+         client,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..ccc095a 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -2,11 +2,11 @@ import ast
+ import json
+ import re
+ import anthropic
+-import backoff
+ import openai
+ import copy
+ 
+ from llm import create_client, get_response_from_llm
++from utils.api_retry import retry_api_call
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+@@ -22,47 +22,31 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=600,
+-    max_value=60,
+-)
++@retry_api_call(max_retries=5, base_delay=2.0, max_delay=60.0)
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+     logging=None, max_retry=3
+ ):
+-    try:
+-        if 'claude' in model:
+-            response = client.messages.create(
+-                model=model,
+-                messages=messages,
+-                max_tokens=4096,
+-                tool_choice=tool_choice,
+-                tools=tools,
+-            )
+-        elif model.startswith('o3-'):
+-            response = client.responses.create(
+-                model=model,
+-                input=messages,
+-                tool_choice=tool_choice,
+-                tools=tools,
+-                parallel_tool_calls=False
+-            )
+-            response = response
+-        else:
+-            raise ValueError(f"Unsupported model: {model}")
+-        return response
+-    except Exception as e:
+-        logging(f"Error in get_response_withtools: {str(e)}")
+-        if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+-
+-        # Hitting the context window limit
+-        if 'Input is too long for requested model' in str(e):
+-            pass
+-
+-        raise  # Re-raise the exception after logging
++    # Transient API failures (rate limits, timeouts, 5xx, overload) are retried
++    # with exponential backoff by retry_api_call. Other errors are raised.
++    if 'claude' in model:
++        return client.messages.create(
++            model=model,
++            messages=messages,
++            max_tokens=4096,
++            tool_choice=tool_choice,
++            tools=tools,
++        )
++    elif model.startswith('o3-'):
++        return client.responses.create(
++            model=model,
++            input=messages,
++            tool_choice=tool_choice,
++            tools=tools,
++            parallel_tool_calls=False
++        )
++    else:
++        raise ValueError(f"Unsupported model: {model}")
+ 
+ def check_for_tool_use(response, model=''):
+     """
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..1b05673 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -76,7 +76,8 @@ class BashSession:
+             output = ''
+             start_time = asyncio.get_event_loop().time()
+             
+-            while True:
++            found = False
++            while not found:
+                 if asyncio.get_event_loop().time() - start_time > self._timeout:
+                     self._timed_out = True
+                     raise ValueError(
+@@ -90,7 +91,7 @@ class BashSession:
+                 
+                 if self._sentinel in stdout_data:
+                     output = stdout_data[: stdout_data.index(self._sentinel)]
+-                    break
++                    found = True
+ 
+             # Clear buffers
+             self._process.stdout._buffer.clear()
+diff --git a/null b/null
+new file mode 100644
+index 0000000..ad0c307
+--- /dev/null
++++ b/null
+@@ -0,0 +1 @@
++cat: utils/llm.py: No such file or directory
+diff --git a/utils/api_retry.py b/utils/api_retry.py
+new file mode 100644
+index 0000000..cde3c07
+--- /dev/null
++++ b/utils/api_retry.py
+@@ -0,0 +1,66 @@
++"""Retry helpers with exponential backoff for transient LLM API failures."""
++import functools
++import random
++import time
++
++import anthropic
++import openai
++
++# Exceptions that are always considered transient.
++_TRANSIENT_EXC_TYPES = (
++    openai.RateLimitError,
++    openai.APITimeoutError,
++    openai.APIConnectionError,
++    openai.InternalServerError,
++    anthropic.RateLimitError,
++    anthropic.APITimeoutError,
++    anthropic.APIConnectionError,
++    anthropic.InternalServerError,
++    anthropic.OverloadedError,
++)
++
++# HTTP status codes that indicate a transient condition.
++_TRANSIENT_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
++
++
++def is_transient_error(exc):
++    """Return True if the exception looks like a transient API failure."""
++    if isinstance(exc, _TRANSIENT_EXC_TYPES):
++        return True
++    status = getattr(exc, "status_code", None)
++    return isinstance(status, int) and status in _TRANSIENT_STATUS_CODES
++
++
++def compute_backoff(attempt, base_delay, max_delay):
++    """Exponential backoff delay (attempt is 0-based) with +/-25% jitter."""
++    delay = min(max_delay, base_delay * (2 ** attempt))
++    return delay * random.uniform(0.75, 1.25)
++
++
++def retry_api_call(max_retries=5, base_delay=2.0, max_delay=60.0, logging=print):
++    """Decorator retrying the wrapped LLM call on transient errors only.
++
++    Makes at most `max_retries + 1` attempts using a bounded loop; non-transient
++    errors are raised immediately.
++    """
++    def decorator(fn):
++        @functools.wraps(fn)
++        def wrapper(*args, **kwargs):
++            last_exc = None
++            for attempt in range(max_retries + 1):
++                try:
++                    return fn(*args, **kwargs)
++                except Exception as e:
++                    if not is_transient_error(e) or attempt == max_retries:
++                        raise
++                    last_exc = e
++                    delay = compute_backoff(attempt, base_delay, max_delay)
++                    logging(
++                        f"Transient API error in {fn.__name__} "
++                        f"(attempt {attempt + 1}/{max_retries + 1}): {e}. "
++                        f"Retrying in {delay:.1f}s."
++                    )
++                    time.sleep(delay)
++            raise last_exc  # pragma: no cover - loop always returns or raises
++        return wrapper
++    return decorator

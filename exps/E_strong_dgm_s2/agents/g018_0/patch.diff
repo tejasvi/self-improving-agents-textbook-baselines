@@ -1,0 +1,601 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2e1a3a1..766e5cf 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -11,6 +11,7 @@ import shutil
+ import sys
+ 
+ from tools.stress_test import tool_function as stress_test
++from tools.run_method import run_calls
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -54,17 +55,110 @@ MAX_CAND = 3    # extended to this many if no candidate passes the samples
+ MAX_FIX_ITERS = 4
+ 
+ 
++EXAMPLE_RE = re.compile(
++    r'Example\s*(\d+)\s*:?\s*\n?\s*Input:\s*(.*?)\s*Output:\s*(.*?)'
++    r'(?=\n\s*Explanation:|\n\s*Example\s*\d+|\n\s*Constraints:|\n\s*#|\Z)',
++    re.S)
++PERF_MODES = ['all_equal', 'random', 'distinct', 'adversarial']
++PERF_LIMIT = 2.0    # seconds per max-size call
++PERF_ROUNDS = 3     # bounded perf-repair rounds
++
++
+ def _extract_samples(problem_statement):
+-    """Return a list of (input_text, expected_output_text) from 'Sample Input N / Sample Output N' blocks."""
++    """Return a list of (input_text, expected_output_text).
++    Stdin tasks: 'Sample Input N / Sample Output N' blocks -> (stdin text, expected stdout).
++    Class-method tasks: 'Example N:' blocks -> (args text like `name = value, ...`, expected output).
++    Falls back to Example blocks only when no Sample blocks are present."""
++    statement = problem_statement or ''
+     samples = []
+-    for m in SAMPLE_RE.finditer(problem_statement or ''):
+-        inp = m.group(2).strip('\n') + '\n'
+-        exp = m.group(3).strip()
+-        samples.append((inp, exp))
++    for m in SAMPLE_RE.finditer(statement):
++        samples.append((m.group(2).strip('\n') + '\n', m.group(3).strip()))
++    if not samples:
++        for m in EXAMPLE_RE.finditer(statement):
++            samples.append((m.group(2).strip(), m.group(3).strip()))
+     return samples
+ 
+ 
+-def _validate_solution(sol_path, stub_text, samples):
++def _detect_task(problem_statement, starter_text=''):
++    """Return ('method', method_name) for LeetCode-style Solution-class tasks, else ('stdin', None).
++    method_name is None when a method task was detected but its name could not be found."""
++    statement = problem_statement or ''
++    is_method = (re.search(r'\bclass\s+Solution\b', statement) is not None
++                 or re.search(r'\bSolution\s+class\b', statement) is not None
++                 or 'method `' in statement)
++    if not is_method:
++        return 'stdin', None
++    for text in (starter_text or '', statement):
++        m = re.search(r'def\s+(\w+)\s*\(\s*self', text)
++        if m:
++            return 'method', m.group(1)
++    m = re.search(r'method `(\w+)`', statement)
++    return 'method', (m.group(1) if m else None)
++
++
++def _load_agent_examples(path, mode):
++    """Load examples written by the agent: JSON list of {"args"|"input": ..., "expected": ...}.
++    Returns a list of (text, expected) tuples, or [] if missing or malformed."""
++    import json
++    try:
++        with open(path) as f:
++            data = json.load(f)
++        out = []
++        for item in data:
++            key = 'args' if mode == 'method' else 'input'
++            text = item[key] if key in item else item['input']
++            out.append((str(text).strip() if mode == 'method' else str(text), str(item['expected']).strip()))
++        return out
++    except (OSError, ValueError, KeyError, TypeError):
++        return []
++
++
++def _values_equal(got_repr, expected_text):
++    """Literal-aware comparison of a repr() result with the expected output text."""
++    norm = re.sub(r'\btrue\b', 'True', re.sub(r'\bfalse\b', 'False', re.sub(r'\bnull\b', 'None', expected_text.strip())))
++    try:
++        return ast.literal_eval(got_repr) == ast.literal_eval(norm)
++    except (ValueError, SyntaxError, TypeError):
++        return got_repr.strip() == expected_text.strip()
++
++
++def _perf_check(sol_path, method_name, helper_dir, limit=PERF_LIMIT):
++    """Deterministic timing of the method on max-size inputs from helper_dir/perf_gen.py.
++    Returns (ok, raw_report)."""
++    gen = os.path.join(helper_dir, 'perf_gen.py')
++    if not os.path.isfile(gen):
++        return False, "perf_gen.py is missing from the helper directory"
++    lines, bad = [], False
++    for mode in PERF_MODES:
++        try:
++            g = subprocess.run([sys.executable, '-I', gen, mode, '0'], capture_output=True, text=True,
++                               timeout=20, cwd=helper_dir, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin')})
++        except subprocess.TimeoutExpired:
++            bad = True
++            lines.append(f"mode {mode}: generator timed out")
++            continue
++        if g.returncode != 0 or not g.stdout.strip():
++            bad = True
++            lines.append(f"mode {mode}: generator failed (rc={g.returncode})\n{g.stderr[-1500:]}")
++            continue
++        r = run_calls(sol_path, method_name, [g.stdout.strip()], timeout=10)
++        size = len(g.stdout)
++        if r['rc'] == 'TIMEOUT' or 0 not in r['results']:
++            bad = True
++            lines.append(f"mode {mode} (args length {size}): FAILED rc={r['rc']} elapsed={r['elapsed']}s\n"
++                         f"--- stderr\n{r['stderr'][-1500:]}")
++        else:
++            el = r['results'][0][0]
++            if el > limit:
++                bad = True
++                lines.append(f"mode {mode} (args length {size}): TOO SLOW {el:.3f}s > {limit}s limit")
++            else:
++                lines.append(f"mode {mode} (args length {size}): ok {el:.3f}s")
++    report = "\n".join(lines)
++    return (not bad), report
++
++
++def _validate_solution(sol_path, stub_text, samples, mode='stdin', method_name=None):
+     """Deterministic check of a solution file. Returns (n_passed, n_total, raw_report).
+     raw_report is '' when the file exists, differs from the stub, parses and passes every sample."""
+     n_total = len(samples)
+@@ -81,6 +175,22 @@ def _validate_solution(sol_path, stub_text, samples):
+     sol_abs = os.path.abspath(sol_path)
+     n_pass = 0
+     reports = []
++    if mode == 'method':
++        if not method_name:
++            return 0, n_total, "method name could not be determined from the statement"
++        r = run_calls(sol_abs, method_name, [inp for inp, _ in samples], timeout=10)
++        for i, (inp, exp) in enumerate(samples):
++            got = r['results'].get(i)
++            if got is not None and _values_equal(got[1], exp):
++                n_pass += 1
++            else:
++                reports.append(f"sample {i + 1} FAILED\n--- args\n{inp}\n--- expected\n{exp}\n"
++                               f"--- got\n{got[1] if got else '(no result)'}\n"
++                               f"--- error\n{r['errors'].get(i, '')}\n--- load error\n{r['load_error'] or ''}\n"
++                               f"--- stderr (rc={r['rc']})\n{r['stderr']}")
++        if n_pass == n_total:
++            return n_pass, n_total, ''
++        return n_pass, n_total, "\n".join(reports)
+     for i, (inp, exp) in enumerate(samples, 1):
+         try:
+             p = subprocess.run([sys.executable, '-I', sol_abs], input=inp, capture_output=True,
+@@ -218,10 +328,20 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def _ensure_solution(self, sol_path, stub_text, samples, task, msg_history, helper_dir, label):
++    def _write_samples(self, samples, samples_dir):
++        for i, (inp, exp) in enumerate(samples, 1):
++            with open(os.path.join(samples_dir, f'sample{i}.in'), 'w') as f:
++                f.write(inp)
++            with open(os.path.join(samples_dir, f'sample{i}.out'), 'w') as f:
++                f.write(exp + '\n')
++
++    def _ensure_solution(self, sol_path, stub_text, samples, task, msg_history, helper_dir, label,
++                         mode='stdin', method_name=None):
+         """Bounded repair loop: validate solution.py deterministically, re-prompt with the raw report.
+         Returns (msg_history, n_pass, n_total, report)."""
+-        n_pass, n_total, report = _validate_solution(sol_path, stub_text, samples)
++        def validate():
++            return _validate_solution(sol_path, stub_text, samples, mode=mode, method_name=method_name)
++        n_pass, n_total, report = validate()
+         for i in range(MAX_FIX_ITERS):
+             if not report:
+                 safe_log(f"[{label}] solution passes all {n_total} samples")
+@@ -236,7 +356,7 @@ class AgenticSystem:
+                 prompt = (f"Create or fix {sol_path} now with the editor tool so it passes the samples. "
+                           f"Reply in under 200 words.\n\nValidation report (raw):\n{report}")
+             msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            n_pass, n_total, report = _validate_solution(sol_path, stub_text, samples)
++            n_pass, n_total, report = validate()
+         if not report:
+             safe_log(f"[{label}] solution passes all {n_total} samples")
+         else:
+@@ -268,17 +388,19 @@ class AgenticSystem:
+         modes_file = os.path.join(helper_dir, 'modes.txt')
+         sol_path = os.path.join(self.git_tempdir, 'solution.py')
+ 
+-        samples = _extract_samples(self.problem_statement)
+-        for i, (inp, exp) in enumerate(samples, 1):
+-            with open(os.path.join(samples_dir, f'sample{i}.in'), 'w') as f:
+-                f.write(inp)
+-            with open(os.path.join(samples_dir, f'sample{i}.out'), 'w') as f:
+-                f.write(exp + '\n')
+-        safe_log(f"[samples] extracted {len(samples)} sample(s) from the statement")
+-
+         # The stub is the repo's solution.py at the base commit (empty if absent there).
+         stub_text = subprocess.run(['git', '-C', self.git_tempdir, 'show', f'{self.base_commit}:solution.py'],
+                                    capture_output=True, text=True).stdout
++        task_mode, method_name = _detect_task(self.problem_statement, stub_text)
++        samples = _extract_samples(self.problem_statement)
++        safe_log(f"[task] mode={task_mode} method={method_name}")
++        safe_log(f"[samples] extracted {len(samples)} sample(s) from the statement")
++        examples_path = os.path.join(samples_dir, 'examples.json')
++        need_agent_examples = len(samples) == 0
++        if need_agent_examples:
++            safe_log("[samples] WARNING: extracted 0 samples; asking the agent to write its own examples "
++                     f"to {examples_path}; sample validation is skipped until they are loaded")
++        self._write_samples(samples, samples_dir)
+ 
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -288,10 +410,18 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
++        if task_mode == 'method':
++            task += (f"\nThis is a class-method task: implement method `{method_name}` in class Solution in solution.py "
++                     f"(keep the class and method signature from the statement/stub).\n")
++        if need_agent_examples:
++            task += ("\nNOTE: no examples could be parsed from the statement. Before coding, write 2-5 examples "
++                     f"taken from the statement to {examples_path} as a JSON list of objects with keys "
++                     "\"args\" (python-literal call arguments, e.g. s = \"acab\") and \"expected\" "
++                     "(the expected return value as a python literal). Use exactly the statement's examples.\n")
+         method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++1. Read the statement and constraints. BEFORE coding, state the complexity as a function of the max n (e.g. O(n^2) with n = 2*10^4 is about 4*10^8 and is too slow), and reject designs above about 5*10^6 basic operations in Python. Prefer the simplest algorithm that fits the constraints over a clever complicated one.
+ 2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method use the run_method tool on the sample arguments (or write a small driver script). Add `from typing import *` and any imports you need at the top of solution.py.
+ 4. Avoid environment-fragile constructs: do not use 3-argument pow (e.g. pow(a, MOD-2, MOD)); write a small hand-written modular power helper `def mpow(b, e, m)` with a loop instead. Avoid threading and recursion-limit tricks; prefer iterative code. Never use `while True` loops.
+ 5. Do a last re-read of solution.py for edge cases such as N=1, empty input, and the smallest/largest constraints.
+ The final solution.py is what gets graded; helper files are ignored."""
+@@ -307,8 +437,18 @@ The final solution.py is what gets graded; helper files are ignored."""
+                 reset_to_commit(self.git_tempdir, self.base_commit)  # clean copy of the base commit
+             phase_a = f"{task}\n\n{method}\n\nFor now do only steps 1-3 and 5 (write solution.py and pass all samples). Do not write any stress tests yet; that comes in the next step. Keep replies concise and write files with the editor tool immediately."
+             msg_history = chat_with_agent(phase_a, model=self.code_model, msg_history=[], logging=safe_log)
++            if need_agent_examples and not samples:
++                loaded = _load_agent_examples(examples_path, task_mode)
++                if loaded:
++                    samples[:] = loaded
++                    self._write_samples(samples, samples_dir)
++                    need_agent_examples = False
++                    safe_log(f"[samples] loaded {len(samples)} agent-written example(s) from {examples_path}")
++                else:
++                    safe_log(f"[samples] WARNING: no usable examples in {examples_path}; validation has no samples")
+             msg_history, n_pass, n_total, _ = self._ensure_solution(
+-                sol_path, stub_text, samples, task, msg_history, helper_dir, f"cand {k + 1}")
++                sol_path, stub_text, samples, task, msg_history, helper_dir, f"cand {k + 1}",
++                mode=task_mode, method_name=method_name)
+             cand_path = os.path.join(helper_dir, f'cand_{k + 1}.py')
+             if os.path.isfile(sol_path):
+                 shutil.copyfile(sol_path, cand_path)
+@@ -332,7 +472,8 @@ The final solution.py is what gets graded; helper files are ignored."""
+                      f"{best[0] if best else 0}/{len(samples)}")
+             # bounded final retry: one fresh chat asking for any best-effort solution
+             msg_history, n_pass, n_total, report = self._ensure_solution(
+-                sol_path, stub_text, samples, task, [], helper_dir, "final retry")
++                sol_path, stub_text, samples, task, [], helper_dir, "final retry",
++                mode=task_mode, method_name=method_name)
+             if report:
+                 if best is not None:
+                     shutil.copyfile(best[2], sol_path)  # keep the best-effort candidate
+@@ -340,6 +481,11 @@ The final solution.py is what gets graded; helper files are ignored."""
+                 return
+             chosen = (n_pass, 0, sol_path)
+ 
++        # ---- Perf gate (method tasks): max-size timing with bounded repair rounds ----
++        if task_mode == 'method' and method_name:
++            msg_history = self._perf_gate(sol_path, stub_text, samples, task, msg_history, helper_dir,
++                                          method_name, task_mode)
++
+         # ---- Phase B part 1: brute.py + gen.py + modes file ----
+         base_b = f"""Phase B: build an independent self-testing harness. Put ALL helper files in the directory {helper_dir} (NOT inside {self.git_tempdir}, do not modify any other repo file). Sample inputs/outputs are in {samples_dir} (sampleN.in / sampleN.out). Keep replies concise and write files with the editor tool immediately.
+ """
+@@ -371,7 +517,7 @@ Write both files with the editor tool immediately; keep the reply under 150 word
+         K = 3
+         cand_fails, cur_fail = {}, 10 ** 9
+         for rnd in range(K):
+-            report, failed, cand_fails = self._run_stress_round(helper_dir, sol_path, modes_file, extra_cands)
++            report, failed, cand_fails = self._run_stress_round(helper_dir, sol_path, modes_file, extra_cands, method_name=method_name if task_mode == "method" else None)
+             with open(attempts_file, 'a') as f:
+                 f.write(f"\n## Round {rnd + 1}\n")
+                 f.write((report or 'stress test could not run').strip()[:4000] + "\n")
+@@ -419,7 +565,39 @@ Instructions:
+ Then give a short final summary."""
+         msg_history = chat_with_agent(final, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+-    def _run_stress_round(self, helper_dir, sol_path, modes_file, extra_cands=()):
++    def _perf_gate(self, sol_path, stub_text, samples, task, msg_history, helper_dir, method_name, mode):
++        """Ask for perf_gen.py once, then time the method on max-size inputs. On a timeout, re-prompt
++        with the raw timing report (at most PERF_ROUNDS rounds). Returns msg_history."""
++        perf_gen = os.path.join(helper_dir, 'perf_gen.py')
++        modes_list = ', '.join(PERF_MODES)
++        msg_history = chat_with_agent(
++            f"Performance gate. Write {perf_gen} with the editor tool: usage `python3 perf_gen.py MODE SEED`, "
++            f"prints ONE line of python-literal call arguments for method `{method_name}` at the MAXIMUM constraints "
++            f"from the statement (max n). Modes: {modes_list} (all_equal: all values equal; random: uniform random; "
++            f"distinct: all distinct; adversarial: the worst-case shape for a naive algorithm). Use random.Random(SEED) only. "
++            f"Reply in under 100 words.",
++            model=self.code_model, msg_history=msg_history, logging=safe_log)
++        for rnd in range(PERF_ROUNDS):
++            ok, report = _perf_check(sol_path, method_name, helper_dir)
++            if ok:
++                safe_log(f"[perf] round {rnd + 1}: all max-size modes within {PERF_LIMIT}s")
++                return msg_history
++            safe_log(f"[perf] round {rnd + 1}: too slow or failed, re-prompting with the timing report")
++            msg_history = chat_with_agent(
++                f"Performance check FAILED for method `{method_name}` in {sol_path} (limit {PERF_LIMIT}s per "
++                f"max-size call). Raw timing report:\n{report}\n\n"
++                f"Find a simpler or asymptotically faster algorithm that still passes the samples. State the complexity "
++                f"in terms of max n first; reject designs above about 5*10^6 basic operations. Edit solution.py with the "
++                f"editor tool, re-check the samples with run_method, then stop. Reply in under 150 words.",
++                model=self.code_model, msg_history=msg_history, logging=safe_log)
++            msg_history, _, _, _ = self._ensure_solution(
++                sol_path, stub_text, samples, task, msg_history, helper_dir,
++                f"perf round {rnd + 1}", mode=mode, method_name=method_name)
++        ok, report = _perf_check(sol_path, method_name, helper_dir)
++        safe_log(f"[perf] final: {'ok' if ok else 'STILL TOO SLOW'}")
++        return msg_history
++
++    def _run_stress_round(self, helper_dir, sol_path, modes_file, extra_cands=(), method_name=None):
+         """Run the stress test tool on the current solution, and on each extra candidate on the
+         small modes. Returns (raw_report, failed_flag, cand_fail_counts)."""
+         gen = os.path.join(helper_dir, 'gen.py')
+@@ -439,16 +617,16 @@ Then give a short final summary."""
+             if small:
+                 parts.append("### small modes (reference: brute.py)\n" + stress_test(
+                     solution_path=sol_path, gen_path=gen, ref_path=brute, checker_path=checker,
+-                    modes=small, seeds_per_mode=30, timeout=10))
++                    modes=small, seeds_per_mode=30, timeout=10, method_name=method_name))
+             if big:
+                 parts.append("### max modes (reference: alt_solution.py)\n" + stress_test(
+                     solution_path=sol_path, gen_path=gen, ref_path=alt, checker_path=checker,
+-                    modes=big, seeds_per_mode=1, timeout=60))
++                    modes=big, seeds_per_mode=1, timeout=60, method_name=method_name))
+             # differential check: each extra candidate against brute.py on the small modes
+             for cand in extra_cands:
+                 if small and os.path.isfile(cand):
+                     out = stress_test(solution_path=cand, gen_path=gen, ref_path=brute, checker_path=checker,
+-                                  modes=small, seeds_per_mode=10, timeout=10)
++                                      modes=small, seeds_per_mode=10, timeout=10, method_name=method_name)
+                 cand_fails[cand] = _fail_count(out)
+                 parts.append(f"### extra candidate {os.path.basename(cand)} vs brute.py (small modes)\n" + out)
+         except Exception as e:
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index ed61658..df1e66f 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -3,6 +3,7 @@ import subprocess
+ import sys
+ import tempfile
+ import time
++import ast
+ 
+ CLIP_INPUT = 400
+ CLIP_OUTPUT = 1500
+@@ -49,6 +50,10 @@ def tool_info():
+                 "timeout": {
+                     "type": "integer",
+                     "description": "Per-run time limit in seconds for generator, solution, reference and checker (default 10)."
++                },
++                "method_name": {
++                    "type": "string",
++                    "description": "Optional. Set for class-method tasks (class Solution). Then gen_path prints ONE line of python-literal call arguments (e.g. `s = \"acab\", k = 2`) instead of stdin, solution_path and ref_path both define Solution with this method, and the return values are compared as python literals (checker_path is ignored)."
+                 }
+             },
+             "required": ["solution_path", "gen_path", "ref_path", "modes", "seeds_per_mode"]
+@@ -86,8 +91,15 @@ def _tokens_equal(a, b):
+     return a.split() == b.split()
+ 
+ 
++def _values_match(a, b):
++    try:
++        return ast.literal_eval(a.strip()) == ast.literal_eval(b.strip())
++    except (ValueError, SyntaxError, TypeError):
++        return a.strip() == b.strip()
++
++
+ def tool_function(solution_path, gen_path, ref_path, modes, seeds_per_mode,
+-                  checker_path=None, timeout=10):
++                  checker_path=None, timeout=10, method_name=None):
+     try:
+         timeout = max(1, min(int(timeout or 10), 120))
+     except (TypeError, ValueError):
+@@ -126,6 +138,33 @@ def tool_function(solution_path, gen_path, ref_path, modes, seeds_per_mode,
+                 with open(in_file, 'w') as f:
+                     f.write(inp)
+ 
++                if method_name:
++                    from tools.run_method import run_calls
++                    args_text = inp.strip()
++                    s_r = run_calls(solution_path, method_name, [args_text], timeout=timeout)
++                    r_r = run_calls(ref_path, method_name, [args_text], timeout=max(timeout, 30))
++                    st['max_elapsed'] = max(st['max_elapsed'], s_r['elapsed'])
++                    if len(inp) > st['largest_len']:
++                        st['largest_len'] = len(inp)
++                        st['largest_elapsed'] = s_r['results'].get(0, (None,))[0]
++                        st['largest_seed'] = seed
++                    if 0 not in r_r['results']:
++                        st['fail'] += 1
++                        fails.append((mode, seed, "REFERENCE failed", inp, '', '', r_r['stderr'] + (r_r['load_error'] or '')))
++                        continue
++                    if 0 not in s_r['results']:
++                        st['fail'] += 1
++                        fails.append((mode, seed, f"solution crashed or timed out (rc={s_r['rc']})", inp, '',
++                                      r_r['results'][0][1], s_r['stderr'] + (s_r['load_error'] or '')))
++                        continue
++                    got, want = s_r['results'][0][1], r_r['results'][0][1]
++                    if _values_match(got, want):
++                        st['pass'] += 1
++                    else:
++                        st['fail'] += 1
++                        fails.append((mode, seed, "return value differs from reference", inp, got, want, s_r['stderr']))
++                    continue
++
+                 s = _run([sys.executable, '-I', solution_path], tmp, data=inp, timeout=timeout)
+                 r = _run([sys.executable, '-I', ref_path], tmp, data=inp, timeout=max(timeout, 30))
+                 st['max_elapsed'] = max(st['max_elapsed'], s['elapsed'])
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..40109c0
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,33 @@
++from typing import *
++import sys
++
++
++class Solution:
++    def minimumDeletions(self, s: str) -> int:
++        # Each 'b' is pushed as an open bracket; each 'a' that finds an open 'b'
++        # closes it and costs one deletion (min over split = matched pairs).
++        open_b = 0
++        deletions = 0
++        for ch in s:
++            if ch == 'b':
++                open_b += 1
++            elif open_b:
++                open_b -= 1
++                deletions += 1
++        return deletions
++
++
++def _main():
++    lines = [ln for ln in sys.stdin.read().splitlines() if ln.strip()]
++    if not lines:
++        return
++    t = lines[0].strip()
++    if "=" in t:
++        t = t.split("=", 1)[1].strip()
++    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
++        t = t[1:-1]
++    print(Solution().minimumDeletions(t))
++
++
++if __name__ == "__main__":
++    _main()
+diff --git a/tools/run_method.py b/tools/run_method.py
+new file mode 100644
+index 0000000..d07eba0
+--- /dev/null
++++ b/tools/run_method.py
+@@ -0,0 +1,137 @@
++import os
++import sys
++import json
++import subprocess
++import time
++
++# Driver executed as `python3 -I -c DRIVER SOL_PATH METHOD`; reads a JSON list of call strings on stdin.
++# Each call string is a comma-separated list of python literals, e.g. `s = "acab", k = 2`.
++# Prints one tab-separated line per call: RESULT\ti\telapsed\trepr  or  ERROR\ti\telapsed\tmessage
++DRIVER = r'''
++import sys, json, time, ast, traceback, importlib.util, os
++sol_path, method_name = sys.argv[1], sys.argv[2]
++sys.path.insert(0, os.path.dirname(sol_path))
++calls = json.loads(sys.stdin.read())
++try:
++    spec = importlib.util.spec_from_file_location("_candidate_solution", sol_path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    sol = mod.Solution()
++    fn = getattr(sol, method_name)
++except Exception as e:
++    traceback.print_exc()
++    print("LOADERROR\t" + type(e).__name__ + ": " + str(e).replace("\n", " "), flush=True)
++    sys.exit(0)
++for i, text in enumerate(calls):
++    try:
++        node = ast.parse("_f(" + text + ")", mode="eval").body
++        args = [ast.literal_eval(a) for a in node.args]
++        kwargs = {k.arg: ast.literal_eval(k.value) for k in node.keywords}
++        t0 = time.time()
++        res = fn(*args, **kwargs)
++        el = time.time() - t0
++        print("RESULT\t%d\t%.3f\t%s" % (i, el, repr(res)), flush=True)
++    except Exception as e:
++        traceback.print_exc()
++        print("ERROR\t%d\t0.000\t%s: %s" % (i, type(e).__name__, str(e).replace("\n", " ")), flush=True)
++'''
++
++
++def tool_info():
++    return {
++        "name": "run_method",
++        "description": (
++            "Import a Python solution file in an isolated subprocess (python3 -I), instantiate its `Solution` class, "
++            "and call the named method once per entry of `calls`. Each entry is a string of python literal arguments "
++            "written like a call, e.g. 'nums = [1, 2, 3], target = 4' or '\"acab\"'. Returns the raw stdout "
++            "(one RESULT line per call with elapsed seconds and repr(result), or an ERROR line), the exit code and "
++            "the raw stderr (tracebacks). Use it to check a Solution-class method on example inputs and to time it on max-size inputs."
++        ),
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the Python file that defines class Solution."
++                },
++                "method_name": {
++                    "type": "string",
++                    "description": "Name of the method to call on a Solution() instance."
++                },
++                "calls": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of argument strings; each is comma-separated python literals (keyword or positional)."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Hard time limit in seconds for the whole subprocess (default 10)."
++                }
++            },
++            "required": ["solution_path", "method_name", "calls"]
++        }
++    }
++
++
++def _to_text(x):
++    if x is None:
++        return ''
++    if isinstance(x, bytes):
++        return x.decode('utf-8', errors='replace')
++    return x
++
++
++def _clip(s, n=4000):
++    if s is None:
++        return ''
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++
++def run_calls(solution_path, method_name, calls, timeout=10):
++    """Structured runner. Returns a dict with keys:
++    rc ('TIMEOUT' or int), stdout, stderr, elapsed, results {i: (elapsed, repr)}, errors {i: msg}, load_error."""
++    sol_abs = os.path.abspath(solution_path)
++    start = time.time()
++    payload = json.dumps([str(c) for c in calls])
++    try:
++        p = subprocess.run([sys.executable, '-I', '-c', DRIVER, sol_abs, str(method_name)],
++                           input=payload, capture_output=True, text=True, timeout=timeout,
++                           cwd=os.path.dirname(sol_abs), env={'PATH': os.environ.get('PATH', '/usr/bin:/bin')},
++                           errors='replace')
++        out, err, rc = p.stdout, p.stderr, p.returncode
++    except subprocess.TimeoutExpired as e:
++        out = _to_text(e.stdout)
++        err = _to_text(e.stderr) + f"\n(timed out after {timeout} seconds)"
++        rc = 'TIMEOUT'
++    results, errors, load_error = {}, {}, None
++    for line in out.splitlines():
++        parts = line.split('\t', 3)
++        try:
++            if parts[0] == 'RESULT' and len(parts) == 4:
++                results[int(parts[1])] = (float(parts[2]), parts[3])
++            elif parts[0] == 'ERROR' and len(parts) == 4:
++                errors[int(parts[1])] = parts[3]
++            elif parts[0] == 'LOADERROR' and len(parts) >= 2:
++                load_error = line.split('\t', 1)[1]
++        except ValueError:
++            continue
++    return {'rc': rc, 'stdout': out, 'stderr': err, 'elapsed': round(time.time() - start, 3),
++            'results': results, 'errors': errors, 'load_error': load_error}
++
++
++def tool_function(solution_path, method_name, calls, timeout=10):
++    try:
++        timeout = max(1, min(int(timeout or 10), 120))
++    except (TypeError, ValueError):
++        timeout = 10
++    if isinstance(calls, str):
++        calls = [calls]
++    if not calls:
++        return "Error: calls is empty"
++    if not os.path.isfile(solution_path):
++        return f"Error: file not found: {solution_path}"
++    r = run_calls(solution_path, method_name, calls, timeout=timeout)
++    return (f"rc={r['rc']} total_elapsed={r['elapsed']}s\n"
++            f"--- stdout\n{_clip(r['stdout'])}\n--- stderr\n{_clip(r['stderr'])}")

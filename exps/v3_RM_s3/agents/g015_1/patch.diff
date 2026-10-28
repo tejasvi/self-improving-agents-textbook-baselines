@@ -1,0 +1,181 @@
+diff --git a/llm.py b/llm.py
+index d6b4da1..a01efec 100644
+--- a/llm.py
++++ b/llm.py
+@@ -7,6 +7,8 @@ import anthropic
+ import backoff
+ import openai
+ 
++from utils.retry_utils import is_transient_api_error
++
+ MAX_OUTPUT_TOKENS = 4096
+ AVAILABLE_LLMS = [
+     # Anthropic models
+@@ -85,7 +87,13 @@ def create_client(model: str):
+         raise ValueError(f"Model {model} not supported.")
+ 
+ # Get N responses from a single message, used for ensembling.
+-@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
++@backoff.on_exception(
++    backoff.expo,
++    Exception,
++    giveup=lambda e: not is_transient_api_error(e),
++    max_tries=6,
++    max_time=300,
++)
+ def get_batch_responses_from_llm(
+         msg,
+         client,
+@@ -166,8 +174,10 @@ def get_batch_responses_from_llm(
+ 
+ @backoff.on_exception(
+     backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=120,
++    Exception,
++    giveup=lambda e: not is_transient_api_error(e),
++    max_tries=6,
++    max_time=300,
+ )
+ def get_response_from_llm(
+         msg,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..0046cc0 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -1,14 +1,12 @@
+ import ast
+ import json
+ import re
+-import anthropic
+-import backoff
+-import openai
+ import copy
+ 
+ from llm import create_client, get_response_from_llm
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
++from utils.retry_utils import retry_api_call
+ 
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+@@ -22,19 +20,20 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=600,
+-    max_value=60,
+-)
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+     logging=None, max_retry=3
+ ):
+-    try:
++    """
++    Call the model with tools. Transient API failures (rate limits, timeouts, connection
++    errors, 5xx) are retried with exponential backoff; other errors are raised immediately.
++    """
++    if logging is None:
++        logging = print
++
++    def _call():
+         if 'claude' in model:
+-            response = client.messages.create(
++            return client.messages.create(
+                 model=model,
+                 messages=messages,
+                 max_tokens=4096,
+@@ -42,27 +41,17 @@ def get_response_withtools(
+                 tools=tools,
+             )
+         elif model.startswith('o3-'):
+-            response = client.responses.create(
++            return client.responses.create(
+                 model=model,
+                 input=messages,
+                 tool_choice=tool_choice,
+                 tools=tools,
+                 parallel_tool_calls=False
+             )
+-            response = response
+         else:
+             raise ValueError(f"Unsupported model: {model}")
+-        return response
+-    except Exception as e:
+-        logging(f"Error in get_response_withtools: {str(e)}")
+-        if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+-
+-        # Hitting the context window limit
+-        if 'Input is too long for requested model' in str(e):
+-            pass
+ 
+-        raise  # Re-raise the exception after logging
++    return retry_api_call(_call, max_retries=max_retry, log=logging)
+ 
+ def check_for_tool_use(response, model=''):
+     """
+diff --git a/utils/retry_utils.py b/utils/retry_utils.py
+new file mode 100644
+index 0000000..0f918a5
+--- /dev/null
++++ b/utils/retry_utils.py
+@@ -0,0 +1,55 @@
++import time
++
++import anthropic
++import openai
++
++# Exception types raised by the Anthropic / OpenAI SDKs that indicate a transient failure.
++TRANSIENT_ERROR_TYPES = (
++    anthropic.RateLimitError,
++    anthropic.APITimeoutError,
++    anthropic.APIConnectionError,
++    anthropic.InternalServerError,
++    openai.RateLimitError,
++    openai.APITimeoutError,
++    openai.APIConnectionError,
++    openai.InternalServerError,
++)
++
++# HTTP status codes that are worth retrying.
++TRANSIENT_STATUS_CODES = {408, 409, 429}
++
++
++def is_transient_api_error(error):
++    """
++    Return True if `error` looks like a transient API failure (rate limit, timeout,
++    connection problem, or 5xx / 408 / 409 / 429 status). Other errors are not retried.
++    """
++    if isinstance(error, TRANSIENT_ERROR_TYPES):
++        return True
++    status_code = getattr(error, 'status_code', None)
++    if isinstance(status_code, int):
++        return status_code in TRANSIENT_STATUS_CODES or status_code >= 500
++    return False
++
++
++def retry_api_call(call, max_retries=5, base_delay=1.0, max_delay=60.0, log=print, sleep=time.sleep):
++    """
++    Invoke the zero-argument callable `call`, retrying transient API failures with exponential backoff.
++
++    Makes at most `max_retries + 1` attempts. Non-transient errors are re-raised immediately,
++    and the last error is re-raised once the retries are exhausted.
++    """
++    total_attempts = max_retries + 1
++    for attempt in range(1, total_attempts + 1):
++        try:
++            return call()
++        except Exception as e:
++            if attempt >= total_attempts or not is_transient_api_error(e):
++                raise
++            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
++            if log is not None:
++                log(
++                    f"Transient API error (attempt {attempt}/{total_attempts}): {e}. "
++                    f"Retrying in {delay:.1f}s."
++                )
++            sleep(delay)

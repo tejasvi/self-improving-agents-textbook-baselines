@@ -1,0 +1,1095 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3a294e3..d383854 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,7 +4,10 @@ import logging
+ import shutil
+ from logging.handlers import RotatingFileHandler
+ import os
++import sys
+ import threading
++import time
++import tempfile
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -12,6 +15,16 @@ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ # Bounded number of solve/verify/review attempts (never use an unbounded loop)
+ MAX_ATTEMPTS = 3
+ 
++# Time limit the grader is assumed to use (seconds) and the fragility budget:
++# a max-size runtime above half of the limit counts as too slow/fragile.
++TIME_LIMIT_SEC = 2.0
++TIME_BUDGET_SEC = TIME_LIMIT_SEC / 2
++
++# Framework-side objective evaluation of the saved attempts on the corpus
++MAX_CORPUS_INPUTS = 200
++EVAL_RUN_TIMEOUT = 5
++CORPUS_DIRNAME = 'corpus'
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -166,24 +179,26 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 8. Prefer simple, standard algorithms over exotic tricks unless the complexity requires them. The final answer must depend only on the Python standard library.
+ The final solution.py is what gets graded; helper files are ignored."""
+ 
+-    def _verify_text(self, attempt, scratch_dir):
++    def _verify_text(self, attempt, scratch_dir, corpus_dir):
+         sol = os.path.join(self.git_tempdir, 'solution.py')
++        checker = os.path.join(scratch_dir, 'checker.py')
+         return f"""# Verification phase (attempt {attempt + 1} of {MAX_ATTEMPTS})
+ 
+-Do not just trust your solution. Verify it now, in this order:
++Do not just trust your solution. Verify it now, in this order.
+ 
+ A. Derivation. In ONE line, state how the solution was derived, using exactly one of: `DERIVATION: proven` (you have a convincing argument for the general rule), `DERIVATION: pattern-guessed` (a formula or rule was inferred from brute-force data), or `DERIVATION: heuristic` (greedy/approximate/unproven idea).
+ 
+-B. Brute force. Write a brute force directly from the rules in the problem statement, not from your solution's logic. Keep it simple and obviously correct. Save it in `{scratch_dir}/brute.py` (or another file in that directory). Put your generator in `{scratch_dir}/gen.py`; it must take the seed as argv[1] and print one valid test input to stdout, following the input format and constraints exactly.
++B. Reference files. Write a brute force directly from the rules in the problem statement, not from your solution's logic. Save it as `{scratch_dir}/brute.py`. Write a generator `{scratch_dir}/gen.py`; it must take the seed as argv[1] and print one valid input following the format and constraints exactly. Use exactly these file names so the framework can find them.
++   If several different outputs can be valid for the same input, you MUST also write a checker `{checker}` that is invoked as `python3 checker.py <input_file> <solution_output_file> [<brute_output_file>]`, verifies that the solution output is a valid answer for the input (recompute the constraints/objective yourself; do not just compare with the brute output), and exits 0 if accepted, non-zero otherwise. Do not compare exact text when a checker is needed.
+ 
+-C. Stress test. Use the `stress_test` tool with solution_path=`{sol}`, the brute and generator paths above, and seed_start=0. Run it in two parts:
+-   - Exhaustive small cases: make the generator enumerate ALL small inputs by seed (for example seed i selects the i-th combination of small parameters), with num_tests set to cover the whole space.
+-   - Random cases: a generator mode with random parameters within the constraints, num_tests of at least 300.
+-   If the derivation is `pattern-guessed` or `heuristic`, you MUST use a much larger range than the brute-force data that suggested the rule: push the brute force as far as it can run in a few seconds, and test random cases at sizes well beyond your first exploration (at least several times larger parameters). Also check the claimed pattern against brute-force values that were NOT used to derive it.
++C. Tests, in three tiers. Use the `stress_test` tool with solution_path=`{sol}`, your generator, and `checker_path` (if written) or `brute_path`. Pass `time_budget={TIME_BUDGET_SEC}` and `save_failures_dir=\"{corpus_dir}\"` so that failing inputs are saved to the corpus.
++   - Tier 1, tiny exhaustive: make the generator enumerate ALL small inputs by seed (e.g. seed i selects the i-th combination of tiny parameters) and set num_tests to cover the whole space.
++   - Tier 2, medium random: random inputs of size in the hundreds to thousands (within the constraints), compared against a polynomial reference (your brute force, or an O(n^2)/DP reference). Use at least 300 tests. If the derivation is `pattern-guessed` or `heuristic`, also test random cases well beyond the sizes that suggested the rule and check the claimed pattern on brute-force values NOT used to derive it.
++   - Tier 3, adversarial and max-size: structured inputs with many duplicates, all-equal values, boundary values of the constraints (minimum and maximum), and the worst case for your chosen algorithm. Also generate at least one maximum-constraint input and time it with `time python3 {sol} < input`.
+ 
+-D. Edge cases. Test the minimum and maximum constraints and degenerate inputs (for example the smallest n, equal values, all-same elements, empty or single-element structures where allowed), by writing them explicitly and running solution.py and the brute force on them.
++D. Timing rule. The time limit is 2 seconds. If the runtime of solution.py on a maximum-size input is above {TIME_BUDGET_SEC} seconds (half the limit), this counts as VERIFY: FAIL due to fragility, even if all outputs are correct. Then the next attempt must pick a simpler or faster algorithm. Do not accept a solution that is close to the limit.
+ 
+-E. Max-size timing. Generate a maximum-constraint input and time `python3 {sol} < input`. It must finish well under 2 seconds.
++E. Corpus. Save these inputs as files in the corpus directory `{corpus_dir}` (create new files there; NEVER delete or overwrite existing files in it, they are shared by all attempts): the sample inputs of the problem statement (name them sample_<k>.txt), every failing input you found (name them fail_a{attempt + 1}_<k>.txt), and a few medium-size and maximum-size inputs (name them med_a{attempt + 1}_<k>.txt and max_a{attempt + 1}_<k>.txt). The framework re-runs every saved attempt on this corpus to pick the final solution.
+ 
+ If any check fails, find the cause and fix solution.py (edit it in place), then rerun the failing checks.
+ 
+@@ -192,11 +207,12 @@ DERIVATION: <proven | pattern-guessed | heuristic>
+ APPROACH: <one-line summary of the algorithm/formula used>
+ VERIFY: PASS or VERIFY: FAIL
+ If FAIL, also write:
++REASON: <correctness | too slow/fragile>
+ FAILING INPUT: <the smallest failing input you found>
+ EXPECTED: <brute force output>
+ ACTUAL: <solution.py output>"""
+ 
+-    def _review_text(self, reviewer_dir):
++    def _review_text(self, reviewer_dir, corpus_dir, attempt):
+         sol = os.path.join(self.git_tempdir, 'solution.py')
+         return f"""# Independent review
+ 
+@@ -210,36 +226,54 @@ The solution is at `{sol}`. It reads stdin and writes stdout. Do NOT modify that
+ 
+ Steps:
+ 1. Read the statement carefully and write your OWN brute force from the rules in the statement, in `{reviewer_dir}/brute.py`.
+-2. Write your own generator in `{reviewer_dir}/gen.py` (seed as argv[1], prints one valid input following the format and constraints exactly).
+-3. Run the `stress_test` tool with solution_path=`{sol}`, your brute and generator, num_tests at least 300, and also a run with a different seed_start to get more coverage.
+-4. Write explicit edge tests (minimum and maximum constraints, degenerate inputs, tricky inputs where a greedy or formula-based answer is likely wrong) and compare solution.py with your brute force on them.
+-5. Time solution.py on a maximum-size input. It must finish well under 2 seconds.
++2. Write your own generator in `{reviewer_dir}/gen.py` (seed as argv[1], prints one valid input following the format and constraints exactly). If several outputs can be valid, also write a checker `{reviewer_dir}/checker.py` (invoked as `checker.py <input_file> <solution_output_file> [<brute_output_file>]`, exit 0 = accepted) and pass it as checker_path.
++3. Run the `stress_test` tool with solution_path=`{sol}`, your brute/checker and generator, num_tests at least 300, and also a run with a different seed_start. Use medium-size inputs (hundreds to thousands) as well as small ones, and pass `save_failures_dir="{corpus_dir}"` so failing inputs are saved to the corpus (name your saved files review_a{attempt + 1}_<k>.txt; never delete or overwrite existing files in that directory).
++4. Write explicit edge tests (minimum and maximum constraints, degenerate inputs, many duplicates, tricky inputs where a greedy or formula-based answer is likely wrong) and compare solution.py with your brute force or checker on them.
++5. Time solution.py on a maximum-size and worst-case input. If its runtime is above {TIME_BUDGET_SEC} seconds (half of the 2 second limit), report REVIEW: FAIL due to fragility, with that input as the counterexample.
+ 
+ Finish your reply with these lines, exactly in this form:
+ REVIEW: PASS or REVIEW: FAIL
+ If FAIL, also write (a concrete counterexample is required):
++REASON: <correctness | too slow/fragile>
+ FAILING INPUT: <input>
+ EXPECTED: <expected output>
+ ACTUAL: <solution.py output>
+-Only report PASS if your stress test and edge tests all matched."""
+-
+-    def _reflection_text(self, attempt, log_text):
++Only report PASS if your stress test, edge tests and timing all passed."""
++
++    def _reflection_text(self, attempt, log_text, matrix_text, prior_approaches, last_reason):
++        if last_reason == 'too slow/fragile':
++            family_rule = (
++                "- The previous failure was timing/fragility. You MUST choose an algorithm family DIFFERENT from every "
++                "approach tried so far (listed below), e.g. a simpler closed form, a linear pass instead of big-number or "
++                "FFT-like tricks, or a different data structure. Do not just micro-optimize the same algorithm.\n")
++        else:
++            family_rule = ("- If the same approach has already failed twice (see the log), do NOT patch it again. "
++                           "Reconsider the problem and choose a different approach, ideally one you can prove.\n")
++        approaches = "\n".join(f"  - {a}" for a in prior_approaches) or "  (none recorded)"
+         return f"""# Previous attempts failed (attempt {attempt + 1} of {MAX_ATTEMPTS})
+ 
+-The solution in `{os.path.join(self.git_tempdir, 'solution.py')}` was rejected by verification and/or an independent review. Here is the log of all previous attempts (derivation, approach, failing input, expected vs actual output):
++The solution in `{os.path.join(self.git_tempdir, 'solution.py')}` was rejected by verification, review, or the objective corpus evaluation. Here is the log of all previous attempts (derivation, approach, failing input, expected vs actual output):
+ 
+ <attempts_log>
+ {log_text}
+ </attempts_log>
+ 
+-Earlier copies of solutions are saved as attempt_<i>.py in the attempts directory `{self.attempts_dir}`.
++Objective comparison of all saved attempts on the shared corpus (`{self._corpus_dir()}`), computed by the framework (rows = corpus inputs, columns = attempts; each cell is the verdict and runtime):
++
++<comparison_matrix>
++{matrix_text}
++</comparison_matrix>
++
++Approaches tried so far:
++{approaches}
++
++Earlier copies of solutions are saved as attempt_<i>.py in the attempts directory `{self.attempts_dir}`. Corpus inputs (samples, failing inputs, medium and max inputs) are in `{self._corpus_dir()}`.
+ 
+ Instructions:
+-- First, reproduce the failing input from the log with solution.py and the brute force, and find the root cause.
++- First, reproduce the failing inputs listed in the log and the matrix (with solution.py and the brute force/checker) and find the root cause.
+ - Re-read the problem statement and the constraints carefully. Check whether the claimed rule or approach is actually correct beyond the sizes you tested.
+-- If the same approach has already failed twice (see the log), do NOT patch it again. Reconsider the problem from scratch and choose a different approach, ideally one you can prove, or a provably correct exhaustive/DP method.
+-- Fix solution.py, then re-run the tests the way you did before (samples, brute-force stress test, edge cases, max-size timing).
+-- Keep solution.py as a complete, self-contained program that reads stdin and writes stdout, using only the standard library.
++{family_rule}- Fix solution.py, then re-run the tests the way you did before (samples, tiny exhaustive, medium random, adversarial and max-size timing). Save any new failing or max-size inputs into the corpus directory without deleting existing files.
++- Keep solution.py as a complete, self-contained program that reads stdin and writes stdout, using only the standard library. Its max-size runtime must stay well below {TIME_BUDGET_SEC} seconds.
+ 
+ Problem statement again:
+ <problem_description>
+@@ -303,6 +337,151 @@ Problem statement again:
+         with open(self.attempts_log, "a") as f:
+             f.write(text + "\n")
+ 
++    # ------------------------------------------------------------------
++    # Framework-side objective evaluation (no LLM verdicts involved)
++    # ------------------------------------------------------------------
++    def _corpus_dir(self):
++        return os.path.join(self.attempts_dir, CORPUS_DIRNAME)
++
++    @staticmethod
++    def _py_cmd(path):
++        if path.endswith('.py'):
++            return [sys.executable, path]
++        return [os.path.abspath(path)]
++
++    @staticmethod
++    def _run_cmd(cmd, stdin_bytes, timeout):
++        """Run a command. Returns dict(ok, rc, out, elapsed)."""
++        t0 = time.time()
++        try:
++            p = subprocess.run(cmd, input=stdin_bytes, capture_output=True, timeout=timeout)
++            return {'ok': p.returncode == 0, 'rc': p.returncode,
++                    'out': p.stdout.decode('utf-8', errors='replace'), 'elapsed': time.time() - t0}
++        except subprocess.TimeoutExpired:
++            return {'ok': False, 'rc': 'TIMEOUT', 'out': '', 'elapsed': float(EVAL_RUN_TIMEOUT)}
++        except OSError as e:
++            return {'ok': False, 'rc': f'OSERROR {e}', 'out': '', 'elapsed': 0.0}
++
++    @staticmethod
++    def _norm(s):
++        return ' '.join((s or '').split())
++
++    def _find_reference_tools(self):
++        """Latest checker/brute written by the agent in the scratch dirs (newest attempt first)."""
++        checker, brute = None, None
++        for k in range(MAX_ATTEMPTS - 1, -1, -1):
++            d = os.path.join(self.attempts_dir, f'scratch_{k}')
++            if checker is None and os.path.isfile(os.path.join(d, 'checker.py')):
++                checker = os.path.join(d, 'checker.py')
++            if brute is None and os.path.isfile(os.path.join(d, 'brute.py')):
++                brute = os.path.join(d, 'brute.py')
++        return checker, brute
++
++    def _evaluate_attempts(self):
++        """
++        Run every saved attempt_<i>.py on every corpus input.
++        Reference: last checker (with brute output as 3rd arg if a brute exists), else last brute,
++        else the majority output among attempts. Returns a dict with per-attempt scores and a text matrix.
++        """
++        corpus = self._corpus_dir()
++        inputs = []
++        if os.path.isdir(corpus):
++            for name in sorted(os.listdir(corpus)):
++                p = os.path.join(corpus, name)
++                if os.path.isfile(p):
++                    inputs.append(p)
++        inputs = inputs[:MAX_CORPUS_INPUTS]
++
++        attempts = []  # (index, path)
++        for k in range(MAX_ATTEMPTS):
++            p = os.path.join(self.attempts_dir, f'attempt_{k}.py')
++            if os.path.isfile(p):
++                attempts.append((k, p))
++
++        checker, brute = self._find_reference_tools()
++        mode = 'checker' if checker else ('brute' if brute else 'majority')
++        tmpdir = tempfile.mkdtemp(prefix='corpus_eval_')
++        # cells[input][k] = (status, elapsed) where status in OK / MISMATCH / CRASH
++        cells = {}
++        scores = {k: {'bad': 0, 'max_time': 0.0, 'bad_inputs': []} for k, _ in attempts}
++        skipped = []
++        try:
++            for inp in inputs:
++                with open(inp, 'rb') as f:
++                    data = f.read()
++                ref_out = None
++                if brute:
++                    b = self._run_cmd(self._py_cmd(brute), data, EVAL_RUN_TIMEOUT)
++                    if not b['ok']:
++                        skipped.append(os.path.basename(inp))
++                        continue
++                    ref_out = b['out']
++                runs = {}
++                for k, p in attempts:
++                    runs[k] = self._run_cmd(self._py_cmd(p), data, EVAL_RUN_TIMEOUT)
++                    scores[k]['max_time'] = max(scores[k]['max_time'], runs[k]['elapsed'])
++                if not checker and not brute:
++                    counts = {}
++                    for k in runs:
++                        if runs[k]['ok']:
++                            h = self._norm(runs[k]['out'])
++                            counts[h] = counts.get(h, 0) + 1
++                    ref_out = max(counts, key=counts.get) if counts else None
++                for k in runs:
++                    r = runs[k]
++                    if not r['ok']:
++                        status = 'CRASH'
++                        good = False
++                    elif checker:
++                        out_file = os.path.join(tmpdir, f'out_{k}.txt')
++                        with open(out_file, 'w', encoding='utf-8', errors='replace') as f:
++                            f.write(r['out'])
++                        in_path = os.path.abspath(inp)
++                        args = [sys.executable, checker, in_path, out_file]
++                        if ref_out is not None:
++                            bf = os.path.join(tmpdir, 'brute_out.txt')
++                            with open(bf, 'w', encoding='utf-8', errors='replace') as f:
++                                f.write(ref_out)
++                            args.append(bf)
++                        c = self._run_cmd(args, b'', EVAL_RUN_TIMEOUT)
++                        good = c['ok']
++                        status = 'OK' if good else 'MISMATCH'
++                    else:
++                        good = ref_out is not None and self._norm(r['out']) == self._norm(ref_out)
++                        status = 'OK' if good else 'MISMATCH'
++                    cells[(os.path.basename(inp), k)] = (status, r['elapsed'])
++                    if not good:
++                        scores[k]['bad'] += 1
++                        scores[k]['bad_inputs'].append(os.path.basename(inp))
++        finally:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++
++        # Text matrix: disagreeing inputs first, then the rest; capped to keep the prompt short.
++        ordered = sorted(inputs, key=lambda p: -sum(
++            1 for k, _ in attempts if cells.get((os.path.basename(p), k), ('OK', 0))[0] != 'OK'))
++        ordered = [p for p in ordered if os.path.basename(p) not in skipped]
++        lines = [f"reference={mode}; corpus inputs evaluated={len(inputs) - len(skipped)}; "
++                 f"skipped (reference failed on them)={len(skipped)}"]
++        if attempts:
++            header = f"{'input':<26}" + ''.join(f"{'attempt_' + str(k):<26}" for k, _ in attempts)
++            lines.append(header)
++            for p in ordered[:60]:
++                name = os.path.basename(p)
++                row = f"{name[:25]:<26}"
++                for k, _ in attempts:
++                    st, el = cells.get((name, k), ('-', 0.0))
++                    row += f"{(st + ' ' + format(el, '.2f') + 's'):<26}"
++                lines.append(row)
++            if len(ordered) > 60:
++                lines.append(f"... {len(ordered) - 60} more inputs not shown")
++        for k, _ in attempts:
++            s = scores[k]
++            lines.append(f"attempt_{k}: mismatches/crashes={s['bad']} max_runtime={s['max_time']:.2f}s "
++                         f"failing_inputs={s['bad_inputs'][:10]}")
++        return {'scores': scores, 'matrix': "\n".join(lines), 'evaluated': len(inputs) - len(skipped),
++                'mode': mode,
++                'disagreeing': [i for k in scores for i in scores[k]['bad_inputs']]}
++
+     # ------------------------------------------------------------------
+     # Main loop
+     # ------------------------------------------------------------------
+@@ -311,23 +490,30 @@ Problem statement again:
+         The forward function for the AgenticSystem.
+ 
+         Bounded loop of up to MAX_ATTEMPTS attempts. Each attempt runs:
+-          A. solve (only the first attempt uses the full solve prompt; later
+-             attempts get the reflection prompt with the failure history),
+-          B. self-verification (derivation, own brute force, stress test, edges, timing),
++          A. solve (the first attempt uses the full solve prompt; later attempts get the
++             reflection prompt with the failure history, the comparison matrix and the
++             approaches already tried),
++          B. self-verification in three test tiers (tiny exhaustive, medium random, adversarial/max),
+           C. an independent reviewer in a fresh context,
+-          D. on failure: save attempt_<i>.py and log the failure details.
+-        The best attempt (fewest failed checks) is restored to solution.py,
+-        followed by the final robust_check step.
++          D. save attempt_<i>.py, then evaluate ALL saved attempts on the persistent corpus
++             (framework side, objective: mismatches/crashes, then max runtime).
++        The loop stops early only if the attempt is clean on the corpus, both LLM verdicts are PASS,
++        and its max runtime is within TIME_BUDGET_SEC. Finally the objectively best attempt is
++        restored to solution.py, followed by the final robust_check step.
+         """
+         solution_path = os.path.join(self.git_tempdir, 'solution.py')
+         self.attempts_dir = os.path.join(
+             os.path.dirname(os.path.abspath(self.chat_history_file)), 'attempts')
+         os.makedirs(self.attempts_dir, exist_ok=True)
++        os.makedirs(self._corpus_dir(), exist_ok=True)  # persistent: never cleared between attempts
+         self.attempts_log = os.path.join(self.attempts_dir, 'attempts_log.md')
+         with open(self.attempts_log, 'w') as f:
+             f.write('')
+ 
+-        best = None  # (failures, attempt index, saved path)
++        matrix_text = "(no previous attempts evaluated yet)"
++        prior_approaches = []
++        last_reason = None
++        final_scores = {}   # attempt index -> score tuple
+         for attempt in range(MAX_ATTEMPTS):
+             scratch_dir = os.path.join(self.attempts_dir, f'scratch_{attempt}')
+             reviewer_dir = os.path.join(self.attempts_dir, f'reviewer_{attempt}')
+@@ -338,43 +524,70 @@ Problem statement again:
+             if attempt == 0:
+                 solve_msg = f"{self._task_text()}\n\n{self._solve_method_text()}"
+             else:
+-                solve_msg = self._reflection_text(attempt, self._read_log()) + "\n\n" + self._solve_method_text()
++                solve_msg = (self._reflection_text(attempt, self._read_log(), matrix_text,
++                                                   prior_approaches, last_reason)
++                             + "\n\n" + self._solve_method_text())
+             history = chat_with_agent(solve_msg, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+             # Phase B: self-verification on the same history
+-            history = chat_with_agent(self._verify_text(attempt, scratch_dir), model=self.code_model,
+-                                      msg_history=history, logging=safe_log)
++            history = chat_with_agent(self._verify_text(attempt, scratch_dir, self._corpus_dir()),
++                                      model=self.code_model, msg_history=history, logging=safe_log)
+             verify_text = self._last_text(history)
+             self_verdict = self._verdict(verify_text, 'VERIFY')
+             derivation = self._field(verify_text, 'DERIVATION') or 'unknown'
+             approach = self._field(verify_text, 'APPROACH') or 'unknown'
++            self_reason = self._field(verify_text, 'REASON')
+ 
+             # Phase C: independent reviewer with a fresh context
+-            review_history = chat_with_agent(self._review_text(reviewer_dir), model=self.code_model,
+-                                             msg_history=[], logging=safe_log)
++            review_history = chat_with_agent(self._review_text(reviewer_dir, self._corpus_dir(), attempt),
++                                             model=self.code_model, msg_history=[], logging=safe_log)
+             review_text = self._last_text(review_history)
+             review_verdict = self._verdict(review_text, 'REVIEW')
++            review_reason = self._field(review_text, 'REASON')
+ 
+-            # Save a copy of this attempt's solution
++            # Phase D: save this attempt, then evaluate all attempts objectively on the corpus
+             saved = os.path.join(self.attempts_dir, f'attempt_{attempt}.py')
+             have_solution = os.path.isfile(solution_path)
+             if have_solution:
+                 shutil.copyfile(solution_path, saved)
++            prior_approaches.append(f"attempt {attempt + 1}: {approach}")
+ 
+-            failures = (0 if self_verdict == 'PASS' else 1) + (0 if review_verdict == 'PASS' else 1)
++            evaluation = self._evaluate_attempts() if have_solution else None
++            matrix_text = evaluation['matrix'] if evaluation else "(solution.py missing)"
++            llm_failures = (0 if self_verdict == 'PASS' else 1) + (0 if review_verdict == 'PASS' else 1)
+             if not have_solution:
+-                failures = 2
+-            if best is None or failures < best[0]:
+-                best = (failures, attempt, saved if have_solution else None)
++                llm_failures = 2
++            corpus_empty = not evaluation or evaluation.get('evaluated', 0) == 0
++            if evaluation and attempt in evaluation['scores']:
++                s = evaluation['scores'][attempt]
++                bad, max_time = s['bad'], s['max_time']
++            else:
++                bad, max_time = 1, float('inf')
++            if corpus_empty and have_solution:
++                # No corpus input to judge on: fall back to the LLM verdict count as the mismatch score.
++                bad = llm_failures
++            too_slow = max_time > TIME_BUDGET_SEC
++            if too_slow:
++                attempt_reason = 'too slow/fragile'
++            elif self_reason or review_reason:
++                attempt_reason = 'too slow/fragile' if 'fragile' in (self_reason + review_reason).lower() \
++                    else 'correctness'
++            else:
++                attempt_reason = 'correctness'
++            last_reason = attempt_reason
++            if have_solution:
++                final_scores[attempt] = (bad, max_time, llm_failures)
+ 
+-            # Phase D: log the failure details for the next attempt
++            # Phase E: log the details for the next attempt
+             self._append_log(
+                 f"## Attempt {attempt + 1}\n"
+                 f"- Derivation: {derivation}\n"
+                 f"- Approach: {approach}\n"
+                 f"- Solution saved as: {saved if have_solution else 'MISSING (solution.py not found)'}\n"
+-                f"- Self verification: {self_verdict or 'NO VERDICT'}\n"
+-                f"- Independent review: {review_verdict or 'NO VERDICT'}\n"
++                f"- Self verification: {self_verdict or 'NO VERDICT'} (reason: {self_reason or 'n/a'})\n"
++                f"- Independent review: {review_verdict or 'NO VERDICT'} (reason: {review_reason or 'n/a'})\n"
++                f"- Objective corpus check: mismatches/crashes={bad}, max runtime={max_time:.2f}s "
++                f"(budget {TIME_BUDGET_SEC:.2f}s){' -> TOO SLOW/FRAGILE' if too_slow else ''}\n"
+                 f"- Self-verification failing details: "
+                 f"input={self._field(verify_text, 'FAILING INPUT')!r} "
+                 f"expected={self._field(verify_text, 'EXPECTED')!r} "
+@@ -386,14 +599,36 @@ Problem statement again:
+                 f"- Reviewer summary: {_clip_text(review_text, 1500)}\n"
+             )
+ 
+-            if self_verdict == 'PASS' and review_verdict == 'PASS':
++            # Early stop only with an objective reference (checker or brute); a majority reference
++            # cannot certify correctness on its own.
++            objective = not corpus_empty and evaluation.get('mode') != 'majority'
++            clean = have_solution and objective and bad == 0 and not too_slow
++            if self_verdict == 'PASS' and review_verdict == 'PASS' and clean:
+                 break
+ 
+-        # Restore the best attempt
+-        if best is not None and best[2] is not None and os.path.isfile(best[2]):
+-            shutil.copyfile(best[2], solution_path)
+-        self._append_log(f"## Final\n- Restored attempt {best[1] + 1 if best else 'none'} "
+-                         f"with {best[0] if best else 'n/a'} failed check(s).")
++        # Restore the objectively best attempt: fewest mismatches/crashes, then lowest max runtime.
++        # Re-evaluate ALL saved attempts together on the final corpus so the comparison is fair.
++        final_eval = self._evaluate_attempts()
++        final_matrix = final_eval['matrix']
++        best = None
++        for k, s_ in final_eval['scores'].items():
++            sc = (s_['bad'], s_['max_time'], final_scores.get(k, (0, 0.0, 0))[2])
++            key = (sc[0], sc[1], sc[2], k)
++            if best is None or key < best[0]:
++                best = (key, k)
++        if best is None:
++            for k, sc in final_scores.items():
++                key = (sc[0], sc[1], sc[2], k)
++                if best is None or key < best[0]:
++                    best = (key, k)
++        if best is not None:
++            best_path = os.path.join(self.attempts_dir, f'attempt_{best[1]}.py')
++            shutil.copyfile(best_path, solution_path)
++        self._append_log(
++            f"## Final\n- Restored attempt {best[1] + 1 if best else 'none'} "
++            f"(mismatches/crashes={best[0][0] if best else 'n/a'}, "
++            f"max runtime={best[0][1] if best else 'n/a'}).\n"
++            f"- Final corpus comparison:\n{final_matrix}")
+ 
+         # Final stage: robust_check on the restored solution
+         final_msg = f"""# Final check
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index 42b5599..2f6f7ba 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -1,21 +1,27 @@
+ import os
++import shutil
+ import subprocess
+ import sys
++import tempfile
+ import time
+ 
+ MAX_TESTS = 100000
+ MAX_TIMEOUT = 60
+ CLIP = 4000
++MAX_SAVED_FAILURES = 50
+ 
+ 
+ def tool_info():
+     return {
+         "name": "stress_test",
+-        "description": """Run a randomized/exhaustive stress test of a solution against a brute-force reference.
++        "description": """Run a randomized/exhaustive stress test of a solution against a brute-force reference and/or a checker.
+ 
+-* For each seed i in [seed_start, seed_start + num_tests): runs `generator_path i` (the seed is passed as argv[1]; the generator prints one test input to stdout), feeds that input via stdin to both `solution_path` and `brute_path`, and compares their whitespace-normalized stdout.
+-* Each run of solution/brute/generator has its own `timeout` (seconds). Files ending in .py are run with the current Python interpreter; other files are executed directly.
+-* Stops at the first mismatch and returns the raw result: the failing seed, the input, both outputs (with exit codes and runtimes), and both stderr streams, plus the number of passing tests and the maximum solution runtime.
++* For each seed i in [seed_start, seed_start + num_tests): runs `generator_path i` (the seed is passed as argv[1]; the generator prints one test input to stdout), feeds that input via stdin to `solution_path`, and judges the result:
++  - Without `checker_path`: `brute_path` is required; the normalized (whitespace-insensitive) stdout of the solution must equal the brute force stdout.
++  - With `checker_path`: the checker is run as `checker <input_file> <solution_output_file> [<brute_output_file>]` (the framework writes the files to a temp dir; the brute output file is passed only if `brute_path` is also given). Exit code 0 means accepted; any non-zero exit is a mismatch. Use a checker when several answers can be valid.
++* Each run of solution/brute/generator/checker has its own `timeout` (seconds). Files ending in .py are run with the current Python interpreter; other files are executed directly.
++* Reports the maximum solution runtime. If `time_budget` (seconds) is given and the max solution runtime exceeds it, the result contains the explicit word SLOW.
++* Without `save_failures_dir`, stops at the first mismatch and returns the raw result (failing seed, input, both outputs with exit codes and runtimes, stderr). With `save_failures_dir`, keeps going through all tests and writes each failing input to a file in that directory (for building a corpus), reporting the number of failures.
+ * Errors are NOT parsed; read the raw output and interpret it yourself.
+ * For exhaustive coverage, make the generator map the seed to the i-th case of an enumeration of small inputs.""",
+         "input_schema": {
+@@ -27,7 +33,11 @@ def tool_info():
+                 },
+                 "brute_path": {
+                     "type": "string",
+-                    "description": "Path to the brute-force reference program (reads stdin, writes stdout)."
++                    "description": "Optional path to a brute-force reference program (reads stdin, writes stdout). Required when no checker_path is given; when given together with checker_path, its output is passed to the checker as a third argument."
++                },
++                "checker_path": {
++                    "type": "string",
++                    "description": "Optional path to a checker for problems with multiple valid answers. Invoked as `checker <input_file> <solution_output_file> [<brute_output_file>]`; exit code 0 = accepted, non-zero = mismatch."
+                 },
+                 "generator_path": {
+                     "type": "string",
+@@ -39,14 +49,22 @@ def tool_info():
+                 },
+                 "timeout": {
+                     "type": "integer",
+-                    "description": "Per-run time limit in seconds for the generator, solution and brute force (default 10)."
++                    "description": "Per-run time limit in seconds for the generator, solution, brute force and checker (default 10)."
+                 },
+                 "seed_start": {
+                     "type": "integer",
+                     "description": "First seed value (default 0)."
++                },
++                "time_budget": {
++                    "type": "number",
++                    "description": "Optional time budget in seconds for the solution. If the max solution runtime exceeds it, the result explicitly flags SLOW."
++                },
++                "save_failures_dir": {
++                    "type": "string",
++                    "description": "Optional directory. If given, every failing input is written there as a file (fail_seed<N>.txt) and the test continues instead of stopping at the first mismatch."
+                 }
+             },
+-            "required": ["solution_path", "brute_path", "generator_path"]
++            "required": ["solution_path", "generator_path"]
+         }
+     }
+ 
+@@ -99,68 +117,154 @@ def _describe(name, r):
+     )
+ 
+ 
+-def tool_function(solution_path, brute_path, generator_path, num_tests=300, timeout=10, seed_start=0):
+-    try:
+-        num_tests = max(1, min(int(num_tests if num_tests is not None else 300), MAX_TESTS))
+-    except (TypeError, ValueError):
+-        num_tests = 300
++def _slow_line(max_time, max_time_seed, time_budget):
++    if time_budget is None:
++        return ""
++    if max_time > time_budget:
++        return (f"SLOW: max solution runtime {max_time:.2f}s exceeds time_budget {time_budget:.2f}s "
++                f"(seed {max_time_seed}).\n")
++    return f"Within time_budget {time_budget:.2f}s.\n"
++
++
++def _as_int(v, default, lo=None, hi=None):
+     try:
+-        timeout = max(1, min(int(timeout if timeout is not None else 10), MAX_TIMEOUT))
++        v = int(v if v is not None else default)
+     except (TypeError, ValueError):
+-        timeout = 10
++        v = default
++    if lo is not None:
++        v = max(lo, v)
++    if hi is not None:
++        v = min(hi, v)
++    return v
++
++
++def _check_with_checker(checker_cmd, input_bytes, sol_out, brute_out, timeout, tmpdir):
++    """Write files and run the checker. Returns (ok, run_result, command_repr)."""
++    in_path = os.path.join(tmpdir, "input.txt")
++    sol_path = os.path.join(tmpdir, "solution_output.txt")
++    with open(in_path, "wb") as f:
++        f.write(input_bytes)
++    with open(sol_path, "w", encoding="utf-8", errors="replace") as f:
++        f.write(sol_out)
++    args = [in_path, sol_path]
++    if brute_out is not None:
++        brute_path_out = os.path.join(tmpdir, "brute_output.txt")
++        with open(brute_path_out, "w", encoding="utf-8", errors="replace") as f:
++            f.write(brute_out)
++        args.append(brute_path_out)
++    r = _run(checker_cmd + args, b"", timeout)
++    ok = (not r["timeout"]) and r["rc"] == 0
++    return ok, r
++
++
++def tool_function(solution_path, generator_path, brute_path=None, checker_path=None,
++                  num_tests=300, timeout=10, seed_start=0, time_budget=None, save_failures_dir=None):
++    num_tests = _as_int(num_tests, 300, 1, MAX_TESTS)
++    timeout = _as_int(timeout, 10, 1, MAX_TIMEOUT)
++    seed_start = _as_int(seed_start, 0)
+     try:
+-        seed_start = int(seed_start if seed_start is not None else 0)
++        time_budget = float(time_budget) if time_budget is not None else None
+     except (TypeError, ValueError):
+-        seed_start = 0
++        time_budget = None
+ 
+-    for label, p in [("solution", solution_path), ("brute", brute_path), ("generator", generator_path)]:
++    if not brute_path and not checker_path:
++        return "Error: provide brute_path (exact-output comparison) and/or checker_path (checker for multiple valid answers)."
++
++    required = [("solution", solution_path), ("generator", generator_path)]
++    if brute_path:
++        required.append(("brute", brute_path))
++    if checker_path:
++        required.append(("checker", checker_path))
++    for label, p in required:
+         if not p or not os.path.isfile(p):
+             return f"Error: {label} file not found: {p}"
+ 
+     sol_cmd = _cmd(solution_path)
+-    brute_cmd = _cmd(brute_path)
++    brute_cmd = _cmd(brute_path) if brute_path else None
++    checker_cmd = _cmd(checker_path) if checker_path else None
+     gen_cmd = _cmd(generator_path)
+ 
++    if save_failures_dir:
++        os.makedirs(save_failures_dir, exist_ok=True)
++    saved_files = []
++    failures = 0
++    tmpdir = tempfile.mkdtemp(prefix="stress_test_") if checker_path else None
+     passes = 0
+     max_time = 0.0
+     max_time_seed = None
+-    for k in range(num_tests):
+-        seed = seed_start + k
+-        g = _run(gen_cmd + [str(seed)], b"", timeout)
+-        if g["timeout"] or g["rc"] != 0:
+-            status = f"TIMEOUT after {timeout}s" if g["timeout"] else f"exit={g['rc']}"
+-            return (
+-                f"GENERATOR FAILED at seed {seed} ({status}) after {passes} passing tests.\n"
+-                f"--- generator stderr ---\n{_clip(g['stderr'])}"
+-            )
+-        data = g["stdout"].encode("utf-8")
+-
+-        sol = _run(sol_cmd, data, timeout)
+-        if sol["elapsed"] > max_time:
+-            max_time = sol["elapsed"]
+-            max_time_seed = seed
+-        brute = _run(brute_cmd, data, timeout)
+-
+-        if brute["timeout"] or brute["rc"] != 0:
+-            return (
+-                f"BRUTE FORCE FAILED at seed {seed} after {passes} passing tests.\n"
+-                f"--- input ---\n{_clip(g['stdout'])}\n"
+-                + _describe("brute", brute)
+-            )
+-
+-        same = (not sol["timeout"] and sol["rc"] == 0 and
+-                " ".join(sol["stdout"].split()) == " ".join(brute["stdout"].split()))
+-        if not same:
+-            return (
+-                f"MISMATCH at seed {seed} (test {k + 1} of {num_tests}) after {passes} passing tests.\n"
+-                f"--- input ---\n{_clip(g['stdout'])}\n"
+-                + _describe("solution", sol)
+-                + _describe("brute", brute)
+-                + f"Max solution runtime so far: {max_time:.2f}s (seed {max_time_seed})"
+-            )
+-        passes += 1
++    try:
++        for k in range(num_tests):
++            seed = seed_start + k
++            g = _run(gen_cmd + [str(seed)], b"", timeout)
++            if g["timeout"] or g["rc"] != 0:
++                status = f"TIMEOUT after {timeout}s" if g["timeout"] else f"exit={g['rc']}"
++                return (
++                    f"GENERATOR FAILED at seed {seed} ({status}) after {passes} passing tests.\n"
++                    f"--- generator stderr ---\n{_clip(g['stderr'])}"
++                )
++            data = g["stdout"].encode("utf-8")
+ 
++            sol = _run(sol_cmd, data, timeout)
++            if sol["elapsed"] > max_time:
++                max_time = sol["elapsed"]
++                max_time_seed = seed
++            brute = _run(brute_cmd, data, timeout) if brute_cmd else None
++
++            if brute is not None and (brute["timeout"] or brute["rc"] != 0):
++                return (
++                    f"BRUTE FORCE FAILED at seed {seed} after {passes} passing tests.\n"
++                    f"--- input ---\n{_clip(g['stdout'])}\n"
++                    + _describe("brute", brute)
++                )
++
++            sol_ok = (not sol["timeout"]) and sol["rc"] == 0
++            if checker_cmd:
++                brute_out = brute["stdout"] if brute is not None else None
++                if sol_ok:
++                    same, chk = _check_with_checker(checker_cmd, data, sol["stdout"], brute_out,
++                                                    timeout, tmpdir)
++                else:
++                    same, chk = False, None
++                extra = ""
++                if chk is not None:
++                    extra = (f"--- checker output ({'TIMEOUT' if chk['timeout'] else 'exit=' + str(chk['rc'])}"
++                             f") ---\n{_clip(chk['stdout'])}\n--- checker stderr ---\n{_clip(chk['stderr'])}\n")
++            else:
++                same = sol_ok and " ".join(sol["stdout"].split()) == " ".join(brute["stdout"].split())
++                extra = ""
++
++            if not same:
++                failures += 1
++                if save_failures_dir and len(saved_files) < MAX_SAVED_FAILURES:
++                    path = os.path.join(save_failures_dir, f"fail_seed{seed}.txt")
++                    with open(path, "w", encoding="utf-8") as f:
++                        f.write(g["stdout"])
++                    saved_files.append(path)
++                if not save_failures_dir:
++                    return (
++                        f"MISMATCH at seed {seed} (test {k + 1} of {num_tests}) after {passes} passing tests.\n"
++                        f"--- input ---\n{_clip(g['stdout'])}\n"
++                        + _describe("solution", sol)
++                        + (_describe("brute", brute) if brute is not None else "")
++                        + extra
++                        + f"Max solution runtime so far: {max_time:.2f}s (seed {max_time_seed})\n"
++                        + _slow_line(max_time, max_time_seed, time_budget)
++                    )
++            else:
++                passes += 1
++    finally:
++        if tmpdir:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++
++    mode = "checker" if checker_path else "brute"
++    if failures:
++        head = (f"MISMATCH: {failures} of {num_tests} tests failed ({mode} mode), {passes} passed. "
++                f"Failing inputs saved to: {', '.join(saved_files) if saved_files else 'none'}.\n")
++    else:
++        head = f"PASS: {passes}/{num_tests} tests matched ({mode} mode).\n"
+     return (
+-        f"PASS: {passes}/{num_tests} tests matched (seeds {seed_start}..{seed_start + num_tests - 1}).\n"
+-        f"Max solution runtime: {max_time:.2f}s (seed {max_time_seed})."
++        head
++        + f"Seeds {seed_start}..{seed_start + num_tests - 1}.\n"
++        + f"Max solution runtime: {max_time:.2f}s (seed {max_time_seed}).\n"
++        + _slow_line(max_time, max_time_seed, time_budget)
+     )
+diff --git a/attempts/attempts_log.md b/attempts/attempts_log.md
+new file mode 100644
+index 0000000..fae68aa
+--- /dev/null
++++ b/attempts/attempts_log.md
+@@ -0,0 +1,82 @@
++## Attempt 1
++- Derivation: unknown
++- Approach: unknown
++- Solution saved as: MISSING (solution.py not found)
++- Self verification: NO VERDICT
++- Independent review: FAIL
++- Self-verification failing details: input='' expected='' actual=''
++- Reviewer failing details: input='not determined. `/dgm/solution.py` is missing and the problem statement is not in the task, so no input could be checked.' expected='not determined.' actual='not determined. The file `/dgm/solution.py` does not exist.'
++- Reviewer summary: I could not complete the review, so I am not reporting PASS.
++
++**What blocked it**
++
++- `/dgm/solution.py` does not exist. `/dgm` contains `attempts/`, `coding_agent.py`, `llm.py`, `llm_withtools.py`, `prompts/`, `tests/`, `tools/`, `utils/` and related files, but no `solution.py`.
++- The only `solution.py` on the machine is `/tmp/run/repo/solution.py`. It is a two-line script that prints `max(a)-min(a)`. That is not the file the task names, so I did not review it as a substitute.
++- The task statement I was given is the coding-agent framework spec (the `coding_agent.py`, `tools/stress_test.py` and `compare_solutions.py` changes). It does not define a competitive-programming problem with input format and constraints. Without that, I cannot write `brute.py` or `gen.py` from the rules, so steps 1–5 cannot be carried out.
++- I created `/dgm/attempts/reviewer_0/` as my working directory. It is empty because no brute, generator or tests could be written.
++
++**What is needed to continue**
++
++1. The intended `/dgm/solution.py`, or confirmation of the path if it lives elsewhere.
++2. The problem statement the solution is meant to solve (input format, constraints, output format, and whether multiple answers are valid).
++
++With those I can write the brute force and generator, run `stress_test` with two seed ranges, check edge cases, and time a maximum-size input.
++
++No counterexample was found, because no test was run.
++
++REVIEW: FAIL
++FAILING INPUT: not determined. `/dgm/solution.py` is missing and the ...<clipped>
++
++## Attempt 2
++- Derivation: unknown
++- Approach: unknown
++- Solution saved as: MISSING (solution.py not found)
++- Self verification: FAIL
++- Independent review: FAIL
++- Self-verification failing details: input='not determined. `/dgm/solution.py` does not exist and no problem statement with input format or constraints was provided, so no brute force or generator could be written from the rules.' expected='not determined.' actual='not determined. No solution file to run.'
++- Reviewer failing details: input='' expected='' actual=''
++- Reviewer summary: I could not complete this review, so I have no verdict on the solution.
++
++`/dgm/solution.py` does not exist. `ls /dgm/` shows no `solution.py`, and `cat` fails with "No such file or directory." I also created the working directory `/dgm/attempts/reviewer_1`, which was empty, but I wrote no brute force or generator because I had no solution to test against.
++
++A `find /` search turned up a file at `/tmp/run/repo/solution.py`. I did not use it. The instructions limit me to `/dgm/solution.py` and my own directory, and it is not clear whether that copy is the intended one.
++
++The problem statement is also not a competitive-programming problem. It describes changes to a coding-agent repository: `tools/stress_test.py`, a new `tools/compare_solutions.py`, and `coding_agent.py`. The review steps assume a contest problem with a brute force and a generator, so they do not match this task. Even with the file present, I would need the actual problem statement to write a brute force.
++
++Nothing was tested, so I am not reporting PASS. To proceed, I need one of the following:
++1. `/dgm/solution.py` restored, plus the contest problem statement that it solves; or
++2. confirmation that `/tmp/run/repo/solution.py` is the intended target, plus the problem statement.
++
++REVIEW: FAIL
++(Not a counterexample-based failure: the review could not run because the file under review is missing. No failing input or actual output exists.)
++
++## Attempt 3
++- Derivation: heuristic. No derivation was possible because there is no problem statement with input format or constraints, and no `/dgm/solution.py` to check.
++- Approach: none. No algorithm was implemented, because no problem was given.
++- Solution saved as: MISSING (solution.py not found)
++- Self verification: FAIL
++- Independent review: FAIL
++- Self-verification failing details: input='not determined. There is no solution file to run and no problem statement to test against.' expected='not determined.' actual='`/dgm/solution.py` does not exist.'
++- Reviewer failing details: input='not determined. `/dgm/solution.py` does not exist, and the problem statement given is the framework spec rather than a problem with input rules, so no input could be checked.' expected='not determined.' actual='not determined. There is no file at `/dgm/solution.py` to run.'
++- Reviewer summary: I could not review this solution, so I am not reporting PASS.
++
++**What I found**
++
++- `/dgm/solution.py` does not exist. `ls /dgm` shows the coding-agent framework (`coding_agent.py`, `llm.py`, `tools/`, `utils/`, `prompts/`, `tests/`) and no solution file.
++- The only `solution.py` on the machine is `/tmp/run/repo/solution.py`. I did not use it, because the task names `/dgm/solution.py` and I was told to work only from that path.
++- The problem statement is not a competitive-programming problem. It is the spec for changing the coding-agent framework: `tools/stress_test.py` (checker support, `time_budget`, `save_failures_dir`), a new `tools/compare_solutions.py`, and `coding_agent.py` changes. It has no input format, constraints, or output rules, so I cannot write a brute force or generator from the rules as steps 1–2 require.
++- The repository's `attempts/attempts_log.md` shows two earlier review attempts that hit the same blocker.
++
++**What I did not do**
++
++- I did not write `brute.py` or `gen.py`, because there is no problem rule set to implement.
++- I did not run `stress_test`, edge tests, or a timing run, because there is nothing to run against.
++- I did not modify `/dgm/solution.py` or any other repository file.
++
++**What is needed to continue**
++
++1. The intended `/dgm/solution.py`, or confirmation that `/tmp/run/repo/solution.py` is the target.
++2. The competitive-programming problem statement that solution implements, including input format, constraints, output format, and whether m...<clipped>
++
++## Final
++- Restored attempt 1 with 2 failed check(s).
+diff --git a/null b/null
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tools/compare_solutions.py b/tools/compare_solutions.py
+new file mode 100644
+index 0000000..07197f2
+--- /dev/null
++++ b/tools/compare_solutions.py
+@@ -0,0 +1,254 @@
++import hashlib
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++
++MAX_TIMEOUT = 60
++MAX_INPUTS = 2000
++MAX_SOLUTIONS = 50
++CLIP = 3000
++
++
++def tool_info():
++    return {
++        "name": "compare_solutions",
++        "description": """Run several solutions on a corpus of input files and return a raw comparison table.
++
++* For every solution in `solution_paths` and every input file (given as a list of files or as a directory whose regular files are used), feeds the input to the solution's stdin and records: exit code (or TIMEOUT), runtime in seconds, and a hash of the whitespace-normalized stdout.
++* If `checker_path` is given, each (input, output) pair is judged by running `checker <input_file> <solution_output_file> [<brute_output_file>]` (exit 0 = accepted); the verdict column shows ACCEPT/REJECT. If `brute_path` is given, its output is computed per input and used as the reference: the agreement column shows AGREE/DIFF with the brute output (and is also passed to the checker as third argument when a checker is used).
++* If neither checker nor brute is given, agreement is computed among the solutions only (each output compared with the first solution's output).
++* Returns the raw table (one row per solution and input), the max runtime per solution, and a list of inputs on which the solutions disagree (or on which some solution failed the checker/brute comparison).
++* Errors are NOT parsed; raw stderr tails are included for failing rows.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_paths": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of solution program paths (each reads stdin and writes stdout). Files ending in .py run with the current Python interpreter; others are executed directly."
++                },
++                "input_files": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of input file paths to feed to every solution. Use this or input_dir."
++                },
++                "input_dir": {
++                    "type": "string",
++                    "description": "Optional directory; all regular files directly inside it are used as inputs (sorted by name). Used in addition to input_files if both are given."
++                },
++                "checker_path": {
++                    "type": "string",
++                    "description": "Optional checker for problems with multiple valid answers: `checker <input_file> <solution_output_file> [<brute_output_file>]`, exit 0 = accepted."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Optional brute-force reference program; its output on each input is the reference for exact-match agreement."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-run time limit in seconds for each solution, brute and checker run (default 10)."
++                }
++            },
++            "required": ["solution_paths"]
++        }
++    }
++
++
++def _cmd(path):
++    if path.endswith(".py"):
++        return [sys.executable, path]
++    return [os.path.abspath(path)]
++
++
++def _run(cmd, data, timeout, args=None):
++    t0 = time.time()
++    try:
++        p = subprocess.run(cmd + (args or []), input=data, capture_output=True, timeout=timeout)
++        return {
++            "timeout": False,
++            "rc": p.returncode,
++            "stdout": p.stdout.decode("utf-8", errors="replace"),
++            "stderr": p.stderr.decode("utf-8", errors="replace"),
++            "elapsed": time.time() - t0,
++        }
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
++        err = e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
++        return {"timeout": True, "rc": None, "stdout": out, "stderr": err, "elapsed": time.time() - t0}
++
++
++def _norm_hash(s):
++    return hashlib.sha1(" ".join(s.split()).encode("utf-8")).hexdigest()[:10]
++
++
++def _tail(s, n=400):
++    s = (s or "").strip()
++    return s if len(s) <= n else "..." + s[-n:]
++
++
++def _gather_inputs(input_files, input_dir):
++    paths = list(input_files or [])
++    if input_dir:
++        if not os.path.isdir(input_dir):
++            return None, f"Error: input_dir not found: {input_dir}"
++        for name in sorted(os.listdir(input_dir)):
++            p = os.path.join(input_dir, name)
++            if os.path.isfile(p):
++                paths.append(p)
++    # de-duplicate, keep order
++    seen, uniq = set(), []
++    for p in paths:
++        ap = os.path.abspath(p)
++        if ap not in seen:
++            seen.add(ap)
++            uniq.append(p)
++    return uniq, None
++
++
++def tool_function(solution_paths, input_files=None, input_dir=None, checker_path=None,
++                  brute_path=None, timeout=10):
++    try:
++        timeout = max(1, min(int(timeout if timeout is not None else 10), MAX_TIMEOUT))
++    except (TypeError, ValueError):
++        timeout = 10
++    if isinstance(solution_paths, str):
++        solution_paths = [solution_paths]
++    solution_paths = list(solution_paths or [])
++    if not solution_paths:
++        return "Error: no solution_paths given."
++    if len(solution_paths) > MAX_SOLUTIONS:
++        return f"Error: too many solutions (max {MAX_SOLUTIONS})."
++
++    for p in solution_paths:
++        if not os.path.isfile(p):
++            return f"Error: solution file not found: {p}"
++    for label, p in [("checker", checker_path), ("brute", brute_path)]:
++        if p and not os.path.isfile(p):
++            return f"Error: {label} file not found: {p}"
++
++    inputs, err = _gather_inputs(input_files, input_dir)
++    if err:
++        return err
++    if not inputs:
++        return "Error: no input files given (use input_files and/or input_dir)."
++    for p in inputs:
++        if not os.path.isfile(p):
++            return f"Error: input file not found: {p}"
++    if len(inputs) > MAX_INPUTS:
++        return f"Error: too many inputs (max {MAX_INPUTS}); split the corpus."
++
++    names = [f"S{i}:{os.path.basename(p)}" for i, p in enumerate(solution_paths)]
++    tmpdir = tempfile.mkdtemp(prefix="compare_solutions_")
++    rows = []           # dicts per (solution, input)
++    max_time = {n: 0.0 for n in names}
++    disagreeing = []
++    try:
++        for inp in inputs:
++            with open(inp, "rb") as f:
++                data = f.read()
++            label = os.path.basename(inp)
++
++            ref_out = None
++            brute_hash = None
++            if brute_path:
++                b = _run(_cmd(brute_path), data, timeout)
++                if b["timeout"] or b["rc"] != 0:
++                    rows.append({"input": label, "solution": "BRUTE", "rc": "TIMEOUT" if b["timeout"] else b["rc"],
++                                 "time": b["elapsed"], "hash": "-", "agree": "BRUTE-FAILED",
++                                 "stderr": _tail(b["stderr"])})
++                    disagreeing.append(label)
++                    continue
++                ref_out = b["stdout"]
++                brute_hash = _norm_hash(ref_out)
++
++            outs = {}
++            cur = {}  # solution name -> row dict for this input
++            for i, sp in enumerate(solution_paths):
++                name = names[i]
++                r = _run(_cmd(sp), data, timeout)
++                outs[name] = r
++                max_time[name] = max(max_time[name], r["elapsed"])
++                ok_run = (not r["timeout"]) and r["rc"] == 0
++                rc_str = "TIMEOUT" if r["timeout"] else str(r["rc"])
++                h = _norm_hash(r["stdout"]) if ok_run else "-"
++                row = {"input": label, "solution": name, "rc": rc_str,
++                       "time": r["elapsed"], "hash": h, "stderr": _tail(r["stderr"])}
++                if checker_path:
++                    if not ok_run:
++                        row["agree"] = "REJECT(run failed)"
++                    else:
++                        # write solution output to a file for checker
++                        out_file = os.path.join(tmpdir, f"out_{i}.txt")
++                        with open(out_file, "w", encoding="utf-8", errors="replace") as f:
++                            f.write(r["stdout"])
++                        args = [inp, out_file]
++                        if ref_out is not None:
++                            bf = os.path.join(tmpdir, "brute_out.txt")
++                            with open(bf, "w", encoding="utf-8", errors="replace") as f:
++                                f.write(ref_out)
++                            args.append(bf)
++                        c = _run(_cmd(checker_path), b"", timeout, args=args)
++                        accepted = (not c["timeout"]) and c["rc"] == 0
++                        row["agree"] = "ACCEPT" if accepted else "REJECT"
++                        if not accepted:
++                            row["checker_out"] = _tail(c["stdout"] + "\n" + c["stderr"])
++                elif ref_out is not None:
++                    if not ok_run:
++                        row["agree"] = "FAILED-RUN"
++                    else:
++                        row["agree"] = "AGREE" if h == brute_hash else "DIFF"
++                rows.append(row)
++                cur[name] = row
++
++            # Disagreement among solutions / with reference
++            if checker_path:
++                bad = [n for n in names if cur[n]["agree"] != "ACCEPT"]
++                if bad:
++                    disagreeing.append(f"{label} (not accepted by checker: {', '.join(bad)})")
++            elif brute_path:
++                bad = [n for n in names if cur[n]["agree"] != "AGREE"]
++                if bad:
++                    disagreeing.append(f"{label} (differs from brute: {', '.join(bad)})")
++            else:
++                hashes = {}
++                for n in names:
++                    r = outs[n]
++                    hashes[n] = _norm_hash(r["stdout"]) if ((not r["timeout"]) and r["rc"] == 0) else "FAILED"
++                base = hashes[names[0]]
++                for n in names:
++                    cur[n]["agree"] = "SAME" if hashes[n] == base else "DIFF"
++                if len(set(hashes.values())) > 1:
++                    disagreeing.append(label)
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++    lines = []
++    lines.append(f"Compared {len(solution_paths)} solution(s) on {len(inputs)} input(s); timeout={timeout}s.")
++    lines.append("")
++    lines.append(f"{'input':<28} {'solution':<28} {'exit':<10} {'time(s)':>8} {'hash':<12} agree")
++    for r in rows:
++        lines.append(f"{r['input'][:28]:<28} {r['solution'][:28]:<28} {str(r['rc'])[:10]:<10} "
++                     f"{r['time']:>8.3f} {r['hash']:<12} {r.get('agree', '-')}")
++    lines.append("")
++    lines.append("Max runtime per solution:")
++    for n in names:
++        lines.append(f"  {n}: {max_time[n]:.3f}s")
++    lines.append("")
++    if disagreeing:
++        lines.append(f"DISAGREEING INPUTS ({len(disagreeing)}):")
++        for d in disagreeing:
++            lines.append(f"  {d}")
++    else:
++        lines.append("No disagreements: all solutions agree on every input.")
++    failing = [r for r in rows if r.get("stderr") and r["rc"] not in (0, "0")]
++    if failing:
++        lines.append("")
++        lines.append("Raw stderr tails of non-zero/timeout runs:")
++        for r in failing[:20]:
++            lines.append(f"  [{r['solution']} on {r['input']} rc={r['rc']}] {_tail(r['stderr'], 300)!r}")
++    lines.append("")
++    lines.append("Solution key: " + "; ".join(f"{n} = {p}" for n, p in zip(names, solution_paths)))
++    return "\n".join(lines)

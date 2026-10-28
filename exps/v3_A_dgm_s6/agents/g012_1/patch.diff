@@ -1,0 +1,319 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index c7fa556..55ba50e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import traceback
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -183,6 +184,70 @@ class AgenticSystem:
+                 return False
+         return True
+ 
++    def _sanitize_history(self, msg_history):
++        """
++        Make a message history safe to resume: drop trailing assistant messages whose text is
++        empty or whitespace-only, so the history ends on a user message. Returns [] if the
++        history is unusable or cannot be repaired.
++        """
++        if not isinstance(msg_history, list):
++            return []
++
++        def _role(m):
++            return m.get('role') if isinstance(m, dict) else getattr(m, 'role', None)
++
++        def _text(m):
++            content = m.get('content') if isinstance(m, dict) else getattr(m, 'content', None)
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                parts = []
++                for block in content:
++                    if isinstance(block, dict):
++                        t = block.get('text')
++                    else:
++                        t = getattr(block, 'text', None)
++                    if isinstance(t, str):
++                        parts.append(t)
++                return "".join(parts)
++            return ""
++
++        history = list(msg_history)
++        while history and _role(history[-1]) == 'assistant' and not _text(history[-1]).strip():
++            history.pop()
++        # The retry message is appended as a new user turn by chat_with_agent, so a history that
++        # ends on non-empty assistant text is still resumable. Only an empty result is unusable.
++        if not history:
++            return []
++        return history
++
++    def _find_deliverable(self):
++        """
++        The file to be edited: the .py file named in backticks in the problem statement,
++        otherwise solution.py if it exists. Returns a path relative to git_tempdir, or None.
++        """
++        mentioned = self._mentioned_deliverables()
++        for name in mentioned:
++            name = name.lstrip('./')
++            if os.path.isfile(os.path.join(self.git_tempdir, name)):
++                return name
++        if mentioned:
++            return mentioned[0].lstrip('./')
++        if os.path.isfile(os.path.join(self.git_tempdir, 'solution.py')):
++            return 'solution.py'
++        return None
++
++    def _read_file_safely(self, path):
++        """Return the contents of a file under git_tempdir, or a short note if unreadable."""
++        if not path:
++            return ""
++        full = os.path.join(self.git_tempdir, path)
++        try:
++            with open(full, 'r', encoding='utf-8', errors='replace') as f:
++                return f.read()
++        except Exception as e:
++            return f"(could not read {path}: {e})"
++
+     def _diff_summary(self):
+         changed = self._changed_files()
+         if not changed:
+@@ -211,6 +276,7 @@ Follow these steps explicitly, calling the tools as you go:
+ 4. Run the program on the sample inputs from the problem statement with bash and check that the output matches the expected output.
+ 5. Where feasible, write a brute-force version and compare it against your solution on many small random inputs using bash. Fix any mismatches.
+ 6. Fix and optimize the solution based on the test results, making sure it meets the constraints.
++7. Keep shell commands short and bounded: use `timeout` for runs, avoid `cat $(...)` constructs that can read stdin, and write the solution file early (before long explorations), then refine it.
+ 
+ Important: Replying without calling tools, or ending your turn without having written or edited the source/deliverable file, counts as failure. Do not only modify test files; the actual source file must be implemented.
+ """
+@@ -228,17 +294,47 @@ Important: Replying without calling tools, or ending your turn without having wr
+                 "the diff is empty, touches only test files, or is missing a deliverable file named in the problem"
+             )
+             safe_log(f"[retry {attempt}/3] Retrying: {reason}")
+-            retry_message = (
+-                f"No source edits were made, or the edits only touch test files, so the task is not complete.\n"
+-                f"Current repository diff summary versus the base commit:\n{self._diff_summary()}\n\n"
+-                f"You must now use the editor tool to write a complete implementation of the solution in the "
+-                f"source/deliverable file (e.g. solution.py in {self.git_tempdir}), then test it: run it on the sample "
+-                f"inputs with bash and compare against a brute force on small random inputs where feasible. "
+-                f"Fix and optimize as needed. Do not reply without editing the source file."
+-            )
+-            new_history = chat_with_agent(retry_message, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            if isinstance(new_history, list):
+-                msg_history = new_history
++            deliverable = self._find_deliverable() or "solution.py"
++            try:
++                if attempt == 1:
++                    retry_message = (
++                        f"No source edits were made, or the edits only touch test files, so the task is not complete.\n"
++                        f"Current repository diff summary versus the base commit:\n{self._diff_summary()}\n\n"
++                        f"You must now use the editor tool (command `edit` or `create`) to write a complete implementation "
++                        f"into the deliverable file {deliverable} (in {self.git_tempdir}). Do this immediately, before any "
++                        f"further exploration. Then run it on the sample inputs with bash (use `timeout 20` and never run "
++                        f"commands that read from stdin), and compare against a brute force on small random inputs where "
++                        f"feasible. Fix and optimize as needed. Do not reply with plain text before the file is edited."
++                    )
++                    safe_log(f"[retry {attempt}/3] Resuming conversation with a forceful reminder to edit {deliverable}")
++                    result = chat_with_agent(
++                        retry_message,
++                        model=self.code_model,
++                        msg_history=self._sanitize_history(msg_history),
++                        logging=safe_log,
++                    )
++                else:
++                    contents = self._read_file_safely(deliverable)
++                    fresh_prompt = (
++                        f"{task}\n"
++                        f"The file {deliverable} currently contains:\n```\n{contents}\n```\n"
++                        f"Immediately use the editor tool `edit` command to write the full implementation into {deliverable}, "
++                        f"then run it with bash on the examples (use `timeout 20` and never run commands that read from stdin). "
++                        f"Do not respond with plain text before the file is edited."
++                    )
++                    safe_log(f"[retry {attempt}/3] Starting a fresh conversation to write {deliverable}")
++                    result = chat_with_agent(
++                        fresh_prompt,
++                        model=self.code_model,
++                        msg_history=[],
++                        logging=safe_log,
++                    )
++                if isinstance(result, list):
++                    msg_history = result
++                else:
++                    safe_log(f"[retry {attempt}/3] chat_with_agent returned non-list result; keeping previous history")
++            except Exception:
++                safe_log(f"[retry {attempt}/3] chat_with_agent raised an exception:\n{traceback.format_exc()}", level=logging.ERROR)
+ 
+         if not self._has_meaningful_edit():
+             safe_log("[retry] Giving up after 3 retries; no meaningful source edit was produced.")
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..4584af0 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,5 +1,7 @@
+ import asyncio
+ import os
++import shlex
++import signal
+ 
+ def tool_info():
+     return {
+@@ -11,13 +13,19 @@ def tool_info():
+ * State is persistent across command calls and discussions with the user.\n
+ * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+ * Please avoid commands that may produce a very large amount of output.\n
+-* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""",
++* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.\n
++* Commands run with stdin detached (from /dev/null), so commands that read stdin will not hang. Use `timeout` for anything that may run long, and keep commands short and bounded. Never use `cat $(...)` constructs that can read stdin.\n
++* Set restart to true to start a fresh shell session.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "command": {
+                     "type": "string",
+-                    "description": "The bash command to run."
++                    "description": "The bash command to run. Required unless restart is true."
++                },
++                "restart": {
++                    "type": "boolean",
++                    "description": "Set to true to restart the bash session. Each call already uses a fresh session, so this only returns a confirmation unless a command is also given."
+                 }
+             },
+             "required": ["command"]
+@@ -47,11 +55,20 @@ class BashSession:
+         )
+         self._started = True
+ 
++    def _kill_group(self):
++        """Kill the whole process group of the shell so no orphan processes remain."""
++        if self._process is None:
++            return
++        try:
++            os.killpg(self._process.pid, signal.SIGKILL)
++        except OSError:
++            pass
++
+     def stop(self):
+         if not self._started:
+             return
+         if self._process.returncode is None:
+-            self._process.terminate()
++            self._kill_group()
+         self._process = None
+         self._started = False
+ 
+@@ -64,34 +81,43 @@ class BashSession:
+             raise ValueError(
+                 f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+             )
+-        
++
++        # Detach stdin for the command so that blocking reads cannot hang the session.
++        # The command is passed as a single quoted argument to eval, keeping the wrapper on one
++        # line (no shell continuation prompts) and keeping cd/export state in the persistent shell.
++        wrapped = f"eval {shlex.quote(command)} < /dev/null"
++
+         # Send command
+         self._process.stdin.write(
+-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
++            wrapped.encode() + f"; echo '{self._sentinel}'\n".encode()
+         )
+         await self._process.stdin.drain()
+ 
+-        # Read output until sentinel
++        # Read output until sentinel, bounded by a deadline
+         try:
+             output = ''
+-            start_time = asyncio.get_event_loop().time()
+-            
+-            while True:
+-                if asyncio.get_event_loop().time() - start_time > self._timeout:
+-                    self._timed_out = True
+-                    raise ValueError(
+-                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-                    )
+-                
++            stdout_data = ''
++            stderr_data = ''
++            loop = asyncio.get_event_loop()
++            deadline = loop.time() + self._timeout
++            found = False
++
++            while loop.time() < deadline:
+                 await asyncio.sleep(self._output_delay)
+                 # Read from the internal buffer
+                 stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+                 stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
++
+                 if self._sentinel in stdout_data:
+                     output = stdout_data[: stdout_data.index(self._sentinel)]
++                    found = True
+                     break
+ 
++            if not found:
++                raise ValueError(
++                    f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
++                )
++
+             # Clear buffers
+             self._process.stdout._buffer.clear()
+             self._process.stderr._buffer.clear()
+@@ -103,27 +129,27 @@ class BashSession:
+ 
+         except Exception as e:
+             self._timed_out = True
++            self._kill_group()
+             raise ValueError(str(e))
+ 
+ def filter_error(error):
+-    # Filter out errors that we do not want to see
++    # Filter out errors that we do not want to see.
++    # Interactive bash prints "Inappropriate ioctl for device" (plus a few lines of prompt noise)
++    # on startup; drop that noise. Bounds-checked so short stderr never raises IndexError.
+     filtered_lines = []
+-    i = 0
+     error_lines = error.splitlines()
++    i = 0
+     while i < len(error_lines):
+         line = error_lines[i]
+-
+-        # Skip the next lines if ioctl error, add relevant lines
+         if "Inappropriate ioctl for device" in line:
+             i += 3
+-            if '<<exit>>' in error_lines[i]:
++            if i < len(error_lines) and '<<exit>>' in error_lines[i]:
+                 i += 1
+             while i < len(error_lines) - 1:
+                 filtered_lines.append(error_lines[i])
+                 i += 1
+             i += 1
+             continue
+-
+         filtered_lines.append(line)
+         i += 1
+     return '\n'.join(filtered_lines).strip()
+@@ -147,7 +173,13 @@ async def tool_function_call(command):
+     except Exception as e:
+         return f"Error: {str(e)}"
+ 
+-def tool_function(command):
++def tool_function(command=None, restart=False):
++    # Each call already creates a new BashSession, so restart only needs to
++    # confirm the restart (or run the given command in the fresh session).
++    if not command:
++        if restart:
++            return "bash restarted"
++        return "Error: no command provided"
+     return asyncio.run(tool_function_call(command))
+ 
+ if __name__ == "__main__":
+@@ -162,4 +194,4 @@ if __name__ == "__main__":
+         input_command = ' '.join(sys.argv[1:])
+         # Run the tool_function asynchronously
+         result = tool_function(input_command)
+-        print(result)
+\ No newline at end of file
++        print(result)

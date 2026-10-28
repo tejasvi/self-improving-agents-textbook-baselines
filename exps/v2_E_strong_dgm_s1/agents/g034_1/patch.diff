@@ -1,0 +1,644 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 8ae8822..aea90c3 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,10 +3,33 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import shutil
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.cross_check import run_cross_check
++
++
++def _has_body(text):
++    """True if `text` has more than the starter stub (imports, signature-only defs, pass/...)."""
++    for raw in text.splitlines():
++        s = raw.strip()
++        if not s or s.startswith("#") or s.startswith("import ") or s.startswith("from ") \
++                or s == "pass" or s == "...":
++            continue
++        if s.startswith("class ") or s.startswith("def "):
++            # Signature-only lines are not body; one-liners like "def f(): return 1" are.
++            _, _, tail = s.partition(":")
++            if not tail.strip() or tail.strip() == "pass":
++                continue
++        return True
++    return False
++
++
++def _clip_text(s, n=3000):
++    s = s or ""
++    return s if len(s) <= n else s[: n // 2] + "\n... <truncated> ...\n" + s[-n // 2:]
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -93,6 +116,18 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++SOLVE_METHOD_PROMPT = """Work like a careful competitive programmer:
++1. FIRST ACTION: before any long analysis, use the editor tool to write a complete working first draft into solution.py (even if unoptimized). Keep replies concise; never end a reply without a tool call until solution.py is implemented and tested. Never stop without having edited the primary source file (solution.py). Then read the statement and constraints and choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++2. Refine solution.py with the editor tool (replace the draft with the efficient version if needed).
++3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++4. Write a brute-force reference (brute.py) that is obviously correct, even if slow.
++5. Write a generator (gen.py) invoked as `python3 gen.py SEED SCALE` that prints one valid input to stdout. The SCALE parameter must control size and cover: tiny inputs (e.g. n<=8, small values), medium inputs (n around 100-300, with both small and large value ranges), large inputs close to the real constraints, and duplicate-heavy cases (many equal values, all-equal, sorted, reversed). Make sure the generator only produces inputs that satisfy the constraints.
++6. If the problem has several valid answers (e.g. "print any valid pair/triple/permutation"), write a validator (checker.py) invoked as `python3 checker.py input_file output_file` that checks every constraint of the output (indices in range, distinctness, the required sum/property, format) and exits with code 0 only if valid. Do not compare such outputs with the brute force directly.
++7. Run the stress_test tool with solution_cmd='python3 solution.py', generator_cmd='python3 gen.py', reference_cmd='python3 brute.py' (only if the brute force is feasible on those scales) and checker_cmd='python3 checker.py' when there are many valid answers. Run it across all scales (e.g. scales=[1,2,3,5,8,20,100]-style values covering tiny, medium and large) with a few hundred seeds in total, and set timeout to a few seconds. Fix every failure, then rerun until everything passes.
++8. Run the validator (or compare with the reference) on max-size outputs too, not only on small ones, and time the max-size runs: solution.py must finish well under 2 seconds. A fast output that is invalid is still wrong.
++9. Once all tests pass, re-read solution.py and look for untested branches (edge cases such as n=1, empty results, all-equal values, boundary values, negative numbers, answers that must be -1). Add tests that exercise them. Prefer a simpler, verifiable algorithm over an unverifiable clever one: if a clever algorithm (e.g. FFT/convolution tricks) cannot be validated at medium scale against the brute force or the checker, replace it with a simpler approach that fits the time limit.
++10. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -202,9 +237,50 @@ class AgenticSystem:
+                     return False
+         return True
+ 
++    # ------------------------------------------------------------------
++    # Phase helpers
++    # ------------------------------------------------------------------
++    def _path(self, name):
++        return os.path.join(self.git_tempdir, name)
++
++    def _snapshot(self, src_name, dst_name):
++        """Copy a repo file to another name (used to keep attempt_A.py independent of later edits)."""
++        src = self._path(src_name)
++        if not os.path.exists(src):
++            return False
++        shutil.copyfile(src, self._path(dst_name))
++        return True
++
++    def _run_phase(self, prompt, msg_history=None, label=""):
++        """One chat_with_agent call. msg_history=None starts a fresh conversation."""
++        safe_log(f"[phase] {label} start")
++        hist = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history or [], logging=safe_log)
++        safe_log(f"[phase] {label} done")
++        return hist
++
++    def _problem_block(self):
++        return f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n"
++
++    def _cross_check(self, solution_files, scales, seeds, timeout, checker=False, reference=False):
++        """Run cross_check on repo files (paths relative to git_tempdir). Returns the result dict."""
++        gen = "python3 gen.py"
++        cmds = [f"python3 {f}" for f in solution_files]
++        kwargs = dict(scales=scales, seeds_per_scale=seeds, timeout=timeout)
++        if checker and os.path.exists(self._path("checker.py")):
++            kwargs["checker_cmd"] = "python3 checker.py"
++        if reference and os.path.exists(self._path("brute.py")):
++            kwargs["reference_cmd"] = "python3 brute.py"
++        return run_cross_check(cmds, gen, cwd=self.git_tempdir, **kwargs)
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Phased workflow:
++          (a) solve: writes solution.py, snapshot to attempt_A.py
++          (b) alternative: independent solution (alt_solution.py) + brute.py, fresh history
++          (c) generator hardening: gen.py with tiny/structured/medium/max scales
++          (d) reconcile loop (bounded, 3 rounds) using cross_check
++          (e) selection of the candidate with the highest pass count -> solution.py
++          (f) final self-review on untested scales / case types
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -214,20 +290,10 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. FIRST ACTION: before any long analysis, use the editor tool to write a complete working first draft into solution.py (even if unoptimized). Keep replies concise; never end a reply without a tool call until solution.py is implemented and tested. Never stop without having edited the primary source file (solution.py). Then read the statement and constraints and choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Refine solution.py with the editor tool (replace the draft with the efficient version if needed).
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference (brute.py) that is obviously correct, even if slow.
+-5. Write a generator (gen.py) invoked as `python3 gen.py SEED SCALE` that prints one valid input to stdout. The SCALE parameter must control size and cover: tiny inputs (e.g. n<=8, small values), medium inputs (n around 100-300, with both small and large value ranges), large inputs close to the real constraints, and duplicate-heavy cases (many equal values, all-equal, sorted, reversed). Make sure the generator only produces inputs that satisfy the constraints.
+-6. If the problem has several valid answers (e.g. "print any valid pair/triple/permutation"), write a validator (checker.py) invoked as `python3 checker.py input_file output_file` that checks every constraint of the output (indices in range, distinctness, the required sum/property, format) and exits with code 0 only if valid. Do not compare such outputs with the brute force directly.
+-7. Run the stress_test tool with solution_cmd='python3 solution.py', generator_cmd='python3 gen.py', reference_cmd='python3 brute.py' (only if the brute force is feasible on those scales) and checker_cmd='python3 checker.py' when there are many valid answers. Run it across all scales (e.g. scales=[1,2,3,5,8,20,100]-style values covering tiny, medium and large) with a few hundred seeds in total, and set timeout to a few seconds. Fix every failure, then rerun until everything passes.
+-8. Run the validator (or compare with the reference) on max-size outputs too, not only on small ones, and time the max-size runs: solution.py must finish well under 2 seconds. A fast output that is invalid is still wrong.
+-9. Once all tests pass, re-read solution.py and look for untested branches (edge cases such as n=1, empty results, all-equal values, boundary values, negative numbers, answers that must be -1). Add tests that exercise them. Prefer a simpler, verifiable algorithm over an unverifiable clever one: if a clever algorithm (e.g. FFT/convolution tricks) cannot be validated at medium scale against the brute force or the checker, replace it with a simpler approach that fits the time limit.
+-10. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log(f"[verify] initial run finished; source edit detected: {self._has_source_edit()}")
++        # (a) solve phase: fresh history, solution.py written by the agent.
++        instruction = f"{task}\n\n{SOLVE_METHOD_PROMPT}"
++        init_edit = self._run_phase(instruction, [], label="solve")
++        safe_log(f"[verify] solve phase finished; source edit detected: {self._has_source_edit()}")
+ 
+         retry_note = (
+             "No change to the primary source file (solution.py) was detected; it is still the starter stub. "
+@@ -249,9 +315,131 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                 f"Working directory: {self.git_tempdir}\n"
+                 "Write the final solution to solution.py with the editor tool; nothing else."
+             )
+-            chat_with_agent(fallback, model=self.code_model, msg_history=[], logging=safe_log)
++            self._run_phase(fallback, [], label="fallback")
+             safe_log(f"[verify] fallback finished; source edit detected: {self._has_source_edit()}")
+ 
++        # Snapshot of the first attempt (independent of later edits).
++        self._snapshot("solution.py", "attempt_A.py")
++
++        # (b) alternative solution phase: fresh history, sees only the problem statement.
++        alt_prompt = (
++            f"I have a repository in the directory {self.git_tempdir}.\n\n"
++            f"{self._problem_block()}\n"
++            "Independent cross-check task. Do NOT look at any existing solution file in the repository "
++            "(do not open solution.py or attempt_A.py); work only from the problem statement.\n"
++            f"1. Write {self.git_tempdir}/alt_solution.py: a complete program that reads stdin and writes stdout, "
++            "using a DIFFERENT algorithm or formulation than the obvious one (e.g. a different invariant, "
++            "a randomized or exhaustive search for small cases, DP instead of greedy, or a different data structure).\n"
++            f"2. Write {self.git_tempdir}/brute.py: an obviously correct brute force (slow is fine) that reads stdin and writes stdout.\n"
++            "3. Run both on the sample inputs from the statement and on a few random small inputs; they must agree "
++            "with each other and with the samples. If they disagree, find out which one is wrong by hand before changing anything.\n"
++            "Keep the output format exactly as the statement requires."
++        )
++        self._run_phase(alt_prompt, [], label="alternative")
++
++        # (c) generator hardening: fresh history.
++        gen_prompt = (
++            f"I have a repository in the directory {self.git_tempdir}.\n\n"
++            f"{self._problem_block()}\n"
++            f"Write {self.git_tempdir}/gen.py, invoked as `python3 gen.py SEED SCALE`, that prints one VALID input "
++            "(satisfying every constraint of the statement) to stdout. Use the scale to control size with these bands:\n"
++            "- scales 1-3: tiny inputs (n <= 6), exhaustive-like, small values, many ties;\n"
++            "- scales 4-5: structured / adversarial cases. Where applicable: trees, cycles, complete graphs, bipartite graphs, "
++            "disconnected graphs, isolated vertices, all-equal values, sorted and reversed sequences, duplicates, "
++            "and boundary values (minimum and maximum of every bound);\n"
++            "- scale 6: medium inputs (n around 100-300), both small and large value ranges;\n"
++            "- scale 7: maximum-size inputs at the real constraints (or as close as the generator can get).\n"
++            "The generator must also balance the answer classes (e.g. about half Yes / half No when the answer is a yes/no), "
++            "and must print class statistics to stderr (sizes, answer class counts) so you can verify coverage.\n"
++            "Verify the generator: run it for every scale and seeds 0..50, check every output is valid "
++            "(constraints, format), and run brute.py on the tiny scales to make sure the balance is real. "
++            "Use bash timing to check that the scale-7 inputs are actually near the constraints."
++        )
++        self._run_phase(gen_prompt, [], label="generator")
++
++        # (d) reconcile loop: bounded, history kept across rounds.
++        history = []
++        for rnd in range(3):
++            res = self._cross_check(["solution.py", "alt_solution.py"], scales=[1, 2, 3, 4, 5, 6, 7],
++                                    seeds=20, timeout=5, checker=True, reference=True)
++            if res.get("error"):
++                safe_log(f"[reconcile] round {rnd + 1}: cross_check error: {res['error']}")
++                break
++            if res["all_passed"]:
++                safe_log(f"[reconcile] round {rnd + 1}: all candidates agree and pass")
++                break
++            ff = res["first_failure"] or {}
++            outs = ff.get("outs", [])
++            out_text = "\n".join(f"--- output of [{o['cmd']}] ({o['status']}) ---\n{_clip_text(o['output'])}" for o in outs)
++            prompt = (
++                f"Reconcile round {rnd + 1}/3 in {self.git_tempdir}.\n\n"
++                f"{self._problem_block()}\n"
++                "cross_check found a disagreement or failure between solution.py and alt_solution.py "
++                "(brute.py is the reference, checker.py validates outputs when present).\n"
++                f"Minimal failing input:\n--- input ---\n{_clip_text(ff.get('input') or '')}\n"
++                f"{out_text}\n"
++                f"Reference output (brute.py): {_clip_text(ff.get('ref') or '(none)')}\n"
++                f"cross_check report:\n{res['text']}\n\n"
++                f"Paths: {self._path('solution.py')} and {self._path('alt_solution.py')}.\n"
++                "Determine the truth first: hand-verify the small input against the statement, and/or run the checker. "
++                "Then fix whichever solution is wrong (or the generator/brute if they are the wrong ones). "
++                "Re-run cross_check-equivalent tests (both solutions on this input and on fresh generator seeds at all scales) before finishing."
++            )
++            history = self._run_phase(prompt, history, label=f"reconcile {rnd + 1}")
++        safe_log("[reconcile] loop done")
++
++        # (e) selection: the candidate with the highest pass count wins; ties keep solution.py.
++        final = self._cross_check(["solution.py", "alt_solution.py"], scales=[1, 2, 3, 4, 5, 6, 7],
++                                  seeds=20, timeout=5, checker=True, reference=True)
++        sel = self._select_candidate(final)
++        if sel:
++            safe_log(f"[select] copying {sel} to solution.py")
++            if sel != "solution.py":
++                shutil.copyfile(self._path(sel), self._path("solution.py"))
++        # Safety net: never leave solution.py as a stub.
++        sol_text = ""
++        if os.path.exists(self._path("solution.py")):
++            with open(self._path("solution.py")) as f:
++                sol_text = f.read()
++        if not _has_body(sol_text) and os.path.exists(self._path("attempt_A.py")):
++            safe_log("[select] solution.py is a stub; restoring attempt_A.py")
++            shutil.copyfile(self._path("attempt_A.py"), self._path("solution.py"))
++
++        # (f) final self-review, repeated once if the max-size coverage is poor.
++        review = (
++            f"Final review in {self.git_tempdir}. Your cross-check report:\n{final.get('text', '')[:3000]}\n\n"
++            "List any scale or case type you did not test (as in your own summary), then test it now: "
++            "run the generator at that scale, run solution.py and brute.py/checker.py on it, and time solution.py on "
++            "the largest inputs (it must finish well under 2 seconds). Fix anything wrong."
++        )
++        history = self._run_phase(review, history, label="review")
++        if self._max_scale_too_small(final):
++            safe_log("[review] max input size far below constraints; re-prompting once")
++            self._run_phase(
++                "The cross-check report shows the max input size seen is far below the constraints. "
++                "Update gen.py so scale 7 produces the largest valid inputs allowed, run it, and run solution.py "
++                "on it with timing (must be well under 2 seconds). Then fix any issues.",
++                history, label="review-max-size")
++
++    def _select_candidate(self, res):
++        """Pick the file with the highest pass count (solution.py wins ties). Returns a repo-relative name."""
++        if not res or res.get("error"):
++            return None
++        names = ["solution.py", "alt_solution.py"]
++        passes = res.get("passes") or []
++        if len(passes) != len(names):
++            return None
++        best = max(range(len(names)), key=lambda i: (passes[i], i == 0))
++        return names[best]
++
++    def _max_scale_too_small(self, res):
++        """True if the largest tokens seen is far below the largest scale's expected size."""
++        if not res or res.get("error"):
++            return False
++        return res.get("max_scale_tokens", 0) < 50 or res.get("max_scale_tests", 0) == 0
++
++
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tests/test_cross_check.py b/tests/test_cross_check.py
+new file mode 100644
+index 0000000..ef21bdf
+--- /dev/null
++++ b/tests/test_cross_check.py
+@@ -0,0 +1,50 @@
++import sys
++from tools import cross_check
++
++
++def _write(tmp_path, name, body):
++    p = tmp_path / name
++    p.write_text(body)
++    return f"{sys.executable} {p}"
++
++
++def test_schema_is_well_formed():
++    s = cross_check.tool_info()["input_schema"]
++    assert set(s) == {"type", "properties", "required"}
++    assert set(s["required"]) == {"solution_cmds", "generator_cmd"}
++    for name, prop in s["properties"].items():
++        assert "type" in prop and "description" in prop, name
++
++
++def test_agreement_and_disagreement(tmp_path):
++    gen = _write(tmp_path, "gen.py", "import sys\nprint(sys.argv[2])\nprint(sys.argv[1])\n")
++    same = _write(tmp_path, "same.py", "print(input(), input())\n")
++    other = _write(tmp_path, "other.py", "a=input(); b=input(); print(a, 'x' if b=='0' else b)\n")
++    res = cross_check.run_cross_check([same, same], gen, scales=[1, 5], seeds_per_scale=2, timeout=5,
++                                      cwd=str(tmp_path))
++    assert res["all_passed"] and res["passes"] == [4, 4]
++    res = cross_check.run_cross_check([same, other], gen, scales=[1, 5], seeds_per_scale=2, timeout=5,
++                                      cwd=str(tmp_path))
++    assert not res["all_passed"]
++    assert "disagree" in res["text"]
++    assert "--- output of" in res["text"]
++
++
++def test_timeout_and_crash_do_not_raise(tmp_path):
++    gen = _write(tmp_path, "gen.py", "print(1)\nprint(2)\n")
++    slow = _write(tmp_path, "slow.py", "import time; time.sleep(5)\n")
++    crash = _write(tmp_path, "crash.py", "raise SystemExit(3)\n")
++    res = cross_check.run_cross_check([slow, crash], gen, scales=[1], seeds_per_scale=1, timeout=1,
++                                      cwd=str(tmp_path))
++    assert res["error"] is None
++    assert not res["all_passed"]
++    txt = cross_check.tool_function([crash], "does_not_exist_gen", scales=[1], seeds_per_scale=1,
++                                    timeout=1)
++    assert isinstance(txt, str)
++
++
++def test_warns_when_largest_scale_is_small(tmp_path):
++    gen = _write(tmp_path, "gen.py", "print(1)\nprint(2)\n")
++    ok = _write(tmp_path, "ok.py", "print('Yes')\n")
++    txt = cross_check.tool_function([ok], gen, scales=[1, 2], seeds_per_scale=1, timeout=5)
++    assert "WARNING" in txt and "largest scale" in txt
+diff --git a/tools/cross_check.py b/tools/cross_check.py
+new file mode 100644
+index 0000000..bab8e4f
+--- /dev/null
++++ b/tools/cross_check.py
+@@ -0,0 +1,315 @@
++"""Differential testing of several solutions against each other, a brute-force
++reference, or a checker. Reuses the process helpers of stress_test.py.
++"""
++import os
++import shutil
++import tempfile
++import time
++from collections import Counter
++
++try:
++    from tools.stress_test import _run, _clip, _cwd, _norm
++except ImportError:  # pragma: no cover
++    from stress_test import _run, _clip, _cwd, _norm
++
++MAX_SHOW = 1500
++DEFAULT_SCALES = [1, 2, 3, 5, 8]
++SKEW_THRESHOLD = 0.9
++SMALL_INPUT_TOKENS = 50  # below this, the largest scale is not considered exercised
++
++
++def tool_info():
++    return {
++        "name": "cross_check",
++        "description": """Differential testing: run several solutions on the same generated inputs and compare them.\n
++* `solution_cmds` is a list of shell commands (e.g. ["python3 solution.py", "python3 alt_solution.py"]); each reads one input on stdin and writes its answer to stdout.\n
++* `generator_cmd` is run as `<generator_cmd> <seed> <scale>` and must print one test input to stdout.\n
++* Every seed in range(seeds_per_scale) is run for every scale. Each run has a `timeout` in seconds; timeouts and crashes are reported, not raised.\n
++* Verdict: with `checker_cmd` (run as `<checker_cmd> input_file output_file [reference_output_file]`, exit code 0 = valid) each output is validated independently; this is the right choice when several answers are valid. With `reference_cmd` (a brute force) outputs must match its normalized output. Otherwise all solutions' normalized outputs must agree with each other.\n
++* Reports: per-solution pass counts, the first failure (truncated input plus every solution's output), the largest input size seen, the max runtime per solution, and the distribution of the first output token with a warning when one class is over 90% of the cases or when no test came close to the largest scale.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmds": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of shell commands, one per solution, each reading stdin and writing stdout. E.g. [\"python3 solution.py\", \"python3 alt_solution.py\"]."
++                },
++                "generator_cmd": {
++                    "type": "string",
++                    "description": "Shell command invoked as '<generator_cmd> seed scale' that prints one test input to stdout, e.g. 'python3 gen.py'."
++                },
++                "scales": {
++                    "type": "array",
++                    "items": {"type": "integer"},
++                    "description": "List of integer scales passed to the generator. Default [1, 2, 3, 5, 8]."
++                },
++                "seeds_per_scale": {
++                    "type": "integer",
++                    "description": "Number of seeds (0 .. seeds_per_scale-1) to run for each scale. Default 20."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Time limit in seconds for each single run of the generator, a solution, the reference or the checker. Default 10."
++                },
++                "checker_cmd": {
++                    "type": "string",
++                    "description": "Optional shell command invoked as '<checker_cmd> input_file output_file [reference_output_file]'; exit code 0 means the output is valid."
++                },
++                "reference_cmd": {
++                    "type": "string",
++                    "description": "Optional brute-force reference command reading stdin; its normalized output is the expected answer."
++                }
++            },
++            "required": ["solution_cmds", "generator_cmd"]
++        }
++    }
++
++
++def _input_size(text):
++    """(number of whitespace tokens, largest absolute integer token)."""
++    tokens = text.split()
++    max_int = 0
++    for t in tokens:
++        try:
++            v = abs(int(t))
++        except ValueError:
++            continue
++        if v > max_int:
++            max_int = v
++    return len(tokens), max_int
++
++
++def _public(info):
++    if info is None:
++        return None
++    return {k: v for k, v in info.items() if not k.startswith("_")}
++
++
++def _timed_run(cmd, cwd, timeout, stdin_path=None, args=()):
++    t0 = time.time()
++    st, out, err = _run(cmd, cwd, timeout, stdin_path=stdin_path, args=args)
++    return st, out, err, time.time() - t0
++
++
++def run_cross_check(solution_cmds, generator_cmd, scales=None, seeds_per_scale=20,
++                    timeout=10, checker_cmd=None, reference_cmd=None, cwd=None):
++    """Returns a dict: {'error', 'text', 'all_passed', 'passes', 'total', 'max_tokens',
++    'max_int', 'max_scale', 'max_scale_tokens', 'max_runtime', 'first_token_counts', 'first_failure'}.
++    Never raises."""
++    tmpdir = tempfile.mkdtemp(prefix="cross_")
++    try:
++        return _cross(solution_cmds, generator_cmd, scales, seeds_per_scale, timeout,
++                      checker_cmd, reference_cmd, tmpdir, cwd)
++    except Exception as e:
++        return {"error": f"cross_check failed internally: {type(e).__name__}: {e}"}
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def _cross(solution_cmds, generator_cmd, scales, seeds_per_scale, timeout,
++           checker_cmd, reference_cmd, tmpdir, cwd=None):
++    if isinstance(solution_cmds, str):
++        solution_cmds = [solution_cmds]
++    solution_cmds = [str(c) for c in (solution_cmds or []) if str(c).strip()]
++    if not solution_cmds or not generator_cmd:
++        return {"error": "solution_cmds (non-empty list) and generator_cmd are required."}
++    scales = [int(s) for s in scales] if scales else list(DEFAULT_SCALES)
++    try:
++        seeds_per_scale = int(seeds_per_scale) if seeds_per_scale is not None else 20
++    except (TypeError, ValueError):
++        seeds_per_scale = 20
++    seeds_per_scale = max(1, min(seeds_per_scale, 100000))
++    try:
++        timeout = int(timeout) if timeout else 10
++    except (TypeError, ValueError):
++        timeout = 10
++    timeout = max(1, min(timeout, 300))
++    cwd = cwd if cwd and os.path.isdir(cwd) else _cwd()
++    mode = "checker" if checker_cmd else ("reference" if reference_cmd else "pairwise-agreement")
++
++    in_path = os.path.join(tmpdir, "input.txt")
++    out_paths = [os.path.join(tmpdir, f"out_{i}.txt") for i in range(len(solution_cmds))]
++    ref_path = os.path.join(tmpdir, "ref_out.txt")
++
++    n = len(solution_cmds)
++    max_scale = max(scales)
++    passes = [0] * n
++    max_runtime = [0.0] * n
++    total = 0
++    total_pass = 0
++    first_token_counts = Counter()
++    max_tokens = 0
++    max_int = 0
++    max_scale_tokens = 0   # largest input size seen at the largest scale
++    max_scale_tests = 0    # number of tests run at the largest scale
++    first_failure = None   # the smallest failing input (generator failures are reported last)
++
++    def consider_failure(info):
++        nonlocal first_failure
++        if info.get("input") is None:
++            key = (1, 0)
++        else:
++            key = (0, len(info["input"]))
++        if first_failure is None:
++            first_failure = info
++            first_failure["_key"] = key
++        elif key < first_failure["_key"]:
++            first_failure = info
++            first_failure["_key"] = key
++
++    for scale in scales:
++        for seed in range(seeds_per_scale):
++            total += 1
++            st, gen_out, gen_err, _ = _timed_run(generator_cmd, cwd, timeout, args=[seed, scale])
++            if st != "ok":
++                consider_failure(dict(kind=f"generator {st}", scale=scale, seed=seed, input=None,
++                                      outs=[], ref=None, info=gen_err))
++                continue
++            with open(in_path, "w") as f:
++                f.write(gen_out)
++            tok, mi = _input_size(gen_out)
++            max_tokens = max(max_tokens, tok)
++            max_int = max(max_int, mi)
++            if scale == max_scale:
++                max_scale_tests += 1
++                max_scale_tokens = max(max_scale_tokens, tok)
++
++            ref_text = None
++            if reference_cmd:
++                st, ro, re_, _ = _timed_run(reference_cmd, cwd, timeout, stdin_path=in_path)
++                if st != "ok":
++                    consider_failure(dict(kind=f"reference {st}", scale=scale, seed=seed,
++                                          input=gen_out, outs=[], ref=None, info=re_))
++                    continue
++                ref_text = ro
++                with open(ref_path, "w") as f:
++                    f.write(ro)
++
++            results = []
++            for i, cmd in enumerate(solution_cmds):
++                st, so, se, dt = _timed_run(cmd, cwd, timeout, stdin_path=in_path)
++                max_runtime[i] = max(max_runtime[i], dt)
++                results.append((st, so, se))
++                with open(out_paths[i], "w") as f:
++                    f.write(so)
++
++            ok_outs = [_norm(r[1]) for r in results if r[0] == "ok"]
++            if ok_outs:
++                first_token_counts[ok_outs[0][0] if ok_outs[0] else "<empty>"] += 1
++            # Consensus for pairwise mode: the most common normalized output.
++            consensus = None
++            if not checker_cmd and not reference_cmd and len(ok_outs) == n and n > 0:
++                cnt = Counter(tuple(o) for o in ok_outs)
++                top, top_c = cnt.most_common(1)[0]
++                if top_c > n / 2 or n == 1:
++                    consensus = list(top)
++
++            verdicts = []
++            reasons = []
++            for i, (st, so, se) in enumerate(results):
++                if st != "ok":
++                    verdicts.append(False)
++                    reasons.append(f"solution {i} {st}")
++                    continue
++                if checker_cmd:
++                    args = [in_path, out_paths[i]] + ([ref_path] if ref_text is not None else [])
++                    cst, co, ce, _ = _timed_run(checker_cmd, cwd, timeout, args=args)
++                    verdicts.append(cst == "ok")
++                    if cst != "ok":
++                        reasons.append(f"checker rejected solution {i} ({cst})")
++                elif ref_text is not None:
++                    good = _norm(so) == _norm(ref_text)
++                    verdicts.append(good)
++                    if not good:
++                        reasons.append(f"solution {i} differs from reference")
++                else:
++                    good = consensus is not None and _norm(so) == consensus
++                    verdicts.append(good)
++                    if not good:
++                        reasons.append(f"solution {i} disagrees with the others")
++
++            for i in range(n):
++                if verdicts[i]:
++                    passes[i] += 1
++            if all(verdicts):
++                total_pass += 1
++            else:
++                consider_failure(dict(kind="; ".join(reasons) or "failure", scale=scale, seed=seed,
++                                      input=gen_out, outs=[
++                                          dict(cmd=solution_cmds[i], status=r[0], output=r[1], err=r[2])
++                                          for i, r in enumerate(results)],
++                                      ref=ref_text, info=""))
++
++    lines = [f"Cross-check: mode={mode}, solutions={n}, scales={scales}, "
++             f"seeds_per_scale={seeds_per_scale}, timeout={timeout}s",
++             f"Total: {total_pass}/{total} tests fully passed"]
++    for i, cmd in enumerate(solution_cmds):
++        lines.append(f"  solution {i} [{cmd}]: {passes[i]}/{total} passed, "
++                     f"max runtime {max_runtime[i]:.2f}s")
++    lines.append(f"Max input size seen: {max_tokens} tokens, largest integer {max_int}; "
++                 f"at the largest scale ({max_scale}): {max_scale_tests} tests, up to {max_scale_tokens} tokens")
++    if max_scale_tests == 0:
++        lines.append(f"WARNING: no test at the largest scale ({max_scale}) was generated; "
++                     "max-size inputs were not exercised.")
++    elif max_scale_tokens < SMALL_INPUT_TOKENS or max_scale_tokens < 0.25 * max_tokens:
++        lines.append(f"WARNING: no test came close to the largest scale: the largest input at scale "
++                     f"{max_scale} has {max_scale_tokens} tokens (largest seen: {max_tokens}). "
++                     "Max-size inputs are not exercised; make the top scale produce near-maximal inputs.")
++    tot_cnt = sum(first_token_counts.values())
++    if tot_cnt:
++        dist = ", ".join(f"{k}: {v}" for k, v in first_token_counts.most_common(8))
++        lines.append(f"First output token distribution: {dist}")
++        top_tok, top_cnt = first_token_counts.most_common(1)[0]
++        if top_cnt / tot_cnt > SKEW_THRESHOLD:
++            lines.append(f"WARNING: answer class '{top_tok}' is {100.0 * top_cnt / tot_cnt:.0f}% of the "
++                         "cases; the generator should balance answer classes.")
++    else:
++        lines.append("First output token distribution: (no successful outputs)")
++
++    if first_failure is None:
++        lines.append("ALL PASSED")
++    else:
++        ff = first_failure
++        lines.append(f"FAILED ({ff['kind']}) at scale={ff['scale']} seed={ff['seed']} "
++                     "(smallest failing input found)")
++        inp = ff.get("input")
++        if inp is not None:
++            if len(inp) <= MAX_SHOW:
++                lines.append("--- input ---\n" + inp.rstrip())
++            else:
++                lines.append(f"--- input (truncated, {len(inp)} chars total) ---\n" + _clip(inp).rstrip())
++        for o in ff.get("outs", []):
++            lines.append(f"--- output of [{o['cmd']}] ({o['status']}) ---\n" + _clip(o['output']).rstrip())
++            if o.get("err") and o["status"] != "ok":
++                lines.append("stderr: " + _clip(o["err"]).rstrip())
++        if ff.get("ref") is not None:
++            lines.append("--- reference output ---\n" + _clip(ff["ref"]).rstrip())
++        if ff.get("info"):
++            lines.append("--- info ---\n" + _clip(ff["info"]).rstrip())
++    return {
++        "error": None,
++        "text": "\n".join(lines),
++        "all_passed": first_failure is None,
++        "passes": passes,
++        "total": total,
++        "total_pass": total_pass,
++        "max_tokens": max_tokens,
++        "max_int": max_int,
++        "max_scale": max_scale,
++        "max_scale_tests": max_scale_tests,
++        "max_scale_tokens": max_scale_tokens,
++        "max_runtime": max_runtime,
++        "first_token_counts": dict(first_token_counts),
++        "first_failure": _public(first_failure),
++    }
++
++
++def tool_function(solution_cmds, generator_cmd, scales=None, seeds_per_scale=20, timeout=10,
++                  checker_cmd=None, reference_cmd=None):
++    res = run_cross_check(solution_cmds, generator_cmd, scales=scales,
++                          seeds_per_scale=seeds_per_scale, timeout=timeout,
++                          checker_cmd=checker_cmd, reference_cmd=reference_cmd)
++    if res.get("error"):
++        return f"Error: {res['error']}"
++    return res["text"]

@@ -1,0 +1,247 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e7e0da9..13b3195 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -93,6 +94,38 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++
++def _sanitize_history(msg_history):
++    """
++    Remove empty/whitespace-only text blocks, drop messages left with no content,
++    and merge adjacent messages that share the same role.
++    """
++    cleaned = []
++    for msg in msg_history or []:
++        content = msg.get('content')
++        if isinstance(content, str):
++            if not content.strip():
++                continue
++            blocks = [{'type': 'text', 'text': content}]
++        else:
++            blocks = []
++            for block in content or []:
++                if isinstance(block, dict) and block.get('type') == 'text':
++                    text = block.get('text')
++                    if not isinstance(text, str) or not text.strip():
++                        continue
++                blocks.append(block)
++            if not blocks:
++                continue
++        new_msg = dict(msg)
++        new_msg['content'] = blocks
++        if cleaned and cleaned[-1].get('role') == new_msg.get('role'):
++            cleaned[-1] = dict(cleaned[-1])
++            cleaned[-1]['content'] = list(cleaned[-1]['content']) + blocks
++        else:
++            cleaned.append(new_msg)
++    return cleaned
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -173,6 +206,149 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++
++    def _find_target_file(self):
++        """
++        Pick the primary source file to implement: prefer a file named in the problem
++        statement, then stub-like files (tiny, or containing 'pass' / 'Write your solution here').
++        Tests, specs, conftest, READMEs and docs are skipped.
++        """
++        try:
++            out = subprocess.run(
++                ['git', 'ls-files'], cwd=self.git_tempdir,
++                capture_output=True, text=True, check=False,
++            ).stdout
++        except Exception as e:
++            safe_log(f"_find_target_file: git ls-files failed: {e}", level=logging.WARNING)
++            return None
++        files = []
++        for path in out.splitlines():
++            lower = path.lower()
++            segments = lower.split('/')
++            filename = segments[-1]
++            if any(kw in lower for kw in ('test', 'spec', 'conftest')):
++                continue
++            if filename.startswith('readme') or filename.endswith(('.md', '.rst', '.txt')):
++                continue
++            if any(seg in ('docs', 'doc') for seg in segments[:-1]):
++                continue
++            files.append(path)
++        if not files:
++            return None
++
++        # A filename explicitly mentioned in the problem statement wins.
++        for path in files:
++            name = path.split('/')[-1]
++            if name and name in (self.problem_statement or ''):
++                return path
++
++        def score(path):
++            full = os.path.join(self.git_tempdir, path)
++            try:
++                with open(full, 'r', errors='ignore') as f:
++                    text = f.read()
++            except Exception:
++                return (2, 0, path)
++            stubby = ('pass' in text.split() or 'Write your solution here' in text
++                      or 'your code here' in text.lower() or len(text.strip()) < 200)
++            return (0 if stubby else 1, len(text), path)
++
++        return sorted(files, key=score)[0]
++
++    def _read_target_text(self, target):
++        if not target:
++            return ''
++        try:
++            with open(os.path.join(self.git_tempdir, target), 'r', errors='ignore') as f:
++                return f.read()
++        except Exception:
++            return ''
++
++    def _fallback_write_code(self, target):
++        """
++        Ask for the complete file in one fenced python block (no tools), extract the
++        last block with a regex, and write it to the target file directly.
++        """
++        if not target:
++            return False
++        stub = self._read_target_text(target)
++        prompt = (
++            "Write the complete solution file for the problem below.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Target file: {target}\n"
++            f"Current content of the file:\n```python\n{stub}\n```\n\n"
++            "Output the entire file content as a single ```python fenced block and nothing else. "
++            "If the optimal solution is not obvious, write a simple correct baseline first. "
++            "It must be a complete, runnable implementation (no placeholders, no 'pass')."
++        )
++        try:
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"_fallback_write_code: chat failed: {e}", level=logging.ERROR)
++            return False
++        text = ''
++        for msg in reversed(_sanitize_history(msg_history)):
++            if msg.get('role') != 'assistant':
++                continue
++            for block in msg.get('content', []):
++                if isinstance(block, dict) and isinstance(block.get('text'), str):
++                    text += block['text'] + '\n'
++            if text.strip():
++                break
++        matches = re.findall(r"```python\s*\n(.*?)```", text, flags=re.DOTALL)
++        if not matches:
++            safe_log("_fallback_write_code: no ```python block found", level=logging.WARNING)
++            return False
++        code = matches[-1]
++        try:
++            with open(os.path.join(self.git_tempdir, target), 'w') as f:
++                f.write(code)
++        except Exception as e:
++            safe_log(f"_fallback_write_code: write failed: {e}", level=logging.ERROR)
++            return False
++        return True
++
++    def _run_followups(self, msg_history, target):
++        """
++        Bounded escalating recovery: continue history, then restart fresh with the
++        stub content, then fall back to direct code generation.
++        """
++        status = self._patch_status()
++        for attempt in range(3):
++            if status == 'ok':
++                break
++            msg_history = _sanitize_history(msg_history)
++            safe_log(f"[patch_status={status}] follow-up attempt {attempt + 1}/3", level=logging.WARNING)
++            try:
++                if attempt == 0:
++                    follow_up = (
++                        "No source file was modified yet (status: " + status + "). Call the editor or bash tool now "
++                        f"to write the implementation into the solution file ({target or 'the primary source file'}). "
++                        "Do not reply with an empty message."
++                    )
++                    msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                elif attempt == 1:
++                    stub = self._read_target_text(target)
++                    follow_up = (
++                        f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                        f"Current content of {target}:\n```python\n{stub}\n```\n\n"
++                        "Write a simple correct baseline implementation to disk FIRST using the editor tool, "
++                        "then test it against the examples and refine it. Always call a tool; never reply with an empty message."
++                    )
++                    msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=[], logging=safe_log)
++                else:
++                    if self._fallback_write_code(target):
++                        follow_up = (
++                            f"The file {target} has been overwritten with a full implementation. "
++                            "Run it on the examples with bash, fix any failures with the editor tool, and verify."
++                        )
++                        msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"follow-up attempt {attempt + 1} failed: {e}", level=logging.ERROR)
++                msg_history = []
++            status = self._patch_status()
++        return status
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -186,6 +362,8 @@ class AgenticSystem:
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ 
+ CRITICAL RULE: The task is not complete until the target source file has been modified on disk via a tool call. Never end a turn with only a plan, derivation, or explanation; every turn must end with a tool call until the solution file is written and verified. A response containing only reasoning is a failure. If the target file is a stub (e.g. it only contains a comment like 'Write your solution here'), it must be overwritten with the real implementation. Write a simple correct baseline to disk early, then refine and test it. Placeholder or stub content must be replaced.
++
++Never reply with an empty message. After any tool result, continue by calling a tool. If you get a tool result and have nothing to say, do not reply with an empty message; continue by calling the editor tool to write the solution file. Your first edit should be a simple correct baseline written to the solution file before you do any lengthy derivation.
+ """
+         workflow = """
+ 
+@@ -225,28 +403,14 @@ Step 5 - If anything fails in an unexpected way, investigate the environment rat
+         instruction = f"{task}{workflow}"
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Bounded follow-up loop: make sure the agent actually modified a non-test source file
+-        status = self._patch_status()
+-        for attempt in range(3):
+-            if status == 'ok':
+-                break
+-            if status == 'empty':
+-                follow_up = (
+-                    "No files in the repository were modified yet, so the task is NOT complete. "
+-                    f"You must now write the implementation into the target source file in {self.git_tempdir} "
+-                    "(for example, overwrite the stub solution file with the real code) using the editor or bash tool right now, "
+-                    "instead of describing it in prose. Then run the examples against it, fix any failures, and verify it. "
+-                    "Do not end your turn without a tool call that modifies the source file."
+-                )
+-            else:
+-                follow_up = (
+-                    "Only test or non-source files (e.g. tests, specs, docs, README) were modified. "
+-                    "The primary source file must be implemented. Write the real solution into the source file "
+-                    "with the editor or bash tool now, then run the examples and verify it."
+-                )
+-            safe_log(f"[patch_status={status}] follow-up attempt {attempt + 1}/3", level=logging.WARNING)
+-            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            status = self._patch_status()
++        # Bounded, exception-safe follow-up recovery for empty / test-only patches
++        target = self._find_target_file()
++        status = self._run_followups(msg_history, target)
++
++        # Last resort: direct code generation, then one bounded verify-and-fix call
++        if status != 'ok' and target:
++            if self._fallback_write_code(target):
++                status = self._patch_status()
+ 
+         if status != 'ok':
+             safe_log(f"WARNING: final patch status is '{status}' after follow-ups", level=logging.WARNING)

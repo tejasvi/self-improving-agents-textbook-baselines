@@ -1,0 +1,331 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..d52d57c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,10 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
++import shutil
++import tempfile
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -39,6 +43,79 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++
++MAX_ATTEMPTS = 3
++TEST_RUN_TIMEOUT = 900
++FEEDBACK_CHARS = 6000
++TIME_BUDGET = 3 * 3600
++
++ATTEMPT_HINTS = [
++    "Start from the most direct reading of the statement. Derive the algorithm carefully, state its complexity, and make sure it fits the limits.",
++    "Look for a different decomposition or a more clever characterization of the answer (for example a greedy argument, a formula, or a DP over a different state). Prefer an approach that differs from the obvious one.",
++    "Be extra careful about edge cases, I/O format details and the largest constraints. Re-read the statement line by line and make the implementation match it exactly.",
++]
++
++SOLVER_PROMPT = """Work like a careful competitive programmer:
++1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++2. Write the complete solution to {SOLUTION_PATH} with the editor tool. For a stdin/stdout program it must read stdin and write stdout. For a `Solution` class problem, define the class exactly as the statement specifies (add `from typing import *` and any imports you need at the top of the file).
++3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 {SOLUTION_PATH} < sample1.txt`; for a `Solution` class write a small driver script (outside the repo, e.g. in /tmp) that calls the method on the sample arguments.
++4. A test harness has already been written by a separate test author in {HARNESS_DIR} (files brute.py, gen.py, check.py and run_tests.sh). Run the full harness with `bash {HARNESS_DIR}/run_tests.sh {SOLUTION_PATH}`. It prints failing inputs with expected vs. actual output, the max runtime on a max-size input, and a final line `PASSED a/b`. Use it to find and fix every failure. Do NOT edit files in {HARNESS_DIR}; if you believe a harness expectation is wrong, say so explicitly in your final answer and explain why.
++5. Additionally, write your own brute-force reference and random small-input generator in /tmp, and stress test a few hundred cases against {SOLUTION_PATH}. Fix every mismatch.
++6. Generate a maximum-size input and check that the solution finishes in well under 2 seconds.
++7. Keep iterating until the harness passes everything and your own checks pass. The solution file at {SOLUTION_PATH} is what gets graded; do not leave debugging code in it. Do not put helper files inside the repository directory other than {SOLUTION_PATH}."""
++
++TEST_AUTHOR_PROMPT = """# Role: test author (you do NOT write the solution)
++You are a test author. Your job is to build an independent test harness for the problem above, from the problem statement alone. Do NOT write or read any solution for the problem, and do not write {SOLUTION_PATH} (another agent will write it). Other agents will later use your harness to judge their solutions, so the harness must be correct even if the solutions are wrong.
++
++Create these files in the directory {HARNESS_DIR} (create it if needed; do not put anything in the repository itself):
++
++1. brute.py: a simple, obviously-correct reference implementation that follows the statement literally (exhaustive search, direct simulation, or a naive DP). It must be correct, not fast. It reads the same input format as the solution and prints the answer in the required output format. For problems with a `Solution` class, brute.py should define a brute-force version of the same method and a driver that reads inputs and prints results in a fixed format.
++
++2. gen.py: a random small-input generator plus edge/extreme-case generators. It takes a seed (e.g. `python3 gen.py <seed>` prints one input; add a mode for the edge cases such as `python3 gen.py edge <k>`) and writes a valid input in the exact format of the statement that respects every constraint. Include minimal sizes, all-equal values, extremes of the value ranges, and random cases of various sizes.
++
++3. check.py: the checker. How it is used depends on the problem type:
++   - Ordinary stdin/stdout problem with a unique answer: compare the solution's output against brute.py's output on the same input (exact token comparison, ignoring trailing whitespace).
++   - Problem with multiple valid answers: do NOT do an exact diff. Write a validator that checks the solution's output satisfies the statement's conditions, and compare only the optimal value (or validity) against brute.py.
++   - Interactive problem (the program talks to a judge through stdin/stdout): write an interactor that spawns the solution as a subprocess with pipes (subprocess.Popen with stdin=PIPE, stdout=PIPE, text mode, flush after each write), answers its queries according to a hidden secret generated from gen.py, counts queries and enforces the query limit from the statement, flags invalid queries (out of range, malformed, repeated when forbidden), flags the solution exiting early or hanging (use timeouts on reads), and compares the final answer against brute.py's answer. Never use an unbounded loop: every read must have a timeout and the number of exchanges must be bounded.
++   - `Solution`-class method problem: write a driver that imports the solution file (e.g. with importlib from the given path), instantiates Solution, calls the method on each generated input, and compares the return value against brute.py's return value (or validates it, if multiple answers are valid).
++   check.py must take the solution path as an argument and return a clear pass/fail for each test.
++
++4. run_tests.sh: takes one argument, the path to the candidate solution (`bash run_tests.sh <solution_path>`). It must:
++   - begin with `cd "$(dirname "$0")"` so it works from any directory;
++   - run the fixed samples from the statement (write them into a file, e.g. samples/ directory) and then a deterministic set of random tests from gen.py (fixed seeds, a few hundred tests), plus the edge cases;
++   - give each run a timeout (e.g. 10 seconds) and count a timeout as a failure;
++   - for each failing test print a short block: test name, the input (truncated if long), expected output and actual output (both truncated), and stop printing details after the first 5 failures (but keep counting);
++   - measure the runtime of the candidate on one maximum-size input from gen.py and print a line `MAX_RUNTIME <seconds>`;
++   - print the final line exactly in this form: `PASSED a/b` where a is the number of passing tests and b the total number of tests.
++   Keep the total runtime of run_tests.sh under about 5 minutes.
++
++Special cases:
++- Interactive problems: the interactor, not run_tests.sh, enforces the protocol; run_tests.sh calls check.py for each test.
++- Multiple-valid-answer problems: check.py uses a validator; never compare the output text exactly.
++- Solution-class problems: use the driver described above.
++
++REQUIRED VALIDATION (do this before you finish):
++a. Run `bash {HARNESS_DIR}/run_tests.sh <path to brute.py>` (or an equivalent slow-but-correct program that reads the same input format, i.e. a copy of brute.py). It must print `PASSED n/n` with n equal to the total. If it does not, fix the harness (the reference itself may have a bug; fix it too).
++b. Create a deliberately wrong program (e.g. brute.py with one output changed) in {HARNESS_DIR} and check that run_tests.sh reports failures and does not print `PASSED n/n`.
++c. Check that gen.py respects the constraints in the statement (sizes, value ranges) and that the max-size input it produces is really at the upper limit.
++
++Use the bash tool to create and run these files. Keep the output of your commands short. When finished, reply with a short summary of the files you created and the results of the validation steps."""
++
++REVIEW_PROMPT = """# Final review
++The solution at {SOLUTION_PATH} was selected from several candidate attempts. The candidates (with the harness pass counts from the selection step) were:
++{CANDIDATES}
++The test harness is in {HARNESS_DIR} (run it with `bash {HARNESS_DIR}/run_tests.sh {SOLUTION_PATH}`; the last line prints `PASSED a/b`).
++
++Review the solution against this requirements checklist, derived from the statement:
++- Input/output format: exact reading of the input, exact output format (spacing, line breaks, case, required flushing for interactive problems), and no extra debug output.
++- Termination: the program stops in all cases, never blocks waiting for input that will not come, and handles the end of input correctly.
++- Limits: the largest constraints are handled within the time limit (test a maximum-size input and check that it runs well under 2 seconds), and recursion depth / memory are safe.
++- Edge cases: minimal sizes, equal values, and the boundary values of every constraint.
++- Problem type: for a `Solution` class, the class and method names and signature match the statement exactly; for interactive problems, the protocol matches exactly; for multiple-answer problems, the output is a valid answer.
++- Disagreements: if the candidates disagree on some input, decide which one is right by reasoning and by comparing with the brute force in the harness; add a test for that input to the harness only if it is clearly a valid test.
++
++Then run the harness again. Fix any problem you find in {SOLUTION_PATH}. Do NOT regress: the harness pass count must not go down compared with the current solution. If you cannot improve it, leave the solution as it is. Finish with a short summary and the final `PASSED a/b` result."""
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -102,7 +179,8 @@ class AgenticSystem:
+             chat_history_file='./chat_history.md',
+             test_description=None,
+             self_improve=False,
+-            language='python'
++            language='python',
++            time_budget=TIME_BUDGET,
+         ):
+         self.problem_statement = problem_statement
+         self.git_tempdir = git_tempdir
+@@ -111,6 +189,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.time_budget = time_budget
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -122,6 +201,8 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
++        self._init_paths()
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -137,11 +218,8 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    def _task_text(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -149,15 +227,185 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _run_harness(self, solution_path):
++        """Run the harness on one candidate. Returns (passed, total, max_runtime, raw_output).
++        passed/total/max_runtime are None when they cannot be read from the output."""
++        run_script = os.path.join(self.harness_dir, 'run_tests.sh')
++        if not os.path.exists(run_script):
++            return None, None, None, "run_tests.sh does not exist; the test harness was not created."
++        try:
++            p = subprocess.run(
++                ['bash', run_script, os.path.abspath(solution_path)],
++                cwd=self.harness_dir, capture_output=True, text=True,
++                timeout=TEST_RUN_TIMEOUT, errors='replace',
++            )
++            out = p.stdout or ''
++            if p.stderr and p.stderr.strip():
++                out += "\nSTDERR:\n" + p.stderr
++            out += f"\n(exit code {p.returncode})"
++        except subprocess.TimeoutExpired as e:
++            partial = e.stdout
++            if isinstance(partial, bytes):
++                partial = partial.decode(errors='replace')
++            out = (partial or '') + f"\nError: run_tests.sh timed out after {TEST_RUN_TIMEOUT} seconds."
++        passed = total = runtime = None
++        m = re.findall(r'PASSED\s+(\d+)\s*/\s*(\d+)', out)
++        if m:
++            passed, total = int(m[-1][0]), int(m[-1][1])
++        m = re.findall(r'MAX_RUNTIME\s+([\d.]+)', out)
++        if m:
++            try:
++                runtime = float(m[-1])
++            except ValueError:
++                runtime = None
++        return passed, total, runtime, out
++
++    def _write_tests(self):
++        """Phase 1: a separate agent with a fresh history builds the test harness from the statement alone."""
++        os.makedirs(self.harness_dir, exist_ok=True)
++        instruction = f"""{self._task_text()}
++
++{TEST_AUTHOR_PROMPT.replace('{HARNESS_DIR}', self.harness_dir).replace('{SOLUTION_PATH}', self.solution_path)}
++"""
++        safe_log("=== Phase 1: writing test harness ===")
++        chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _solve(self, attempt_idx, hint, prior_feedback):
++        """Phase 2: one solver attempt with a fresh history. Returns a record of the candidate."""
++        if os.path.exists(self.solution_path):
++            os.remove(self.solution_path)
++        feedback_block = ""
++        if prior_feedback:
++            feedback_block = f"\n\n# Feedback from the previous attempt\n{prior_feedback}"
++        method = SOLVER_PROMPT.replace('{HARNESS_DIR}', self.harness_dir).replace('{SOLUTION_PATH}', self.solution_path)
++        instruction = f"{self._task_text()}\n\n{method}\n\n# Strategy hint for this attempt\n{hint}{feedback_block}"
++        safe_log(f"=== Phase 2: solve attempt {attempt_idx} ===")
++        chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++        record = {'idx': attempt_idx, 'path': None, 'code': None,
++                  'passed': None, 'total': None, 'runtime': None, 'output': ''}
++        if not os.path.exists(self.solution_path):
++            record['output'] = "No solution.py was written in this attempt."
++            return record
++        record['path'] = os.path.join(self.attempts_dir, f'solution_{attempt_idx}.py')
++        shutil.copyfile(self.solution_path, record['path'])
++        with open(record['path']) as f:
++            record['code'] = f.read()
++        passed, total, runtime, out = self._run_harness(record['path'])
++        record.update(passed=passed, total=total, runtime=runtime, output=out)
++        return record
++
++    @staticmethod
++    def _score_key(rec):
++        passed = rec['passed'] if rec['passed'] is not None else -1
++        total = rec['total'] if rec['total'] is not None else 0
++        failures = total - passed if passed >= 0 else float('inf')
++        runtime = rec['runtime'] if rec['runtime'] is not None else float('inf')
++        return (-passed, failures, runtime)
++
++    @staticmethod
++    def _tail(text, n=FEEDBACK_CHARS):
++        return text if len(text) <= n else "...<clipped>...\n" + text[-n:]
++
++    def _select_and_finalize(self, records, task_text):
++        """Phase 3: re-score every candidate, copy the best to solution.py, then run the final review."""
++        safe_log("=== Phase 3: selection ===")
++        scored = []
++        for rec in records:
++            if rec['path'] is None or not os.path.exists(rec['path']):
++                continue
++            passed, total, runtime, out = self._run_harness(rec['path'])
++            rec.update(passed=passed, total=total, runtime=runtime, output=out)
++            scored.append(rec)
++            safe_log(f"candidate {rec['idx']}: passed={passed} total={total} runtime={runtime}")
++
++        best = None
++        if scored:
++            best = min(scored, key=self._score_key)
++            shutil.copyfile(best['path'], self.solution_path)
++            safe_log(f"selected candidate {best['idx']} -> {self.solution_path}")
++            best_key = self._score_key(best)
++        else:
++            best_key = None
++            safe_log("No candidate solutions were produced; the review step will work from scratch.")
++
++        # Final review (one agent call). Keep a backup so a regression can be undone.
++        backup = None
++        if os.path.exists(self.solution_path):
++            backup = os.path.join(self.attempts_dir, 'solution_before_review.py')
++            shutil.copyfile(self.solution_path, backup)
++
++        candidate_list = "\n".join(
++            f"- candidate {r['idx']}: {r['path']} (passed={r['passed']}/{r['total']})" for r in scored
++        ) or "(none)"
++        review_prompt = REVIEW_PROMPT.replace('{HARNESS_DIR}', self.harness_dir) \
++                                     .replace('{SOLUTION_PATH}', self.solution_path) \
++                                     .replace('{CANDIDATES}', candidate_list)
++        safe_log("=== Phase 4: final review ===")
++        chat_with_agent(f"{task_text}\n\n{review_prompt}", model=self.code_model, msg_history=[], logging=safe_log)
++
++        # Guard against regressions introduced by the review.
++        if backup and os.path.exists(self.solution_path) and best_key is not None:
++            passed, total, runtime, out = self._run_harness(self.solution_path)
++            if passed is None or (-passed, total - passed) > (best_key[0], best_key[1]):
++                safe_log("Review regressed the solution (or the harness no longer runs); restoring the pre-review version.")
++                shutil.copyfile(backup, self.solution_path)
++            else:
++                safe_log(f"Review result: passed={passed}/{total}")
++        if backup and os.path.exists(backup):
++            os.remove(backup)
++
++    def forward(self):
++        """
++        Multi-phase, test-driven pipeline:
++        1. test author writes a harness (brute, gen, check, run_tests.sh)
++        2. up to MAX_ATTEMPTS solver attempts with different hints, each scored by the harness
++        3. the best-scoring candidate is copied to solution.py
++        4. a final review checks the requirements and re-runs the tests
++        """
++        start = time.time()
++        task_text = self._task_text()
++        self._write_tests()
++
++        records = []
++        for k in range(1, MAX_ATTEMPTS + 1):
++            if k > 1 and time.time() - start > self.time_budget * 0.6:
++                safe_log("Time budget mostly used; skipping remaining attempts.")
++                break
++            prior_feedback = None
++            if records:
++                prev = records[-1]
++                prior_feedback = (
++                    f"Previous candidate code:\n```python\n{prev['code'] or '(none)'}\n```\n"
++                    f"Harness output (tail):\n{self._tail(prev['output'])}"
++                )
++                if prev['passed'] is not None and prev['total'] and prev['passed'] == prev['total']:
++                    prior_feedback += ("\nThe previous candidate passed every test. Write an independent solution "
++                                       "with a different approach to cross-check it against.")
++            record = self._solve(k, ATTEMPT_HINTS[(k - 1) % len(ATTEMPT_HINTS)], prior_feedback)
++            records.append(record)
++
++            all_pass = [r for r in records if r['passed'] is not None and r['total'] and r['passed'] == r['total']]
++            if len(all_pass) >= 2:
++                safe_log("Two independent candidates pass all tests; stopping early for selection.")
++                break
++            if all_pass and time.time() - start > self.time_budget * 0.4:
++                break
++
++        self._select_and_finalize(records, task_text)
++
++    def _init_paths(self):
++        repo = os.path.abspath(self.git_tempdir.rstrip('/'))
++        self.solution_path = os.path.join(repo, 'solution.py')
++        # Harness lives outside the repo so it never appears in the graded diff.
++        self.harness_dir = os.path.join(os.path.dirname(repo), '.' + os.path.basename(repo) + '_dgm_tests')
++        try:
++            os.makedirs(self.harness_dir, exist_ok=True)
++        except OSError:
++            self.harness_dir = tempfile.mkdtemp(prefix='dgm_tests_')
++        self.attempts_dir = os.path.join(self.harness_dir, 'attempts')
++        os.makedirs(self.attempts_dir, exist_ok=True)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

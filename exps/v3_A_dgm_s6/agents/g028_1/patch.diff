@@ -1,0 +1,203 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2a97f61..6db250e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -383,10 +383,15 @@ The task is only complete once the solution source file has been written to disk
+         target = self._extract_target_filename()
+         target_path = os.path.join(self.git_tempdir, target)
+ 
++        # Tracks whether the most recent *raw* model reply was empty. This must be
++        # computed before _sanitize_history, which drops empty assistant turns and
++        # would otherwise hide the empty reply from the repair loop.
++        last_reply = {'empty': False}
++
+         def _send(prompt, history):
+-            return _sanitize_history(
+-                chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
+-            )
++            raw = chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
++            last_reply['empty'] = _last_message_empty(raw)
++            return _sanitize_history(raw)
+ 
+         # Escalating recovery ladder (max 3 rungs, bounded by range)
+         msg_history = []
+@@ -440,7 +445,7 @@ The task is only complete once the solution source file has been written to disk
+             # Bounded verification-and-repair loop (max 3 rounds)
+             for round_idx in range(1, 4):
+                 failure = _last_run_failed(msg_history)
+-                empty = _last_message_empty(msg_history)
++                empty = last_reply['empty']
+                 if not failure and not empty:
+                     break
+                 safe_log(f"Repair round {round_idx}/3: failure_detected={bool(failure)} empty_last_message={empty}")
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..21bd90e 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -106,24 +106,26 @@ class BashSession:
+             raise ValueError(str(e))
+ 
+ def filter_error(error):
+-    # Filter out errors that we do not want to see
++    # Filter out errors that we do not want to see.
++    # When an "Inappropriate ioctl for device" line appears, drop it and the
++    # following noise lines (up to 3 lines total, and a trailing <<exit>> marker).
++    # All index accesses are bounds-checked so short stderr cannot raise IndexError.
++    error_lines = error.splitlines()
+     filtered_lines = []
+     i = 0
+-    error_lines = error.splitlines()
+-    while i < len(error_lines):
++    n = len(error_lines)
++    while i < n:
+         line = error_lines[i]
+-
+-        # Skip the next lines if ioctl error, add relevant lines
+         if "Inappropriate ioctl for device" in line:
+             i += 3
+-            if '<<exit>>' in error_lines[i]:
++            if i < n and '<<exit>>' in error_lines[i]:
+                 i += 1
+-            while i < len(error_lines) - 1:
++            # Keep remaining lines, except the final one (as the original did)
++            while i < n - 1:
+                 filtered_lines.append(error_lines[i])
+                 i += 1
+             i += 1
+             continue
+-
+         filtered_lines.append(line)
+         i += 1
+     return '\n'.join(filtered_lines).strip()
+diff --git a/stress_empty_reply.py b/stress_empty_reply.py
+new file mode 100644
+index 0000000..c706add
+--- /dev/null
++++ b/stress_empty_reply.py
+@@ -0,0 +1,79 @@
++"""Stress test: the repair loop must see an empty final model reply.
++
++Compares coding_agent's empty-reply detection against a reference over random
++histories (including the smallest counterexample), and checks that
++AgenticSystem.forward() runs a repair round when the model replies with whitespace.
++Prints 'ALL OK' or the first MISMATCH.
++"""
++import os, random, subprocess, sys, tempfile
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import coding_agent as ca
++
++
++def text_msg(role, text):
++    return {"role": role, "content": [{"type": "text", "text": text}]}
++
++
++def reference_empty(raw):
++    """Reference: is the final assistant turn in the raw reply blank?"""
++    asst = [m for m in raw if m["role"] == "assistant"]
++    if not asst:
++        return True
++    return not any(b["text"].strip() for b in asst[-1]["content"])
++
++
++def random_history(rng):
++    msgs = [text_msg("user", "task")]
++    for _ in range(rng.randint(0, 5)):
++        role = rng.choice(["user", "assistant"])
++        msgs.append(text_msg(role, rng.choice(["", "  ", "\n", "plan", "ok"])))
++    return msgs
++
++
++def check_helpers():
++    # Smallest counterexample: non-empty plan, then whitespace-only reply.
++    smallest = [text_msg("user", "task"), text_msg("assistant", "plan"),
++                text_msg("user", "continue"), text_msg("assistant", "  ")]
++    if ca._last_message_empty(smallest) is not True:
++        return "smallest counterexample: raw reply should be empty"
++    rng = random.Random(0)
++    for i in range(20000):
++        raw = random_history(rng)
++        if ca._last_message_empty(raw) != reference_empty(raw):
++            return f"helper mismatch on case {i}: {raw}"
++    return None
++
++
++def check_forward():
++    repo = tempfile.mkdtemp()
++    subprocess.run(["git", "init", "-q", repo], check=True)
++    open(os.path.join(repo, "README.md"), "w").write("x\n")
++    subprocess.run(["git", "-C", repo, "add", "."], check=True)
++    subprocess.run(["git", "-C", repo, "-c", "user.email=a@b", "-c", "user.name=n",
++                    "commit", "-qm", "init"], check=True)
++    base = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
++                          capture_output=True, text=True).stdout.strip()
++    calls = {"n": 0}
++
++    def fake_chat(prompt, model=None, msg_history=None, logging=None):
++        calls["n"] += 1
++        reply = "Plan: write solution.py" if calls["n"] == 1 else "   "
++        return (msg_history or []) + [text_msg("user", prompt), text_msg("assistant", reply)]
++
++    ca.chat_with_agent = fake_chat
++    logf = os.path.join(repo, "chat.md")
++    agent = ca.AgenticSystem(problem_statement="Write `solution.py`.", git_tempdir=repo,
++                             base_commit=base, chat_history_file=logf)
++    agent.forward()
++    log = open(logf).read() if os.path.exists(logf) else ""
++    if "Repair round" not in log:
++        return f"forward() did not run a repair round for an empty reply (calls={calls['n']})"
++    return None
++
++
++if __name__ == "__main__":
++    err = check_helpers() or check_forward()
++    if err:
++        print("MISMATCH:", err)
++        sys.exit(1)
++    print("ALL OK")
+diff --git a/stress_filter_error.py b/stress_filter_error.py
+new file mode 100644
+index 0000000..f369b07
+--- /dev/null
++++ b/stress_filter_error.py
+@@ -0,0 +1,41 @@
++"""Stress test: bounds-safe filter_error must match the original wherever the
++original does not crash, and must never raise. Prints 'ALL OK' or MISMATCH."""
++import importlib.util, os, random, sys
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++from tools.bash import filter_error as new_filter
++
++# Original implementation, loaded from the pre-change snapshot
++ORIG = "/tmp/bash.orig.py"
++if os.path.exists(ORIG):
++    spec = importlib.util.spec_from_file_location("bash_orig", ORIG)
++    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
++    old_filter = m.filter_error
++else:
++    old_filter = None
++
++PIECES = ["Inappropriate ioctl for device", "<<exit>>", "real error", "", "warn", "  x  "]
++
++def random_err(rng):
++    return "\n".join(rng.choice(PIECES) for _ in range(rng.randint(0, 7)))
++
++rng = random.Random(1)
++compared = 0
++for i in range(50000):
++    s = random_err(rng)
++    try:
++        got = new_filter(s)
++    except Exception as e:
++        print(f"MISMATCH: new filter_error raised {e!r} on {s!r}")
++        sys.exit(1)
++    if old_filter is not None:
++        try:
++            want = old_filter(s)
++        except IndexError:
++            continue  # original crashed; new behaviour is the fix
++        compared += 1
++        if got != want:
++            print(f"MISMATCH on {s!r}: new={got!r} old={want!r}")
++            sys.exit(1)
++print(f"compared={compared}")
++print("ALL OK")

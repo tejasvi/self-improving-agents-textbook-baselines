@@ -1,0 +1,185 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f47e589..dc29d74 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -195,23 +195,22 @@ def _run_until_nonempty(prompt, model, history, max_nudges=3):
+     up to `max_nudges` times. Returns the updated message history; if the turn stays
+     empty, returns anyway so the caller can fall back (e.g. to the saved draft).
+     """
+-    msg_history = chat_with_agent(prompt, model=model, msg_history=history, logging=safe_log)
+-    for nudge_idx in range(max_nudges):
+-        if not _last_assistant_is_empty(msg_history):
+-            break
+-        safe_log(f"[_run_until_nonempty] Empty assistant turn; nudge {nudge_idx + 1}/{max_nudges}.")
+-        msg_history = chat_with_agent(_build_nudge(msg_history), model=model, msg_history=msg_history, logging=safe_log)
+-        if _last_assistant_is_empty(msg_history):
+-            safe_log(f"[_run_until_nonempty] Nudge {nudge_idx + 1}/{max_nudges} also returned an empty turn.")
+-    else:
+-        if _last_assistant_is_empty(msg_history):
+-            safe_log(f"[_run_until_nonempty] Still empty after {max_nudges} nudges; returning to caller.")
++    # robust_chat already runs the escalation ladder (compacted prompt, fresh history,
++    # then the alternate model), so a single call covers every retry step.
++    msg_history = robust_chat(prompt, model, history)
++    if _last_assistant_is_empty(msg_history):
++        safe_log("[_run_until_nonempty] Still empty after escalation ladder; returning to caller.")
+     return msg_history
+ 
+-def _read_stub_context(git_tempdir):
+-    """Return the non-test tracked files and their contents as a prompt-ready string."""
++def _read_stub_context(git_tempdir, problem_statement=None):
++    """Return the non-test tracked files and their contents as a prompt-ready string.
++    Documentation-like files (README, *.md, *.txt) and files duplicating the problem
++    statement are skipped so the statement is not included twice."""
+     parts = []
+     for rel_path, text in read_starter_files(git_tempdir):
++        if _is_duplicate_doc(rel_path, text, problem_statement):
++            safe_log(f"[_read_stub_context] Skipping duplicate/doc file: {rel_path}")
++            continue
+         parts.append(f"### {rel_path}\n```\n{text}\n```")
+     return "\n\n".join(parts) if parts else "(no starter files found)"
+ 
+@@ -246,6 +245,107 @@ if __name__ == "__main__":
+     main()
+ """
+ 
++
++# ---------------------------------------------------------------------------
++# Prompt compaction & escalation helpers
++# ---------------------------------------------------------------------------
++
++_MAX_RUN_LINES = 30      # runs longer than this are collapsed
++_KEEP_RUN_LINES = 10     # lines kept from the start of a collapsed run
++
++
++def _compact_problem(statement, max_chars=6000):
++    """
++    Shrink a problem statement for retry prompts:
++      * collapse any run of more than ~30 consecutive lines (e.g. huge sample
++        inputs) down to its first ~10 lines plus an '... (N lines omitted)' marker;
++      * cap the total length at max_chars.
++    """
++    if not statement:
++        return ""
++    lines = statement.splitlines()
++    out = []
++    run = []
++
++    def flush_run():
++        if len(run) > _MAX_RUN_LINES:
++            out.extend(run[:_KEEP_RUN_LINES])
++            out.append(f"... ({len(run) - _KEEP_RUN_LINES} lines omitted)")
++        else:
++            out.extend(run)
++        run.clear()
++
++    for line in lines:
++        if line.strip():
++            run.append(line)
++        else:
++            flush_run()
++            out.append(line)
++    flush_run()
++
++    text = "\n".join(out)
++    if len(text) > max_chars:
++        text = text[:max_chars].rstrip() + "\n... (truncated)"
++    return text
++
++
++def _alternate_model(model):
++    """Return the other model in the CLAUDE_MODEL / OPENAI_MODEL pair."""
++    return OPENAI_MODEL if model == CLAUDE_MODEL else CLAUDE_MODEL
++
++
++def robust_chat(prompt, model, history, compact_prompt=None):
++    """
++    Call chat_with_agent, escalating when the assistant reply is empty.
++
++    Ladder (bounded, no loops that can spin):
++      1. Normal call with `prompt` and `history`.
++      2. If empty: compacted prompt, fresh history, same model.
++      3. If still empty: compacted prompt, fresh history, alternate model.
++
++    Returns the first history whose last assistant turn is non-empty,
++    otherwise the last history produced.
++    """
++    compact = compact_prompt or _compact_problem(prompt)
++
++    steps = [
++        ("initial", prompt, history, model),
++        ("compact-same-model", compact, [], model),
++        ("compact-alternate-model", compact, [], _alternate_model(model)),
++    ]
++
++    results = []
++    for label, p, h, m in steps:
++        if results:
++            safe_log(f"[robust_chat] escalating ({label}) -> model={m}, "
++                     f"prompt_chars={len(p)}, history_len={len(h)}")
++        result = chat_with_agent(p, m, msg_history=h, logging=safe_log)
++        results.append(result)
++        if not _last_assistant_is_empty(result):
++            return result
++        safe_log(f"[robust_chat] empty assistant reply at step '{label}' (model={m}).")
++
++    return results[-1]
++
++
++def _is_duplicate_doc(name, content, problem_statement):
++    """
++    True if a starter file is documentation-like (README, *.md, *.txt) or
++    mostly repeats the problem statement, so it should not be included again.
++    """
++    lower = name.lower()
++    if lower.endswith((".md", ".txt", ".rst")) or lower.startswith("readme"):
++        return True
++    if not content or not problem_statement:
++        return False
++    stmt_lines = {l.strip() for l in problem_statement.splitlines() if l.strip()}
++    file_lines = [l.strip() for l in content.splitlines() if l.strip()]
++    if not file_lines:
++        return False
++    overlap = sum(1 for l in file_lines if l in stmt_lines)
++    return overlap / len(file_lines) > 0.5
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -295,11 +395,12 @@ class AgenticSystem:
+         Tool-free draft stage: ask the model for the full target file, validate it, and write it.
+         Returns the draft code, or None if no usable draft was produced.
+         """
+-        stub_context = _read_stub_context(self.git_tempdir)
++        stub_context = _read_stub_context(self.git_tempdir, self.problem_statement)
++        compact_statement = _compact_problem(self.problem_statement)
+         base = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+-{self.problem_statement}
++{compact_statement}
+ </problem_description>
+ 
+ Starter files in the repository:
+@@ -313,7 +414,11 @@ Starter files in the repository:
+         ]
+         is_python = target_file.endswith('.py')
+         for idx, prompt in enumerate(prompt_variants):
+-            history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            history = robust_chat(prompt, self.code_model, [])
++            if _last_assistant_is_empty(history):
++                # Don't burn the other identical variants; move on to the tool-based agent.
++                safe_log(f"[_draft_solution] Variant {idx + 1}: empty reply after escalation; stopping draft stage.")
++                break
+             code = _extract_code(_last_assistant_text(history))
+             if code is None or not code.strip():
+                 safe_log(f"[_draft_solution] Variant {idx + 1}: no code extracted.")
+@@ -401,7 +506,7 @@ You have NOT yet modified the primary source file with a solution. Implement the
+             ]
+             code = None
+             for idx, fallback_msg in enumerate(fallback_prompts):
+-                reply_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
++                reply_history = robust_chat(fallback_msg, self.code_model, [])
+                 code = _extract_code(_last_assistant_text(reply_history))
+                 safe_log(f"[forward] Fallback attempt {idx + 1}: extracted={code is not None}.")
+                 if code is not None:

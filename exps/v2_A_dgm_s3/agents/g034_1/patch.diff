@@ -1,0 +1,357 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d89dc7b..9ddad7c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -550,12 +550,18 @@ Only after steps 1-4 are done, write the efficient solution to {target_path} wit
+             says_slow = bool(self.SLOW_PATTERN.search(text))
+             safe_log(f"Complexity gate round {round_idx + 1}/{max_rounds}: timing={detail}, "
+                      f"says_slow={says_slow}, timing_failed={failed}")
+-            if not failed and not says_slow:
++            # Fail closed: a pass requires an actual max-size timing that was OK and no slow admission.
++            if ran and not failed and not says_slow:
+                 if os.path.isfile(target_path):
+                     shutil.copyfile(target_path, '/tmp/stress/best_solution.py')
+                 return msg_history
+             prompt = (
+-                "Complexity check failed: " + (f"the timing test reported: {detail}. " if ran else "")
++                "Complexity check failed: " + (f"the timing test reported: {detail}. " if ran else
++                    "there is no max-size timing yet, so the gate is NOT passed. First write /tmp/stress/scale_gen.py "
++                    "(`python3 scale_gen.py <n>` prints a worst-case input of size n; for Solution-class tasks a wrapper "
++                    "that reads the input and calls the method), then call the scale_check tool with solution_cmd "
++                    f"\"python3 {target_path}\", generator_cmd \"python3 /tmp/stress/scale_gen.py\" and max_n set to the "
++                    "maximum n from the constraints. ")
+                 + ("Your last message says the solution is too slow or not efficient. " if says_slow else "")
+                 + f"\n\nRedesign round (bounded, keep reasoning brief). Target: {target_path}\n"
+                 "1. Tabulate the slow reference (/tmp/ref/ref.py) on small inputs and look for patterns.\n"
+@@ -629,8 +635,7 @@ When everything is done, end your reply with a short report that includes the st
+             safe_log(f"Verification round {round_idx + 1}/{max_rounds} starting.")
+             prompt = self._verification_prompt(round_idx, max_rounds)
+             msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            final_text = self._last_message_text(msg_history)
+-            passed = "STRESS TEST PASSED" in final_text
++            passed = self._marker_passed(msg_history)
+             safe_log(f"Verification round {round_idx + 1}/{max_rounds} finished. "
+                      f"Marker found: {passed}. Changed files: {self._get_changed_files()}")
+             if passed:
+@@ -652,9 +657,22 @@ When everything is done, end your reply with a short report that includes the st
+         safe_log("Verification finalize round starting.")
+         msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         safe_log(f"Verification finalize round finished. Marker found: "
+-                 f"{'STRESS TEST PASSED' in self._last_message_text(msg_history)}")
++                 f"{self._marker_passed(msg_history)}")
+         return msg_history
+ 
++    STRESS_MARKER = re.compile(r'^STRESS TEST PASSED$', re.MULTILINE)
++
++    def _marker_passed(self, msg_history):
++        """True only if the last message has a standalone STRESS TEST PASSED line AND the stress_test
++        tool last reported ALL TESTS PASSED (persisted to /tmp/stress/last_result.txt by the tool)."""
++        if not self.STRESS_MARKER.search(self._last_message_text(msg_history)):
++            return False
++        try:
++            with open('/tmp/stress/last_result.txt', 'r', errors='replace') as fh:
++                return 'ALL TESTS PASSED' in fh.read()
++        except OSError:
++            return False
++
+     def _last_resort_llm(self, model, msg, system_message):
+         """One tool-free LLM call. Returns the text or '' on any failure (never raises)."""
+         try:
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 9efee14..8e7d6cb 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -8,6 +8,10 @@ import openai
+ import copy
+ 
+ from llm import create_client, get_response_from_llm, _call_with_token_escalation, TOKEN_ESCALATION
++
++# Agent turns (design, verification, redesign) start with a larger output budget so hidden reasoning
++# cannot exhaust max_tokens before the editor/bash tool call.
++AGENT_TOKEN_ESCALATION = [8192, 16384, 32000]
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+@@ -54,7 +58,7 @@ def get_response_withtools(
+         if 'claude' in model:
+             response = _call_with_token_escalation(
+                 client.messages.create,
+-                max_tokens_list=TOKEN_ESCALATION,
++                max_tokens_list=AGENT_TOKEN_ESCALATION,
+                 log=logging or print,
+                 disable_thinking=disable_thinking,
+                 model=model,
+@@ -496,6 +500,7 @@ def chat_with_agent_claude(
+         msg_history=None,
+         logging=print,
+         first_turn_force_tool='editor',
++        force_tool_this_turn=False,
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -523,7 +528,9 @@ def chat_with_agent_claude(
+ 
+         # Call API. The first request of a fresh conversation may force the given tool
+         # (thinking disabled) so the first turn ends with an edit instead of hidden reasoning.
++        # force_tool_this_turn forces the editor on the first request of this call regardless of history.
+         first_turn = not msg_history
++        force_first = first_turn_force_tool if (first_turn or force_tool_this_turn) else None
+         response = get_response_withtools(
+             client=client,
+             model=client_model,
+@@ -531,7 +538,7 @@ def chat_with_agent_claude(
+             tool_choice={"type": "auto"},
+             tools=tools,
+             logging=logging,
+-            force_tool=first_turn_force_tool if first_turn else None,
++            force_tool=force_first,
+         )
+ 
+         final_response = None
+@@ -711,13 +718,15 @@ def chat_with_agent(
+     msg_history=None,
+     logging=print,
+     convert=False,  # Convert the message history to a generic format, so that msg_history can be used across models
++    force_tool_this_turn=False,  # Force the editor tool on the first request of this call even with history
+ ):
+     if msg_history is None:
+         msg_history = []
+ 
+     if 'claude' in model:
+         # Claude models
+-        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging,
++                                                 force_tool_this_turn=force_tool_this_turn)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         logging(conv_msg_history)
+         if convert:
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index 1d2cfbf..eaa43e1 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -86,6 +86,19 @@ def _run_checker(checker_cmd, input_text, output_text, timeout):
+     return ok, f"[checker exit {proc.returncode}] {msg}"
+ 
+ 
++LAST_RESULT_PATH = os.path.join(SCRATCH_DIR, "last_result.txt")
++
++
++def _record_result(text):
++    """Persist the last stress-test result so the harness can verify it actually passed."""
++    try:
++        os.makedirs(SCRATCH_DIR, exist_ok=True)
++        with open(LAST_RESULT_PATH, "w") as f:
++            f.write(text)
++    except OSError:
++        pass
++
++
+ def _save_failure(test_input):
+     try:
+         os.makedirs(SCRATCH_DIR, exist_ok=True)
+@@ -112,6 +125,7 @@ def tool_function(solution_cmd: str, generator_cmd: str, num_tests: int,
+         size_levels = [s.strip() for s in size_levels.split(",") if s.strip()]
+     levels = [str(l) for l in size_levels] if size_levels else []
+ 
++    _record_result("FAILED")
+     for seed in range(1, num_tests + 1):
+         level = levels[(seed - 1) % len(levels)] if levels else None
+         gen_cmd = f"{generator_cmd} {level} {seed}" if level is not None else f"{generator_cmd} {seed}"
+@@ -161,7 +175,9 @@ def tool_function(solution_cmd: str, generator_cmd: str, num_tests: int,
+     if checker_cmd:
+         checks.append("accepted by checker")
+     lvl = f" across size levels {levels}" if levels else ""
+-    return f"ALL TESTS PASSED: {num_tests} random cases{lvl}, all {' and '.join(checks)}."
++    result = f"ALL TESTS PASSED: {num_tests} random cases{lvl}, all {' and '.join(checks)}."
++    _record_result(result)
++    return result
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tools/scale_check.py b/tools/scale_check.py
+new file mode 100644
+index 0000000..944dd3d
+--- /dev/null
++++ b/tools/scale_check.py
+@@ -0,0 +1,181 @@
++import math
++import os
++import signal
++import subprocess
++import time
++
++
++def _run_killable(cmd, data, timeout):
++    """Run a shell command in its own process group; kill the whole group on timeout."""
++    proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE, start_new_session=True)
++    try:
++        out, err = proc.communicate(data, timeout=timeout)
++        return proc.returncode, out, err
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except OSError:
++            pass
++        proc.communicate()
++        raise
++
++
++MAX_OUTPUT_CHARS = 1000
++DEFAULT_LOWER = 256
++DEFAULT_UPPER_CAP = 16384
++
++
++def tool_info():
++    return {
++        "name": "scale_check",
++        "description": """Empirically check how a solution scales with input size n, and extrapolate its running time to the maximum constraint.
++* Provide `generator_cmd` as a size-parameterised generator: it is run as `<generator_cmd> <n>` and must print a worst-case-like input of size n to stdout.
++* The solution is run on increasing sizes (default: geometric from 256 up to min(max_n, 16384)), each with a hard time limit.
++* Reports the raw timings per size, the log-log growth exponent between the last two completed sizes, and the extrapolated time at max_n.
++* Verdicts: 'SCALES OK', 'EXTRAPOLATED TOO SLOW', or 'TIMEOUT' (also 'RUNTIME ERROR' / 'GENERATOR FAILED' with raw output).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command that runs the solution. It reads the input on stdin and writes the answer to stdout."
++                },
++                "generator_cmd": {
++                    "type": "string",
++                    "description": "Shell command run as `<generator_cmd> <n>`; it prints an input of size n to stdout."
++                },
++                "max_n": {
++                    "type": "integer",
++                    "description": "The maximum input size n from the problem constraints; the time is extrapolated to this size."
++                },
++                "sizes": {
++                    "type": "array",
++                    "items": {
++                        "type": "integer",
++                        "description": "An input size n to test."
++                    },
++                    "description": "Optional. Explicit list of sizes to run, in increasing order. Defaults to a geometric sequence from 256 up to min(max_n, 16384)."
++                },
++                "time_limit_seconds": {
++                    "type": "number",
++                    "description": "Optional. Time limit in seconds for each single run. Defaults to 2."
++                }
++            },
++            "required": ["solution_cmd", "generator_cmd", "max_n"]
++        }
++    }
++
++
++LAST_VERDICT_PATH = '/tmp/stress/last_scale.txt'
++
++
++def _record_verdict(verdict):
++    """Persist the last scale verdict so the calling harness can read it."""
++    try:
++        os.makedirs(os.path.dirname(LAST_VERDICT_PATH), exist_ok=True)
++        with open(LAST_VERDICT_PATH, 'w') as fh:
++            fh.write(verdict)
++    except OSError:
++        pass
++
++
++def _truncate(text, limit=MAX_OUTPUT_CHARS):
++    if len(text) <= limit:
++        return text
++    return text[:limit] + f"\n... (truncated, {len(text) - limit} more characters)"
++
++
++def _default_sizes(max_n):
++    upper = min(max_n, DEFAULT_UPPER_CAP)
++    sizes = []
++    n = min(DEFAULT_LOWER, upper)
++    while n < upper:
++        sizes.append(n)
++        n *= 4
++    sizes.append(upper)
++    return sorted(set(sizes))
++
++
++def tool_function(solution_cmd, generator_cmd, max_n, sizes=None, time_limit_seconds=2):
++    try:
++        max_n = int(max_n)
++    except (TypeError, ValueError):
++        return f"Error: max_n must be an integer, got {max_n!r}"
++    if max_n <= 0:
++        return "Error: max_n must be positive."
++    try:
++        limit = float(time_limit_seconds) if time_limit_seconds is not None else 2.0
++    except (TypeError, ValueError):
++        limit = 2.0
++
++    if sizes:
++        try:
++            sizes = sorted({int(s) for s in sizes if int(s) > 0})
++        except (TypeError, ValueError):
++            return "Error: sizes must be a list of positive integers."
++    else:
++        sizes = _default_sizes(max_n)
++    if not sizes:
++        return "Error: no sizes to test."
++
++    lines = []
++    completed = []  # (n, elapsed)
++    verdict = 'SCALES OK'
++    for n in sizes:
++        try:
++            gcode, gout, gerr = _run_killable(f"{generator_cmd} {n}", None, max(limit * 5, 60))
++        except subprocess.TimeoutExpired:
++            return f"Verdict: GENERATOR TIMEOUT at n={n}.\nCommand: {generator_cmd} {n}"
++        if gcode != 0:
++            return (f"Verdict: GENERATOR FAILED at n={n} (exit {gcode}).\n"
++                    f"stderr: {_truncate(gerr.decode(errors='replace'))}")
++        start = time.monotonic()
++        try:
++            code, out, err = _run_killable(solution_cmd, gout, limit)
++        except subprocess.TimeoutExpired:
++            verdict = 'TIMEOUT'
++            lines.append(f"n={n}: killed after {time.monotonic() - start:.2f}s (limit {limit:g}s)")
++            break
++        elapsed = time.monotonic() - start
++        lines.append(f"n={n}: {elapsed:.3f}s, exit code {code}")
++        if code != 0:
++            verdict = 'RUNTIME ERROR'
++            lines.append(f"stderr: {_truncate(err.decode(errors='replace'))}")
++            break
++        completed.append((n, max(elapsed, 1e-4)))
++
++    report = []
++    _record_verdict(verdict)
++    exponent = None
++    extrapolated = None
++    if verdict == 'SCALES OK' and len(completed) >= 2:
++        (n1, t1), (n2, t2) = completed[-2], completed[-1]
++        if n2 > n1 and t2 > 0:
++            exponent = math.log(t2 / t1) / math.log(n2 / n1)
++            exponent = max(exponent, 0.0)
++            extrapolated = t2 * (max_n / n2) ** exponent
++            if extrapolated > limit:
++                verdict = 'EXTRAPOLATED TOO SLOW'
++    elif verdict == 'SCALES OK' and len(completed) == 1:
++        n1, t1 = completed[0]
++        extrapolated = t1 * (max_n / n1)  # linear fallback when only one size completed
++        if extrapolated > limit:
++            verdict = 'EXTRAPOLATED TOO SLOW'
++
++    if verdict == 'TIMEOUT':
++        report.append(f"Verdict: TIMEOUT at n={sizes[len(completed)]}")
++    elif verdict == 'RUNTIME ERROR':
++        report.append(f"Verdict: RUNTIME ERROR")
++    else:
++        report.append(f"Verdict: {verdict}")
++    report.append(f"Time limit per run: {limit:g}s; max_n: {max_n}")
++    report.append("Timings:")
++    report.extend(lines)
++    if exponent is not None:
++        report.append(f"Estimated growth exponent (log-log, last two sizes): {exponent:.2f}")
++    if extrapolated is not None:
++        report.append(f"Extrapolated time at max_n={max_n}: ~{extrapolated:.2f}s")
++    text = "\n".join(report)
++    _record_verdict(verdict)
++    return text

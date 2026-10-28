@@ -1,0 +1,195 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 4b77c28..6e7e417 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -242,6 +242,91 @@ class AgenticSystem:
+             return True
+         return False
+ 
++    @staticmethod
++    def _sanitize_history(msg_history):
++        """
++        Removes trailing assistant messages with no non-whitespace text and no tool_use blocks,
++        and merges consecutive messages of the same role. Returns a new list.
++        """
++        if not isinstance(msg_history, list):
++            return []
++        cleaned = [m for m in msg_history if isinstance(m, dict)]
++
++        def is_empty_assistant(msg):
++            if msg.get('role') != 'assistant':
++                return False
++            content = msg.get('content')
++            if isinstance(content, str):
++                return not content.strip()
++            if isinstance(content, list):
++                text = ''.join(
++                    b.get('text', '') for b in content
++                    if isinstance(b, dict) and isinstance(b.get('text'), str)
++                )
++                has_tool = any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in content)
++                return not text.strip() and not has_tool
++            return not content
++
++        for _ in range(len(cleaned)):
++            if not cleaned or not is_empty_assistant(cleaned[-1]):
++                break
++            cleaned.pop()
++
++        merged = []
++        for msg in cleaned:
++            if merged and merged[-1].get('role') == msg.get('role'):
++                prev = merged[-1]
++                prev_content = prev.get('content')
++                new_content = msg.get('content')
++                if isinstance(prev_content, str):
++                    prev_content = [{"type": "text", "text": prev_content}]
++                if isinstance(new_content, str):
++                    new_content = [{"type": "text", "text": new_content}]
++                merged[-1] = {**prev, "content": list(prev_content or []) + list(new_content or [])}
++            else:
++                merged.append(dict(msg))
++        return merged
++
++    def _force_write_solution(self, path):
++        """
++        Last resort: ask the model in a fresh context for the full file contents and write them directly.
++        Returns True if a non-empty file was written.
++        """
++        if not path:
++            return False
++        prompt = (
++            f"Solve this competitive programming problem.\n\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Output ONLY the complete contents of {path} in one ```python code block, with no explanation."
++        )
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = self._sanitize_history(msg_history)
++        text = ''
++        for msg in reversed(msg_history):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                text = content
++            elif isinstance(content, list):
++                text = ''.join(
++                    b.get('text', '') for b in content
++                    if isinstance(b, dict) and isinstance(b.get('text'), str)
++                )
++            break
++        blocks = re.findall(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```", text, flags=re.DOTALL)
++        if not blocks or not blocks[-1].strip():
++            safe_log("[forward] Forced write: no fenced code block found in reply.")
++            return False
++        code = blocks[-1]
++        if re.search(r'\bList\b', code) and 'from typing import' not in code and 'import typing' not in code:
++            code = 'from typing import List\n' + code
++        full_path = os.path.join(self.git_tempdir, path)
++        os.makedirs(os.path.dirname(full_path) or '.', exist_ok=True)
++        with open(full_path, 'w') as fh:
++            fh.write(code if code.endswith('\n') else code + '\n')
++        safe_log(f"[forward] Forced write of {path} from fenced code block.")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -259,12 +344,13 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ Please analyze the problem description carefully. Then make edits to the code files to complete the instruction.
+ 
+ Follow this workflow:
+-1. Explore the repository to find the primary solution file (e.g. a placeholder solution.py or the file the problem expects) and any existing tests.
+-2. Write the solution to the target source file using the editor tool.
+-3. Run the program on the sample inputs from the problem statement using the bash tool, and compare with the expected outputs.
+-4. Write a brute-force solution and compare against your solution on small random inputs. Also test on large inputs to check efficiency.
+-5. Fix any issues you find and re-run the checks until they pass.
+-6. After the solution is valid, compare its stdout to each sample's expected output exactly (use diff, or the sample_diff tool if available). If the problem says multiple answers are accepted but your output differs from the sample, do NOT assume the grader is a special checker; hidden tests may compare exact output. Reverse-engineer the construction behind the sample outputs (try different orderings of basis vectors, bit positions from the highest bit down, choosing the lexicographically largest/smallest or the canonical construction, scaling) and change your deterministic choices until all samples match exactly.
++1. Find the primary solution file (e.g. a placeholder solution.py) and any existing tests.
++2. Write the complete solution to the primary source file using the editor tool. The primary source file MUST be edited via the editor tool.
++3. Run the program on the sample inputs with bash and compare with the expected outputs exactly.
++4. Test small random inputs against a brute-force solution, and check efficiency on large inputs.
++5. Fix any issues and re-run the checks until they pass.
++
++Tip: a `(exit code N)` result from `ls` with a missing glob pattern is harmless; keep exploring.
+ 
+ Bash hygiene:
+ - Keep commands short and bounded. Never use `cat $(...)` (it can block on stdin when the expansion is empty).
+@@ -279,6 +365,9 @@ HARD RULE: You MUST use the editor/bash tools to write your code to disk. Do not
+         if not isinstance(msg_history, list):
+             safe_log("[forward] chat_with_agent did not return a history list; falling back to empty history.")
+             msg_history = []
++        # Record emptiness of the raw turn before sanitizing (sanitizing drops the empty turn).
++        last_turn_empty = self._last_assistant_is_empty(msg_history)
++        msg_history = self._sanitize_history(msg_history)
+ 
+         for attempt in range(3):
+             diff = self._get_diff()
+@@ -286,27 +375,41 @@ HARD RULE: You MUST use the editor/bash tools to write your code to disk. Do not
+                 safe_log(f"[forward] Source edits detected after {attempt} retries.")
+                 break
+             state = "the diff only changed test files" if (diff and str(diff).strip()) else "the diff is empty"
+-            if self._last_assistant_is_empty(msg_history):
++            empty_last = last_turn_empty
++            if empty_last:
+                 safe_log(f"[forward] Last assistant reply was empty (failed turn); retry {attempt + 1}/3.")
+             safe_log(f"[forward] No source edits found ({state}); retry {attempt + 1}/3.")
+             path, contents, _ = self._snapshot_repo()
+-            if path:
+-                reminder = (
+-                    f"Your previous response did not modify any source files ({state}). "
+-                    f"The file {path} currently contains:\n```\n{contents}\n```\n"
+-                    f"Call the editor tool with command=edit (or create) and path={path} now, with the complete implementation. "
+-                    "Do not explore further."
++            msg_history = self._sanitize_history(msg_history)
++            if path and (empty_last or attempt >= 1):
++                # Fresh-context directive retry: the empty or polluted history is dropped.
++                directive = (
++                    f"Solve this competitive programming problem.\n\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                    f"Target file: {path}\n```\n{contents}\n```\n\n"
++                    f"Call the editor tool with command=edit and path={path} with the complete implementation as file_text. "
++                    "Do not call other tools first."
+                 )
++                msg_history = chat_with_agent(directive, model=self.code_model, msg_history=[], logging=safe_log)
+             else:
+-                reminder = (
+-                    f"Your previous response did not modify any source files ({state}). "
+-                    "Do not describe a plan. Use the editor tool right now to create or edit the primary solution file "
+-                    "that solves the problem, then run it with bash on the sample inputs."
+-                )
+-            msg_history = chat_with_agent(reminder, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                if path:
++                    reminder = (
++                        f"Your previous response did not modify any source files ({state}). "
++                        f"The file {path} currently contains:\n```\n{contents}\n```\n"
++                        f"Call the editor tool with command=edit (or create) and path={path} now, with the complete implementation. "
++                        "Do not explore further."
++                    )
++                else:
++                    reminder = (
++                        f"Your previous response did not modify any source files ({state}). "
++                        "Do not describe a plan. Use the editor tool right now to create or edit the primary solution file "
++                        "that solves the problem, then run it with bash on the sample inputs."
++                    )
++                msg_history = chat_with_agent(reminder, model=self.code_model, msg_history=msg_history, logging=safe_log)
+             if not isinstance(msg_history, list):
+                 safe_log("[forward] chat_with_agent did not return a history list; falling back to empty history.")
+                 msg_history = []
++            last_turn_empty = self._last_assistant_is_empty(msg_history)
++            msg_history = self._sanitize_history(msg_history)
+ 
+         if not self._has_source_edits(self._get_diff()):
+             path, contents, listing = self._snapshot_repo()
+@@ -326,6 +429,13 @@ HARD RULE: You MUST use the editor/bash tools to write your code to disk. Do not
+             msg_history = chat_with_agent(fallback, model=self.code_model, msg_history=[], logging=safe_log)
+             if not isinstance(msg_history, list):
+                 msg_history = []
++            msg_history = self._sanitize_history(msg_history)
++
++        if not self._has_source_edits(self._get_diff()):
++            path, _, _ = self._snapshot_repo()
++            safe_log("[forward] Still no source edits; forcing a direct write of the solution file.")
++            if self._force_write_solution(path):
++                msg_history = self._sanitize_history(msg_history)
+ 
+         has_source = self._has_source_edits(self._get_diff())
+ 

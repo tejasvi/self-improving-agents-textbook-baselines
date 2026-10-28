@@ -1,0 +1,212 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5e7dadb..e0662f8 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -80,6 +81,79 @@ def get_changed_files(diff_text):
+             files.append(path.strip())
+     return files
+ 
++CANDIDATE_MAX_BYTES = 4000
++READ_MAX_CHARS = 20000
++
++def _git_list_files(git_dir):
++    """Tracked plus untracked (not ignored) file paths, relative to git_dir."""
++    files = []
++    for args in (["git", "-C", git_dir, "ls-files"],
++                 ["git", "-C", git_dir, "ls-files", "--others", "--exclude-standard"]):
++        try:
++            res = subprocess.run(args, capture_output=True, text=True, timeout=60)
++            files.extend(line.strip() for line in res.stdout.splitlines() if line.strip())
++        except Exception:
++            pass
++    return list(dict.fromkeys(files))
++
++def _find_target_files(git_dir, problem_statement, limit=3):
++    """Pick candidate non-test source files, preferring files named in the statement and small stubs."""
++    candidates = []
++    for rel in _git_list_files(git_dir):
++        if _is_test_path(rel):
++            continue
++        full = os.path.join(git_dir, rel)
++        if not os.path.isfile(full):
++            continue
++        try:
++            size = os.path.getsize(full)
++        except OSError:
++            continue
++        base = os.path.basename(rel)
++        mentioned = base in (problem_statement or "")
++        if not mentioned and size > CANDIDATE_MAX_BYTES:
++            continue
++        candidates.append((0 if mentioned else 1, size, rel))
++    candidates.sort()
++    return [rel for _, _, rel in candidates[:limit]]
++
++def _read_file(path):
++    """Read a file's text (truncated); returns an explanatory string on failure."""
++    try:
++        with open(path, 'r', errors='replace') as f:
++            text = f.read(READ_MAX_CHARS + 1)
++        if len(text) > READ_MAX_CHARS:
++            text = text[:READ_MAX_CHARS] + "\n... (truncated)"
++        return text
++    except Exception as e:
++        return f"(could not read {path}: {e})"
++
++def _last_assistant_text(msg_history):
++    """Concatenate text of the last assistant message in a history (dict or SDK block forms)."""
++    for msg in reversed(msg_history or []):
++        if msg.get("role") != "assistant":
++            continue
++        content = msg.get("content")
++        if isinstance(content, str):
++            return content
++        parts = []
++        for block in content or []:
++            if isinstance(block, dict):
++                if block.get("type") == "text":
++                    parts.append(block.get("text", ""))
++            elif getattr(block, "type", None) == "text":
++                parts.append(getattr(block, "text", ""))
++        return "\n".join(parts)
++    return ""
++
++def _extract_code_block(text):
++    """Return the first fenced code block's body, or None."""
++    m = re.search(r"```(?:python|py)?[ \t]*\n(.*?)```", text or "", re.DOTALL)
++    if not m:
++        return None
++    code = m.group(1).strip("\n")
++    return code + "\n" if code.strip() else None
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -188,6 +262,9 @@ class AgenticSystem:
+             return False
+         return any(not _is_test_path(f) for f in changed)
+ 
++    def _current_targets(self):
++        return _find_target_files(self.git_tempdir, self.problem_statement)
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -197,44 +274,61 @@ class AgenticSystem:
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+         instruction = f"""{task}
++HARD REQUIREMENT: Step 1 is to read the stub source file. Step 2 is to IMMEDIATELY write a complete baseline solution into that non-test source file with the editor tool. Do not explore further before writing it. Only after that, do steps 3-5.
++
++3. Test the solution: write a brute-force oracle for small inputs and a stress test comparing against it, covering all output branches. Check the samples from the statement, if any.
++4. Create `/tmp/check.sh` that runs the oracle comparison and sample checks and exits non-zero on any mismatch. Run `bash /tmp/check.sh` and make it pass.
++5. Fix the solution until the check passes. Never end without editing the source file. Never send an empty reply.
+ 
+-Please follow this workflow:
+-1. Explore the repository with simple, quick commands (e.g. `ls`, `git status`, `cat` on a specific file). Avoid long-running or complex pipelines such as `find ... | cat $(...)`.
+-2. Read the starter/stub file that needs to be implemented (it may contain only `pass` or a placeholder). The task is a competitive programming problem: the solution is either a complete program reading stdin and writing stdout, or a method of a given `Solution` class.
+-3. Before coding, consider the harness's I/O format. Read the statement's input section carefully and decide how the program must read its input (token-based reading, number of lines, interaction).
+-4. Implement the solution in the non-test source file. Prefer the editor tool for creating and editing files (use heredocs in bash only when needed). Do not put the solution only in test files.
+-5. BUILD AN ORACLE / SIMULATOR (mandatory): write a TRUE brute-force oracle that solves the problem exhaustively on small inputs (it must NOT reuse your construction), and a stress test that compares your solution against it on many small random inputs. The stress test must cover all output branches (e.g. both "Yes" and "No" cases, or every distinct answer type the problem allows). For problems with multiple valid answers, check validity with a verifier and still compare the answer branch with the oracle. Placeholder checks such as `pass` or assertions that always succeed are not allowed.
+-6. CHECK SCRIPT (mandatory): create `/tmp/check.sh` (or `/tmp/check.py`) that runs your oracle comparison / stress tests (and the sample checks below) and exits with a non-zero exit code on ANY mismatch, printing the counterexample. Run it with `bash /tmp/check.sh` and make it pass before finishing.
+-7. SAMPLE OUTPUT MATCH: if the statement contains sample inputs and outputs, extract every one and save them as /tmp/sample_i.in and /tmp/sample_i.out (i = 1, 2, ...). If the statement contains no samples, skip this step and rely on the oracle instead. Run the solution on each sample and diff the actual output against the expected output, e.g. `python solution.py < /tmp/sample_i.in | diff -b - /tmp/sample_i.out` (`diff -b` ignores whitespace differences). Report explicitly, for each sample, whether the output matches exactly.
+-   If any diff is non-empty, do NOT dismiss it just because the problem says "any valid answer is accepted". The hidden tests may compare against a fixed expected output. Try up to 5 natural variants of your construction (e.g. reverse iteration order, bit order, choice of free variables, minimum vs maximum choices, traversal order) while keeping a validity checker as a secondary check on every variant.
+-8. INTERACTIVE / UNUSUAL I/O: some problems are interactive or have unusual input formats. Hidden tests for interactive problems may be run NON-interactively, with the judge's data (e.g. the hidden array and the recorded answers) supplied on stdin after the first line. Write the program defensively: read all tokens with `sys.stdin.read().split()` where possible instead of reading one line per query, and include a test mode that simulates both styles (the interactive style and the non-interactively-preloaded style) and verify it against your oracle.
+-9. Refine the solution until the oracle check and the samples pass, and the logic is correct for edge cases (n=1, minimal/maximal values, empty-like inputs).
+-10. Make sure your final changes are saved in the source file.
+-11. In your final answer, state explicitly: whether each sample output matches the expected output exactly (or that the statement had no samples), what you changed to align them (if anything), and the results of the stress test.
+-
+-Important: ending your turn without modifying a source file is a failure. Changing only test files is also a failure. Finishing with no edits counts as failure.
++Finish by stating whether each sample matches exactly and the stress test results.
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Retry (bounded) until a valid, non-test source patch exists
++        # Retry (bounded): fresh history and self-contained prompt each time
+         for attempt in range(3):
+             if self._patch_is_valid():
+                 break
+-            msg_history = chat_with_agent(
+-                f"No valid source patch was found: the repository has no changes, or only test files were changed. "
+-                f"This is attempt {attempt + 1} of 3. Now implement the solution in the primary source file (the stub with `pass` or the placeholder) "
+-                f"using the editor tool, then run the check script and stop.",
+-                model=self.code_model, msg_history=msg_history, logging=safe_log,
++            targets = self._current_targets()
++            target_list = ", ".join(targets) if targets else "the primary non-test source file"
++            contents = "\n\n".join(
++                f"--- {p} (current contents) ---\n{_read_file(os.path.join(self.git_tempdir, p))}" for p in targets
++            ) or "(no candidate source files were found)"
++            prompt = (
++                f"{task}\n"
++                f"No valid source patch exists yet (the repo has no changes, or only test files changed).\n\n"
++                f"Current repo edits:\n{self.get_current_edits()[0]['content'][0]['text']}\n\n"
++                f"Target file(s): {target_list}\n\n{contents}\n\n"
++                f"Use the editor tool now to write the complete solution to {targets[0] if targets else 'the primary target file'}. "
++                f"Do not answer with text only. Do not explore further. Never send an empty reply."
+             )
+-
+-        # Verification loop (bounded): run the check script, feed raw output back on failure
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++        # Deterministic fallback: ask for code in a fenced block and write it ourselves
++        if not self._patch_is_valid():
++            targets = self._current_targets()
++            if targets:
++                fallback_prompt = (
++                    f"{task}\n"
++                    "Reply with ONLY the complete final source code for the solution in a single ```python fenced code block. "
++                    "No other text."
++                )
++                reply_history = chat_with_agent(fallback_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++                code = _extract_code_block(_last_assistant_text(reply_history))
++                if code:
++                    with open(os.path.join(self.git_tempdir, targets[0]), 'w') as f:
++                        f.write(code)
++                    safe_log(f"Fallback wrote solution to {targets[0]}.")
++                else:
++                    safe_log("Fallback produced no fenced code block.")
++
++        # Verification loop (bounded), only once a valid patch exists
+         check_cmd = ["bash", "/tmp/check.sh"]
+         max_rounds = 5
+         for verify_round in range(max_rounds):
++            if not self._patch_is_valid():
++                break
+             check_path = "/tmp/check.sh"
+             if not os.path.exists(check_path):
+                 check_failed = True
+@@ -256,17 +350,11 @@ Important: ending your turn without modifying a source file is a failure. Changi
+                 break
+ 
+             safe_log(f"Check failed on verification round {verify_round + 1}.")
+-            if check_failed:
+-                follow_up = (
+-                    "Your check fails; the counterexamples show your algorithm is wrong; "
+-                    "revise the algorithm, not only the code, and rerun until it passes.\n\n"
+-                    f"Check output:\n{output_text}"
+-                )
+-            else:
+-                follow_up = (
+-                    "The check passes, but no valid non-test source file has been changed. "
+-                    "Implement the solution in the primary source file and rerun the check."
+-                )
++            follow_up = (
++                "Your check fails; the counterexamples show your algorithm is wrong; "
++                "revise the algorithm, not only the code, and rerun until it passes.\n\n"
++                f"Check output:\n{output_text}"
++            )
+             msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+ 

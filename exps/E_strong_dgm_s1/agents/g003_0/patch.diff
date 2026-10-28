@@ -1,0 +1,486 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3fb1389..d03375e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,14 +8,16 @@ import threading
+ import sys
+ import time
+ 
+-try:
+-    import resource
+-except ImportError:  # non-POSIX
+-    resource = None
+-
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from tools import solution_check
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++MAX_ATTEMPTS = 4          # bounded solve attempts, each with a fresh chat
++STRESS_TESTS = 200       # random seeds for the brute-force stress test
++REPORT_HEAD_CHARS = 5000
++_PROSE_RE = re.compile(r'\s*(Explanation|Note|Example|Constraints?|Sample|Input|Output)\b', re.I)
++REPORT_TAIL_CHARS = 3000
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -191,124 +193,209 @@ class AgenticSystem:
+                 return False
+         return True
+ 
+-    # ---- scale gate: run solution.py on the agent-created max-size input ----
+-    _SCALE_TIME_LIMIT = 5          # seconds for solution.py on the max-size input
+-    _SCALE_MEM_LIMIT_MB = 512      # address-space limit for solution.py / generator
+-    _SCALE_INPUT_FILES = ('max_input.txt', 'maxinput.txt')
+-    _SCALE_GEN_FILES = ('max_gen.py', 'maxgen.py')
++    # ---- sample extraction ----
++    _SAMPLE_RE = re.compile(
++        r'Sample\s+Input\s*(\d+)\s*:?[ \t]*\n(.*?)Sample\s+Output\s*\1\s*:?[ \t]*\n(.*?)(?=Sample\s+Input\s*\d+|\Z)',
++        re.S | re.I)
++
++    @staticmethod
++    def _sample_body(block):
++        """Clean one sample block: use the first ``` fenced body if present, else the raw lines."""
++        fence = re.search(r'```[^\n]*\n(.*?)```', block, re.S)
++        body = fence.group(1) if fence else block
++        out = []
++        for line in body.splitlines():
++            if not fence and out and (not line.strip() or _PROSE_RE.match(line)):
++                break
++            out.append(line.rstrip())
++        return '\n'.join(out).strip('\n')
++
++    @classmethod
++    def _extract_samples(cls, problem_statement):
++        """
++        Parse 'Sample Input k' / 'Sample Output k' blocks into a list of (input, expected_output).
++        Input is returned with a trailing newline; expected output is stripped.
++        """
++        samples = []
++        for m in cls._SAMPLE_RE.finditer(problem_statement or ''):
++            inp = cls._sample_body(m.group(2))
++            out = cls._sample_body(m.group(3))
++            if inp.strip():
++                samples.append((inp + '\n', out))
++        return samples
+ 
+-    def _scale_limit_preexec(self):
+-        def _apply():
+-            if resource is not None:
+-                limit = self._SCALE_MEM_LIMIT_MB * 1024 * 1024
+-                resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+-        return _apply if (resource is not None and os.name == 'posix') else None
++    # ---- validation harness ----
++    @staticmethod
++    def _score_from_report(report):
++        """
++        Comparable score tuple (samples_passed, stress_ok, max_ok) parsed from the raw report.
++        Larger is better. Only the harness summary lines are read; the report itself is untouched.
++        """
++        m = re.search(r'^(\d+)/(\d+) passed', report or '', re.M)
++        samples_passed = int(m.group(1)) if m else 0
++        stress_ok = 1 if re.search(r'^stress: \d+/\d+ passed', report or '', re.M) else 0
++        max_ok = 1 if 'MAX-SIZE CHECK: OK' in (report or '') else 0
++        return (samples_passed, stress_ok, max_ok)
+ 
+-    def _scale_gate(self):
++    def _run_validation(self):
+         """
+-        Returns (ok, raw_report). Runs `python3 solution.py` on the max-size input the agent
+-        was asked to create (max_input.txt, or the output of max_gen.py) with a time and
+-        memory limit. The raw stderr / timing is returned verbatim; no error parsing is done.
++        Run the solution_check harness on solution.py. Samples are plain-mode inputs; brute.py + gen.py
++        enable a stress test; max_gen.py enables the max-size check. Returns (raw_report, score).
+         """
+         cwd = self.git_tempdir
+-        sol = os.path.join(cwd, 'solution.py')
+-        if not os.path.isfile(sol):
+-            return False, "solution.py does not exist."
+-        preexec = self._scale_limit_preexec()
+-        input_path = None
+-        for name in self._SCALE_INPUT_FILES:
+-            if os.path.isfile(os.path.join(cwd, name)):
+-                input_path = os.path.join(cwd, name)
+-                break
+-        if input_path is None:
+-            for name in self._SCALE_GEN_FILES:
+-                gen = os.path.join(cwd, name)
+-                if os.path.isfile(gen):
+-                    try:
+-                        gp = subprocess.run(['python3', name], cwd=cwd, capture_output=True,
+-                                            text=True, timeout=10, preexec_fn=preexec, errors='replace')
+-                    except subprocess.TimeoutExpired:
+-                        return False, f"{name} timed out after 10s while generating the max-size input."
+-                    if gp.returncode != 0 or gp.stderr.strip():
+-                        return False, (f"{name} failed (exit code {gp.returncode}).\n"
+-                                       f"STDERR (raw):\n{gp.stderr[-3000:]}")
+-                    input_path = os.path.join(cwd, '_max_input_generated.txt')
+-                    with open(input_path, 'w') as f:
+-                        f.write(gp.stdout)
+-                    break
+-        if input_path is None:
+-            return False, ("No max-size input found. Create max_input.txt or max_gen.py "
+-                           "that prints a maximum-size input.")
+-        with open(input_path, 'r', errors='replace') as f:
+-            stdin_text = f.read()
+-        t0 = time.monotonic()
++        kwargs = {'solution_path': os.path.join(cwd, 'solution.py')}
++        samples = self._extract_samples(self.problem_statement)
++        if samples:
++            kwargs['inputs'] = [inp for inp, _ in samples]
++            kwargs['expected_outputs'] = [out for _, out in samples]
++        brute = os.path.join(cwd, 'brute.py')
++        gen = os.path.join(cwd, 'gen.py')
++        if os.path.isfile(brute) and os.path.isfile(gen):
++            kwargs['brute_path'] = brute
++            kwargs['gen_path'] = gen
++            kwargs['num_tests'] = STRESS_TESTS
++        max_gen = os.path.join(cwd, 'max_gen.py')
++        if os.path.isfile(max_gen):
++            kwargs['max_gen_path'] = max_gen
++        report = solution_check.tool_function(**kwargs)
++        return report, self._score_from_report(report)
++
++    @staticmethod
++    def _pick_best(current, candidate):
++        """
++        Keep the candidate (score, code) only if it strictly beats the current best.
++        Ties keep the earlier snapshot. `current` may be None.
++        """
++        if current is None or candidate[0] > current[0]:
++            return candidate
++        return current
++
++    @staticmethod
++    def _is_complete(score, total_samples):
++        """True when all samples pass (vacuously if there are none), stress passed and max-size passed."""
++        return score[0] == total_samples and score[1] == 1 and score[2] == 1
++
++    @staticmethod
++    def _clip_middle(text, head=REPORT_HEAD_CHARS, tail=REPORT_TAIL_CHARS):
++        if len(text) <= head + tail:
++            return text
++        return text[:head] + "\n...[middle truncated]...\n" + text[-tail:]
++
++    # ---- helpers for the solve loop ----
++    def _solution_path(self):
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _read_solution(self):
+         try:
+-            p = subprocess.run(['python3', 'solution.py'], cwd=cwd, input=stdin_text, capture_output=True,
+-                               text=True, timeout=self._SCALE_TIME_LIMIT, preexec_fn=preexec, errors='replace')
+-        except subprocess.TimeoutExpired as e:
+-            el = time.monotonic() - t0
+-            err = e.stderr if isinstance(e.stderr, str) else ''
+-            return False, (f"TIMEOUT: solution.py did not finish within {self._SCALE_TIME_LIMIT}s "
+-                           f"on the max-size input (elapsed {el:.2f}s).\nSTDERR (raw):\n{err[-3000:]}")
+-        el = time.monotonic() - t0
+-        if p.returncode != 0 or p.stderr.strip():
+-            return False, (f"solution.py FAILED on the max-size input: exit code {p.returncode}, time {el:.2f}s.\n"
+-                           f"STDERR (raw):\n{p.stderr[-3000:]}")
+-        return True, f"OK: finished in {el:.2f}s on the max-size input."
++            with open(self._solution_path(), 'r', encoding='utf-8', errors='replace') as f:
++                return f.read()
++        except OSError:
++            return ''
++
++    @staticmethod
++    def _has_code(text):
++        return any(line.strip() and not line.strip().startswith('#') for line in text.splitlines())
++
++    def _write_solution(self, code):
++        with open(self._solution_path(), 'w', encoding='utf-8') as f:
++            f.write(code)
++
++    def _task_header(self):
++        return (f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++                f"Help solve the following problem.\n\n<problem_description>\n{self.problem_statement}\n</problem_description>\n")
++
++    def _brute_prompt(self):
++        return (f"{self._task_header()}\n"
++                f"Without looking at any solution.py, create two files in {self.git_tempdir} with the editor tool "
++                f"(command=create):\n"
++                f"1. brute.py: an obviously correct exhaustive solution. Reads stdin, prints stdout in the statement's format. "
++                f"Exponential time is fine.\n"
++                f"2. gen.py: uses sys.argv[1] as an integer seed (random.seed(int(sys.argv[1]))) and prints one small random "
++                f"valid input to stdout, respecting the constraints. Keep sizes small so brute.py is fast.\n"
++                f"Do not create solution.py. Keep replies concise.")
++
++    def _first_attempt_prompt(self):
++        return (f"{self._task_header()}\n"
++                f"Write a draft solution.py in {self.git_tempdir} NOW with the editor tool (command=create), even if simple. "
++                f"Then:\n"
++                f"1. Check the max constraints; aim for well under 10^7 Python operations and modest memory.\n"
++                f"2. Run solution.py on each sample and compare outputs exactly (for a Solution class method, use a small driver script).\n"
++                f"3. Create max_gen.py in {self.git_tempdir} that prints one maximum-size valid input; run solution.py on it to check time and memory.\n"
++                f"4. Fix any failure, and use the solution_check tool to test if helpful.\n"
++                f"Do not use while loops that may never end. Keep replies concise.")
++
++    def _retry_prompt(self, prev_code, prev_report, attempt, brute_exists):
++        arbiter = ""
++        if brute_exists and ("WRONG ANSWER" in prev_report or "solution FAILED on seed" in prev_report):
++            arbiter = ("The stress test disagreed with brute.py. First decide which one is wrong: check brute.py and gen.py "
++                       "against the sample outputs, which are ground truth. If brute.py is wrong, fix brute.py; "
++                       "otherwise fix solution.py.\n")
++        return (f"{self._task_header()}\n"
++                f"This is attempt {attempt + 1} of {MAX_ATTEMPTS}. The previous solution.py was:\n"
++                f"<previous_solution>\n{self._clip_middle(prev_code, 6000, 2000)}\n</previous_solution>\n\n"
++                f"Raw validation report from the harness:\n<validation_report>\n{self._clip_middle(prev_report)}\n</validation_report>\n\n"
++                f"{arbiter}"
++                f"Either fix the specific failures shown (wrong answers, timeouts, crashes) or switch to a different, correct "
++                f"algorithm. Update {self.git_tempdir}/solution.py with the editor tool right away, then test it on the samples. "
++                f"Do not use while loops that may never end. Keep replies concise.")
++
++    def _empty_retry_prompt(self):
++        return (f"{self._task_header()}\n"
++                f"Call the editor tool now (command=create) to write {self._solution_path()} with a complete Python solution. "
++                f"Do not explain, just make the call.")
++
++    def _run_brute_stage(self):
++        """Fresh-context call that sees only the statement and writes brute.py and gen.py."""
++        chat_with_agent(self._brute_prompt(), model=self.code_model, msg_history=[], logging=safe_log)
++        brute = os.path.join(self.git_tempdir, 'brute.py')
++        gen = os.path.join(self.git_tempdir, 'gen.py')
++        if not (os.path.isfile(brute) and os.path.isfile(gen)):
++            safe_log("Brute stage produced no brute.py/gen.py; retrying once.")
++            retry = (f"{self._task_header()}\nCall the editor tool now (command=create) to write "
++                     f"{brute} and {gen} as described: an exhaustive brute.py and a seeded gen.py. "
++                     f"Do not write solution.py.")
++            chat_with_agent(retry, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Bounded multi-attempt pipeline. Each attempt uses a fresh chat (msg_history=[]).
++        Attempt 0 asks for a draft; later attempts get the previous code and the raw harness report.
++        Every attempt is validated and snapshotted; the best snapshot is restored at the end.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Write down the maximum constraint values and a short complexity estimate (approximate number of operations AND memory at the maximum constraints) before choosing an algorithm. Python does roughly 10^7 simple operations per second, so aim for well under that. A draft whose operations or memory would exceed the limits (e.g. an O(W*H) table with W,H up to 10^6) is NOT a final answer: derive a fundamentally faster algorithm (formulas, prefix sums, sorting, combinatorics with factorials, two pointers, etc.).
+-2. Immediately after reading the statement, write a draft solution.py with the editor tool (command=create), even if it is simple or brute-force, before any extended analysis. No turn may end without an editor call that creates or edits the source file. Keep replies concise to avoid the output limit.
+-3. Early on, also create a max-size input generator `max_gen.py` (prints one input with the largest constraints, e.g. all limits at their maximum) or a file `max_input.txt`. Run `python3 solution.py < max_input.txt` and check the time and memory. This is mandatory: solution.py must finish within about 4 seconds and within 512 MB on it.
+-4. Run solution.py on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-5. Write brute.py (a simple, obviously-correct brute force) and gen.py (takes an integer seed as sys.argv[1], uses random.seed(seed), and prints one small random valid input to stdout). Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Fix every mismatch, crash or timeout it reports, then re-run it until it reports RESULT: OK.
+-6. Run the `solution_check` tool with max_gen_path=max_gen.py (or the max_input file) to test solution.py at maximum size. If it reports TIMEOUT or MemoryError, the algorithm is too slow or too big: state the operation count at max constraints, derive a better algorithm, verify it against brute.py on small inputs, and update solution.py. Keep iterating until the max-size check reports OK.
+-7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement, with max_gen_path set, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
+-8. An unrun stress test means the task is NOT finished. Do not end your turn until step 5 (stress mode) has been run and reported RESULT: OK on the final version of solution.py, and the max-size check passes.
+-9. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
+-The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # Bounded continuation loop (same conversation): require a primary source edit AND
+-        # a passing max-size scale gate. Failures are sent back with the raw output.
+-        for attempt in range(5):
+-            edit_ok = self._has_primary_edit()
+-            gate_ok, gate_raw = (False, "skipped: no primary source edit yet.")
+-            if edit_ok:
+-                gate_ok, gate_raw = self._scale_gate()
+-            if edit_ok and gate_ok:
+-                safe_log(f"Checks passed on attempt {attempt}.")
+-                break
+-            safe_log(f"Checks failed (edit={edit_ok}, scale_gate={gate_ok}); continuation {attempt + 1}/5")
+-            if not edit_ok:
+-                follow_up = (f"Your previous attempt ended without editing any source file. In your very next reply "
+-                             f"call the editor tool (command=create) to write a first-draft solution.py at "
+-                             f"{self.git_tempdir}/solution.py, even if it is a simple or brute-force solution. "
+-                             f"Keep your reasoning brief. Then create max_gen.py (max-size input generator), "
+-                             f"test on the samples, and refine.")
++        samples = self._extract_samples(self.problem_statement)
++        safe_log(f"Extracted {len(samples)} sample(s) from the statement.")
++
++        self._run_brute_stage()
++
++        best = None          # (score, code)
++        prev_code, prev_report = "", ""
++        for attempt in range(MAX_ATTEMPTS):
++            if attempt == 0:
++                prompt = self._first_attempt_prompt()
+             else:
+-                follow_up = (f"Your solution.py failed the max-size check. Raw output:\n{gate_raw}\n\n"
+-                             f"The current approach is too slow or uses too much memory for the constraints. "
+-                             f"State the operation count and memory at the maximum constraints, derive a fundamentally "
+-                             f"better algorithm (e.g. O(N) or O(N log N) formulas, prefix sums, combinatorics with "
+-                             f"factorials), verify it against brute.py on small inputs, and update solution.py. "
+-                             f"Do not finish until the max-size check passes.")
+-            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        else:
+-            safe_log("Max continuation attempts reached; checks may still be failing.")
++                brute_exists = os.path.isfile(os.path.join(self.git_tempdir, 'brute.py'))
++                prompt = self._retry_prompt(prev_code, prev_report, attempt, brute_exists)
++
++            before = self._read_solution()
++            chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            after = self._read_solution()
++            if after == before or not self._has_code(after):
++                safe_log(f"Attempt {attempt}: solution.py unchanged or empty; retrying with minimal prompt.")
++                chat_with_agent(self._empty_retry_prompt(), model=self.code_model, msg_history=[], logging=safe_log)
++
++            report, score = self._run_validation()
++            code = self._read_solution()
++            safe_log(f"Attempt {attempt} validation score (samples, stress, max): {score}")
++            best = self._pick_best(best, (score, code))
++            if self._is_complete(score, len(samples)):
++                safe_log(f"Attempt {attempt} passed all validations.")
++                break
++            prev_code, prev_report = code, report
++
++        if best is not None and best[1] != self._read_solution():
++            safe_log(f"Restoring best snapshot with score {best[0]}.")
++            self._write_solution(best[1])
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tests/test_validation_pipeline.py b/tests/test_validation_pipeline.py
+new file mode 100644
+index 0000000..03fbfe2
+--- /dev/null
++++ b/tests/test_validation_pipeline.py
+@@ -0,0 +1,137 @@
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++from coding_agent import AgenticSystem
++
++
++STATEMENT = """Sample Input 1:
++3
++1 2 3
++Sample Output 1:
++6
++Explanation: the sum is 6.
++
++Sample Input 2:
++```
++5
++```
++Sample Output 2:
++```
++10
++```
++"""
++
++
++def test_extract_samples_plain_and_fenced():
++    samples = AgenticSystem._extract_samples(STATEMENT)
++    assert samples == [("3\n1 2 3\n", "6"), ("5\n", "10")]
++
++
++def test_extract_samples_none():
++    assert AgenticSystem._extract_samples("no samples here") == []
++    assert AgenticSystem._extract_samples("") == []
++
++
++def test_score_orders_samples_then_stress_then_max():
++    report_ok = ("2/2 passed, max time 0.1 s\nstress: 200/200 passed, max time 0.1 s\n"
++                 "MAX-SIZE CHECK: OK time=0.5s\nRESULT: OK")
++    report_no_max = "2/2 passed, max time 0.1 s\nstress: 200/200 passed, max time 0.1 s\nRESULT: OK"
++    report_stress_fail = ("2/2 passed, max time 0.1 s\nWRONG ANSWER on seed 3\n"
++                          "RESULT: FAILED (stress: 3/200 seeds ran before failure)")
++    report_samples_fail = "1/2 passed, max time 0.1 s\nRESULT: FAILED (plain)"
++    s_ok = AgenticSystem._score_from_report(report_ok)
++    s_nomax = AgenticSystem._score_from_report(report_no_max)
++    s_stress = AgenticSystem._score_from_report(report_stress_fail)
++    s_samples = AgenticSystem._score_from_report(report_samples_fail)
++    assert s_ok == (2, 1, 1)
++    assert s_nomax == (2, 1, 0)
++    assert s_stress == (2, 0, 0)
++    assert s_samples == (1, 0, 0)
++    assert s_ok > s_nomax > s_stress
++    assert s_stress > s_samples
++
++
++def test_score_on_garbage_is_zero():
++    assert AgenticSystem._score_from_report("") == (0, 0, 0)
++    assert AgenticSystem._score_from_report("some crash text") == (0, 0, 0)
++
++
++def test_is_complete():
++    assert AgenticSystem._is_complete((2, 1, 1), 2)
++    assert not AgenticSystem._is_complete((2, 1, 0), 2)
++    assert not AgenticSystem._is_complete((1, 1, 1), 2)
++    assert not AgenticSystem._is_complete((0, 0, 0), 0)
++    assert AgenticSystem._is_complete((0, 1, 1), 0)  # no samples: stress + max decide
++
++
++def test_pick_best_keeps_highest_and_earliest_on_tie():
++    best = None
++    best = AgenticSystem._pick_best(best, ((1, 0, 0), "a"))
++    best = AgenticSystem._pick_best(best, ((2, 0, 0), "b"))
++    best = AgenticSystem._pick_best(best, ((2, 0, 0), "c"))  # tie: keep earlier
++    best = AgenticSystem._pick_best(best, ((0, 1, 1), "d"))
++    assert best == ((2, 0, 0), "b")
++
++
++def test_run_validation_on_toy_solution(tmp_path):
++    (tmp_path / "solution.py").write_text("n = int(input())\nprint(sum(map(int, input().split())))\n")
++    (tmp_path / "brute.py").write_text("n = int(input())\nprint(sum(map(int, input().split())))\n")
++    (tmp_path / "gen.py").write_text("import random, sys\nrandom.seed(int(sys.argv[1]))\n"
++                                     "n = random.randint(1, 5)\nprint(n)\nprint(*[random.randint(0, 9) for _ in range(n)])\n")
++    (tmp_path / "max_gen.py").write_text("print(200000)\nprint(*([7] * 200000))\n")
++    agent = AgenticSystem.__new__(AgenticSystem)
++    agent.git_tempdir = str(tmp_path)
++    agent.problem_statement = "Sample Input 1:\n3\n1 2 3\nSample Output 1:\n6\n"
++    report, score = agent._run_validation()
++    assert score == (1, 1, 1), report
++    assert "RESULT: OK" in report
++
++
++def test_run_validation_detects_wrong_solution(tmp_path):
++    (tmp_path / "solution.py").write_text("n = int(input())\nprint(sum(map(int, input().split())) + 1)\n")
++    agent = AgenticSystem.__new__(AgenticSystem)
++    agent.git_tempdir = str(tmp_path)
++    agent.problem_statement = "Sample Input 1:\n3\n1 2 3\nSample Output 1:\n6\n"
++    report, score = agent._run_validation()
++    assert score[0] == 0
++    assert "output differs from expected" in report
++
++
++def test_forward_empty_reply_retry_and_best_restore(tmp_path, monkeypatch):
++    """
++    Mocked LLM, keyed on prompt content. Attempt 0 writes a wrong (but fast) solution, attempt 1 is
++    empty so the minimal retry runs and writes the correct one. The best snapshot must be restored.
++    """
++    (tmp_path / "gen.py").write_text("import random, sys\nrandom.seed(int(sys.argv[1]))\nprint(random.randint(1, 9))\n")
++    (tmp_path / "brute.py").write_text("print(int(input()) * 2)\n")
++    (tmp_path / "max_gen.py").write_text("print(5)\n")
++    good = "print(int(input()) * 2)\n"
++    bad = "print(int(input()) * 3)\n"
++    messages = []
++
++    def fake_chat(msg, model=None, msg_history=None, logging=None):
++        assert msg_history == []           # every call is a fresh context
++        messages.append(msg)
++        sol = tmp_path / "solution.py"
++        if "Write a draft solution.py" in msg:
++            sol.write_text(bad)            # attempt 0: wrong answer on the sample
++        elif "Call the editor tool now" in msg:
++            sol.write_text(good)           # minimal retry: correct solution
++        return []                          # attempt replies are empty
++
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake_chat)
++    monkeypatch.setattr(coding_agent, "safe_log", lambda *a, **k: None)
++    agent = AgenticSystem.__new__(AgenticSystem)
++    agent.git_tempdir = str(tmp_path)
++    agent.problem_statement = "Sample Input 1:\n3\nSample Output 1:\n6\n"
++    agent.code_model = "m"
++    agent.forward()
++    # Attempt 0 is wrong on the sample; the retry prompt for attempt 1 must carry the failure.
++    retry_prompts = [m for m in messages if "This is attempt 2 of" in m]
++    assert retry_prompts, messages
++    assert "output differs from expected" in retry_prompts[0]
++    assert any("Call the editor tool now" in m for m in messages)
++    assert (tmp_path / "solution.py").read_text() == good

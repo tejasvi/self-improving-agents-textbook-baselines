@@ -1,0 +1,281 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a0798f2..8b77c84 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -267,6 +267,71 @@ def _is_empty_response(msg_history):
+     """
+     return (not _last_assistant_text(msg_history).strip()) and (not _has_tool_use(msg_history))
+ 
++def _extract_code(text):
++    """
++    Extract Python code from a model reply. Prefers the first ```python fenced block;
++    falls back to any fenced block, then to the raw text if it looks like code. Returns '' if none.
++    """
++    text = text or ''
++    match = re.search(r'```(?:python|py)[ \t]*\r?\n(.*?)```', text, flags=re.DOTALL)
++    if match is None:
++        match = re.search(r'```[^\n]*\n(.*?)```', text, flags=re.DOTALL)
++    if match is not None:
++        return match.group(1) if match.group(1).strip() else ''
++    if text.strip() and any(k in text for k in ('def ', 'import ', 'input(', 'print(')):
++        return text.strip() + "\n"
++    return ''
++
++def _extract_sample_io(problem_statement):
++    """
++    Best-effort extraction of (sample_input, expected_output) pairs from a problem statement.
++    Looks for 'Input'/'Output' headings followed by code blocks or indented/plain lines.
++    Returns a list of (input_text, output_text or None).
++    """
++    text = problem_statement or ''
++    pairs = []
++    pattern = re.compile(
++        r'(?:sample|example)\s*input\s*\d*\s*:?\s*\n(?:```[^\n]*\n)?(.*?)(?:```|\n\s*\n)'
++        r'(?:.*?(?:sample|example)\s*output\s*\d*\s*:?\s*\n(?:```[^\n]*\n)?(.*?)(?:```|\n\s*\n|$))?',
++        flags=re.IGNORECASE | re.DOTALL,
++    )
++    for m in pattern.finditer(text):
++        inp = m.group(1).strip('\n') + "\n"
++        out = m.group(2).strip() if m.group(2) else None
++        if inp.strip():
++            pairs.append((inp, out))
++    return pairs[:3]
++
++def _run_sample(target_path, cwd, sample_io):
++    """
++    Run the solution file on each sample input with a timeout. Returns (ok, report_text).
++    ok is None when no samples were available to check.
++    """
++    if not sample_io:
++        return None, "No sample input could be extracted from the problem statement."
++    lines = []
++    all_ok = True
++    for idx, (inp, expected) in enumerate(sample_io):
++        try:
++            proc = subprocess.run(
++                ["python3", target_path], input=inp, capture_output=True, text=True,
++                timeout=10, cwd=cwd,
++            )
++        except subprocess.TimeoutExpired:
++            all_ok = False
++            lines.append(f"Sample {idx}: timed out after 10 seconds.")
++            continue
++        out = proc.stdout.strip()
++        if proc.returncode != 0:
++            all_ok = False
++            lines.append(f"Sample {idx}: exited with code {proc.returncode}.\nstderr:\n{proc.stderr.strip()}")
++        elif expected is not None and out.split() != expected.split():
++            all_ok = False
++            lines.append(f"Sample {idx}: wrong output.\nInput:\n{inp}\nExpected:\n{expected}\nGot:\n{out}")
++        else:
++            lines.append(f"Sample {idx}: ok.")
++    return all_ok, "\n".join(lines)
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -293,6 +358,7 @@ class AgenticSystem:
+         self.active_model = self.code_model
+         self.primary_empty_count = 0
+         self.last_model_used = None
++        self.last_strategy = None
+ 
+         # Initialize logger and store it in thread-local storage
+         self.logger = setup_logger(chat_history_file)
+@@ -316,40 +382,56 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def _chat_robust(self, prompt):
++    def _chat_robust(self, prompt, outline=None):
+         """
+-        Call the LLM with a fixed list of attempts and return the first non-empty message history
+-        (or the last one if all are empty). Attempts: (primary, prompt), (primary, minimal prompt),
+-        (alternate, minimal prompt). Switches the primary model for the rest of the run after the
+-        primary model returns empty twice.
++        Call the LLM with a fixed list of distinct strategies and return the first non-empty
++        message history (or the last one if all are empty). Strategies:
++          (a) primary model, full prompt;
++          (b) primary model, short prompt asking for a plain-text algorithm outline (no tools);
++          (c) primary model, prompt containing the outline asking only for the final code in a ```python block.
++        An alternate model is only tried when it differs from the primary model.
+         """
+         alt_model = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
+         primary = self.active_model
+-        alternate = alt_model if primary == self.code_model else self.code_model
++        if alt_model == primary:
++            safe_log(f"Alternate model equals primary model ({primary}); no model switch will be attempted.")
++        task_text = self.problem_statement
+         minimal_prompt = (
+-            f"Task:\n{self.problem_statement}\n\n"
+-            "Write the full solution into solution.py using the editor tool."
++            f"Task:\n{task_text}\n\n"
++            "Outline the algorithm in plain text (no tools, no code): the key idea, the data structures, "
++            "and the steps, plus the time complexity."
++        )
++        outline_text = outline or "(no outline available; design a simple correct algorithm yourself)"
++        code_prompt = (
++            f"Task:\n{task_text}\n\n"
++            f"Algorithm outline:\n{outline_text}\n\n"
++            "Write the complete Python program that implements this outline. Reply with ONLY the final code "
++            "inside a single ```python block. Begin your reply with ```python"
+         )
+-        attempts = [(primary, prompt), (primary, minimal_prompt), (alternate, minimal_prompt)]
++        attempts = [
++            ("full", primary, prompt),
++            ("outline", primary, minimal_prompt),
++            ("code_from_outline", primary, code_prompt),
++        ]
++        if alt_model != primary:
++            attempts.append(("alternate_model_full", alt_model, prompt))
+         last_history = []
+-        for i, (model, text) in enumerate(attempts):
++        for i, (strategy, model, text) in enumerate(attempts):
+             if i > 0:
+                 time.sleep(1)
+             history = chat_with_agent(text, model=model, msg_history=[], logging=safe_log)
+             empty = _is_empty_response(history)
+             self.last_model_used = model
+-            safe_log(f"_chat_robust attempt {i}: model={model}, empty_response={empty}")
+-            if model == primary and i < 2 and empty:
++            self.last_strategy = strategy
++            safe_log(f"_chat_robust attempt {i}: strategy={strategy}, model={model}, empty_response={empty}")
++            if model == primary and empty:
+                 self.primary_empty_count += 1
+-                if self.primary_empty_count >= 2 and self.active_model == self.code_model:
+-                    self.active_model = alternate
+-                    safe_log(f"Primary model {primary} returned empty responses twice; switching to {alternate} for the rest of the run.")
+             elif model == primary and not empty:
+                 self.primary_empty_count = 0
+             last_history = history
+             if not empty:
+                 return history
+-            safe_log(f"Empty response from model={model}; last assistant message repr: {_last_assistant_text(history)!r}")
++            safe_log(f"Empty response from model={model} (strategy={strategy}); last assistant message repr: {_last_assistant_text(history)!r}")
+         return last_history
+ 
+     def forward(self):
+@@ -367,11 +449,11 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         instruction = f"""{task}
+ 
+ Please analyze the problem description carefully, then follow this workflow:
+-1. Explore the repository with the editor `view` command or bash (e.g. `ls`, `cat`) to find the target file. If the task names a file such as `solution.py` that does not exist yet, create it.
+-2. Implement the complete solution by actually calling the editor tool to write the code to disk. Do not only describe the solution in text.
+-3. Run the program on the sample inputs with bash and compare the output against the expected outputs. Fix any discrepancies.
+-4. Consider time complexity (e.g. N up to 10^6) and test with a large input to make sure the solution is fast enough.
+-5. Do not stop until the source file is saved on disk with the full solution.
++1. FIRST tool call: use the editor tool to create `solution.py` in {self.git_tempdir} (or the file named in the task) containing a simple, correct solution, even if it is slow (e.g. brute force). Get a valid baseline on disk before anything else.
++2. Only after that, test the baseline on the sample inputs from the problem statement and compare against the expected outputs. Fix any discrepancies.
++3. Then optimize: consider time complexity (e.g. N up to 10^6) and, if needed, rewrite solution.py with a faster algorithm and re-test it.
++4. Keep experiments small and fast. Prefix EVERY bash command with `timeout 10` (e.g. `timeout 10 python3 solution.py < input.txt`). Do not run long experiments or brute-force stress tests outside the repository, and do not use heredocs outside the repository. Write any helper files with the editor tool.
++5. Do not stop until solution.py is saved on disk with the full solution.
+ 
+ IMPORTANT: The task is incomplete until a source file has been created or edited with the editor or bash tool. Ending your turn without writing code to disk is a failure. If the task says to write a program in a file such as `solution.py`, you must ensure that file exists with the full solution."""
+         init_edit = self._chat_robust(instruction)
+@@ -404,13 +486,17 @@ Repository snapshot:
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         reason = _needs_retry(diff)
+         if reason is None:
++            safe_log(f"Final patch accepted; produced by strategy={self.last_strategy}, model={self.last_model_used}.")
+             return
+         safe_log(f"Patch validation still failing after maximum retries: {reason}. Running deterministic fallback.")
+         self._fallback_write_solution(task, repo_context)
+ 
+     def _fallback_write_solution(self, task, repo_context):
+         """
+-        Ask the model for only the full solution file contents and write them to the target file.
++        Deterministic fallback: (1) ask for a plain-text outline, (2) ask for the code given the
++        outline (text-only, no tools), write it to the target file, (3) run the sample input(s)
++        from the problem statement, and if they fail call chat_with_agent once more with the error
++        output and current file contents. A minimal scaffold is written only as a last resort.
+         """
+         target_rel = None
+         for f in re.findall(r'^--- (.+?) ---$', repo_context, flags=re.MULTILINE):
+@@ -420,33 +506,74 @@ Repository snapshot:
+         if target_rel is None:
+             target_rel = 'solution.py'
+         target_path = os.path.join(self.git_tempdir, target_rel)
+-        fallback_msg = f"""{task}
++
++        # Step 1: plain-text outline (no tools).
++        outline_msg = f"""Task:
++{self.problem_statement}
+ 
+ Repository snapshot:
+ {repo_context}
+ 
+-Reply with ONLY the complete contents of `{target_rel}` (a full, working Python implementation including the starter class/method signature shown above) inside a single ```python fenced code block. No other text, no tool calls."""
+-        fallback_result = self._chat_robust(fallback_msg)
+-        text = _last_assistant_text(fallback_result)
+-        match = re.search(r'```(?:python|py)?\s*\n(.*?)```', text, flags=re.DOTALL)
+-        if match and match.group(1).strip():
+-            code = match.group(1)
+-        elif text.strip() and any(k in text for k in ('def ', 'import', 'input(')):
+-            code = text.strip() + "\n"
+-        else:
+-            safe_log("Fallback: no usable code in the model reply; writing a minimal stub so the patch is not empty.")
++Outline the algorithm for this problem in plain text (no code, no tools): the key idea, the data structures, the steps, and the time complexity."""
++        outline_result = chat_with_agent(outline_msg, model=self.active_model, msg_history=[], logging=safe_log)
++        self.last_model_used = self.active_model
++        self.last_strategy = 'fallback_outline'
++        outline = _last_assistant_text(outline_result).strip()[:6000]
++
++        # Step 2: code from the outline (text-only).
++        code_msg = f"""Task:
++{self.problem_statement}
++
++Repository snapshot:
++{repo_context}
++
++Algorithm outline:
++{outline or '(none)'}
++
++Write the complete Python program for `{target_rel}` that reads from stdin and writes to stdout, implementing the outline above (including the starter signature shown in the snapshot if one exists). Begin your reply with ```python and output only the code block. No other text, no tool calls."""
++        code_result = chat_with_agent(code_msg, model=self.active_model, msg_history=[], logging=safe_log)
++        self.last_strategy = 'fallback_code_from_outline'
++        code = _extract_code(_last_assistant_text(code_result))
++        if not code.strip():
++            safe_log("Fallback: no usable code in the model reply; writing a minimal scaffold so the patch is not empty.")
+             code = (
+                 "import sys\n\n\n"
+                 "def main():\n"
+                 "    data = sys.stdin.read()\n"
+-                "    # TODO: implement the solution\n\n\n"
++                "    # TODO: implement the solution\n"
++                "    print('')\n\n\n"
+                 "if __name__ == '__main__':\n"
+                 "    main()\n"
+             )
+         os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
+         with open(target_path, 'w', encoding='utf-8') as f:
+             f.write(code)
+-        safe_log(f"Fallback wrote {len(code)} chars to {target_path} (model={self.last_model_used}).")
++        safe_log(f"Fallback wrote {len(code)} chars to {target_path} (strategy={getattr(self, 'last_strategy', None)}, model={self.last_model_used}).")
++
++        # Step 3: run the sample input(s) from the problem statement.
++        sample_io = _extract_sample_io(self.problem_statement)
++        ok, report = _run_sample(target_path, self.git_tempdir, sample_io)
++        safe_log(f"Fallback sample check: ok={ok}\n{report}")
++        if ok is False:
++            # Step 4: one repair attempt with the tool-using agent.
++            with open(target_path, 'r', encoding='utf-8') as f:
++                current = f.read()
++            fix_msg = f"""{task}
++
++The file `{target_rel}` currently contains:
++```python
++{current}
++```
++
++Running it on the sample input(s) produced this result:
++{report[:4000]}
++
++Fix `{target_rel}` using the editor tool so that it reads stdin, produces the expected output and does not crash. Test it with `timeout 10 python3 {target_rel}`. Do not reply with text only."""
++            try:
++                fix_history = chat_with_agent(fix_msg, model=self.last_model_used or self.code_model, msg_history=[], logging=safe_log)
++                safe_log(f"Fallback repair finished; last assistant message repr: {_last_assistant_text(fix_history)[:500]!r}")
++            except Exception as e:
++                safe_log(f"Fallback repair failed: {e}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

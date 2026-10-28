@@ -1,0 +1,172 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e54d58c..7f242a1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -93,6 +94,76 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _has_changes(git_tempdir, base_commit):
++    """
++    Return True if the repository differs from base_commit (tracked or untracked files).
++    """
++    return bool(diff_versus_commit(git_tempdir, base_commit).strip())
++
++def _find_target_file(git_tempdir):
++    """
++    Locate the stub file the agent should edit, as a path relative to git_tempdir.
++    Preference: solution.py, then a git-tracked .py file containing a
++    'Write your solution here' comment or a `class Solution`, then the first .py file.
++    """
++    result = subprocess.run(
++        ["git", "-C", git_tempdir, "ls-files"],
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
++    )
++    files = result.stdout.decode(errors='replace').splitlines()
++    py_files = [f for f in files if f.endswith('.py')]
++
++    for f in py_files:
++        if os.path.basename(f) == 'solution.py':
++            return f
++
++    for f in py_files:
++        try:
++            with open(os.path.join(git_tempdir, f), 'r', encoding='utf-8', errors='replace') as fh:
++                content = fh.read()
++        except OSError:
++            continue
++        if 'Write your solution here' in content or re.search(r'^\s*class\s+Solution\b', content, re.MULTILINE):
++            return f
++
++    if py_files:
++        return py_files[0]
++    return 'solution.py'
++
++def _message_text(msg):
++    """
++    Extract plain text from a chat history entry (Claude-style content blocks,
++    OpenAI-style objects, or plain strings).
++    """
++    if isinstance(msg, dict):
++        content = msg.get('content')
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            parts = []
++            for block in content:
++                if isinstance(block, dict) and isinstance(block.get('text'), str):
++                    parts.append(block['text'])
++                elif isinstance(getattr(block, 'text', None), str):
++                    parts.append(block.text)
++            return "\n".join(parts)
++        return str(msg)
++    output_text = getattr(msg, 'output_text', None)
++    if isinstance(output_text, str):
++        return output_text
++    return str(msg)
++
++def _extract_last_python_block(msg_history):
++    """
++    Return the content of the last ```python fenced block in the history, or None.
++    """
++    pattern = re.compile(r'```python[ \t]*\n(.*?)```', re.DOTALL)
++    for msg in reversed(msg_history):
++        matches = pattern.findall(_message_text(msg))
++        if matches:
++            return matches[-1]
++    return None
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -162,23 +233,60 @@ Follow this workflow carefully and do not stop until the solution is implemented
+ 7. Test the worst-case input size from the constraints to confirm the solution runs within the time limit. Optimize if it is too slow.
+ 8. Fix any failures you find. Re-run the tests after each fix.
+ 9. Before finishing, confirm that your changes are saved in the files and summarize what you changed and the test results. Do not finish with an empty patch: the task is only complete once the code changes are written to disk.
++
++Important rules:
++- Never end a turn with an empty message: every turn must either contain a tool call or a final summary.
++- Write a first-draft solution to disk early, before extensive analysis, then refine it.
++- numpy or other third-party packages may not be installed. Prefer pure Python, or verify availability first.
+ """
+         history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Ensure that some code was actually written; retry a bounded number of times
+-        for attempt in range(3):
+-            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if not diff.strip():
+-                followup = (
+-                    "No changes were detected in the repository, so no files were modified. "
+-                    "You must now write the implementation in the appropriate file(s) in "
+-                    f"{self.git_tempdir}, then test it (run the examples and a brute-force stress test). "
+-                    "Do not just describe the solution: use the editor tool to write the code to disk, "
+-                    "and confirm the file was saved."
++        # Ensure that some code was actually written, escalating recovery if needed
++        if not _has_changes(self.git_tempdir, self.base_commit):
++            target_rel = _find_target_file(self.git_tempdir)
++            target_path = os.path.join(self.git_tempdir, target_rel)
++
++            # Rung 1: continue the existing conversation with a forceful nudge
++            followup = (
++                "No changes were detected in the repository, so no files were modified. "
++                "Write the implementation to disk immediately, in "
++                f"{target_path}, using the editor tool. Write a complete first-draft solution now, "
++                "then test it (run the examples and a brute-force stress test). "
++                "Do not just describe the solution, and do not end your turn without a tool call or a final summary."
++            )
++            history = chat_with_agent(followup, model=self.code_model, msg_history=history, logging=safe_log)
++
++            # Rung 2: fresh conversation with a concise prompt including the current file contents
++            if not _has_changes(self.git_tempdir, self.base_commit):
++                try:
++                    with open(target_path, 'r', encoding='utf-8', errors='replace') as fh:
++                        current_contents = fh.read()
++                except OSError:
++                    current_contents = ""
++                fresh_prompt = (
++                    "Solve the following programming problem by editing the file below.\n\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                    f"Target file: {target_path}\n"
++                    f"Current contents:\n<file_contents>\n{current_contents}\n</file_contents>\n\n"
++                    "First, write a complete first-draft solution to the target file right away using the editor tool. "
++                    "Then test it against the examples and a brute-force stress test, and refine it. "
++                    "Keep the existing class and method signatures, and make sure the file is saved to disk."
+                 )
+-                history = chat_with_agent(followup, model=self.code_model, msg_history=history, logging=safe_log)
+-            else:
+-                break
++                history = chat_with_agent(fresh_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++            # Rung 3: last resort, ask for only the source code and write it directly
++            if not _has_changes(self.git_tempdir, self.base_commit):
++                code_prompt = (
++                    "Reply with only the complete Python source in a ```python block, no tools. "
++                    "The source must solve the following problem and be a full, runnable file.\n\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++                )
++                history = chat_with_agent(code_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++                code = _extract_last_python_block(history)
++                if code is not None:
++                    os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
++                    with open(target_path, 'w', encoding='utf-8') as fh:
++                        fh.write(code)
+ 
+         # Bounded verification rounds once a non-empty diff exists
+         verification_prompts = [
+@@ -196,7 +304,7 @@ Follow this workflow carefully and do not stop until the solution is implemented
+             ),
+         ]
+         for prompt in verification_prompts:
+-            if not diff_versus_commit(self.git_tempdir, self.base_commit).strip():
++            if not _has_changes(self.git_tempdir, self.base_commit):
+                 break
+             history = chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
+ 

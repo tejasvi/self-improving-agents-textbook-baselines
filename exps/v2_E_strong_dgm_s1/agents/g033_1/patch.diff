@@ -1,0 +1,438 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3f7e7d5..8ec1088 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -13,6 +13,7 @@ import os
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from tools import scaling_probe
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -56,6 +57,15 @@ RUN_TIMEOUT_S = 10        # timeout for every solution / generator / brute run
+ REPORT_CLIP = 2000        # max chars of any raw input/output in a report
+ CODE_CLIP = 30000
+ TIME_LIMIT_S = 1.0        # soft limit for a max-size run         # max chars of solution code pasted into a prompt
++DEFAULT_MAX_N = 200000    # fallback max size when the statement constraints cannot be parsed
++SCALING_MARKER = "Scaling probe"  # feedback marker for the adversarial scaling probe report
++
++SCALING_HINT = ("Scaling probe FAILED: the solution is too slow on adversarial max-size inputs (all-equal, a single "
++                "dominant element, two-value mixes, sorted, reverse-sorted or random). Pruning, early breaks or caching "
++                "are NOT a complexity fix: they do not trigger on these shapes. Before changing code, write down the "
++                "dominant loop bounds in terms of n and the maximum count M (for example, candidates x per-candidate "
++                "DP size = ops), and derive a lower-complexity algorithm where the total work is near-linear "
++                "(harmonic sums, per-letter greedy, bounded carry, prefix sums). Re-check the new ops count at max_n.\n")
+ 
+ STDLIB_EXTRA = {'__future__'}
+ IMPORT_CRASH_HINT = ("Only the Python standard library is available in grading; "
+@@ -666,6 +676,68 @@ class AgenticSystem:
+             ok = False
+         return ok, "Max-size timing (class task):\n" + "\n".join(lines)
+ 
++    def _parse_max_n(self):
++        """Largest constraint-like bound from the statement (`<= 2 * 10^4`, `<= 10^5`, `<= 20000`), else DEFAULT_MAX_N."""
++        text = self.problem_statement or ''
++        vals = []
++        pat = r"(?:<=|\u2264)\s*(?:(\d+)\s*\*\s*)?10\s*\^\s*\{?\s*(\d+)\s*\}?|(?:<=|\u2264)\s*(\d+)\b"
++        for m in re.finditer(pat, text):
++            if m.group(2) is not None:
++                v = (int(m.group(1)) if m.group(1) else 1) * 10 ** int(m.group(2))
++            else:
++                v = int(m.group(3))
++            if 2 <= v <= 2 * 10 ** 6:  # larger bounds are usually value ranges, not sizes
++                vals.append(v)
++        return max(vals) if vals else DEFAULT_MAX_N
++
++    def _infer_input_kind(self):
++        """(input_kind, None) from the starter signature `def name(self, s: str)` / `List[int]`, or (None, reason)."""
++        method = self._class_method_name()
++        if method is None:
++            return None, "could not find the target method"
++        m = re.search(r"def\s+" + re.escape(method) + r"\s*\(\s*self\s*,\s*(\w+)\s*:\s*"
++                      r"([A-Za-z_][\w.]*(?:\[[^\]]*\])?)\s*[,)]",
++                      self.problem_statement or '')
++        if m is None:
++            return None, "could not read a single typed argument from the starter signature"
++        annot = m.group(2).strip().replace(' ', '')
++        if annot == 'str':
++            return 'string', None
++        if annot in ('List[int]', 'list[int]'):
++            return 'int_array', None
++        return None, f"unsupported argument type `{annot}`"
++
++    def _run_scaling(self):
++        """
++        Adversarial scaling probe (tools/scaling_probe.py) at the statement's max size. Class tasks use the
++        built-in families for a single string / int-array argument; stdin tasks need gen_scale.py SIZE (optional).
++        Returns (ok, report). A skipped probe returns ok=True with a note, so it never blocks the attempt silently
++        as a failure; a flagged probe returns ok=False.
++        """
++        max_n = self._parse_max_n()
++        if self._is_class_task():
++            method = self._class_method_name()
++            kind, reason = self._infer_input_kind()
++            if kind is None or method is None:
++                return True, f"Scaling probe skipped: {reason}."
++            report = scaling_probe.tool_function(self._sol_path(), 'class_method', max_n, kind,
++                                                 method_name=method, timeout_s=3)
++        else:
++            if self._is_interactive():
++                return True, "Scaling probe skipped: interactive problem."
++            gen = os.path.join(self.git_tempdir, 'gen_scale.py')
++            if not os.path.isfile(gen):
++                return True, "Scaling probe skipped: gen_scale.py missing (write it to produce max-size input for a given N)."
++            cwd = repr(self.git_tempdir)
++            expr = (f"__import__('subprocess').run(['python3', 'gen_scale.py', str(N)], capture_output=True, "
++                    f"text=True, cwd={cwd}, timeout={RUN_TIMEOUT_S}).stdout")
++            report = scaling_probe.tool_function(self._sol_path(), 'stdin', max_n, 'custom',
++                                                 gen_expr=expr, timeout_s=3)
++        if report.startswith('Error'):
++            return True, f"Scaling probe skipped: {report}"
++        ok = 'VERDICT: FAIL' not in report
++        return ok, report
++
+     def _run_timing(self):
+         """Run solution.py on max-size inputs from gen_big.py. Returns (ok, report)."""
+         gen_big = os.path.join(self.git_tempdir, 'gen_big.py')
+@@ -737,6 +809,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+    d. If any case takes more than about 1s, or the estimated operation count is over about 5*10^7, throw away the heuristic approach and look for a lower-complexity formulation. Do not micro-optimize a bad algorithm.
+    e. Pruning/early-break heuristics do not count as a complexity guarantee; test inputs that defeat them.
+    f. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
++   g. Run scaling_probe on an all-equal / single-dominant-element input at the maximum constraints (the probe reports the growth exponent per family). For a stdin task, also write gen_scale.py (`python3 gen_scale.py N` prints a valid stdin input at size N with an adversarial shape) so the probe can run. Write the number of candidates x the per-candidate DP size explicitly at max constraints (e.g. "26 letters x M=20000 counts x O(26) = 1.3*10^7 ops"); if the probe reports a FAIL verdict, the algorithm must be replaced, not pruned.
+ 8. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+ 
+     def _brute_fallback(self):
+@@ -774,7 +847,7 @@ Diagnose the root cause first. If your algorithm is fundamentally wrong, derive
+ If the previous solution failed stress or relied on heavy case analysis (modular wrap-around enumeration, sign tracking), re-derive a simpler formulation: start from brute.py's state definition and use a DP over the single free coordinate with O(Q*N) transitions, so that it matches the brute force by construction.
+ {HYPOTHESIS_LINE}
+ {HEURISTIC_AUDIT_STEP}
+-{self._timeout_hint(feedback)}{self._interactive_hint()}{STDLIB_LINE} Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
++{self._timeout_hint(feedback)}{self._scaling_hint(feedback)}{self._interactive_hint()}{STDLIB_LINE} Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
+ """
+ 
+     TIMEOUT_HINT = ("solution.py is still exponential; derive an O(1) or O(log) per-case method, starting from the "
+@@ -782,6 +855,12 @@ If the previous solution failed stress or relied on heavy case analysis (modular
+                     "use compare_functions(fast_path=solution.py, ref_path=brute.py, ...) to check the new formula "
+                     "against brute.py.\n")
+ 
++    def _scaling_hint(self, feedback):
++        """Scaling-probe failure instruction for the retry prompt, only when the feedback reports a failed probe."""
++        if not feedback or SCALING_MARKER not in feedback or 'VERDICT: FAIL' not in feedback:
++            return ""
++        return SCALING_HINT + "\n"
++
+     def _timeout_hint(self, feedback):
+         """Timeout instruction for the retry prompt, only when the feedback reports a timeout and lacks the hint."""
+         if not feedback or "TIMEOUT" not in feedback or self.TIMEOUT_HINT in feedback:
+@@ -1014,6 +1093,9 @@ Action: rewrite solution.py NOW in pure Python (standard library only; no numpy/
+                 if not stress_mismatch:
+                     timing_ok, timing_report = self._run_class_timing()
+                     report_parts.append(timing_report)
++                    scaling_ok, scaling_report = self._run_scaling()
++                    report_parts.append(scaling_report)
++                    timing_ok = timing_ok and scaling_ok
+             elif interactive:
+                 # Interactive tasks: plain-pipe stress/timing would feed brute.py / solution.py the wrong protocol.
+                 report_parts.append("Stress/timing skipped: interactive problem; the harness cannot drive the judge.")
+@@ -1028,6 +1110,9 @@ Action: rewrite solution.py NOW in pure Python (standard library only; no numpy/
+                 if not stress_mismatch:
+                     timing_ok, timing_report = self._run_timing()
+                     report_parts.append(timing_report)
++                    scaling_ok, scaling_report = self._run_scaling()
++                    report_parts.append(scaling_report)
++                    timing_ok = timing_ok and scaling_ok
+             else:
+                 report_parts.append("Oracle/stress phase skipped until all samples pass.")
+ 
+diff --git a/exact.py b/exact.py
+new file mode 100644
+index 0000000..502da40
+--- /dev/null
++++ b/exact.py
+@@ -0,0 +1,9 @@
++# Same algorithm as solution.py with no caps/prunes (there are none): one linear pass.
++import sys
++def solve(data):
++    n, lo, hi = int(data[0]), int(data[1]), int(data[2])
++    return sum(int(x) for x in data[3:3 + n] if lo <= int(x) <= hi)
++if __name__ == "__main__":
++    data = sys.stdin.read().split()
++    if data:
++        print(f"! {solve(data)}")
+diff --git a/heuristics.md b/heuristics.md
+new file mode 100644
+index 0000000..47ce471
+--- /dev/null
++++ b/heuristics.md
+@@ -0,0 +1,5 @@
++# Heuristic audit
++# solution.py has no heuristics: no caps, prunes, restricted ranges or early breaks.
++# Assumed contract only (no statement): values parsed as Python ints (arbitrary size).
++# (no heuristics in solution.py; listed for completeness)
++# Single linear pass, sums v with lo<=v<=hi: exact by definition of the assumed contract, no caps.
+diff --git a/tools/scaling_probe.py b/tools/scaling_probe.py
+new file mode 100644
+index 0000000..b24b4f5
+--- /dev/null
++++ b/tools/scaling_probe.py
+@@ -0,0 +1,259 @@
++import json
++import math
++import os
++import random
++import signal
++import subprocess
++import sys
++import time
++
++# Wall/measured time above this (seconds) at max_n (measured or extrapolated) fails the probe.
++LIMIT_S = 1.0
++# Points faster than this are too noisy to use for the growth-exponent fit.
++FIT_MIN_S = 0.02
++
++_HARNESS = r'''
++import sys, json, importlib.util, os, time
++spec = json.loads(sys.stdin.read())
++sys.setrecursionlimit(10000)
++sys.path.insert(0, os.path.dirname(os.path.abspath(spec["path"])))
++mod_spec = importlib.util.spec_from_file_location("sol_under_test", spec["path"])
++mod = importlib.util.module_from_spec(mod_spec)
++mod_spec.loader.exec_module(mod)
++g = dict(vars(mod))
++g["N"] = spec["n"]
++args = eval("(" + spec["expr"] + ",)", g)
++obj = mod.Solution()
++t0 = time.perf_counter()
++res = getattr(obj, spec["method"])(*args)
++dt = time.perf_counter() - t0
++sys.stderr.write("@@T %r\n" % dt)
++'''
++
++
++def tool_info():
++    return {
++        "name": "scaling_probe",
++        "description": """Adversarial scaling probe: runs a solution on built-in worst-case input families at sizes max_n/16, max_n/8, max_n/4, max_n/2 and max_n, each run in an isolated subprocess with a hard timeout.
++* Families for input_kind 'string': all-equal ('a'*n), single dominant letter plus random others, two-letter mix, sorted random letters, reverse-sorted random letters, random letters.
++* Families for input_kind 'int_array': all-equal [7]*n, single dominant value plus distinct values, two-value mix, range(n), reversed range, random values.
++* input_kind 'custom': only the family given by gen_expr is used.
++* mode 'class_method': solution.py defines `class Solution`; method_name is called with the generated argument(s) and only the method call itself is timed.
++* mode 'stdin': solution.py is a stdin/stdout program. gen_expr is REQUIRED: a Python expression using the variable N that evaluates to the full stdin text for size N (e.g. "'1\\n' + ' '.join(['5']*N) + '\\n'").
++* Prints a per-family table (family, size, time, status), the fitted growth exponent (log-log fit) and the extrapolated time at max_n for each family. Families whose time at max_n (measured or extrapolated) exceeds about 1 s, or that time out, are flagged.
++* The last line is 'VERDICT: PASS' or 'VERDICT: FAIL (...)'. A multiplicative O(n^2) behaviour in a count shows up as exponent near 2.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the solution Python file."},
++                "mode": {"type": "string", "description": "Either 'class_method' (call Solution().method_name(...)) or 'stdin' (run the file as a program with stdin)."},
++                "method_name": {"type": "string", "description": "Name of the Solution method to call (required for class_method mode; ignored for stdin)."},
++                "max_n": {"type": "integer", "description": "The maximum size allowed by the statement constraints, e.g. 20000 for a string of length 2*10^4."},
++                "input_kind": {"type": "string", "description": "One of 'string' (single str argument), 'int_array' (single list of ints argument) or 'custom' (use gen_expr only)."},
++                "gen_expr": {"type": "string", "description": "Optional. Python expression using the variable N. Class mode: a comma-separated argument list (evaluated like the method arguments). Stdin mode: the full stdin text. Required for stdin mode and for input_kind 'custom'."},
++                "timeout_s": {"type": "integer", "description": "Hard timeout in seconds per run (default 5)."}
++            },
++            "required": ["solution_path", "mode", "max_n", "input_kind"]
++        }
++    }
++
++
++def _run_proc(cmd, stdin_text, cwd, timeout_s):
++    """Run cmd; returns (status, wall_seconds, stdout, stderr). status is OK, ERROR or TIMEOUT."""
++    t0 = time.perf_counter()
++    try:
++        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                             text=True, cwd=cwd, start_new_session=True)
++    except Exception as e:
++        return 'ERROR', 0.0, '', f'failed to start: {e}'
++    try:
++        out, err = p.communicate(stdin_text, timeout=timeout_s)
++        el = time.perf_counter() - t0
++        if p.returncode != 0:
++            return 'ERROR', el, out or '', (err or '') + f'\n(exit code {p.returncode})'
++        return 'OK', el, out or '', err or ''
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(p.pid, signal.SIGKILL)
++        except Exception:
++            p.kill()
++        try:
++            p.communicate(timeout=5)
++        except Exception:
++            pass
++        return 'TIMEOUT', time.perf_counter() - t0, '', f'killed after {timeout_s}s'
++
++
++def _families(input_kind, n):
++    """Return list of (family_name, class_argument_expression_text) for built-in families of size n."""
++    rng = random.Random(12345)
++    letters = 'abcdefghijklmnopqrstuvwxyz'
++    if input_kind == 'string':
++        dom = list('a' * (n - n // 10) + ''.join(rng.choice('bcdefg') for _ in range(n // 10)))
++        rng.shuffle(dom)
++        dom = ''.join(dom)
++        rnd = ''.join(rng.choice(letters) for _ in range(n))
++        srt = ''.join(sorted(rnd))
++        return [
++            ('all_equal', repr('a' * n)),
++            ('single_dominant', repr(dom)),
++            ('two_letter_mix', repr(''.join(rng.choice('ab') for _ in range(n)))),
++            ('sorted', repr(srt)),
++            ('reverse_sorted', repr(srt[::-1])),
++            ('random', repr(rnd)),
++        ]
++    if input_kind == 'int_array':
++        dom = [7] * (n - n // 10) + [rng.randint(0, 10 ** 9) for _ in range(n // 10)]
++        rng.shuffle(dom)
++        return [
++            ('all_equal', repr([7] * n)),
++            ('single_dominant', repr(dom)),
++            ('two_value_mix', repr([rng.choice([1, 10 ** 9]) for _ in range(n)])),
++            ('sorted', repr(list(range(n)))),
++            ('reverse_sorted', repr(list(range(n))[::-1])),
++            ('random', repr([rng.randint(0, max(1, n)) for _ in range(n)])),
++        ]
++    return []
++
++
++def _fit(points):
++    """Least-squares slope and prediction function over (n, t) points with t > FIT_MIN_S. Returns (slope, a) or None."""
++    pts = [(math.log(n), math.log(t)) for n, t in points if n > 0 and t > FIT_MIN_S]
++    if len(pts) < 2:
++        return None
++    mx = sum(x for x, _ in pts) / len(pts)
++    my = sum(y for _, y in pts) / len(pts)
++    den = sum((x - mx) ** 2 for x, _ in pts)
++    if den <= 0:
++        return None
++    slope = sum((x - mx) * (y - my) for x, y in pts) / den
++    return slope, my - slope * mx
++
++
++def _sizes(max_n):
++    sizes = []
++    for d in (16, 8, 4, 2, 1):
++        s = max(1, max_n // d)
++        if s not in sizes:
++            sizes.append(s)
++    return sizes
++
++
++def tool_function(solution_path, mode, max_n, input_kind, method_name=None, gen_expr=None, timeout_s=5):
++    try:
++        timeout_s = max(1, min(int(timeout_s or 5), 60))
++    except Exception:
++        timeout_s = 5
++    try:
++        max_n = int(max_n)
++    except Exception:
++        return "Error: max_n must be an integer."
++    if max_n < 2:
++        return "Error: max_n must be at least 2."
++    max_n = min(max_n, 2_000_000)
++    path = os.path.abspath(str(solution_path))
++    if not os.path.isfile(path):
++        return f"Error: solution file not found: {path}"
++    if mode not in ('class_method', 'stdin'):
++        return "Error: mode must be 'class_method' or 'stdin'."
++    if mode == 'class_method' and not method_name:
++        return "Error: method_name is required in class_method mode."
++    if input_kind not in ('string', 'int_array', 'custom'):
++        return "Error: input_kind must be 'string', 'int_array' or 'custom'."
++    if input_kind == 'custom' and not gen_expr:
++        return "Error: input_kind 'custom' needs gen_expr."
++    if mode == 'stdin' and not gen_expr:
++        return "Error: stdin mode needs gen_expr (a Python expression using N that yields the full stdin text)."
++    cwd = os.path.dirname(path)
++
++    # Build (family, size) -> input payload generator
++    def stdin_text_for(n):
++        try:
++            text = eval(gen_expr, {'N': n, 'random': random})
++        except Exception as e:
++            return None, f"gen_expr failed for N={n}: {e}"
++        return str(text), None
++
++    results = {}  # family -> list of (n, status, time, detail)
++    if input_kind == 'custom' or mode == 'stdin':
++        family_names = ['custom']
++    else:
++        family_names = [name for name, _ in _families(input_kind, 4)]
++
++    for fam in family_names:
++        results[fam] = []
++        stop = False
++        for n in _sizes(max_n):
++            if stop:
++                break
++            if mode == 'stdin':
++                text, err = stdin_text_for(n)
++                if err:
++                    results[fam].append((n, 'ERROR', 0.0, err))
++                    continue
++                status, el, out, errtxt = _run_proc([sys.executable, path], text, cwd, timeout_s)
++            else:
++                if input_kind == 'custom':
++                    expr = gen_expr
++                else:
++                    expr = dict(_families(input_kind, n))[fam]
++                payload = json.dumps({'path': path, 'method': method_name, 'expr': expr, 'n': n})
++                status, el, out, errtxt = _run_proc([sys.executable, '-c', _HARNESS], payload, cwd, timeout_s)
++                if status == 'OK':
++                    for ln in (errtxt or '').splitlines():
++                        if ln.startswith('@@T '):
++                            try:
++                                el = float(ln[4:])
++                            except ValueError:
++                                pass
++            detail = ''
++            if status == 'ERROR':
++                detail = (errtxt or '').strip().splitlines()[-1:] or ['']
++                detail = detail[0][:200]
++            results[fam].append((n, status, el, detail))
++            if status == 'TIMEOUT':
++                stop = True  # larger sizes of this family would only time out too
++
++    lines = [f"Scaling probe of {path} ({mode}{', ' + method_name if method_name else ''}), "
++             f"max_n={max_n}, input_kind={input_kind}, timeout {timeout_s}s per run, limit {LIMIT_S}s at max_n",
++             f"{'family':<18} {'size':>9} {'time(s)':>9}  status"]
++    failures = []
++    summary = []
++    for fam in family_names:
++        rows = results[fam]
++        for n, status, el, detail in rows:
++            lines.append(f"{fam:<18} {n:>9} {el:>9.3f}  {status}" + (f" {detail}" if status == 'ERROR' and detail else ''))
++        ok_pts = [(n, el) for n, status, el, _ in rows if status == 'OK']
++        timed_out = any(status == 'TIMEOUT' for _, status, _, _ in rows)
++        fit = _fit(ok_pts)
++        measured_max = next((el for n, status, el, _ in rows if n == max_n and status == 'OK'), None)
++        if fit is not None:
++            slope, a = fit
++            extrap = math.exp(a + slope * math.log(max_n))
++            fit_txt = f"exponent {slope:.2f}"
++        elif ok_pts:
++            n_last, t_last = ok_pts[-1]
++            extrap = t_last * (max_n / n_last)
++            slope = None
++            fit_txt = "exponent n/a (all runs < 0.02s); linear extrapolation"
++        else:
++            extrap = None
++            slope = None
++            fit_txt = "no successful run"
++        at_max = measured_max if measured_max is not None else extrap
++        flagged = timed_out or (at_max is not None and max(at_max, extrap or 0.0) > LIMIT_S)
++        est = f"{extrap:.3f}s" if extrap is not None else "n/a"
++        summary.append(f"  {fam:<18} {fit_txt}; extrapolated at max_n={max_n}: {est}"
++                       + (f"; measured at max_n: {measured_max:.3f}s" if measured_max is not None else "")
++                       + ("  <-- FLAG" if flagged else ""))
++        if flagged:
++            why = "timed out" if timed_out else f"extrapolated {est} > {LIMIT_S}s"
++            failures.append(f"{fam} ({why})")
++    lines.append("Growth per family:")
++    lines.extend(summary)
++    if failures:
++        lines.append("VERDICT: FAIL (" + "; ".join(failures) + "). Complexity is too high at max_n: "
++                     "derive a lower-complexity algorithm; pruning or early breaks do not fix this.")
++    else:
++        lines.append("VERDICT: PASS (all families within the limit at max_n).")
++    return "\n".join(lines)

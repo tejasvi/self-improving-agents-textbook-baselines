@@ -1,0 +1,283 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7e15990..a9dd607 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,6 @@
+ import argparse
++import ast
++import re
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -93,6 +95,69 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _block_text(block):
++    """Return the text of a content block (dict or SDK object), or None if it has no text field."""
++    if isinstance(block, dict):
++        if block.get('type') == 'text' or 'text' in block:
++            value = block.get('text')
++            return value if isinstance(value, str) else None
++        return None
++    value = getattr(block, 'text', None)
++    return value if isinstance(value, str) else None
++
++def _clean_history(history):
++    """
++    Return a copy of the message history with empty / whitespace-only text blocks removed,
++    and messages left with no content dropped.
++    """
++    cleaned = []
++    for msg in history or []:
++        if not isinstance(msg, dict):
++            continue
++        content = msg.get('content')
++        if isinstance(content, str):
++            if not content.strip():
++                continue
++            new_msg = dict(msg)
++        elif isinstance(content, list):
++            new_blocks = []
++            for block in content:
++                text = _block_text(block)
++                if text is not None and not text.strip():
++                    continue
++                new_blocks.append(block)
++            if not new_blocks:
++                continue
++            new_msg = dict(msg)
++            new_msg['content'] = new_blocks
++        else:
++            if content is None:
++                continue
++            new_msg = dict(msg)
++        cleaned.append(new_msg)
++    return cleaned
++
++def _message_text(msg):
++    """Concatenate the text of a message whose content is a string or a list of blocks."""
++    if not isinstance(msg, dict):
++        return ''
++    content = msg.get('content')
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts = [_block_text(b) for b in content]
++        return '\n'.join(p for p in parts if p)
++    return ''
++
++def _last_python_block(history):
++    """Return the code of the last ```python fenced block found in the history (searching newest first), or None."""
++    for msg in reversed(history or []):
++        text = _message_text(msg)
++        matches = re.findall(r"```python[ \t]*\n(.*?)```", text, re.DOTALL)
++        if matches:
++            return matches[-1]
++    return None
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -254,6 +319,7 @@ Stage A (analysis and first solution):
+ 2. Derive the algorithm and write a short written proof of correctness.
+ 3. Your FIRST tool call after reading the repo must create/edit {self.git_tempdir}/solution.py using the editor tool. A brute-force version is acceptable as a first version, but it must be a complete, runnable solution.
+ Do not end your turn without writing the file.
++Never reply with an empty message; if you are unsure, write your best attempt to {self.git_tempdir}/solution.py first.
+ """
+ 
+         stage_b = f"""Stage B (verification against brute force):
+@@ -271,65 +337,95 @@ Keep all test scripts outside {self.git_tempdir} (in /tmp). Make sure {self.git_
+ 4. Make sure {self.git_tempdir}/solution.py is complete and working when you finish.
+ """
+ 
++        self._ensure_typing_imports()
++
+         history = []
+-        history = chat_with_agent(stage_a, model=self.code_model, msg_history=history, logging=safe_log)
++        history = chat_with_agent(stage_a, model=self.code_model, msg_history=_clean_history(history), logging=safe_log)
++        safe_log(f"Stage A final assistant text: {_message_text(history[-1]) if history else ''}")
+         history = self._ensure_deliverable(history, deliverable)
+ 
+-        history = chat_with_agent(stage_b, model=self.code_model, msg_history=history, logging=safe_log)
++        history = chat_with_agent(stage_b, model=self.code_model, msg_history=_clean_history(history), logging=safe_log)
++        safe_log(f"Stage B final assistant text: {_message_text(history[-1]) if history else ''}")
+         history = self._ensure_deliverable(history, deliverable)
+ 
+-        history = chat_with_agent(stage_c, model=self.code_model, msg_history=history, logging=safe_log)
++        history = chat_with_agent(stage_c, model=self.code_model, msg_history=_clean_history(history), logging=safe_log)
++        safe_log(f"Stage C final assistant text: {_message_text(history[-1]) if history else ''}")
+         history = self._ensure_deliverable(history, deliverable)
+ 
+         history = self._ensure_deliverable(history, deliverable)
+         return history
+ 
++    def _ensure_typing_imports(self):
++        """
++        If solution.py uses `List` without importing it, prepend the common imports so the stub is valid Python.
++        """
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(solution_path):
++            return
++        try:
++            with open(solution_path, 'r', errors='ignore') as f:
++                current = f.read()
++        except Exception:
++            return
++        uses_list = re.search(r'\bList\b', current) is not None
++        imports_list = re.search(r'^\s*from\s+typing\s+import\s+.*\bList\b', current, re.MULTILINE) is not None
++        if uses_list and not imports_list:
++            header = "from typing import List\nfrom collections import *\nimport bisect, heapq, math, itertools\n"
++            with open(solution_path, 'w') as f:
++                f.write(header + current)
++            safe_log("Prepended typing/common imports to solution.py.")
++
+     def _ensure_deliverable(self, history, deliverable):
+         """
+-        Bounded re-prompting (3 tool-driven attempts) until solution.py is a real deliverable.
+-        If still failing, ask for the full code in a ```python block and write it to solution.py.
++        Bounded re-prompting until solution.py is a real deliverable:
++        1. Up to 2 nudged attempts using the cleaned history.
++        2. A fresh-context call (msg_history=[]) asking for the full file in one ```python block.
++        The returned code is validated with ast.parse and written to solution.py.
+         Returns the updated message history.
+         """
+-        import re
+-        messages = [
+-            f"You have not modified solution.py. Call the editor tool now to write {deliverable}.",
+-            f"solution.py still is not a valid deliverable (unchanged from the starter, empty, unparseable, or a stub). "
+-            f"Call the editor tool immediately to write the complete code: {deliverable}.",
++        if self._deliverable_exists():
++            return history
++
++        nudges = [
++            f"solution.py is not a valid deliverable yet (unchanged from the starter, empty, unparseable, or a stub). "
++            f"Call the editor tool now to write the complete code: {deliverable}. Do not reply with an empty message.",
+             f"This is your last chance to use tools. Write the complete working solution to solution.py with the editor tool right now: {deliverable}.",
+         ]
+-        for msg in messages:
++        for msg in nudges:
++            history = chat_with_agent(msg, model=self.code_model, msg_history=_clean_history(history), logging=safe_log)
++            safe_log(f"Nudge final assistant text: {_message_text(history[-1]) if history else ''}")
+             if self._deliverable_exists():
+                 return history
+-            history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+-        if self._deliverable_exists():
+-            return history
+ 
+-        # Fallback: ask for the full file in a fenced block and write it ourselves.
+-        msg = (
+-            f"Output the complete contents of solution.py in a single ```python fenced code block "
+-            f"and nothing else. Requirement: {deliverable}."
++        # Fallback: fresh context, ask for the full file only.
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
++        try:
++            with open(solution_path, 'r', errors='ignore') as f:
++                current_code = f.read()
++        except Exception:
++            current_code = ''
++        fresh_prompt = (
++            f"Solve the following competitive programming problem in Python.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Current contents of solution.py:\n```python\n{current_code}\n```\n\n"
++            f"Requirements: {deliverable}.\n"
++            f"Include `from typing import List` and any other needed imports at the top of the file.\n"
++            f"Respond with only the complete solution.py in one ```python block, no tool use."
+         )
+-        history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+-        last_text = ''
+-        if history and isinstance(history[-1], dict):
+-            content = history[-1].get('content')
+-            if isinstance(content, str):
+-                last_text = content
+-            elif isinstance(content, list):
+-                last_text = '\n'.join(
+-                    c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text'
+-                )
+-        match = re.search(r"```python\s*\n(.*?)```", last_text, re.DOTALL)
+-        if match:
+-            code = match.group(1)
+-            try:
+-                import ast
+-                ast.parse(code)
+-                with open(os.path.join(self.git_tempdir, 'solution.py'), 'w') as f:
+-                    f.write(code)
+-                safe_log("Wrote solution.py from fenced code block fallback.")
+-            except SyntaxError:
+-                safe_log("Fallback code block did not parse; solution.py not written.", level=logging.WARNING)
++        fresh_history = chat_with_agent(fresh_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"Fresh-context final assistant text: {_message_text(fresh_history[-1]) if fresh_history else ''}")
++        code = _last_python_block(fresh_history)
++        if code is None:
++            safe_log("Fresh-context response had no ```python block; solution.py not written.", level=logging.WARNING)
++            return history
++        try:
++            ast.parse(code)
++        except SyntaxError:
++            safe_log("Fresh-context code block did not parse; solution.py not written.", level=logging.WARNING)
++            return history
++        with open(solution_path, 'w') as f:
++            f.write(code)
++        safe_log("Wrote solution.py from fresh-context fallback.")
+         return history
+ 
+ def main():
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..56e9b61
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,53 @@
++from typing import List
++
++
++class Solution:
++    def maxDistance(self, side: int, points: List[List[int]], k: int) -> int:
++        # Map each boundary point to its position along the perimeter, in [0, 4*side).
++        perim = 4 * side
++
++        def pos(x: int, y: int) -> int:
++            if y == 0:
++                return x
++            if x == side:
++                return side + y
++            if y == side:
++                return 3 * side - x
++            return 4 * side - y  # x == 0
++
++        pts = sorted((pos(x, y), x, y) for x, y in points)
++        n = len(pts)
++        # Doubled array to handle the cyclic wrap-around.
++        ext = pts + [(p + perim, x, y) for p, x, y in pts]
++
++        def manhattan(a, b) -> int:
++            return abs(a[1] - b[1]) + abs(a[2] - b[2])
++
++        def feasible(d: int) -> bool:
++            # Pick k points on the cycle with all pairwise Manhattan distances >= d.
++            # Try each start point; greedily take the next point in perimeter order
++            # that is far enough from the current one, and check the wrap-around.
++            if k <= 1:
++                return True
++            for s in range(n):
++                start = ext[s]
++                cur = start
++                count = 1
++                j = s + 1
++                while count < k and j < s + n:
++                    if manhattan(cur, ext[j]) >= d:
++                        cur = ext[j]
++                        count += 1
++                    j += 1
++                if count >= k and manhattan(cur, start) >= d:
++                    return True
++            return False
++
++        lo, hi = 0, 2 * side
++        while lo < hi:
++            mid = (lo + hi + 1) // 2
++            if feasible(mid):
++                lo = mid
++            else:
++                hi = mid - 1
++        return lo

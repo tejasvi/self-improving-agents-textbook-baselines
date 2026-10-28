@@ -1,0 +1,179 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7f8c664..7c6c1b7 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -156,6 +157,67 @@ class AgenticSystem:
+         p = path.lower()
+         return any(s in p for s in ['/test', 'tests/', 'test_', '_test.', '.spec.', 'conftest'])
+ 
++    @staticmethod
++    def _block_text(block):
++        if isinstance(block, dict):
++            return block.get('type'), block.get('text')
++        return getattr(block, 'type', None), getattr(block, 'text', None)
++
++    @staticmethod
++    def _sanitize_history(msg_history):
++        """
++        Drop trailing assistant messages whose content blocks are all empty text.
++        Returns [] if no meaningful messages remain.
++        """
++        history = list(msg_history or [])
++        while history:
++            last = history[-1]
++            if last.get('role') != 'assistant':
++                break
++            content = last.get('content')
++            if isinstance(content, str):
++                if content.strip():
++                    break
++                history.pop()
++                continue
++            blocks = content or []
++            all_empty = True
++            for block in blocks:
++                btype, text = AgenticSystem._block_text(block)
++                if btype != 'text' or (text or '').strip():
++                    all_empty = False
++                    break
++            if all_empty:
++                history.pop()
++            else:
++                break
++        return history
++
++    def _target_filename(self):
++        """
++        Extract the expected output file (a backticked *.py name) from the problem statement.
++        Defaults to 'solution.py'.
++        """
++        match = re.search(r'`([\w./-]+\.py)`', self.problem_statement or '')
++        return match.group(1) if match else 'solution.py'
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            texts = []
++            for block in content or []:
++                btype, text = AgenticSystem._block_text(block)
++                if btype == 'text' and text:
++                    texts.append(text)
++            if texts:
++                return "\n".join(texts)
++        return ""
++
+     def _has_source_edit(self):
+         """
+         True if at least one changed file is not a test file.
+@@ -185,31 +247,80 @@ Please follow this workflow:
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.{workflow}"
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        retry_msg = (
+-            "No edits to non-test source files were detected in the repository. "
+-            "You must use the editor tool (create/edit) or bash to write the solution file now. "
+-            "Do not answer with text only. After writing, run it against the sample inputs."
+-        )
+-        for attempt in range(3):
++        target = self._target_filename()
++        retry_templates = [
++            (
++                "No edits to non-test source files were detected in the repository. "
++                f"Immediately call the editor tool to create {target} with a straightforward correct solution first; "
++                "optimize afterwards. Do not reply with text only. After writing, run it against the sample inputs."
++            ),
++            (
++                "Still no edits to non-test source files. "
++                f"Immediately call the editor tool to create {target} with a straightforward correct solution first; "
++                "optimize afterwards. Do not reply with text only."
++            ),
++            (
++                "Final attempt: no source file has been written yet. "
++                f"Immediately call the editor tool to create {target} with a straightforward correct solution first; "
++                "optimize afterwards. Do not reply with text only. "
++                f"If {target} does not exist, you must create it now."
++            ),
++        ]
++
++        max_attempts = 3
++        for attempt in range(max_attempts):
+             if self._has_source_edit():
+                 break
+-            safe_log(f"No source edits detected; retry attempt {attempt + 1}/3")
+-            if attempt == 2:
+-                retry_msg_final = retry_msg + (
+-                    " If the task names an output file (e.g. solution.py) and it does not exist, "
+-                    "you must create it."
++            safe_log(f"No source edits detected; retry attempt {attempt + 1}/{max_attempts}")
++            retry_msg = retry_templates[attempt]
++            try:
++                sanitized = self._sanitize_history(msg_history)
++                if sanitized:
++                    safe_log(f"Retrying within existing conversation ({len(sanitized)} messages)")
++                    msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=sanitized, logging=safe_log)
++                else:
++                    safe_log("Conversation history empty after sanitizing; starting fresh conversation")
++                    msg_history = chat_with_agent(
++                        f"{instruction}\n\n{retry_msg}",
++                        model=self.code_model,
++                        msg_history=[],
++                        logging=safe_log,
++                    )
++            except Exception as e:
++                safe_log(f"Exception during retry attempt {attempt + 1}/{max_attempts}: {e}", level=logging.ERROR)
++                msg_history = []
++
++        if not self._has_source_edit():
++            safe_log("Still no source edit after retries; running final code-block fallback")
++            try:
++                fallback_msg = (
++                    "Output ONLY the complete Python 3 program for the task in a single ```python code block, nothing else. "
++                    "Make it a simple correct solution that reads from standard input and writes to standard output."
+                 )
+-            else:
+-                retry_msg_final = retry_msg
+-            if msg_history:
+-                msg_history = chat_with_agent(retry_msg_final, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            else:
+-                msg_history = chat_with_agent(
+-                    f"{instruction}\n\n{retry_msg_final}",
++                fallback_history = chat_with_agent(
++                    f"{instruction}\n\n{fallback_msg}",
+                     model=self.code_model,
+                     msg_history=[],
+                     logging=safe_log,
+                 )
++                text = self._last_assistant_text(fallback_history)
++                match = re.search(r'```(?:python|py)?[ \t]*\n(.*?)```', text, re.DOTALL)
++                if match and match.group(1).strip():
++                    code = match.group(1)
++                    out_path = os.path.join(self.git_tempdir, target)
++                    out_dir = os.path.dirname(out_path)
++                    if out_dir:
++                        os.makedirs(out_dir, exist_ok=True)
++                    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
++                        with open(out_path, 'w') as f:
++                            f.write(code)
++                        safe_log(f"Fallback wrote code block to {out_path}")
++                    else:
++                        safe_log(f"Fallback skipped: {out_path} already exists and is non-empty")
++                else:
++                    safe_log("Fallback failed: no fenced code block found in response", level=logging.WARNING)
++            except Exception as e:
++                safe_log(f"Exception during fallback: {e}", level=logging.ERROR)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

@@ -1,0 +1,213 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 413ff8f..d8cd8a2 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -165,10 +165,103 @@ class AgenticSystem:
+                     return True
+         return False
+ 
++    def _find_target_file(self):
++        """
++        Returns the primary solution file in the repo: solution.py if present,
++        otherwise the first non-test .py file in the repo root, or None.
++        """
++        solution = os.path.join(self.git_tempdir, 'solution.py')
++        if os.path.isfile(solution):
++            return solution
++        try:
++            names = sorted(os.listdir(self.git_tempdir))
++        except OSError:
++            return None
++        for name in names:
++            path = os.path.join(self.git_tempdir, name)
++            if name.endswith('.py') and os.path.isfile(path) and not self._is_test_file(name):
++                return path
++        return None
++
++    @staticmethod
++    def _extract_text(msg):
++        """
++        Returns the concatenated text of a message (dict or object form), or ''.
++        """
++        content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++        if isinstance(content, str):
++            return content
++        if not isinstance(content, list):
++            return ''
++        parts = []
++        for block in content:
++            if isinstance(block, dict):
++                if block.get('type') == 'text' and block.get('text'):
++                    parts.append(block['text'])
++            elif getattr(block, 'type', None) == 'text' and getattr(block, 'text', None):
++                parts.append(block.text)
++        return ''.join(parts)
++
++    @staticmethod
++    def _has_tool_use(msg):
++        content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++        if not isinstance(content, list):
++            return False
++        for block in content:
++            btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++            if btype in ('tool_use', 'function_call'):
++                return True
++        return False
++
++    def _is_empty_response(self, msg_history):
++        """
++        True if the last assistant message has no tool-use blocks and near-empty text.
++        """
++        last = None
++        for msg in msg_history or []:
++            role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++            if role == 'assistant':
++                last = msg
++        if last is None:
++            empty = True
++        else:
++            empty = (not self._has_tool_use(last)) and len(self._extract_text(last).strip()) < 20
++        safe_log(f"[forward] Empty response check: {empty}")
++        return empty
++
++    def _has_real_progress(self, msg_history):
++        """
++        True if the history contains at least one tool call and some non-empty assistant text.
++        """
++        has_tool = any(self._has_tool_use(m) for m in msg_history or [])
++        has_text = any(len(self._extract_text(m).strip()) >= 20 for m in msg_history or [])
++        return has_tool and has_text
++
++    def _run_chat(self, msg, msg_history):
++        result = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        if not isinstance(result, list):
++            safe_log("[forward] chat_with_agent did not return a history list; using empty history.")
++            return []
++        return result
++
++    def _check_compile(self, target):
++        """
++        Runs py_compile on target; returns the raw stderr on failure, else None.
++        """
++        result = subprocess.run(
++            ["python", "-m", "py_compile", target],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
++        )
++        if result.returncode != 0:
++            return result.stderr
++        return None
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+         """
++        target = self._find_target_file()
++        target_desc = target if target else os.path.join(self.git_tempdir, 'solution.py')
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -179,6 +272,8 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         instruction = f"""{task}
+ 
++The primary solution file is {target_desc}; you must edit it.
++
+ Please analyze the problem description carefully. Then make edits to the code files to complete the instruction.
+ 
+ Follow this workflow:
+@@ -190,12 +285,16 @@ Follow this workflow:
+ 
+ HARD RULE: You MUST use the editor/bash tools to write your code to disk. Do not finish your turn with only a plan or explanation. Your work is only counted if files in the repo are changed. The primary solution file must be modified (not only test files)."""
+ 
+-        msg_history = []
+         safe_log("[forward] Starting initial attempt.")
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not isinstance(msg_history, list):
+-            safe_log("[forward] chat_with_agent did not return a history list; falling back to empty history.")
+-            msg_history = []
++        msg_history = self._run_chat(instruction, [])
++        self._is_empty_response(msg_history)
++
++        escalated = (
++            f"{task}\n"
++            f"Your first action MUST be a call to the editor tool that writes a complete solution to {target_desc}. "
++            "Write a first draft now even if unsure; refine it after running samples.\n"
++            "Follow up by running the program on the sample inputs with bash, and fix any mismatches with the editor tool."
++        )
+ 
+         for attempt in range(3):
+             diff = self._get_diff()
+@@ -203,29 +302,62 @@ HARD RULE: You MUST use the editor/bash tools to write your code to disk. Do not
+                 safe_log(f"[forward] Source edits detected after {attempt} retries.")
+                 break
+             state = "the diff only changed test files" if (diff and str(diff).strip()) else "the diff is empty"
+-            safe_log(f"[forward] No source edits found ({state}); retry {attempt + 1}/3.")
+-            reminder = (
+-                f"Your previous response did not modify any source files ({state}). "
+-                "Do not describe a plan. Use the editor tool right now to create or edit the primary solution file "
+-                "that solves the problem, then run it with bash on the sample inputs."
++            safe_log(f"[forward] No source edits found ({state}); retry {attempt + 1}/3 with a fresh conversation.")
++            # Keep old history only if it had real tool activity and progress.
++            if not self._has_real_progress(msg_history):
++                retry_history = []
++            else:
++                retry_history = msg_history
++            msg_history = self._run_chat(escalated, retry_history if retry_history else [])
++
++        if not self._has_source_edits(self._get_diff()):
++            safe_log("[forward] Still no source edits; requesting a raw program from the model.")
++            raw_msg = (
++                "Reply with ONLY the full Python program in a ```python block. "
++                "Do not use any tools. The program must read stdin and write stdout, solving: "
++                f"{self.problem_statement}"
+             )
+-            msg_history = chat_with_agent(reminder, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            if not isinstance(msg_history, list):
+-                safe_log("[forward] chat_with_agent did not return a history list; falling back to empty history.")
+-                msg_history = []
++            raw_history = self._run_chat(raw_msg, [])
++            code_text = self._extract_text(raw_history[-1]) if raw_history else ''
++            blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", code_text, re.DOTALL)
++            if not blocks:
++                # Fall back to scanning all assistant messages for a code block.
++                for m in reversed(raw_history):
++                    role = m.get('role') if isinstance(m, dict) else getattr(m, 'role', None)
++                    if role == 'assistant':
++                        blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", self._extract_text(m), re.DOTALL)
++                        if blocks:
++                            break
++            if blocks:
++                write_path = target if target else os.path.join(self.git_tempdir, 'solution.py')
++                with open(write_path, 'w') as f:
++                    f.write(blocks[-1])
++                safe_log(f"[forward] Wrote fallback program to {write_path}.")
++                target = write_path
++            else:
++                safe_log("[forward] Fallback produced no code block.")
+ 
+         has_source = self._has_source_edits(self._get_diff())
+ 
+         if has_source:
++            if target:
++                compile_err = self._check_compile(target)
++                if compile_err:
++                    safe_log("[forward] py_compile failed; sending raw stderr to agent.")
++                    msg_history = self._run_chat(
++                        f"Running `python -m py_compile {target}` failed with this stderr:\n{compile_err}\n"
++                        "Fix the file with the editor tool.",
++                        msg_history,
++                    )
+             safe_log("[forward] Running final verification pass.")
+             verify_msg = (
+                 "Run the program on the sample inputs from the problem statement using bash. "
+                 "If the output does not match the expected output, fix the source file with the editor tool "
+                 "and re-run until all samples match."
+             )
+-            msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            msg_history = self._run_chat(verify_msg, msg_history)
+         else:
+-            safe_log("[forward] No source edits after retries; giving up.")
++            safe_log("[forward] No source edits after retries and fallback; giving up.")
+ 
+ 
+ def main():

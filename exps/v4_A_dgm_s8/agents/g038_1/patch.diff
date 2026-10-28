@@ -1,0 +1,196 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 906b78b..8655375 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -175,6 +175,107 @@ class AgenticSystem:
+             return True
+         return False
+ 
++    def _sanitize_history(self, msg_history):
++        """
++        Remove trailing assistant messages that carry no content: every block is a text
++        block with empty/whitespace text and there are no tool_use blocks.
++        Returns a new list; None or non-list input yields [].
++        """
++        if not isinstance(msg_history, list):
++            return []
++        history = list(msg_history)
++        while history:
++            last = history[-1]
++            if not isinstance(last, dict) or last.get('role') != 'assistant':
++                break
++            content = last.get('content')
++            if isinstance(content, str):
++                empty = content.strip() == ''
++            elif isinstance(content, list):
++                empty = True
++                for block in content:
++                    if not isinstance(block, dict) or block.get('type') == 'tool_use':
++                        empty = False
++                        break
++                    if block.get('type') != 'text' or (block.get('text') or '').strip() != '':
++                        empty = False
++                        break
++            else:
++                empty = content is None
++            if not empty:
++                break
++            history.pop()
++        return history
++
++    def _candidate_targets(self, files):
++        """
++        Order non-test files so that likely target files (solution.* / main.*) come first.
++        """
++        def rank(path):
++            base = path.replace('\\', '/').split('/')[-1].lower()
++            if base.startswith('solution.') or base == 'solution':
++                return 0
++            if base.startswith('main.') or base == 'main':
++                return 1
++            return 2
++        candidates = [f for f in files if not self._is_test_file(f)]
++        return sorted(candidates, key=rank)
++
++    def _target_file(self):
++        """
++        Pick the most likely target file among tracked non-test files (solution.* / main.* first).
++        """
++        try:
++            result = subprocess.run(
++                ["git", "-C", self.git_tempdir, "ls-files"],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++            )
++            tracked = [f for f in result.stdout.decode(errors='replace').splitlines() if f]
++        except Exception:
++            tracked = []
++        candidates = self._candidate_targets(tracked)
++        return candidates[0] if candidates else 'the solution source file'
++
++    def _repo_context(self, max_files=5, max_bytes=5 * 1024):
++        """
++        Build a string with the tracked (non-test) file listing and the contents of a few small,
++        likely-target files, so the model can see the stub it has to edit.
++        """
++        try:
++            result = subprocess.run(
++                ["git", "-C", self.git_tempdir, "ls-files"],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++            )
++            tracked = result.stdout.decode(errors='replace').splitlines()
++        except Exception as e:
++            safe_log(f"[repo_context] git ls-files failed: {e}")
++            tracked = []
++        non_test = [f for f in tracked if f and not self._is_test_file(f)]
++
++        sections = []
++        shown = 0
++        for rel in self._candidate_targets(non_test):
++            if shown >= max_files:
++                break
++            path = os.path.join(self.git_tempdir, rel)
++            try:
++                if not os.path.isfile(path) or os.path.getsize(path) > max_bytes:
++                    continue
++                with open(path, 'r', errors='replace') as f:
++                    content = f.read()
++            except Exception as e:
++                safe_log(f"[repo_context] failed to read {rel}: {e}")
++                continue
++            sections.append(f"--- {rel} ---\n{content}")
++            shown += 1
++
++        listing = '\n'.join(non_test) if non_test else '(no tracked non-test files)'
++        contents = '\n\n'.join(sections) if sections else '(no small source files to display)'
++        return (
++            f"# Repository files (tracked, non-test)\n{listing}\n\n"
++            f"# Contents of likely target files\n{contents}\n"
++        )
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -196,8 +297,14 @@ Follow this workflow:
+ 4. Run the final solution against all sample inputs in the problem statement and compare with the expected outputs. If anything mismatches, fix the source file and re-run.
+ 5. Optionally stress test the solution against a brute-force implementation on small random inputs.
+ 6. Finish only when the repository's source file has been modified. Ending the turn without having modified the target source file is a failure. Do not end with an empty message; finish with a brief summary of the changes you made.
+-"""
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++{self._repo_context()}"""
++        msg_history = []
++        try:
++            msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"[initial] chat_with_agent failed: {e!r}", level=logging.ERROR)
++            msg_history = []
+ 
+         for attempt in range(MAX_RETRIES):
+             diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+@@ -218,27 +325,48 @@ Follow this workflow:
+                 )
+             safe_log(f"[retry {attempt + 1}/{MAX_RETRIES}] Patch check failed: {reason}. {detail}")
+ 
+-            corrective_msg = f"""Patch check failed: {reason}.
+-{detail}
++            target = self._target_file()
++
++            try:
++                if attempt == 0:
++                    msg_history = self._sanitize_history(msg_history)
++                    corrective_msg = (
++                        f"You have not modified any source file ({reason}). "
++                        f"Call the editor tool now (command=edit) on {target} with the complete solution. "
++                        "Do not reply with text only; make the tool call."
++                    )
++                    msg_history = chat_with_agent(
++                        corrective_msg,
++                        model=self.code_model,
++                        msg_history=msg_history,
++                        logging=safe_log,
++                    )
++                else:
++                    fresh_msg = f"""{task}
++Important: no source file has been modified yet. Immediately use the editor tool to write the full solution into {target}, then run the sample tests from the problem statement and fix any mismatch. Do not reply with text only before editing.
++
++{self._repo_context()}"""
++                    msg_history = chat_with_agent(
++                        fresh_msg,
++                        model=self.code_model,
++                        msg_history=[],
++                        logging=safe_log,
++                    )
++            except Exception as e:
++                safe_log(f"[retry {attempt + 1}/{MAX_RETRIES}] chat_with_agent failed: {e!r}", level=logging.ERROR)
+ 
+-Scratch files in /tmp or other locations outside the repository do not count as a solution.
+-Now, implement the solution in the appropriate source file in {self.git_tempdir} using the editor tool, then test it against the sample inputs from the problem statement and fix any mismatch. Do not end your turn until the source file has been modified.
+-
+-Current repo diff for reference:
+-{diff if diff.strip() else '(empty)'}
+-"""
+-            msg_history = chat_with_agent(
+-                corrective_msg,
+-                model=self.code_model,
+-                msg_history=msg_history,
+-                logging=safe_log,
++            diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            changed_files = self._changed_files(diff)
++            has_source = any(not self._is_test_file(f) for f in changed_files)
++            safe_log(
++                f"[retry {attempt + 1}/{MAX_RETRIES}] changed files: {changed_files}; "
++                f"non-test source modified: {has_source}"
+             )
+ 
+-        else:
+-            # Loop completed without a source change; log final state.
+-            diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-            if not any(not self._is_test_file(f) for f in self._changed_files(diff)):
+-                safe_log(f"[retry] Still no non-test source changes after {MAX_RETRIES} retries.")
++        # Final state check.
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        if not any(not self._is_test_file(f) for f in self._changed_files(diff)):
++            safe_log(f"[retry] Still no non-test source changes after {MAX_RETRIES} retries.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

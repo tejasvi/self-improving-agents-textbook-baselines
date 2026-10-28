@@ -1,0 +1,256 @@
+import argparse
+import subprocess
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import threading
+
+from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+
+# reset_to_commit(git_dname, commit)
+# apply_patch(git_dname, patch_str)
+
+# TEST COMMANDS for different languages
+# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+NPM_TEST_COMMANDS = [
+    ["sh", "-c", "set -e"],
+    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+    ["npm", "run", "test"]
+]
+
+CPP_TEST_COMMANDS = [
+    ["sh", "-c", "set -e"],
+    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+    ["sh", "-c", "cd build"],
+    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+    ["make"],
+    ["sh", "-c", "cd ../"]
+]
+
+TEST_COMMANDS = {
+    "python": [["pytest", "-rA", "--tb=long"]],
+    "rust": [["cargo", "test", "--", "--include-ignored"]],
+    "go": [["go", "test", "./..."]],
+    "javascript": NPM_TEST_COMMANDS,
+    "cpp": CPP_TEST_COMMANDS,
+    "java": [["./gradlew", "test"]],
+}
+
+# Thread-local storage for logger instances
+thread_local = threading.local()
+
+def get_thread_logger():
+    """
+    Get the logger instance specific to the current thread.
+    Returns None if no logger has been set for this thread.
+    """
+    return getattr(thread_local, 'logger', None)
+
+def set_thread_logger(logger):
+    """
+    Set the logger instance for the current thread.
+    """
+    thread_local.logger = logger
+
+def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+    """
+    Set up a logger with both file and console handlers.
+    """
+    # Create logger with a unique name based on thread ID
+    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+    logger.setLevel(level)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers = []
+    
+    # Create formatters
+    file_formatter = logging.Formatter('%(message)s')
+    
+    # Create and set up file handler
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+    file_handler.setLevel(level)
+    file_handler.setFormatter(file_formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    
+    # Store logger in thread-local storage
+    set_thread_logger(logger)
+    
+    return logger
+
+def safe_log(message, level=logging.INFO):
+    """
+    Thread-safe logging function that ensures messages go to the correct logger.
+    """
+    logger = get_thread_logger()
+    if logger:
+        logger.log(level, message)
+    else:
+        print(f"Warning: No logger found for thread {threading.get_ident()}")
+
+class AgenticSystem:
+    def __init__(
+            self,
+            problem_statement,
+            git_tempdir,
+            base_commit,
+            chat_history_file='./chat_history.md',
+            test_description=None,
+            self_improve=False,
+            language='python'
+        ):
+        self.problem_statement = problem_statement
+        self.git_tempdir = git_tempdir
+        self.base_commit = base_commit
+        self.chat_history_file = chat_history_file
+        self.test_description = test_description
+        self.self_improve = self_improve
+        self.language = language
+
+        # Set the code model based on whether self-improvement is enabled
+        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+
+        # Initialize logger and store it in thread-local storage
+        self.logger = setup_logger(chat_history_file)
+        
+        # Clear the log file
+        with open(chat_history_file, 'w') as f:
+            f.write('')
+
+    def get_current_edits(self):
+        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+        new_msg_history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"# Current Repo Edits\n{diff}",
+                    }
+                ],
+            }
+        ]
+        return new_msg_history
+
+    def _changed_files(self):
+        """Return a list of file paths that have changed since ``base_commit``.
+
+        This includes tracked modifications (via ``git diff --name-only``) and
+        untracked files (via ``git ls-files --others --exclude-standard``).
+        """
+        # Tracked changes
+        diff_cmd = ["git", "-C", self.git_tempdir, "diff", "--name-only", self.base_commit]
+        diff_res = subprocess.run(diff_cmd, capture_output=True, text=True)
+        changed = []
+        if diff_res.returncode == 0:
+            changed.extend([line.strip() for line in diff_res.stdout.splitlines() if line.strip()])
+        # Untracked files
+        ls_cmd = ["git", "-C", self.git_tempdir, "ls-files", "--others", "--exclude-standard"]
+        ls_res = subprocess.run(ls_cmd, capture_output=True, text=True)
+        if ls_res.returncode == 0:
+            changed.extend([line.strip() for line in ls_res.stdout.splitlines() if line.strip()])
+        return changed
+
+    def _has_source_edit(self):
+        """Return True if any non-test source file has been edited and is non‑empty.
+
+        Files whose basename or any path segment matches ``test``, ``tests``,
+        ``spec``, ``conftest`` (case‑insensitive) are considered test files and
+        are ignored.
+        """
+        for path in self._changed_files():
+            # Normalize path components for case‑insensitive comparison
+            parts = [p.lower() for p in path.split(os.sep)]
+            if any(p in {"test", "tests", "spec", "conftest"} for p in parts):
+                continue
+            full_path = os.path.join(self.git_tempdir, path)
+            if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+                return True
+        return False
+
+    def forward(self):
+        """
+        The forward function for the AgenticSystem.
+        """
+        # Build a detailed instruction that enforces a phased workflow.
+        # The agent must:
+        #   1. Analyze the problem constraints and explicitly state the chosen algorithm and its time/space complexity.
+        #   2. Implement the solution respecting those constraints.
+        #   3. Write a brute‑force reference solution (e.g., brute.py) and a small random input generator (e.g., gen.py) in /tmp (or any non‑repo location) – these files should not be committed to the repository.
+        #   4. If the problem has multiple valid outputs, also provide a checker script (e.g., check.py) that verifies a solution's output against the brute output.
+        #   5. Run a stress test using the new `stress_test` tool, which executes the generator, solution, and brute (or checker) for many random cases.
+        #   6. Generate a maximum‑size test case and time the solution with `timeout <seconds> python3 solution.py < input` using file redirection (avoid heredocs).
+        #   7. The agent must not finish until the stress test reports all cases passing and the maximum‑size timing test stays within the allowed time limit.
+        #   8. Throughout, the agent should use file redirection (`< input_file`) rather than heredocs, as heredocs caused hangs previously.
+        #   9. All raw tool outputs (including failures) should be returned to the agent for analysis; do not attempt to parse them within the tool.
+        #
+        # The following task description is provided to the LLM.
+        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+
+<problem_description>
+{self.problem_statement}
+</problem_description>
+
+Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+
+Please follow the phased workflow described above: first state the constraints and chosen algorithmic complexity, then implement the solution, then create the necessary brute‑force, generator, and optional checker scripts (outside the repo, e.g., in /tmp), run the `stress_test` tool to validate correctness on many random cases, and finally run a timed max‑size test using `timeout` and file redirection. Only finish when all tests pass.
+
+Never end your turn without having edited the source file; an empty response is not acceptable.
+"""
+        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+        # Initial interaction
+        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+
+        # Retry up to three times if no source edit detected
+        for attempt in range(3):
+            if self._has_source_edit():
+                break
+            changed = self._changed_files()
+            changed_repr = "\n".join(changed) if changed else "(none)"
+            corrective = f"No source‑code edit detected after attempt {attempt + 1}. Changed files so far:\n{changed_repr}\nPlease use the editor tool now to edit a non‑test source file and continue the workflow."
+            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
+
+        # Final fallback if still no edit
+        if not self._has_source_edit():
+            final_msg = "Please provide a minimal best‑effort implementation for the main solution file in the repository using the editor tool."
+            chat_with_agent(final_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+
+def main():
+    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+    args = parser.parse_args()
+
+    # Process the repository
+    agentic_system = AgenticSystem(
+        problem_statement=args.problem_statement,
+        git_tempdir=args.git_dir,
+        base_commit=args.base_commit,
+        chat_history_file=args.chat_history_file,
+        test_description=args.test_description,
+        self_improve=args.self_improve,
+        language=args.language,
+    )
+
+    # Run the agentic system to try to solve the problem
+    agentic_system.forward()
+
+    # Get code diff and save to model_patch.diff
+    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+    with open(model_patch_outfile, 'w') as f:
+        f.write(model_patch)
+
+if __name__ == "__main__":
+    main()

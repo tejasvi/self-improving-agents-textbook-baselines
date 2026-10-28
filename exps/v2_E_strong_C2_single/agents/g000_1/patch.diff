@@ -1,0 +1,286 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..63b99b4 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,10 +3,20 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import glob
++import shlex
++import subprocess
++import tempfile
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.stress_test import run_stress_test
++
++MAX_REPAIR_ATTEMPTS = 4      # bounded verification/repair rounds after the first pass
++SAMPLE_TIMEOUT = 10          # seconds per sample run
++STRESS_ITERATIONS = 200      # random seeds per stress round
++MAX_SHOWN_CHARS = 4000       # clip very long raw texts in follow-up prompts
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -115,6 +125,10 @@ class AgenticSystem:
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+ 
++        # Samples, brute.py and gen.py live outside the repo so they do not pollute the diff
++        self.aux_dir = tempfile.mkdtemp(prefix='agent_aux_')
++        os.makedirs(os.path.join(self.aux_dir, 'samples'), exist_ok=True)
++
+         # Initialize logger and store it in thread-local storage
+         self.logger = setup_logger(chat_history_file)
+         
+@@ -137,6 +151,110 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def run_samples(self):
++        """
++        Run `python3 solution.py` in git_tempdir on every samples/NAME.in and compare with
++        samples/NAME.out. Returns a list of raw failure records (no error parsing); empty list
++        means every sample passed.
++        """
++        failures = []
++        samples_dir = os.path.join(self.aux_dir, 'samples')
++        for in_path in sorted(glob.glob(os.path.join(samples_dir, '*.in'))):
++            out_path = in_path[:-len('.in')] + '.out'
++            name = os.path.basename(in_path)[:-len('.in')]
++            with open(in_path) as f:
++                sample_input = f.read()
++            expected = open(out_path).read() if os.path.exists(out_path) else ''
++            try:
++                p = subprocess.run(
++                    ['python3', 'solution.py'],
++                    input=sample_input,
++                    capture_output=True,
++                    text=True,
++                    timeout=SAMPLE_TIMEOUT,
++                    cwd=self.git_tempdir,
++                )
++                got, stderr, rc = p.stdout, p.stderr, p.returncode
++            except subprocess.TimeoutExpired as e:
++                got = e.stdout.decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
++                stderr = f"Timeout: solution.py did not finish within {SAMPLE_TIMEOUT} seconds."
++                rc = 'timeout'
++            if rc == 0 and [l.rstrip() for l in got.strip().splitlines()] == [l.rstrip() for l in expected.strip().splitlines()]:
++                continue
++            failures.append({
++                'sample': name,
++                'input': sample_input,
++                'expected': expected,
++                'got': got,
++                'stderr': stderr,
++                'returncode': rc,
++            })
++        return failures
++
++    def run_stress(self):
++        """Run brute.py vs solution.py on random seeds. Returns the raw first mismatch or None."""
++        brute = os.path.join(self.aux_dir, 'brute.py')
++        gen = os.path.join(self.aux_dir, 'gen.py')
++        if not (os.path.exists(brute) and os.path.exists(gen)):
++            return None
++        return run_stress_test(
++            solution_cmd=f"python3 {shlex.quote(os.path.join(self.git_tempdir, 'solution.py'))}",
++            brute_cmd=f"python3 {shlex.quote(brute)}",
++            gen_cmd=f"python3 {shlex.quote(gen)}",
++            iterations=STRESS_ITERATIONS,
++            cwd=self.git_tempdir,
++        )
++
++    @staticmethod
++    def _clip(text):
++        text = '' if text is None else str(text)
++        if len(text) <= MAX_SHOWN_CHARS:
++            return text
++        return text[:MAX_SHOWN_CHARS // 2] + f"\n... <{len(text) - MAX_SHOWN_CHARS} characters clipped> ...\n" + text[-MAX_SHOWN_CHARS // 2:]
++
++    def _format_sample_failures(self, failures):
++        blocks = []
++        for f in failures:
++            blocks.append(
++                f"--- sample {f['sample']} ---\n"
++                f"input:\n{self._clip(f['input'])}\n"
++                f"expected output:\n{self._clip(f['expected'])}\n"
++                f"actual output:\n{self._clip(f['got'])}\n"
++                f"stderr:\n{self._clip(f['stderr'])}\n"
++                f"return code: {f['returncode']}"
++            )
++        return "\n\n".join(blocks)
++
++    def _format_stress_failure(self, result):
++        return "\n".join(f"{k}:\n{self._clip(v)}" for k, v in result.items())
++
++    def _debug_protocol(self):
++        return f"""Debugging protocol (follow it, do NOT just rewrite the same idea):
++1. Do not rewrite from scratch with the same algorithm. First identify what is wrong with the current approach.
++2. Find the smallest failing input: use the brute force ({self.aux_dir}/brute.py) and the generator ({self.aux_dir}/gen.py) to search for small failing cases, or shrink the failing sample by hand.
++3. Print intermediate states (e.g. DP tables, key variables per step) from BOTH the brute force and solution.py on that small input, and find the first step where they diverge.
++4. State the faulty transition or assumption in one or two sentences.
++5. Fix that transition in solution.py.
++6. Rerun every sample in {self.aux_dir}/samples/ (`python3 solution.py < samples/NAME.in` and compare with NAME.out) and rerun the stress test against brute.py with at least 200 random seeds."""
++
++    def _nudge_needed(self, msg_history):
++        """True if the last assistant message is empty or looks cut off."""
++        if not msg_history:
++            return True
++        last = msg_history[-1]
++        if last.get('role') != 'assistant':
++            return True
++        content = last.get('content')
++        if isinstance(content, str):
++            text = content
++        else:
++            text = ''.join(b.get('text') or '' for b in (content or []) if isinstance(b, dict))
++        text = text.strip()
++        if not text or text == '(no output)':
++            return True
++        # Unbalanced code fence suggests a truncated reply.
++        return text.count('```') % 2 == 1
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -149,15 +267,40 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
++        method = f"""Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++2. Save every sample input and expected output from the statement as files {self.aux_dir}/samples/NAME.in and {self.aux_dir}/samples/NAME.out (e.g. 1.in/1.out, 2.in/2.out). Do NOT put these files inside {self.git_tempdir}.
++3. Write the solution in {self.git_tempdir}/solution.py with the editor tool.
++4. Run it on every sample and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < {self.aux_dir}/samples/1.in`; for a `Solution` class method write a small driver script (outside the repo) that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++5. Write a brute-force reference at {self.aux_dir}/brute.py and a random small-input generator at {self.aux_dir}/gen.py (gen.py takes an integer seed as its last argument and prints one test input). Then run a stress test of a few hundred cases comparing solution.py with brute.py. Fix every mismatch. The `stress_test` tool can do this.
++6. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
++7. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++        for attempt in range(MAX_REPAIR_ATTEMPTS):
++            failures = self.run_samples()
++            if failures:
++                follow_up = (
++                    f"Verification round {attempt + 1}: solution.py FAILS {len(failures)} sample(s). "
++                    "Raw results of running `python3 solution.py` on each sample:\n\n"
++                    f"{self._format_sample_failures(failures)}\n\n"
++                    f"{self._debug_protocol()}\n\n"
++                    "Do not stop until every sample passes."
++                )
++            else:
++                stress_failure = self.run_stress()
++                if stress_failure is None:
++                    break
++                follow_up = (
++                    f"Verification round {attempt + 1}: all samples pass, but the stress test FAILS against brute.py. "
++                    "First mismatching random input and outputs:\n\n"
++                    f"{self._format_stress_failure(stress_failure)}\n\n"
++                    f"{self._debug_protocol()}"
++                )
++            if self._nudge_needed(msg_history):
++                follow_up = "continue\n\n" + follow_up
++            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..b71e052
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,85 @@
++import os
++import shlex
++import subprocess
++
++STRESS_TIMEOUT = 10
++MAX_ITERATIONS = 1000
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Run a random stress test comparing a solution against a brute-force reference.\n
++* For seed = 1..iterations it runs `gen_cmd SEED` (the seed is appended as the last argument) to get one test input (printed to stdout), then runs `brute_cmd` and `solution_cmd` on that input (via stdin).\n
++* Returns the first mismatching input together with the expected (brute force) and actual (solution) outputs, plus stderr and exit code. Returns a success message if all tests match.\n
++* Commands are split with shell-style quoting but NOT run through a shell; use absolute paths for scripts, e.g. `python3 /abs/path/brute.py`.\n
++* Each command is run with a 10 second timeout.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {"type": "string", "description": "Command that runs the solution; it reads the test input from stdin, e.g. `python3 /abs/path/solution.py`."},
++                "brute_cmd": {"type": "string", "description": "Command that runs the brute-force reference; it reads the test input from stdin, e.g. `python3 /abs/path/brute.py`."},
++                "gen_cmd": {"type": "string", "description": "Command that prints one random test input to stdout; the integer seed is passed as the last argument, e.g. `python3 /abs/path/gen.py`."},
++                "iterations": {"type": "integer", "description": "Number of random seeds to test (1 to 1000)."}
++            },
++            "required": ["solution_cmd", "brute_cmd", "gen_cmd", "iterations"]
++        }
++    }
++
++
++def _as_text(x):
++    if x is None:
++        return ''
++    if isinstance(x, bytes):
++        return x.decode(errors='replace')
++    return x
++
++
++def _run(args, stdin_text, cwd, timeout=STRESS_TIMEOUT):
++    """Returns (returncode, stdout, stderr). returncode is the string 'timeout' on timeout."""
++    try:
++        p = subprocess.run(args, input=stdin_text, capture_output=True, text=True,
++                           timeout=timeout, cwd=cwd, errors='replace')
++        return p.returncode, p.stdout, p.stderr
++    except subprocess.TimeoutExpired as e:
++        return 'timeout', _as_text(e.stdout), _as_text(e.stderr)
++
++
++def _normalize(s):
++    return [line.rstrip() for line in s.strip().splitlines()]
++
++
++def run_stress_test(solution_cmd, brute_cmd, gen_cmd, iterations=200, cwd=None, timeout=STRESS_TIMEOUT):
++    """
++    Returns None if every tested seed matches, otherwise a dict describing the first
++    failure (raw outputs, no parsing of error messages).
++    """
++    cwd = cwd or os.getcwd()
++    iterations = max(1, min(int(iterations), MAX_ITERATIONS))
++    for seed in range(1, iterations + 1):
++        rc, gen_out, gen_err = _run(shlex.split(gen_cmd) + [str(seed)], None, cwd, timeout)
++        if rc != 0:
++            return {'seed': seed, 'error': 'generator failed', 'stderr': gen_err, 'returncode': rc}
++        test_input = gen_out
++        b_rc, b_out, b_err = _run(shlex.split(brute_cmd), test_input, cwd, timeout)
++        if b_rc != 0:
++            return {'seed': seed, 'error': 'brute force failed', 'input': test_input,
++                    'stderr': b_err, 'returncode': b_rc}
++        s_rc, s_out, s_err = _run(shlex.split(solution_cmd), test_input, cwd, timeout)
++        if s_rc == 0 and _normalize(s_out) == _normalize(b_out):
++            continue
++        return {'seed': seed, 'input': test_input, 'expected': b_out, 'got': s_out,
++                'stderr': s_err, 'returncode': s_rc}
++    return None
++
++
++def tool_function(solution_cmd, brute_cmd, gen_cmd, iterations):
++    try:
++        iterations = int(iterations)
++    except (TypeError, ValueError):
++        return f"Error: iterations must be an integer, got {iterations!r}."
++    result = run_stress_test(solution_cmd, brute_cmd, gen_cmd, iterations=iterations, cwd=os.getcwd())
++    if result is None:
++        return f"All {max(1, min(iterations, MAX_ITERATIONS))} random tests matched the brute force."
++    lines = [f"{k}: {v}" for k, v in result.items()]
++    return "First failing case:\n" + "\n".join(lines)

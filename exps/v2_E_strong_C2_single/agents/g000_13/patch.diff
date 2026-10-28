@@ -1,0 +1,190 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..46f5121 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,6 @@
+ import argparse
++import re
++import shutil
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -8,6 +10,13 @@ import threading
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++# Phase/loop configuration
++MAX_ATTEMPTS = 3
++SUITE_TIME_THRESHOLD = 1.0   # seconds; max candidate run time considered acceptable
++SUITE_TIMEOUT = 1500         # seconds; hard limit for one run of tests/run_suite.sh
++SUITE_TAIL_CHARS = 3000
++_SUITE_LINE_RE = re.compile(r"PASSED\s+(\d+)/(\d+),\s*max_time=([0-9.]+)")
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -139,7 +148,11 @@ class AgenticSystem:
+ 
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Multi-phase, multi-attempt pipeline:
++          1. Build persistent test infrastructure in tests/.
++          2. Up to MAX_ATTEMPTS solve/test attempts (bounded for-loop), each saved as
++             attempts/solution_{i}.py and scored by running tests/run_suite.sh.
++          3. Copy the best-scoring attempt to solution.py and re-run the suite on it.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -149,15 +162,142 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        # ---------------- Phase 1: test infrastructure ----------------
++        infra_prompt = f"""{task}
++
++Phase 1 of 3: TEST INFRASTRUCTURE. Do NOT write the solution yet. Create the following files inside the tests/ directory (create the directory if needed). Keep them persistent; they will be reused by later phases.
++
++1. tests/validator.py : reads ONE input file (path given as argv[1]) and asserts every input constraint from the problem statement (ranges of N and every other parameter, format, distinctness/sum limits if stated, guarantees). Exit code 0 if valid; otherwise raise/assert with a clear message and exit code 1.
++2. tests/brute.py : an exhaustive, obviously-correct reference solver for TINY inputs (e.g. enumerate all candidates). Reads the input file (argv[1]) and writes its answer to the output file (argv[2]). It must produce a correct answer for every valid tiny input, including the no-answer case.
++3. tests/checker.py : usage `python3 tests/checker.py INPUT_FILE OUTPUT_FILE [REFERENCE_OUTPUT_FILE]`. It must NOT compare output text exactly: it accepts ANY valid answer (problems may have multiple correct answers, so verify certificates / constructed objects against the constraints). It prints a short message and exits with code 0 if the output is valid, and exits with code 1 (printing the reason) otherwise. When the problem has a unique yes/no or optimal value, it also checks the output against the expected value (e.g. the brute force answer) if one is given. Verify certificates by actually checking them, never by eye.
++4. tests/gen.py : usage `python3 tests/gen.py MODE SEED` that prints ONE valid input to stdout, deterministically from SEED. Required modes (implement all, each must generate VALID inputs that pass validator.py):
++   - tiny: small random cases (N tiny, values small), suitable for brute.py
++   - dup: heavy duplicates / small value range
++   - equal: all elements equal
++   - sorted: sorted ascending and descending / already structured
++   - boundary: N and every other parameter at their minimum and maximum allowed values
++   - planted: a random instance with a unique planted answer
++   - noanswer: a valid instance where the answer does not exist (if the problem has such a case)
++   - maxadv: max-size adversarial instance (N at its maximum, values chosen to stress the worst case of naive algorithms)
++   - mid: mid-size random instances (N around 100-1000) for differential testing against a slower reference
++   Add any further modes that cover tricky structures of this problem.
++5. Self-check: run tests/validator.py on every sample input from the problem statement, and confirm they pass (if a sample violates your validator, fix the validator). Then run gen.py in every mode for a few seeds and confirm validator.py accepts all outputs. Also run tests/validator.py with a deliberately invalid input to confirm it rejects it.
++
++Write at least one test for each edge-case category: minimum N, maximum N, all equal values, sorted and reversed, duplicates, boundary values, no-answer, and any category specific to this problem. Use python3 for all helper scripts.
++
++Finish with a short summary of the files you created and the commands to run them."""
++        infra_log = chat_with_agent(infra_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        infra_summary = _final_text(infra_log)
++
++        # ---------------- Phase 2/3: bounded solve/test attempts ----------------
++        attempt_summaries = []   # raw-output summaries of earlier attempts (strings)
++        candidates = []          # (passed, total, max_time, attempt_index)
++        best_key = None
++        best_idx = None
++        for attempt in range(MAX_ATTEMPTS):
++            prev_block = "\n\n".join(attempt_summaries) if attempt_summaries else "(none; this is the first attempt)"
++            solve_prompt = f"""{task}
++
++Phase 2 of 3: SOLVE AND TEST. Attempt {attempt + 1} of {MAX_ATTEMPTS}.
++
++The test infrastructure already exists in tests/ (validator.py, brute.py, checker.py, gen.py); summary from the previous phase:
++{infra_summary}
++
++Previous attempts and their results (raw suite output):
++{prev_block}
++
++Steps:
++1. Read the problem and constraints. Choose an algorithm whose complexity fits the limits (Python does roughly 10^7 simple operations per second; aim well under that). If previous attempts failed, FIX the bug or SWITCH to a different approach, and explain briefly what changed.
++2. Write the candidate solution to attempts/solution_{attempt + 1}.py (create the attempts/ directory if needed). For a stdin program it reads stdin and writes stdout. For a `Solution` class method, add the required top-level wrapper so it still runs as a script on stdin, or follow the existing convention in the problem statement.
++3. Also write an independent, simpler reference (tests/ref_slow.py, may be slow, correct for mid-size N) that is written differently from the candidate, so that bugs are unlikely to be shared. Keep it in tests/ and reuse it across attempts.
++4. Run the candidate on every sample in the statement and compare the output exactly with the expected output (or verify with checker.py if multiple answers are valid).
++5. Differential-test: run the candidate against tests/brute.py on many tiny inputs and against tests/ref_slow.py on mid-size inputs, using generators from tests/gen.py across ALL modes and many seeds (at least about 1000 cases in total). Validate every generated input with tests/validator.py before using it. Check every output with tests/checker.py.
++6. Timing: generate max-size inputs (gen.py maxadv mode, and other large modes) and time the candidate. Use conservative time budgets: target under 1 second locally.
++7. Write (or update) tests/run_suite.sh. It takes the candidate path as its first argument ($1), runs all generator modes with many seeds against brute.py (tiny N) and, when available, against ref_slow.py (mid N), validates each input with validator.py, checks outputs with checker.py, and runs timed max-size runs. It must print a final line exactly of the form `PASSED x/y, max_time=t` where x is the number of passing checks, y is the total number of checks, and t is the maximum run time in seconds of the candidate. Make the script self-contained and runnable as `bash tests/run_suite.sh attempts/solution_{attempt + 1}.py` from the repository root.
++8. Run `bash tests/run_suite.sh attempts/solution_{attempt + 1}.py` and fix anything that fails. Do not finish until the suite reports all checks passed with a conservative max_time.
++
++Avoid environment-specific tricks (e.g. relying on specific recursion limits, thread stacks, or machine-specific paths) unless you also provide a fallback. Do not hardcode answers for the samples. Keep all test files in tests/; do not delete them at the end.
++
++Finish with a short summary: the approach used, the final suite line, and any remaining risks."""
++            solve_log = chat_with_agent(solve_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            final_text = _final_text(solve_log)
++
++            passed, total, max_time, tail = _run_suite(self.git_tempdir, f"attempts/solution_{attempt + 1}.py")
++            safe_log(f"[attempt {attempt + 1}] suite: PASSED {passed}/{total}, max_time={max_time}")
++
++            attempt_summaries.append(
++                f"--- Attempt {attempt + 1} (attempts/solution_{attempt + 1}.py) ---\n"
++                f"Agent's final message (truncated):\n{final_text[-1500:]}\n"
++                f"Suite output (tail):\n{tail}"
++            )
++
++            if passed is not None:
++                key = (passed, -max_time)  # more passes first; ties go to lower max_time
++                if best_key is None or key > best_key:
++                    best_key = key
++                    best_idx = attempt + 1
++                candidates.append((passed, total, max_time, attempt + 1))
++                if total and passed == total and max_time is not None and max_time < SUITE_TIME_THRESHOLD:
++                    break  # all checks passed and timing is fine: stop early
++
++        # ---------------- Phase 3: selection and finalization ----------------
++        if best_idx is None:
++            # No attempt produced a parseable score: fall back to the most recent attempt file that exists.
++            for i in range(MAX_ATTEMPTS, 0, -1):
++                if os.path.exists(os.path.join(self.git_tempdir, f"attempts/solution_{i}.py")):
++                    best_idx = i
++                    break
++            safe_log("No attempt produced a parseable suite score; falling back to the latest attempt file.")
++        src = os.path.join(self.git_tempdir, f"attempts/solution_{best_idx}.py")
++        dst = os.path.join(self.git_tempdir, "solution.py")
++        if os.path.exists(src):
++            shutil.copyfile(src, dst)
++            safe_log(f"Selected attempts/solution_{best_idx}.py as solution.py (best of {len(candidates)} scored attempts).")
++        else:
++            safe_log("No attempt file was written; solution.py left as is.")
++        passed, total, max_time, tail = _run_suite(self.git_tempdir, "solution.py")
++        safe_log(f"[final] suite on solution.py: PASSED {passed}/{total}, max_time={max_time}\n{tail}")
++
++
++def _final_text(msg_history):
++    """Return the text of the last assistant message in an agent message history ('' if none)."""
++    for msg in reversed(msg_history or []):
++        if isinstance(msg, dict) and msg.get("role") == "assistant":
++            content = msg.get("content")
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
++                if texts:
++                    return "\n".join(texts)
++    return ""
++
++
++def _run_suite(git_tempdir, candidate_relpath):
++    """
++    Run `bash tests/run_suite.sh <candidate>` in git_tempdir.
++    Returns (passed, total, max_time, tail_of_output). passed/total/max_time are None
++    if the final 'PASSED x/y, max_time=t' line is missing. Only that line is parsed.
++    """
++    try:
++        p = subprocess.run(
++            ["bash", "tests/run_suite.sh", candidate_relpath],
++            cwd=git_tempdir, capture_output=True, text=True, timeout=SUITE_TIMEOUT, errors="replace",
++        )
++        out = (p.stdout or "") + ("\nSTDERR:\n" + p.stderr if p.stderr else "")
++    except subprocess.TimeoutExpired as e:
++        out = (e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")) \
++            + f"\nError: suite timed out after {SUITE_TIMEOUT} seconds."
++    tail = out[-SUITE_TAIL_CHARS:]
++    m = None
++    for line in out.splitlines():
++        found = _SUITE_LINE_RE.search(line)
++        if found:
++            m = found
++    if m is None:
++        return None, None, None, tail
++    return int(m.group(1)), int(m.group(2)), float(m.group(3)), tail
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

@@ -1,0 +1,327 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7a86b9f..7f0803a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -11,6 +11,7 @@ import threading
+ from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools import run_samples
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -347,6 +348,7 @@ IMPORTANT RULES:
+ - If the task names an output file such as solution.py, create it.
+ - Responding with text only and no file edits counts as failure.
+ - Modifying only test files does not solve the task; the primary source file must be changed.
++- Never leave an exponential brute force as the final solution if constraints are large; write brute force to /tmp/stress/brute.py and put the efficient solution in the target file.
+ """
+         target = self._target_file()
+         snapshot = self._snapshot_repo()
+@@ -399,6 +401,7 @@ IMPORTANT RULES:
+             else:
+                 safe_log("All escalation strategies finished without a source patch.")
+ 
++        msg_history = self._enforce_sample_gate(msg_history)
+         self._run_verification(msg_history)
+ 
+         if not self._has_source_patch():
+@@ -452,11 +455,57 @@ The solution at {target_path} passing the sample tests is NOT enough; subtle mod
+ 
+ When everything is done, end your reply with a short report that includes the stress test summary (number of cases, seeds, result) and the timing of the max-size input. If and only if the stress test passed with zero mismatches, include the exact marker line `STRESS TEST PASSED` in that final reply."""
+ 
++    def _run_sample_gate(self, timeout=10.0):
++        """
++        Objective check: run the target file on every sample pair found in the problem statement.
++        Returns (ok, report). ok is False if any sample fails, times out, or no samples were found.
++        """
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        cmd = f"python3 {target_path}"
++        try:
++            report = run_samples.tool_function(
++                solution_cmd=cmd, samples=self.problem_statement or '', timeout=timeout,
++            )
++        except Exception as e:
++            return False, f"Sample gate error: {e!r}"
++        ok = isinstance(report, str) and report.startswith("ALL SAMPLES PASSED")
++        return ok, report
++
++    def _sample_fix_prompt(self, report, round_idx, max_rounds):
++        """Feedback prompt sent when the sample gate fails."""
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        return (
++            f"Sample gate (round {round_idx + 1} of {max_rounds}): the solution fails or times out on samples. "
++            f"Raw report from running `python3 {target_path}` on the problem's samples:\n\n{report}\n\n"
++            f"Fix this now. A brute force is only an oracle: keep it in /tmp (e.g. /tmp/stress/brute.py) and "
++            f"do NOT submit it. Implement a faster algorithm in {target_path} (use the editor tool), re-run the "
++            f"samples with bash, and make sure every sample passes within the time limit. Then finish with a short summary."
++        )
++
++    def _enforce_sample_gate(self, msg_history, max_rounds=2):
++        """
++        After the initial/escalation phase: if a source patch exists but fails the sample gate,
++        send the raw report back to the agent for a bounded number of fix rounds.
++        """
++        if not self._has_source_patch():
++            return msg_history
++        for round_idx in range(max_rounds):
++            ok, report = self._run_sample_gate()
++            safe_log(f"Sample gate after initial phase (round {round_idx + 1}/{max_rounds}): ok={ok}")
++            if ok:
++                break
++            safe_log(f"Sample gate report:\n{report}")
++            msg_history = chat_with_agent(
++                self._sample_fix_prompt(report, round_idx, max_rounds),
++                model=self.code_model, msg_history=msg_history, logging=safe_log,
++            )
++        return msg_history
++
+     def _run_verification(self, msg_history, max_rounds=2):
+         """
+         Mandatory differential-testing phase: a bounded number of rounds (no unbounded loops),
+-        each a chat_with_agent call that reuses the message history. Stops early once the agent
+-        reports the STRESS TEST PASSED marker in its final message.
++        each a chat_with_agent call that reuses the message history. A round is accepted only when
++        the objective sample gate passes (not based on the agent's text).
+         """
+         if not self._has_source_patch():
+             safe_log("Verification skipped: no source patch present.")
+@@ -465,14 +514,19 @@ When everything is done, end your reply with a short report that includes the st
+             safe_log(f"Verification round {round_idx + 1}/{max_rounds} starting.")
+             prompt = self._verification_prompt(round_idx, max_rounds)
+             msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            final_text = self._last_message_text(msg_history)
+-            passed = "STRESS TEST PASSED" in final_text
++            ok, report = self._run_sample_gate()
+             safe_log(f"Verification round {round_idx + 1}/{max_rounds} finished. "
+-                     f"Marker found: {passed}. Changed files: {self._get_changed_files()}")
+-            if passed:
++                     f"Sample gate ok: {ok}. Changed files: {self._get_changed_files()}")
++            if ok:
+                 break
++            safe_log(f"Sample gate report:\n{report}")
++            if round_idx + 1 < max_rounds:
++                msg_history = chat_with_agent(
++                    self._sample_fix_prompt(report, round_idx, max_rounds),
++                    model=self.code_model, msg_history=msg_history, logging=safe_log,
++                )
+         else:
+-            safe_log(f"Verification: marker not found after {max_rounds} rounds.")
++            safe_log(f"Verification: sample gate not passed after {max_rounds} rounds.")
+         return msg_history
+ 
+     def _last_resort_write(self):
+diff --git a/llm_withtools.py b/llm_withtools.py
+index d6c3c4b..66e5780 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -11,6 +11,7 @@ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
++DEFAULT_MAX_TOKENS = 16000
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+ 
+ def safe_extract_text(response):
+@@ -88,7 +89,7 @@ def get_response_withtools(
+             response = client.messages.create(
+                 model=model,
+                 messages=messages,
+-                max_tokens=max_tokens or 4096,
++                max_tokens=max_tokens or DEFAULT_MAX_TOKENS,
+                 tool_choice=tool_choice,
+                 tools=tools,
+                 **kwargs,
+@@ -503,7 +504,7 @@ def chat_with_agent_claude(
+             ],
+         }
+     ]
+-    sampling = _sampling_kwargs(temperature, max_tokens)
++    sampling = _sampling_kwargs(temperature, max_tokens)  # None -> DEFAULT_MAX_TOKENS in get_response_withtools
+ 
+     try:
+         # Create client
+@@ -527,6 +528,7 @@ def chat_with_agent_claude(
+ 
+         final_response = None
+         gave_up = False
++        retried_budget = False
+         # Bounded: up to 3 attempts to recover from empty responses (no text and no tool call).
+         for attempt in range(3):
+             # Check for tool use
+@@ -567,6 +569,22 @@ def chat_with_agent_claude(
+             if not _is_empty_response(response, model=client_model):
+                 break
+             logging(f"Empty turn diagnostic: {describe_response(response)}; safe text={safe_extract_text(response)!r}")
++            # Output budget exhausted by hidden thinking: retry once with a doubled budget before nudging.
++            if getattr(response, 'stop_reason', None) == 'max_tokens' and not retried_budget:
++                retried_budget = True
++                doubled = (max_tokens or DEFAULT_MAX_TOKENS) * 2
++                logging(f"Empty max_tokens turn; retrying once with max_tokens={doubled}.")
++                response = get_response_withtools(
++                    client=client,
++                    model=client_model,
++                    messages=msg_history + new_msg_history,
++                    tool_choice={"type": "auto"},
++                    tools=tools,
++                    logging=logging,
++                    **_sampling_kwargs(temperature, doubled),
++                )
++                if not _is_empty_response(response, model=client_model):
++                    continue
+ 
+             # Empty turn: drop it (never stored in history) and nudge with an escalating message.
+             logging(f"Dropping empty assistant turn (attempt {attempt + 1}/3); nudging the model.")
+diff --git a/tools/edit.py b/tools/edit.py
+index c55b038..2d91b31 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -69,7 +69,10 @@ def validate_path(path: str, command: str) -> Path:
+     elif command == "create":
+         # Path must not exist
+         if path_obj.exists():
+-            raise ValueError(f"Cannot create new file; {path} already exists.")
++            raise ValueError(
++                f"Cannot create new file; {path} already exists. Use the 'edit' command "
++                f"(full overwrite with file_text) or 'str_replace' (targeted change) instead."
++            )
+     elif command in ("edit", "str_replace"):
+         # Path must exist and must be a file
+         if not path_obj.exists():
+diff --git a/tools/run_samples.py b/tools/run_samples.py
+new file mode 100644
+index 0000000..705b667
+--- /dev/null
++++ b/tools/run_samples.py
+@@ -0,0 +1,131 @@
++import os
++import re
++import signal
++import subprocess
++import time
++
++def tool_info():
++    return {
++        "name": "run_samples",
++        "description": """Run a solution command on the sample tests found in a problem statement and report raw results.\n
++* Pass the problem statement (or any text) in `samples`; blocks labelled 'Sample Input N' / 'Sample Output N' (or 'Input:' / 'Expected output:') are extracted.\n
++* Each sample is fed to `solution_cmd` via stdin. Reported per sample: PASS, FAIL or TIMEOUT, the runtime, stderr, and the first differing lines.\n
++* The result is raw output; no interpretation is applied. Use it to check timing as well as correctness.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command that runs the solution; reads the sample input on stdin and writes the answer to stdout."
++                },
++                "samples": {
++                    "type": "string",
++                    "description": "Text containing the sample input/output blocks (usually the full problem statement)."
++                },
++                "timeout": {
++                    "type": "number",
++                    "description": "Per-sample timeout in seconds (default 10)."
++                }
++            },
++            "required": ["solution_cmd"]
++        }
++    }
++
++_INPUT_OUTPUT_RE = re.compile(
++    r'(?:Sample Input\s*(\d*)\s*:?|Input:)[ \t]*\n(.*?)\n[ \t]*'
++    r'(?:Sample Output\s*\1\s*:?|Expected output:|Output:)[ \t]*\n(.*?)(?=\n[ \t]*\n|\n[ \t]*(?:Sample Input|Input:)|\Z)',
++    re.DOTALL | re.IGNORECASE,
++)
++
++def parse_samples(text):
++    """Return a list of (input_text, expected_output_text) pairs found in text."""
++    pairs = []
++    if not text:
++        return pairs
++    for m in _INPUT_OUTPUT_RE.finditer(text):
++        inp = m.group(2).strip('\n') + '\n'
++        out = m.group(3).strip()
++        pairs.append((inp, out))
++    return pairs
++
++def _run_one(cmd, stdin_text, timeout):
++    """Run cmd in its own session; kill the whole process group on timeout."""
++    start = time.time()
++    proc = subprocess.Popen(
++        cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        text=True, start_new_session=True,
++    )
++    try:
++        out, err = proc.communicate(stdin_text, timeout=timeout)
++        return {"timed_out": False, "stdout": out, "stderr": err,
++                "returncode": proc.returncode, "elapsed": time.time() - start}
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except (ProcessLookupError, PermissionError, OSError):
++            proc.kill()
++        out, err = proc.communicate()
++        return {"timed_out": True, "stdout": out or "", "stderr": err or "",
++                "returncode": None, "elapsed": time.time() - start}
++
++def _first_diff(expected, actual, max_lines=5):
++    exp_lines = expected.strip().splitlines()
++    act_lines = actual.strip().splitlines()
++    diffs = []
++    for i in range(max(len(exp_lines), len(act_lines))):
++        e = exp_lines[i] if i < len(exp_lines) else '<missing>'
++        a = act_lines[i] if i < len(act_lines) else '<missing>'
++        if e != a:
++            diffs.append(f"line {i + 1}: expected {e!r}, got {a!r}")
++            if len(diffs) >= max_lines:
++                break
++    return diffs
++
++def tool_function(solution_cmd: str, samples: str = None, timeout: float = 10.0, **kwargs) -> str:
++    try:
++        timeout = float(timeout) if timeout is not None else 10.0
++    except (TypeError, ValueError):
++        return f"Error: timeout must be a number, got {timeout!r}"
++    if not solution_cmd or not str(solution_cmd).strip():
++        return "Error: solution_cmd must be a non-empty command string."
++
++    pairs = parse_samples(samples or '')
++    if not pairs:
++        return "Error: no sample input/output blocks found in the provided text."
++
++    lines = []
++    all_ok = True
++    for idx, (inp, expected) in enumerate(pairs, start=1):
++        res = _run_one(solution_cmd, inp, timeout)
++        elapsed = f"{res['elapsed']:.2f}s"
++        if res["timed_out"]:
++            all_ok = False
++            status = "TIMEOUT"
++            lines.append(f"Sample {idx}: {status} after {timeout}s (elapsed {elapsed})")
++            if res["stdout"].strip():
++                lines.append(f"  partial stdout: {res['stdout'].strip()[:500]!r}")
++            continue
++        if res["returncode"] != 0:
++            all_ok = False
++            status = f"FAIL (exit code {res['returncode']})"
++        elif res["stdout"].strip() == expected.strip():
++            status = "PASS"
++        else:
++            all_ok = False
++            status = "FAIL (wrong answer)"
++        lines.append(f"Sample {idx}: {status} (runtime {elapsed})")
++        if status != "PASS":
++            lines.append(f"  expected: {expected.strip()[:500]!r}")
++            lines.append(f"  got:      {res['stdout'].strip()[:500]!r}")
++            for d in _first_diff(expected, res["stdout"]):
++                lines.append(f"  {d}")
++        if res["stderr"].strip():
++            lines.append(f"  stderr: {res['stderr'].strip()[-1000:]}")
++
++    header = "ALL SAMPLES PASSED" if all_ok else "SAMPLES NOT PASSED"
++    return f"{header} ({len(pairs)} samples, timeout {timeout}s)\n" + "\n".join(lines)
++
++if __name__ == "__main__":
++    import sys
++    text = sys.stdin.read()
++    print(tool_function(solution_cmd=sys.argv[1], samples=text))

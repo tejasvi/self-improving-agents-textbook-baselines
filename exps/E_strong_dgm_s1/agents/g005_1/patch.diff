@@ -1,0 +1,837 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3703691..7730ca5 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,9 @@
+ import argparse
++import json
++import shutil
+ import subprocess
++import sys
++import time
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -8,6 +12,24 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools import solution_check
++
++# Pipeline settings (see forward()). Overridable via class attributes if needed.
++K_CANDIDATES = 3          # independent solver sessions
++R_REFLECTIONS = 3         # repair rounds on the best candidate
++DESIGN_ATTEMPTS = 2       # test-design sessions (validated by the harness)
++BUDGET_SECONDS = 3000     # wall-clock budget for the whole pipeline
++TIME_LIMIT = 4            # per-run limit (s) for samples / stress / max-size runs
++STRESS_SEEDS = 150        # seeds per stress mode (2 modes -> 300 cases)
++STRESS_MODES = ['small', 'edge']
++GEN_MODES = ['small', 'edge', 'max']
++MAX_MODE = 'max'
++STRESS_BUDGET = 120.0     # seconds per candidate's stress run at most
++CANDIDATE_HINTS = [
++    "simple and obviously correct: prefer the clearest algorithm that is clearly right, then check speed",
++    "optimal complexity: pick the best known algorithm for the constraints and make sure it is fast in Python",
++    "re-derive from the constraints and edge cases: carefully reread the statement, enumerate edge cases, and choose an approach that handles them",
++]
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -153,7 +175,7 @@ class AgenticSystem:
+         """True for test files and helper scripts (brute force, generators, tests dirs)."""
+         parts = path.replace('\\', '/').split('/')
+         base = parts[-1]
+-        if any(part in ('tests', 'test') for part in parts[:-1]):
++        if any(part in ('tests', 'test', 'cands') for part in parts[:-1]):
+             return True
+         if base.startswith('test_') or base.endswith('_test.py') or base.endswith('.spec.js') or base.endswith('.test.js'):
+             return True
+@@ -184,11 +206,27 @@ class AgenticSystem:
+                 return False
+         return True
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    # ------------------------------------------------------------------
++    # Multi-candidate pipeline: design tests -> K candidates -> score -> reflect -> finalize
++    # All scoring is done by the harness (tools/solution_check.py), never by the LLM.
++    # ------------------------------------------------------------------
++
++    def _init_pipeline(self, budget_seconds=None):
++        self.num_candidates = K_CANDIDATES
++        self.num_reflections = R_REFLECTIONS
++        self.budget_seconds = budget_seconds or BUDGET_SECONDS
++        self.deadline = time.monotonic() + self.budget_seconds
++        self.brute_path = os.path.join(self.git_tempdir, 'tests', 'brute.py')
++        self.gen_path = os.path.join(self.git_tempdir, 'tests', 'gen.py')
++        self.samples_path = os.path.join(self.git_tempdir, 'tests', 'samples.json')
++        self.cands_dir = os.path.join(self.git_tempdir, 'cands')
++        self.solution_path = os.path.join(self.git_tempdir, 'solution.py')
++
++    def _time_left(self):
++        return self.deadline - time.monotonic()
++
++    def _task_text(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -196,30 +234,295 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Immediately after reading the statement, write a draft solution.py with the editor tool (command=create), even if it is simple or brute-force, before any extended analysis. No turn may end without an editor call that creates or edits the source file. Keep replies concise to avoid the output limit.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Write brute.py (a simple, obviously-correct brute force) and gen.py (takes an integer seed as sys.argv[1], uses random.seed(seed), and prints one small random valid input to stdout). Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Fix every mismatch, crash or timeout it reports, then re-run it until it reports RESULT: OK.
+-6. Generate a maximum-size input (gen-style, with the largest constraints) and check that solution.py finishes in well under 2 seconds. Keep iterating on the solution until all checks pass.
+-7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
+-8. An unrun stress test means the task is NOT finished. Do not end your turn until step 5 (stress mode) has been run and reported RESULT: OK on the final version of solution.py.
+-9. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
+-The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # Bounded retries if no primary source file was edited
+-        retry_prompt = f"""{task}
+-
+-Your previous attempt ended without editing any source file. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {self.git_tempdir}/solution.py, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
++
++    def _load_samples(self):
++        """Return list of (input, output) from tests/samples.json. Raises ValueError if malformed."""
++        with open(self.samples_path, 'r') as f:
++            data = json.load(f)
++        if not isinstance(data, list) or not data:
++            raise ValueError("tests/samples.json must be a non-empty JSON list")
++        pairs = []
++        for item in data:
++            if not isinstance(item, dict) or 'input' not in item or 'output' not in item:
++                raise ValueError("each entry of tests/samples.json needs 'input' and 'output'")
++            pairs.append((str(item['input']), str(item['output'])))
++        return pairs
++
++    def _validate_tests(self):
++        """Harness-side check of the design-phase files. Returns (ok, report_text)."""
++        problems = []
++        for p in (self.brute_path, self.gen_path, self.samples_path):
++            if not os.path.isfile(p):
++                problems.append(f"missing file: {p}")
++        if problems:
++            return False, "\n".join(problems)
++        try:
++            samples = self._load_samples()
++        except (ValueError, OSError) as e:
++            return False, f"tests/samples.json is invalid: {e}"
++        res = solution_check.run_plain(self.brute_path, [i for i, _ in samples],
++                                       [o for _, o in samples], timeout=TIME_LIMIT)
++        if res['passed'] != len(samples):
++            problems.append("tests/brute.py does not reproduce the sample outputs:\n" + res['report'])
++        for mode in GEN_MODES:
++            text, err = solution_check.generate_input(self.gen_path, 0, mode, timeout=TIME_LIMIT)
++            if text is None or not text.strip():
++                problems.append(f"tests/gen.py failed or printed nothing for mode '{mode}':\n{err}")
++        for mode in ('small', 'edge'):
++            inputs = []
++            for seed in range(5):
++                text, err = solution_check.generate_input(self.gen_path, seed, mode, timeout=TIME_LIMIT)
++                if text is not None:
++                    inputs.append(text)
++            if inputs:
++                res = solution_check.run_plain(self.brute_path, inputs, None, timeout=TIME_LIMIT)
++                if res['crashed']:
++                    problems.append(f"tests/brute.py fails or is too slow on small '{mode}' inputs:\n{res['report']}")
++        if problems:
++            return False, "\n\n".join(problems)
++        return True, f"tests valid: {len(samples)} samples reproduced by brute; generator modes {GEN_MODES} run"
++
++    def _design_tests(self, feedback=None):
++        """Separate session that sees only the statement and writes tests/brute.py, tests/gen.py, tests/samples.json."""
++        os.makedirs(os.path.join(self.git_tempdir, 'tests'), exist_ok=True)
++        prompt = self._task_text() + f"""
++You are preparing the TEST HARNESS only. Do not solve the problem in solution.py and do not write any solution file.
++Work from the problem statement alone. Create these files with the editor tool:
++
++1. {self.brute_path}
++   A simple, obviously-correct brute-force reference program that reads stdin and writes stdout exactly like the real solution is expected to. Keep it simple; it may be slow, but must finish on small inputs.
++2. {self.gen_path}
++   A random input generator. It takes an integer seed as sys.argv[1] and an optional mode as sys.argv[2]:
++   - no mode or 'small': small random valid inputs (small enough for the brute force).
++   - 'edge': edge cases (minimal sizes, equal values, boundaries of the constraints), still small.
++   - 'max': a maximum-size valid input using the largest constraints from the statement.
++   Use random.seed(int(sys.argv[1])). Print exactly one valid input to stdout.
++3. {self.samples_path}
++   A JSON list of objects {{"input": "<exact stdin text>", "output": "<exact expected stdout>"}} containing every sample input and expected output given in the problem statement. Copy them exactly.
++
++Check that the generator runs for seeds 0..4 in each mode, and that brute.py reproduces the samples (run `python3 {self.brute_path} < file`). Do not write anything else under tests/ except these files.
++"""
++        if feedback:
++            prompt += f"""
++The harness checked your previous files and found these problems (raw report):
++{feedback}
++
++Fix the files so that every check passes.
++"""
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _score_candidate(self, path):
++        """
++        Harness-side scoring. Returns (score, report) where score = (samples_passed, stress_passed, no_crash).
++        Higher is better. Perfect score means all samples pass, all stress cases pass, nothing crashes.
++        """
++        if not os.path.isfile(path):
++            return (0, 0, 0), f"candidate file not found: {path}"
++        if not (os.path.isfile(self.brute_path) and os.path.isfile(self.gen_path) and os.path.isfile(self.samples_path)):
++            return (0, 0, 0), "test harness files are missing; cannot score"
++        try:
++            samples = self._load_samples()
++        except (ValueError, OSError) as e:
++            return (0, 0, 0), f"tests/samples.json is invalid: {e}"
++        n = len(samples)
++        report = []
++
++        sres = solution_check.run_plain(path, [i for i, _ in samples], [o for _, o in samples], timeout=TIME_LIMIT)
++        if sres['report']:
++            report.append(sres['report'])
++        report.append(f"samples: {sres['passed']}/{n} passed")
++
++        max_text, max_err = solution_check.generate_input(self.gen_path, 0, MAX_MODE, timeout=TIME_LIMIT)
++        if max_text is None:
++            max_ok = False
++            report.append(f"max-size generation failed:\n{max_err}")
++        else:
++            mres = solution_check.run_plain(path, [max_text], None, timeout=TIME_LIMIT)
++            max_ok = mres['crashed'] == 0
++            if not max_ok:
++                report.append("max-size input FAILED:\n" + mres['report'])
++            report.append(f"max-size: {'ok' if max_ok else 'failed'}, time {mres['max_time']:.3f} s"
++                          if max_text is not None else "max-size: not run")
++
++        stress_budget = min(STRESS_BUDGET, max(10.0, self._time_left() / 4))
++        st = solution_check.run_stress(path, self.brute_path, self.gen_path, range(STRESS_SEEDS),
++                                       modes=STRESS_MODES, timeout=TIME_LIMIT, budget=stress_budget)
++        if st['first_failure']:
++            report.append(st['first_failure'])
++        report.append(f"stress: {st['passed']}/{st['total']} passed"
++                      + (" (budget reached)" if st['budget_hit'] else ""))
++
++        no_crash = int(sres['crashed'] == 0 and max_ok and st['crashed'] == 0)
++        score = (sres['passed'], st['passed'], no_crash)
++        perfect = score == (n, st['total'], 1) and not st['budget_hit']
++        report.append("RESULT: OK" if perfect else "RESULT: FAILED")
++        return score, "\n\n".join(report)
++
++    @staticmethod
++    def _pick_best(entries):
++        """entries: list of (score, path, report). Returns the entry with the highest score; ties keep the earliest."""
++        best = None
++        for entry in entries:
++            if best is None or entry[0] > best[0]:
++                best = entry
++        return best
++
++    @staticmethod
++    def _is_perfect_report(report):
++        return "RESULT: OK" in report.splitlines()[-1:] if report else False
++
++    def _solve_candidate(self, i, hint, feedback=None):
++        """Independent solver session writing cands/cand_i.py. Returns the path it should have written."""
++        os.makedirs(self.cands_dir, exist_ok=True)
++        out_path = os.path.join(self.cands_dir, f"cand_{i}.py")
++        prompt = self._task_text() + f"""
++Strategy for this attempt: {hint}
++
++Write your complete solution to {out_path} using the editor tool (command=create). Do NOT write or edit {self.solution_path}; the harness will pick the best candidate.
++The test harness already exists: the brute force is {self.brute_path}, the generator is {self.gen_path} (usage: `python3 gen.py <seed> [small|edge|max]`) and the samples are in {self.samples_path}.
++Steps:
++1. Read the statement and constraints; choose an algorithm whose complexity fits the limits (Python does roughly 10^7 simple operations per second).
++2. Write the draft to {out_path} immediately, then run it on every sample and compare exactly.
++3. Stress test against {self.brute_path} with {self.gen_path} on a few hundred seeds (write your own driver under /tmp, not in the repo). Fix every mismatch, crash or timeout.
++4. Test on a max-size input from the generator (mode max); it must finish well under 2 seconds.
++Avoid shadowing Python builtins. Keep replies concise.
++"""
++        if feedback:
++            prompt += f"\nPrevious attempt feedback (raw harness report):\n{feedback}\n"
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        return out_path
++
++    def _read_file(self, path):
++        try:
++            with open(path, 'r', errors='replace') as f:
++                return f.read()
++        except OSError:
++            return ''
++
++    def _adjudicate(self, best_path, report):
++        """Brute and candidate keep disagreeing: decide which one misreads the statement and fix it."""
++        prompt = self._task_text() + f"""
++The reference brute force ({self.brute_path}) and the current best solution ({best_path}) disagree on some generated input.
++Raw harness report:
++{report}
++
++Decide which one misreads the problem statement. Re-read the statement carefully, check the samples by hand, and then fix the faulty file with the editor tool: edit {self.brute_path} if the brute force is wrong, or edit {best_path} if the solution is wrong. Do not edit the other one.
+ """
+-        for attempt in range(3):
+-            if self._has_primary_edit():
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _reflect(self, best_path, report, out_path, history):
++        """One repair round. Writes the repaired code to out_path. history: list of earlier attempt summaries."""
++        code = self._read_file(best_path)
++        hist = "\n".join(f"- {h}" for h in history) or "- (none)"
++        prompt = self._task_text() + f"""
++Strategy: repair the best candidate so far, keep what already works, and fix the failures in the raw report.
++
++Current best code ({best_path}):
++```python
++{code}
++```
++
++Raw harness report for this code (inputs, actual output, expected output, stderr, timing):
++{report}
++
++Summary of earlier attempts:
++{hist}
++
++Write the full repaired solution to {out_path} using the editor tool (command=create). Do NOT edit {self.solution_path}. Re-check against the samples in {self.samples_path} and the stress test with {self.brute_path} and {self.gen_path} (run `python3 gen.py <seed> [small|edge|max]`). Keep replies concise.
++"""
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _finalize(self, best_path):
++        """Copy the best candidate to solution.py and re-run the final validation."""
++        if best_path and os.path.isfile(best_path):
++            shutil.copyfile(best_path, self.solution_path)
++        score, report = self._score_candidate(self.solution_path) if os.path.isfile(self.solution_path) else ((0, 0, 0), 'no solution.py')
++        safe_log(f"FINAL solution.py score={score}")
++        return score, report
++
++    def forward(self):
++        """
++        The forward function for the AgenticSystem.
++        Pipeline: design tests (validated by harness) -> K candidates -> score each -> R repair rounds
++        (keep best-so-far) -> finalize into solution.py.
++        """
++        self._init_pipeline()
++        task = self._task_text()
++        os.makedirs(self.cands_dir, exist_ok=True)
++
++        # 1. Test design (separate session; harness validates it, bounded retries)
++        ok, report = False, 'not run'
++        for attempt in range(DESIGN_ATTEMPTS):
++            if attempt > 0 and self._time_left() <= 0:
++                break
++            self._design_tests(feedback=None if attempt == 0 else report)
++            ok, report = self._validate_tests()
++            safe_log(f"test design attempt {attempt + 1}: {'OK' if ok else 'INVALID'}")
++            if ok:
++                break
++        if not ok:
++            safe_log("WARNING: test harness invalid after retries; candidates will score as failing.\n" + report)
++
++        # 2. Candidates (independent sessions, different strategies)
++        entries = []
++        history = []
++        for i in range(self.num_candidates):
++            if self._time_left() <= 0:
++                safe_log("budget exhausted; stopping candidate generation")
+                 break
+-            safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
+-            chat_with_agent(retry_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            hint = CANDIDATE_HINTS[i % len(CANDIDATE_HINTS)]
++            path = self._solve_candidate(i + 1, hint)
++            if not os.path.isfile(path):
++                history.append(f"candidate {i + 1} ({hint}): wrote no file")
++                continue
++            score, rep = self._score_candidate(path)
++            entries.append((score, path, rep))
++            history.append(f"candidate {i + 1} ({hint}): score {score}")
++            safe_log(f"candidate {i + 1} score={score}")
++            if self._is_perfect_report(rep):
++                break
++
++        best = self._pick_best(entries) if entries else None
++        best_score, best_path, best_report = best if best else ((0, 0, 0), None, 'no candidate produced a file')
++
++        # 3. Reflection: repair the best candidate, keep best-so-far
++        wrong_streak = 0
++        for r in range(self.num_reflections):
++            if best_path is None or self._is_perfect_report(best_report) or self._time_left() <= 0:
++                break
++            if 'WRONG ANSWER' in best_report:
++                wrong_streak += 1
++            else:
++                wrong_streak = 0
++            if wrong_streak >= 2:
++                self._adjudicate(best_path, best_report)
++                wrong_streak = 0
++            out_path = os.path.join(self.cands_dir, f"repair_{r + 1}.py")
++            self._reflect(best_path, best_report, out_path, history)
++            if not os.path.isfile(out_path):
++                history.append(f"repair {r + 1}: wrote no file")
++                continue
++            score, rep = self._score_candidate(out_path)
++            if score > best_score:
++                history.append(f"repair {r + 1}: score {score} (kept)")
++                best_score, best_path, best_report = score, out_path, rep
++            else:
++                history.append(f"repair {r + 1}: score {score} (rejected, worse or equal to {best_score})")
++            safe_log(f"repair {r + 1} score={score} best={best_score}")
++
++        # 4. Finalization: write best to solution.py, re-validate, fallback if still empty
++        if best_path is not None:
++            self._finalize(best_path)
++        if not self._has_primary_edit():
++            retry_prompt = f"""{task}
++
++Your previous attempt ended without a usable solution. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {self.solution_path}, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
++"""
++            for attempt in range(3):
++                if self._has_primary_edit():
++                    break
++                safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
++                chat_with_agent(retry_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tests/test_has_primary_edit.py b/tests/test_has_primary_edit.py
+index a533c30..b392059 100644
+--- a/tests/test_has_primary_edit.py
++++ b/tests/test_has_primary_edit.py
+@@ -65,3 +65,11 @@ def test_has_primary_edit_other_source_file(tmp_path):
+     (repo / "solution.py").write_text("print('hi')\n")
+     (repo / "main.py").write_text("print('hi')\n")
+     assert _agent(repo, commit)._has_primary_edit() is True
++
++
++def test_has_primary_edit_candidate_files_do_not_count(tmp_path):
++    repo, commit = _make_repo(tmp_path)
++    (repo / "cands").mkdir()
++    (repo / "cands" / "cand_1.py").write_text("print(1)\n")
++    (repo / "cands" / "repair_1.py").write_text("print(2)\n")
++    assert _agent(repo, commit)._has_primary_edit() is False
+diff --git a/tools/solution_check.py b/tools/solution_check.py
+index 21d5cc0..afc6c60 100644
+--- a/tools/solution_check.py
++++ b/tools/solution_check.py
+@@ -11,6 +11,11 @@ import time
+ # The solution is copied into a fresh temp dir as _sol.py and run with `python -I`
+ # (isolated mode: no cwd / user site on sys.path, no PYTHON* env vars), so the
+ # result mirrors how a grader would execute it.
++#
++# Reusable functions (no LLM involved):
++#   run_plain(solution_path, inputs, expected_outputs=None, timeout=10) -> dict
++#   run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=10, budget=...) -> dict
++#   generate_input(gen_path, seed=0, mode=None, timeout=10) -> (text or None, error text)
+ 
+ _MAX_STREAM = 4000        # chars of stdout/stderr kept per run
+ _STRESS_BUDGET = 240.0    # total wall-clock seconds allowed for stress mode
+@@ -22,7 +27,7 @@ def tool_info():
+         "description": """Grader-style checker for a stdin-based Python solution.\n
+ * Copies the solution into a fresh temp directory as `_sol.py` and runs it with `python -I` (isolated mode) using only the provided stdin, so it behaves like the real grader.\n
+ * Without brute_path/gen_path: runs every entry of `inputs` and reports stdout, stderr, exit code and elapsed time. If `expected_outputs` is given, compares each output (whitespace-normalised) with the matching expected output.\n
+-* With brute_path and gen_path (stress mode): for seeds 0..num_tests-1, runs `python gen.py <seed>` to make an input, then runs both the brute-force reference and the solution on it. Stops at the first mismatch, runtime error (nonzero exit) or timeout and prints the input and both outputs.\n
++* With brute_path and gen_path (stress mode): for seeds 0..num_tests-1, runs `python gen.py <seed>` (or `python gen.py <seed> <mode>` when `mode` is given) to make an input, then runs both the brute-force reference and the solution on it. Stops at the first mismatch, runtime error (nonzero exit) or timeout and prints the input and both outputs.\n
+ * Any stderr is shown verbatim. A nonzero exit code or any stderr output is a failure.\n
+ * Pass the same solution file again after every edit; the check always uses the current contents.""",
+         "input_schema": {
+@@ -34,6 +39,7 @@ def tool_info():
+                 "brute_path": {"type": "string", "description": "Path to a trusted brute-force Python reference program (stress mode, needs gen_path)."},
+                 "gen_path": {"type": "string", "description": "Path to a random input generator; it is called as `python gen.py <seed>` and prints one test input to stdout (stress mode, needs brute_path)."},
+                 "num_tests": {"type": "integer", "description": "Number of random seeds to try in stress mode (default 200)."},
++                "mode": {"type": "string", "description": "Optional generator mode (e.g. small, edge, max). If given, the generator is called as `python gen.py <seed> <mode>`. Omit it to call `python gen.py <seed>`."},
+                 "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."}
+             },
+             "required": ["solution_path"]
+@@ -98,8 +104,143 @@ def _fmt_run(label, status, out, err, rc, elapsed):
+     return "\n".join(lines)
+ 
+ 
++def _gen_args(seed, mode):
++    """Generator argv: `<seed>` when no mode is given (backwards compatible), else `<seed> <mode>`."""
++    return [str(seed)] if mode is None else [str(seed), str(mode)]
++
++
++def _solution_crashed(status, rc, err):
++    return status == 'timeout' or (rc is not None and rc != 0) or bool(err.strip())
++
++
++def _tmp_with(files):
++    """Create a temp dir holding copies of files: {dest_name: source_path}. Returns the dir."""
++    tmpdir = tempfile.mkdtemp(prefix='solcheck_')
++    for dest, src in files.items():
++        shutil.copyfile(src, os.path.join(tmpdir, dest))
++    return tmpdir
++
++
++def generate_input(gen_path, seed=0, mode=None, timeout=10):
++    """Run the generator once. Returns (input_text, '') on success or (None, error_text)."""
++    if not gen_path or not os.path.isfile(gen_path):
++        return None, f"Error: file not found: {gen_path}"
++    tmpdir = _tmp_with({'_gen.py': gen_path})
++    try:
++        st, out, err, rc, el = _run([sys.executable, '-I', '_gen.py', *_gen_args(seed, mode)], tmpdir, '', timeout)
++        if st != 'ok' or rc != 0:
++            return None, _fmt_run("gen", st, out, err, rc, el)
++        return out, ''
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def run_plain(solution_path, inputs, expected_outputs=None, timeout=10):
++    """
++    Run the solution on fixed inputs.
++    Returns dict: passed, total, max_time, crashed (timeouts / nonzero exit / stderr), report (failure text).
++    """
++    tmpdir = _tmp_with({'_sol.py': solution_path})
++    try:
++        passed, max_t, crashed = 0, 0.0, 0
++        blocks = []
++        for i, inp in enumerate(inputs):
++            status, out, err, rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, inp, timeout)
++            max_t = max(max_t, el)
++            problems = []
++            if status == 'timeout':
++                problems.append("timeout")
++            if rc != 0:
++                problems.append(f"exit code {rc}")
++            if err.strip():
++                problems.append("stderr is not empty")
++            if _solution_crashed(status, rc, err):
++                crashed += 1
++            if expected_outputs is not None and i < len(expected_outputs) and status == 'ok':
++                if _normalise(out) != _normalise(expected_outputs[i]):
++                    problems.append("output differs from expected")
++            if problems:
++                block = (f"[input {i}] FAIL: {', '.join(problems)}\n"
++                         f"input:\n{_clip(inp).rstrip()}\n"
++                         + _fmt_run(f"solution on input {i}", status, out, err, rc, el))
++                if expected_outputs is not None and i < len(expected_outputs):
++                    block += "\nexpected:\n" + _clip(expected_outputs[i]).rstrip()
++                blocks.append(block)
++            else:
++                passed += 1
++        return {'passed': passed, 'total': len(inputs), 'max_time': max_t,
++                'crashed': crashed, 'report': "\n\n".join(blocks)}
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def _one_case(tmpdir, seed, mode, timeout):
++    """
++    Evaluate one stress case in tmpdir (containing _sol.py, _brute.py, _gen.py).
++    Returns (kind, detail, elapsed) where kind is ok | gen | brute | crash | wrong.
++    """
++    label = f"seed {seed}" + ("" if mode is None else f" mode {mode}")
++    gst, gen_out, gerr, grc, _ = _run([sys.executable, '-I', '_gen.py', *_gen_args(seed, mode)], tmpdir, '', timeout)
++    if gst != 'ok' or grc != 0:
++        return 'gen', f"generator failed on {label}\n" + _fmt_run("gen", gst, gen_out, gerr, grc, 0.0), 0.0
++    test_in = gen_out
++    bst, bout, berr, brc, _ = _run([sys.executable, '-I', '_brute.py'], tmpdir, test_in, timeout)
++    if bst != 'ok' or brc != 0 or berr.strip():
++        return 'brute', (f"brute-force reference failed on {label} (fix the brute/gen, not the solution)\n"
++                         f"input:\n{_clip(test_in).rstrip()}\n"
++                         + _fmt_run("brute", bst, bout, berr, brc, 0.0)), 0.0
++    sst, sout, serr, src_rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, test_in, timeout)
++    if _solution_crashed(sst, src_rc, serr):
++        why = 'timeout' if sst == 'timeout' else (f'exit code {src_rc}' if src_rc != 0 else 'stderr not empty')
++        return 'crash', (f"solution FAILED on {label}: {why}\ninput:\n{_clip(test_in).rstrip()}\n"
++                         + _fmt_run("solution", sst, sout, serr, src_rc, el)
++                         + "\n" + _fmt_run("brute (expected)", bst, bout, berr, brc, 0.0)), el
++    if _normalise(sout) != _normalise(bout):
++        return 'wrong', (f"WRONG ANSWER on {label}\ninput:\n{_clip(test_in).rstrip()}\n"
++                         + _fmt_run("solution", sst, sout, serr, src_rc, el)
++                         + "\n" + _fmt_run("brute (expected)", bst, bout, berr, brc, 0.0)), el
++    return 'ok', '', el
++
++
++def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=10, budget=_STRESS_BUDGET):
++    """
++    Compare solution against brute on generated inputs for every (mode, seed) pair.
++    Runs all cases (does not stop at the first failure) unless the wall-clock budget is hit.
++    Returns dict: total (planned cases), ran, passed, crashed, max_time, budget_hit,
++                  first_failure (raw report text or None), first_failure_kind (or None).
++    """
++    seeds = list(seeds)
++    modes = [None] if not modes else list(modes)
++    cases = [(m, s) for m in modes for s in seeds]
++    result = {'total': len(cases), 'ran': 0, 'passed': 0, 'crashed': 0, 'max_time': 0.0,
++              'budget_hit': False, 'first_failure': None, 'first_failure_kind': None}
++    if not cases:
++        return result
++    tmpdir = _tmp_with({'_sol.py': solution_path, '_brute.py': brute_path, '_gen.py': gen_path})
++    try:
++        t_start = time.monotonic()
++        for mode, seed in cases:
++            if time.monotonic() - t_start > budget:
++                result['budget_hit'] = True
++                break
++            result['ran'] += 1
++            kind, detail, el = _one_case(tmpdir, seed, mode, timeout)
++            result['max_time'] = max(result['max_time'], el)
++            if kind == 'ok':
++                result['passed'] += 1
++                continue
++            if kind == 'crash':
++                result['crashed'] += 1
++            if result['first_failure'] is None:
++                result['first_failure'] = detail
++                result['first_failure_kind'] = kind
++        return result
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
+ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=None, gen_path=None,
+-                  num_tests=200, timeout=10):
++                  num_tests=200, timeout=10, mode=None):
+     try:
+         timeout = max(1, int(timeout or 10))
+         num_tests = max(0, int(num_tests if num_tests is not None else 200))
+@@ -120,86 +261,33 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+         src = f.read()
+     warnings = _builtin_shadow_warnings(src)
+ 
+-    tmpdir = tempfile.mkdtemp(prefix='solcheck_')
+-    try:
+-        shutil.copyfile(solution_path, os.path.join(tmpdir, '_sol.py'))
+-        report = []
+-        if warnings:
+-            report.append("WARNING (builtin shadowing, can break in the grader):\n  " + "\n  ".join(warnings))
+-
+-        # ---- plain mode: fixed inputs ----
+-        if inputs:
+-            passed, max_t, failed = 0, 0.0, False
+-            for i, inp in enumerate(inputs):
+-                status, out, err, rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, inp, timeout)
+-                max_t = max(max_t, el)
+-                problems = []
+-                if status == 'timeout':
+-                    problems.append("timeout")
+-                if rc != 0:
+-                    problems.append(f"exit code {rc}")
+-                if err.strip():
+-                    problems.append("stderr is not empty")
+-                if expected_outputs is not None and i < len(expected_outputs) and status == 'ok':
+-                    if _normalise(out) != _normalise(expected_outputs[i]):
+-                        problems.append("output differs from expected")
+-                if problems:
+-                    failed = True
+-                    report.append(f"[input {i}] FAIL: {', '.join(problems)}\n"
+-                                  f"input:\n{_clip(inp).rstrip()}\n"
+-                                  + _fmt_run(f"solution on input {i}", status, out, err, rc, el))
+-                    if expected_outputs is not None and i < len(expected_outputs):
+-                        report.append("expected:\n" + _clip(expected_outputs[i]).rstrip())
+-                else:
+-                    passed += 1
+-            report.append(f"{passed}/{len(inputs)} passed, max time {max_t:.3f} s")
+-            if failed:
+-                report.append("RESULT: FAILED")
+-            elif not warnings:
+-                report.append("RESULT: OK")
+-
+-        # ---- stress mode: brute vs solution on generated inputs ----
+-        if stress:
+-            shutil.copyfile(brute_path, os.path.join(tmpdir, '_brute.py'))
+-            shutil.copyfile(gen_path, os.path.join(tmpdir, '_gen.py'))
+-            t_start = time.monotonic()
+-            ran, max_t, mismatch = 0, 0.0, None
+-            for seed in range(num_tests):
+-                if time.monotonic() - t_start > _STRESS_BUDGET:
+-                    report.append(f"Stress budget of {_STRESS_BUDGET:.0f}s reached; stopped early.")
+-                    break
+-                gst, gen_out, gerr, grc, _ = _run([sys.executable, '-I', '_gen.py', str(seed)], tmpdir, '', timeout)
+-                if gst != 'ok' or grc != 0:
+-                    mismatch = f"generator failed on seed {seed}\n" + _fmt_run("gen", gst, gen_out, gerr, grc, 0.0)
+-                    break
+-                test_in = gen_out
+-                bst, bout, berr, brc, _ = _run([sys.executable, '-I', '_brute.py'], tmpdir, test_in, timeout)
+-                if bst != 'ok' or brc != 0 or berr.strip():
+-                    mismatch = (f"brute-force reference failed on seed {seed} (fix the brute/gen, not the solution)\n"
+-                                f"input:\n{_clip(test_in).rstrip()}\n"
+-                                + _fmt_run("brute", bst, bout, berr, brc, 0.0))
+-                    break
+-                sst, sout, serr, src_rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, test_in, timeout)
+-                max_t = max(max_t, el)
+-                ran += 1
+-                if sst == 'timeout' or src_rc != 0 or serr.strip():
+-                    why = 'timeout' if sst == 'timeout' else (f'exit code {src_rc}' if src_rc != 0 else 'stderr not empty')
+-                    mismatch = (f"solution FAILED on seed {seed}: {why}\ninput:\n{_clip(test_in).rstrip()}\n"
+-                                + _fmt_run("solution", sst, sout, serr, src_rc, el)
+-                                + "\n" + _fmt_run("brute (expected)", bst, bout, berr, brc, 0.0))
+-                    break
+-                if _normalise(sout) != _normalise(bout):
+-                    mismatch = (f"WRONG ANSWER on seed {seed}\ninput:\n{_clip(test_in).rstrip()}\n"
+-                                + _fmt_run("solution", sst, sout, serr, src_rc, el)
+-                                + "\n" + _fmt_run("brute (expected)", bst, bout, berr, brc, 0.0))
+-                    break
+-            if mismatch:
+-                report.append(mismatch)
+-                report.append(f"RESULT: FAILED (stress: {ran}/{num_tests} seeds ran before failure)")
+-            else:
+-                report.append(f"stress: {ran}/{num_tests} passed, max time {max_t:.3f} s")
+-                if not warnings:
+-                    report.append("RESULT: OK")
+-        return "\n\n".join(report)
+-    finally:
+-        shutil.rmtree(tmpdir, ignore_errors=True)
++    report = []
++    failed = False
++    if warnings:
++        report.append("WARNING (builtin shadowing, can break in the grader):\n  " + "\n  ".join(warnings))
++
++    # ---- plain mode: fixed inputs ----
++    if inputs:
++        res = run_plain(solution_path, inputs, expected_outputs, timeout)
++        if res['report']:
++            report.append(res['report'])
++        report.append(f"{res['passed']}/{res['total']} passed, max time {res['max_time']:.3f} s")
++        failed = failed or res['passed'] != res['total']
++
++    # ---- stress mode: brute vs solution on generated inputs ----
++    if stress:
++        res = run_stress(solution_path, brute_path, gen_path, range(num_tests),
++                         modes=[mode] if mode else None, timeout=timeout)
++        if res['first_failure']:
++            report.append(res['first_failure'])
++            failed = True
++            report.append(f"stress: {res['passed']}/{res['total']} passed before failure")
++        else:
++            report.append(f"stress: {res['passed']}/{res['total']} passed, max time {res['max_time']:.3f} s"
++                          + ("; stopped early (budget)" if res['budget_hit'] else ""))
++
++    if failed:
++        report.append("RESULT: FAILED")
++    elif not warnings:
++        report.append("RESULT: OK")
++    return "\n\n".join(report)
+diff --git a/tests/test_scoring_selection.py b/tests/test_scoring_selection.py
+new file mode 100644
+index 0000000..b1c2257
+--- /dev/null
++++ b/tests/test_scoring_selection.py
+@@ -0,0 +1,121 @@
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++from tools import solution_check
++
++BRUTE = "a, b = map(int, input().split())\nprint(a + b)\n"
++GEN = ("import random, sys\n"
++       "random.seed(int(sys.argv[1]))\n"
++       "mode = sys.argv[2] if len(sys.argv) > 2 else 'small'\n"
++       "if mode == 'max':\n"
++       "    print(10**9, 10**9)\n"
++       "else:\n"
++       "    print(random.randint(0, 9), random.randint(0, 9))\n")
++SAMPLES = [{"input": "1 2\n", "output": "3\n"}, {"input": "5 5\n", "output": "10\n"}]
++
++
++def _agent(tmp_path, samples=SAMPLES):
++    root = tmp_path / "repo"
++    (root / "tests").mkdir(parents=True)
++    (root / "cands").mkdir()
++    (root / "tests" / "brute.py").write_text(BRUTE)
++    (root / "tests" / "gen.py").write_text(GEN)
++    (root / "tests" / "samples.json").write_text(json.dumps(samples))
++    agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
++    agent.git_tempdir = str(root)
++    agent._init_pipeline(budget_seconds=600)
++    return agent, root
++
++
++CORRECT = BRUTE
++WRONG_SAMPLES_ONLY = "a, b = map(int, input().split())\nprint(a + b if (a, b) == (1, 2) else 0)\n"
++CRASHING = "a, b = map(int, input().split())\nprint(a + b)\nraise SystemExit(1)\n"
++WRONG_ALL = "a, b = map(int, input().split())\nprint(a + b + 1)\n"
++
++
++def _write(root, name, src):
++    p = root / "cands" / name
++    p.write_text(src)
++    return str(p)
++
++
++def test_perfect_candidate_scores_top(tmp_path):
++    agent, root = _agent(tmp_path)
++    score, rep = agent._score_candidate(_write(root, "good.py", CORRECT))
++    assert score[0] == 2 and score[2] == 1 and score[1] > 0
++    assert rep.splitlines()[-1] == "RESULT: OK"
++
++
++def test_scores_order_candidates_and_pick_highest(tmp_path):
++    agent, root = _agent(tmp_path)
++    cands = {
++        "crash.py": CRASHING,
++        "wrong.py": WRONG_ALL,
++        "good.py": CORRECT,
++    }
++    entries = []
++    for name, src in cands.items():
++        score, rep = agent._score_candidate(_write(root, name, src))
++        entries.append((score, str(root / "cands" / name), rep))
++    best = agent._pick_best(entries)
++    assert best[1].endswith("good.py")
++    by_name = {os.path.basename(p): s for s, p, _ in entries}
++    assert by_name["good.py"] > by_name["wrong.py"]
++    assert by_name["good.py"][2] == 1
++    assert by_name["crash.py"][2] == 0
++    assert by_name["wrong.py"][0] == 0
++
++
++def test_partial_sample_credit_counts(tmp_path):
++    agent, root = _agent(tmp_path)
++    score, rep = agent._score_candidate(_write(root, "partial.py", WRONG_SAMPLES_ONLY))
++    assert score[0] == 1  # (1, 2) matches the sample; (5, 5) does not
++    assert score[2] == 1  # no crash, just wrong answers
++    assert "RESULT: FAILED" in rep
++
++
++def test_pick_best_ties_keep_earliest_and_empty_is_none(tmp_path):
++    assert coding_agent.AgenticSystem._pick_best([]) is None
++    entries = [((2, 5, 1), "a.py", ""), ((2, 5, 1), "b.py", "")]
++    assert coding_agent.AgenticSystem._pick_best(entries)[1] == "a.py"
++
++
++def test_missing_candidate_scores_zero(tmp_path):
++    agent, root = _agent(tmp_path)
++    score, rep = agent._score_candidate(str(root / "cands" / "nope.py"))
++    assert score == (0, 0, 0)
++    assert "not found" in rep
++
++
++def test_run_stress_reports_first_failure_and_counts(tmp_path):
++    root = tmp_path
++    (root / "good.py").write_text(CORRECT)
++    (root / "brute.py").write_text(BRUTE)
++    (root / "gen.py").write_text(GEN)
++    (root / "wrong.py").write_text(WRONG_ALL)
++    res = solution_check.run_stress(str(root / "wrong.py"), str(root / "brute.py"), str(root / "gen.py"),
++                                    range(3), modes=['small'], timeout=10)
++    assert res['total'] == 3 and res['passed'] == 0 and res['first_failure_kind'] == 'wrong'
++    assert "WRONG ANSWER" in res['first_failure']
++    ok = solution_check.run_stress(str(root / "good.py"), str(root / "brute.py"), str(root / "gen.py"),
++                                   range(3), modes=['small', 'edge'], timeout=10)
++    assert ok['total'] == 6 and ok['passed'] == 6 and ok['first_failure'] is None
++
++
++def test_generator_mode_is_optional(tmp_path):
++    (tmp_path / "gen.py").write_text(GEN)
++    text, err = solution_check.generate_input(str(tmp_path / "gen.py"), 3)
++    assert text is not None and err == ''
++    text, err = solution_check.generate_input(str(tmp_path / "gen.py"), 0, 'max')
++    assert text.strip() == "1000000000 1000000000"
++
++
++def test_pick_best_works_with_harness_report_last_line(tmp_path):
++    agent, root = _agent(tmp_path)
++    assert agent._is_perfect_report("x\nRESULT: OK")
++    assert not agent._is_perfect_report("x\nRESULT: FAILED")
++    assert not agent._is_perfect_report("")

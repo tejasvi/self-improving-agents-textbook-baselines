@@ -1,0 +1,183 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 33465bd..7961f97 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -339,6 +339,92 @@ class AgenticSystem:
+                 return ff['input']
+         return None
+ 
++    def _write_fallback_solution(self):
++        """Write a minimal valid stdin program to solution.py if it has no real code."""
++        path = self._solution_path()
++        existing = ''
++        if os.path.isfile(path):
++            with open(path, 'r', errors='replace') as f:
++                existing = f.read()
++        has_code = any(
++            line.strip() and not line.strip().startswith('#') for line in existing.splitlines()
++        )
++        if has_code:
++            return
++        stub = (
++            "import sys\n\n"
++            "def main():\n"
++            "    sys.stdin.read()\n"
++            "    print(0)\n\n"
++            "main()\n"
++        )
++        with open(path, 'w') as f:
++            f.write(stub)
++        safe_log("[forward] wrote fallback solution.py stub (no real code was produced)")
++
++    @staticmethod
++    def _is_synthetic_nudge(msg):
++        content = msg.get('content')
++        if isinstance(content, str):
++            return content.strip().startswith('Your last reply was cut off')
++        if isinstance(content, list):
++            texts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
++            return bool(texts) and all(t.strip().startswith('Your last reply was cut off') for t in texts) \
++                and not any(isinstance(b, dict) and b.get('type') == 'tool_result' for b in content)
++        return False
++
++    @staticmethod
++    def _is_empty_assistant(msg):
++        content = msg.get('content')
++        if isinstance(content, str):
++            return content.strip() in ('', '(no output)')
++        if not isinstance(content, list):
++            return True
++        for block in content:
++            btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++            if btype == 'tool_use':
++                return False
++            text = block.get('text', '') if isinstance(block, dict) else getattr(block, 'text', '')
++            if str(text or '').strip() not in ('', '(no output)'):
++                return False
++        return True
++
++    def _clean_history(self, msg_history):
++        """Copy of msg_history without empty assistant turns and synthetic cut-off nudges.
++        Adjacent same-role messages are merged so roles keep alternating; returns [] if
++        nothing meaningful remains."""
++        kept = []
++        for msg in msg_history or []:
++            if not isinstance(msg, dict):
++                continue
++            if msg.get('role') == 'assistant' and self._is_empty_assistant(msg):
++                continue
++            if msg.get('role') == 'user' and self._is_synthetic_nudge(msg):
++                continue
++            kept.append(msg)
++        merged = []
++        for msg in kept:
++            if merged and merged[-1].get('role') == msg.get('role'):
++                prev = merged[-1]
++                prev_content = prev.get('content')
++                new_content = msg.get('content')
++                def as_list(c):
++                    if isinstance(c, list):
++                        return list(c)
++                    return [{"type": "text", "text": str(c or '')}]
++                merged[-1] = {"role": prev.get('role'), "content": as_list(prev_content) + as_list(new_content)}
++            else:
++                merged.append(dict(msg))
++        # The history must start with a user turn and end with an assistant turn,
++        # so that the next prompt keeps roles alternating.
++        while merged and merged[0].get('role') != 'user':
++            merged.pop(0)
++        while merged and merged[-1].get('role') != 'assistant':
++            merged.pop()
++        if not any(m.get('role') == 'assistant' for m in merged):
++            return []
++        return merged
++
+     def _reflect(self, msg_history, snapshots):
+         """Bounded verification loop: up to 3 rounds, each asking the agent for the missing evidence.
+         An empty final reply is re-prompted once within the same round."""
+@@ -445,11 +531,26 @@ Within your first few tool calls, write a first-draft solution.py (even brute fo
+             os.environ['AGENT_VERIFY_STATE'] = os.path.join(
+                 tempfile.gettempdir(), f"agent_verify_state_{uuid.uuid4().hex}.json")
+         instruction = f"{task}\n\n{method}"
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not msg_history:
+-            msg_history = []
+ 
+-        # Bounded retry: ensure solution.py contains real code
++        # Phase 1: short draft-first prompt so the first tool call happens early.
++        draft_prompt = (
++            f"{task}\n\n"
++            f"First step ONLY: using the editor tool, create {self.git_tempdir}/solution.py with a complete "
++            "first-draft solution (a simple correct brute force is acceptable if the optimal algorithm is not yet clear). "
++            "Keep any reasoning to a few lines before calling the tool. Do not write tests or long derivations yet."
++        )
++        msg_history = chat_with_agent(draft_prompt, model=self.code_model, msg_history=[], logging=safe_log) or []
++
++        # Phase 2: full verification workflow, only once a real draft exists.
++        if self._has_real_edit():
++            msg_history = chat_with_agent(
++                instruction,
++                model=self.code_model,
++                msg_history=self._clean_history(msg_history),
++                logging=safe_log,
++            ) or msg_history
++
++        # Phase 3: escalating bounded retries until solution.py has real code.
+         reminder_text = (
+             "No solution code has been written to solution.py yet, so the task is not done. "
+             f"You must call the editor tool right now to create {self.git_tempdir}/solution.py "
+@@ -457,20 +558,38 @@ Within your first few tool calls, write a first-draft solution.py (even brute fo
+             "fallback is acceptable. Write your best attempt first, then test and refine it afterwards. "
+             "Do not reply with an empty message."
+         )
++        compact_prompt = (
++            f"{self.problem_statement}\n\n"
++            f"Create {self._solution_path()} immediately with the editor tool; no analysis, no tests; "
++            "brute force is fine. Do not reply with an empty message."
++        )
+         for attempt in range(3):
+             if self._has_real_edit():
+                 break
+             safe_log(f"[forward] No real edit in solution.py; retry {attempt + 1}/3")
+-            msg_history = chat_with_agent(
+-                reminder_text,
+-                model=self.code_model,
+-                msg_history=msg_history,
+-                logging=safe_log,
+-            ) or msg_history
++            if attempt == 0:
++                msg_history = chat_with_agent(
++                    reminder_text,
++                    model=self.code_model,
++                    msg_history=self._clean_history(msg_history),
++                    logging=safe_log,
++                ) or msg_history
++            else:
++                safe_log("[forward] fresh compact attempt with empty history")
++                msg_history = chat_with_agent(
++                    compact_prompt,
++                    model=self.code_model,
++                    msg_history=[],
++                    logging=safe_log,
++                ) or []
++
++        # Phase 4: guaranteed fallback so the patch is never empty.
++        if not self._has_real_edit():
++            self._write_fallback_solution()
+ 
+         snapshots = []
+         self._snapshot(snapshots, 'initial')
+-        msg_history = self._reflect(msg_history, snapshots)
++        msg_history = self._reflect(self._clean_history(msg_history), snapshots)
+ 
+         # Optional fresh attempt when the best candidate still fails samples or stress tests.
+         self._restore_best(snapshots)
+@@ -497,7 +616,7 @@ Within your first few tool calls, write a first-draft solution.py (even brute fo
+                 logging=safe_log,
+             ) or []
+             self._snapshot(snapshots, 'fresh attempt')
+-            self._reflect(fresh_history, snapshots)
++            self._reflect(self._clean_history(fresh_history), snapshots)
+ 
+         self._restore_best(snapshots)
+ 

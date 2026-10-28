@@ -1,0 +1,323 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..96c6b4a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,7 @@
+ import argparse
++import glob
+ import subprocess
++import time
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -7,6 +9,11 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from prompts.workflow_prompts import PLAN_AND_IMPLEMENT, VERIFY_AND_REPAIR, FINAL_REVIEW
++
++MAX_REPAIR_ROUNDS = 3
++GATE_COMPILE_TIMEOUT = 30
++GATE_SAMPLE_TIMEOUT = 10
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -137,27 +144,128 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _gate_check(self):
++        """
++        Automatic gate on the final solution. Returns a raw text report (no error parsing).
++        Sets self.gate_ok to True only if solution.py exists, compiles, and every sample run
++        exits 0 without timing out.
++        """
++        report = []
++        gate_ok = True
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++
++        # 1. existence
++        exists = os.path.isfile(sol_path)
++        report.append(f"[exists] {sol_path}: {'yes' if exists else 'NO'}")
++        if not exists:
++            self.gate_ok = False
++            return "\n".join(report)
++
++        # 2. compile
++        try:
++            p = subprocess.run(['python3', '-m', 'py_compile', sol_path], cwd=self.git_tempdir,
++                               capture_output=True, text=True, timeout=GATE_COMPILE_TIMEOUT)
++            report.append(f"[py_compile] exit={p.returncode}\nstdout:\n{p.stdout}\nstderr:\n{p.stderr}")
++            if p.returncode != 0:
++                gate_ok = False
++        except subprocess.TimeoutExpired:
++            report.append("[py_compile] TIMEOUT")
++            gate_ok = False
++
++        # 3. structure: class Solution or stdin usage (raw grep output)
++        try:
++            p = subprocess.run(['grep', '-n', '-E', r'class Solution|sys\.stdin|input\(', sol_path],
++                               capture_output=True, text=True, timeout=10)
++            report.append(f"[grep class Solution|stdin] exit={p.returncode}\n{p.stdout.strip()}")
++            if p.returncode != 0:
++                gate_ok = False  # neither class Solution nor stdin usage found
++        except subprocess.TimeoutExpired:
++            report.append("[grep] TIMEOUT")
++
++        # 4. run on sample inputs created by the agent
++        samples = sorted(glob.glob(os.path.join(self.git_tempdir, 'sample*.txt')) +
++                         glob.glob(os.path.join(self.git_tempdir, 'tests', '*.in')))
++        if not samples:
++            report.append("[samples] none found (sample*.txt or tests/*.in)")
++        for sample in samples[:10]:
++            start = time.time()
++            try:
++                with open(sample) as fin:
++                    p = subprocess.run(['python3', sol_path], stdin=fin, cwd=self.git_tempdir,
++                                       capture_output=True, text=True, timeout=GATE_SAMPLE_TIMEOUT)
++                elapsed = time.time() - start
++                report.append(f"[run {os.path.basename(sample)}] exit={p.returncode} time={elapsed:.2f}s\n"
++                              f"stdout:\n{p.stdout[-2000:]}\nstderr:\n{p.stderr[-2000:]}")
++                if p.returncode != 0:
++                    gate_ok = False
++            except subprocess.TimeoutExpired:
++                report.append(f"[run {os.path.basename(sample)}] TIMEOUT after {GATE_SAMPLE_TIMEOUT}s")
++                gate_ok = False
++
++        self.gate_ok = gate_ok
++        report.append(f"[summary] gate_ok={gate_ok}")
++        return "\n".join(report)
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        """Text of the last assistant message in the history ('' if none)."""
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            texts = []
++            for block in content or []:
++                if isinstance(block, dict):
++                    texts.append(block.get('text') or '')
++                else:
++                    texts.append(getattr(block, 'text', None) or '')
++            return "\n".join(texts)
++        return ''
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Phases: plan+implement, bounded verify/repair rounds (gate report injected), final review.
++        All phases share one message history.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = []
++        gate_report = "(not run yet)"
++
++        # Phase 1: plan and implement
++        msg_history = chat_with_agent(
++            PLAN_AND_IMPLEMENT.format(git_tempdir=self.git_tempdir, problem_statement=self.problem_statement),
++            model=self.code_model, msg_history=msg_history, logging=safe_log,
++        )
++        gate_report = self._gate_check()
++        safe_log(f"[gate after plan+implement]\n{gate_report}")
++
++        # Phase 2: verify and repair, bounded rounds
++        for round_number in range(1, MAX_REPAIR_ROUNDS + 1):
++            msg_history = chat_with_agent(
++                VERIFY_AND_REPAIR.format(
++                    git_tempdir=self.git_tempdir,
++                    round_number=round_number,
++                    max_rounds=MAX_REPAIR_ROUNDS,
++                    gate_report=gate_report,
++                ),
++                model=self.code_model, msg_history=msg_history, logging=safe_log,
++            )
++            gate_report = self._gate_check()
++            safe_log(f"[gate after verify round {round_number}]\n{gate_report}")
++            agent_says_passed = 'CHECKS: PASSED' in self._last_assistant_text(msg_history)
++            if self.gate_ok and agent_says_passed:
++                break
++
++        # Phase 3: final review
++        msg_history = chat_with_agent(
++            FINAL_REVIEW.format(git_tempdir=self.git_tempdir),
++            model=self.code_model, msg_history=msg_history, logging=safe_log,
++        )
++        gate_report = self._gate_check()
++        safe_log(f"[gate after final review]\n{gate_report}")
++        return msg_history
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/prompts/workflow_prompts.py b/prompts/workflow_prompts.py
+new file mode 100644
+index 0000000..b01b45d
+--- /dev/null
++++ b/prompts/workflow_prompts.py
+@@ -0,0 +1,68 @@
++"""Phase-specific prompts for the coding agent's multi-phase workflow.
++
++Placeholders are filled with str.format(); literal braces must not appear
++in these templates except as placeholders.
++"""
++
++PLAN_AND_IMPLEMENT = """I have uploaded a code repository in the directory {git_tempdir}. Help solve the following problem.
++
++<problem_description>
++{problem_statement}
++</problem_description>
++
++Your task is to make changes to the files in the {git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++
++PHASE 1: PLAN AND IMPLEMENT.
++1. Read the statement and constraints carefully. Note the input format, output format, and exact limits (n, values, time limit if given).
++2. Write a short plan to `{git_tempdir}/notes.md` containing:
++   - Analysis of the problem and the key observation(s).
++   - An estimate of the intended time and memory complexity, and whether it fits the limits in Python (Python does roughly 10^7 simple operations per second; aim well under that).
++   - The simplest correct algorithm that fits the limits. Prefer simple over clever when both are correct.
++   - An edge-case list (e.g. n=1, all equal values, empty or minimal input, maximum values, worst-case structure, overflow-like sizes, deep recursion chains).
++3. Implement the solution in `{git_tempdir}/solution.py` with the editor tool.
++   - If the problem is a complete program, it must read standard input via `sys.stdin` and write to standard output.
++   - If the problem asks for a method of a `Solution` class, define `class Solution` with exactly the requested method name and signature, and begin the file with `from typing import *`.
++   - `solution.py` must be self-contained: no dependence on helper files, notes, or test data.
++4. Run `python3 -m py_compile {git_tempdir}/solution.py` to make sure it compiles.
++5. Run it on the sample inputs from the statement and compare with the expected outputs exactly.
++
++Do not stop until `solution.py` exists, compiles, and reproduces the samples. Use the tools as needed; do not just describe the solution.
++"""
++
++VERIFY_AND_REPAIR = """PHASE 2: VERIFY AND REPAIR (round {round_number} of {max_rounds}).
++
++Here is the automatic gate report for `{git_tempdir}/solution.py`. It contains raw output from checking the file exists, compiles, has the expected entry point, and runs on sample files. Read it yourself; it is not parsed:
++
++<gate_report>
++{gate_report}
++</gate_report>
++
++If the gate report shows any problem (missing file, compile error, crash, non-zero exit, wrong output on a sample), fix it first.
++
++Then verify the solution thoroughly, as follows:
++1. Write a brute-force reference solution for small inputs, in a separate file such as `{git_tempdir}/brute.py`. It should be obviously correct even if slow.
++2. Write a random small-input generator in `{git_tempdir}/gen.py` that takes a seed as its command-line argument (use `random.seed(int(sys.argv[1]))`) and prints one valid input to stdout. Include edge values in the random choices (minimum sizes, equal values, extremes of the value range).
++3. Run a stress test of at least 300 random small cases comparing `solution.py` with `brute.py`. You can use the `stress_test` tool, or a bash loop over seeds. For a `Solution` class method, call the method from a driver script and compare with the brute force's result. Print the first mismatching input and both outputs. Fix every mismatch in `solution.py` and re-run until zero mismatches.
++4. Run a maximum-size timing test: generate an input at the largest allowed size (and worst-case structure, e.g. deep chains or many duplicates), then run `time python3 solution.py < big.txt`. The run must finish well under 2 seconds. If it is slow, improve the algorithm (not just micro-optimise). Use `sys.stdin` for fast reading and avoid recursion depth issues (raise `sys.setrecursionlimit` and/or use an iterative approach).
++5. Re-run the samples and confirm the output format is exact (no extra spaces, debug prints, or missing newlines).
++
++Keep helper files (brute.py, gen.py, driver scripts) outside solution.py. Solution.py must not import them.
++
++When finished, end your reply with exactly one of these lines on its own:
++CHECKS: PASSED   (only if the gate is clean, the stress test had at least 300 cases with zero mismatches, and the timing test passed)
++CHECKS: FAILED   (otherwise)
++"""
++
++FINAL_REVIEW = """PHASE 3: FINAL REVIEW.
++
++Review `{git_tempdir}/solution.py` against this checklist and fix anything that fails. Re-run the samples after any change.
++- Fast IO: uses `sys.stdin` (e.g. `sys.stdin.read().split()`) and writes output once, not per-line `print` in huge loops, when there are many outputs.
++- Recursion: no deep recursion that could exceed Python's default limit. Either use an iterative DFS/BFS or raise the recursion limit together with `threading` stack size.
++- No debug output: no stray `print`, no logging, no input prompts, no leftover test code under the entry point.
++- Exact output format: matches the statement (separators, newlines, case, YES/NO spelling, floating-point precision if specified).
++- Correct entry point: for a `Solution` task, `class Solution` with the exact method name and signature from the problem, and `from typing import *` at the top. For a stdin program, the code runs on import-free execution and handles the full input.
++- Self-contained: `solution.py` imports only the standard library and does not depend on any helper file, notes, or test data.
++- Edge cases from your notes are handled.
++
++When done, reply with a short summary of the final state, and end with exactly one line: CHECKS: PASSED or CHECKS: FAILED.
++"""
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..b9fc836
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,73 @@
++import subprocess
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Randomized stress test: compare a solution against a brute-force reference.\n
++* `gen_cmd` must print one random input to stdout and accept an integer seed as its last command-line argument (the seed is appended to the command for each test).\n
++* For each seed from 1 to `num_tests`, the generated input is fed to both `solution_cmd` and `brute_cmd` via stdin.\n
++* Outputs are compared after stripping trailing whitespace. A non-zero exit code or a timeout counts as a failure.\n
++* Returns 'all passed' or the first differing input together with both outputs (and stderr/exit codes).\n
++* Commands run through the shell; use `cd <dir> && ...` if needed, e.g. `python3 solution.py`.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {"type": "string", "description": "Shell command that runs the solution under test, reading the input from stdin, e.g. `python3 solution.py`."},
++                "brute_cmd": {"type": "string", "description": "Shell command that runs the brute-force reference, reading the input from stdin, e.g. `python3 brute.py`."},
++                "gen_cmd": {"type": "string", "description": "Shell command that prints a random test input to stdout; the seed is appended as the last argument, e.g. `python3 gen.py`."},
++                "num_tests": {"type": "integer", "description": "Number of random tests to run (seeds 1..num_tests). Use at least 300."},
++                "timeout": {"type": "integer", "description": "Per-run time limit in seconds for each program (default 10)."}
++            },
++            "required": ["solution_cmd", "brute_cmd", "gen_cmd", "num_tests"]
++        }
++    }
++
++def _clip(s, n=3000):
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++def _run(cmd, stdin_text, timeout):
++    """Run a shell command; return (status, stdout, stderr). status is 'ok', 'exit N' or 'timeout'."""
++    try:
++        p = subprocess.run(cmd, shell=True, input=stdin_text, capture_output=True, text=True,
++                           timeout=timeout, errors='replace')
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout if isinstance(e.stdout, str) else ''
++        err = e.stderr if isinstance(e.stderr, str) else ''
++        return 'timeout', out, err
++    status = 'ok' if p.returncode == 0 else f'exit {p.returncode}'
++    return status, p.stdout, p.stderr
++
++def tool_function(solution_cmd, brute_cmd, gen_cmd, num_tests, timeout=10):
++    try:
++        num_tests = int(num_tests)
++    except (TypeError, ValueError):
++        num_tests = 300
++    try:
++        timeout = int(timeout) if timeout else 10
++    except (TypeError, ValueError):
++        timeout = 10
++    timeout = max(1, min(timeout, 120))
++    num_tests = max(1, min(num_tests, 100000))
++
++    for seed in range(1, num_tests + 1):
++        gen_status, test_input, gen_err = _run(f"{gen_cmd} {seed}", "", timeout)
++        if gen_status != 'ok':
++            return f"Generator failed on seed {seed} ({gen_status}).\nSTDERR:\n{_clip(gen_err)}"
++
++        sol_status, sol_out, sol_err = _run(solution_cmd, test_input, timeout)
++        brute_status, brute_out, brute_err = _run(brute_cmd, test_input, timeout)
++
++        same = (sol_status == 'ok' and brute_status == 'ok'
++                and sol_out.rstrip() == brute_out.rstrip())
++        if not same:
++            return (
++                f"MISMATCH at seed {seed}.\n"
++                f"Input:\n{_clip(test_input.rstrip())}\n\n"
++                f"Solution status: {sol_status}\nSolution output:\n{_clip(sol_out.rstrip())}\n"
++                f"Solution stderr:\n{_clip(sol_err.rstrip())}\n\n"
++                f"Brute status: {brute_status}\nBrute output:\n{_clip(brute_out.rstrip())}\n"
++                f"Brute stderr:\n{_clip(brute_err.rstrip())}"
++            )
++    return f"all passed ({num_tests} tests)"

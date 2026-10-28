@@ -1,0 +1,249 @@
+diff --git a/tests/test_run_io_tests_tool.py b/tests/test_run_io_tests_tool.py
+new file mode 100644
+index 0000000..ce9ffc0
+--- /dev/null
++++ b/tests/test_run_io_tests_tool.py
+@@ -0,0 +1,101 @@
++import json
++import sys
++import pytest
++
++sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__))))
++
++from tools.run_io_tests import tool_info, tool_function
++
++SUM_PROGRAM = "a, b = map(int, input().split())\nprint(a + b)\n"
++
++
++def _write(tmp_path, name, src):
++    p = tmp_path / name
++    p.write_text(src)
++    return str(p)
++
++
++def test_schema_structure():
++    info = tool_info()
++    assert info["name"] == "run_io_tests"
++    schema = info["input_schema"]
++    assert schema["type"] == "object"
++    assert set(schema["required"]) == {"solution_path", "test_cases"}
++    assert set(schema["properties"]) >= {"solution_path", "test_cases", "timeout_seconds"}
++    for prop in schema["properties"].values():
++        assert "type" in prop and "description" in prop
++    assert "required" not in schema["properties"]
++
++
++def test_all_pass(tmp_path):
++    path = _write(tmp_path, "sol.py", SUM_PROGRAM)
++    cases = json.dumps([
++        {"input": "1 2\n", "expected_output": "3\n"},
++        {"input": "10 -4\n", "expected_output": "6\n"},
++    ])
++    assert tool_function(path, cases) == "PASS 2/2"
++
++
++def test_wrong_output_reports_expected_and_actual(tmp_path):
++    path = _write(tmp_path, "sol.py", "a, b = map(int, input().split())\nprint(a - b)\n")
++    cases = json.dumps([{"input": "5 2\n", "expected_output": "7\n"}])
++    out = tool_function(path, cases)
++    assert out.startswith("PASS 0/1")
++    assert "FAIL" in out
++    assert "7" in out and "3" in out
++
++
++def test_timeout_is_reported(tmp_path):
++    path = _write(tmp_path, "loop.py", "while 1:\n    pass\n")
++    cases = json.dumps([{"input": "", "expected_output": "x\n"}])
++    out = tool_function(path, cases, timeout_seconds=0.5)
++    assert "TIMEOUT" in out
++    assert "PASS 0/1" in out
++
++
++def test_exception_stderr_reported(tmp_path):
++    path = _write(tmp_path, "boom.py", "raise ValueError('kaboom')\n")
++    cases = json.dumps([{"input": "", "expected_output": "1\n"}])
++    out = tool_function(path, cases)
++    assert "PASS 0/1" in out
++    assert "kaboom" in out
++
++
++def test_whitespace_and_crlf_tolerance(tmp_path):
++    path = _write(tmp_path, "sol.py", "print('1 2')\nprint('3')\n")
++    cases = json.dumps([{"input": "", "expected_output": "1 2\r\n3"}])
++    assert tool_function(path, cases) == "PASS 1/1"
++
++
++def test_malformed_json(tmp_path):
++    path = _write(tmp_path, "sol.py", SUM_PROGRAM)
++    out = tool_function(path, "[{bad json")
++    assert "not valid JSON" in out
++
++
++def test_empty_list(tmp_path):
++    path = _write(tmp_path, "sol.py", SUM_PROGRAM)
++    assert "empty" in tool_function(path, "[]")
++
++
++def test_bad_entry_shape(tmp_path):
++    path = _write(tmp_path, "sol.py", SUM_PROGRAM)
++    out = tool_function(path, json.dumps([{"input": "1 2"}]))
++    assert "expected_output" in out
++
++
++def test_missing_file(tmp_path):
++    out = tool_function(str(tmp_path / "nope.py"), json.dumps([{"input": "", "expected_output": ""}]))
++    assert "does not exist" in out
++
++
++def test_non_py_file(tmp_path):
++    path = _write(tmp_path, "sol.txt", SUM_PROGRAM)
++    out = tool_function(path, json.dumps([{"input": "", "expected_output": ""}]))
++    assert ".py" in out
++
++
++def test_loader_picks_up_tool():
++    from tools import load_all_tools
++    names = [t["name"] for t in load_all_tools(logging=lambda *_: None)]
++    assert "run_io_tests" in names
+diff --git a/tools/run_io_tests.py b/tools/run_io_tests.py
+new file mode 100644
+index 0000000..256fe4d
+--- /dev/null
++++ b/tools/run_io_tests.py
+@@ -0,0 +1,136 @@
++import json
++import os
++import subprocess
++import sys
++
++MAX_OUTPUT_CHARS = 4000
++DEFAULT_TIMEOUT_SECONDS = 10
++
++
++def tool_info():
++    return {
++        "name": "run_io_tests",
++        "description": """Runs a Python solution program on given input/expected-output test cases and compares its standard output with the expected output.
++* Each test case is run as a separate subprocess: `python <solution_path>` with the case's `input` fed to stdin.
++* Outputs are compared token-wise (whitespace and line-ending differences are ignored).
++* Returns a summary line `PASS i/n` and, for each failing case, the input, expected output, actual output, stderr tail, and exit code or TIMEOUT marker.
++* Use it to validate a solution against the sample tests from the problem statement (and any extra cases you craft) before finishing.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the Python program to test (a .py file). Absolute or relative to the current working directory."
++                },
++                "test_cases": {
++                    "type": "string",
++                    "description": "A JSON string holding a list of objects, each with keys \"input\" (string fed to stdin) and \"expected_output\" (string to compare with stdout). Example: [{\"input\": \"1 2\\n\", \"expected_output\": \"3\\n\"}]"
++                },
++                "timeout_seconds": {
++                    "type": "number",
++                    "description": "Maximum run time in seconds for each test case. Defaults to 10."
++                }
++            },
++            "required": ["solution_path", "test_cases"]
++        }
++    }
++
++
++def _truncate(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
++    if text is None:
++        return ""
++    if len(text) > max_chars:
++        return text[:max_chars] + "\n<response clipped>"
++    return text
++
++
++def _tail(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
++    if text is None:
++        return ""
++    if len(text) > max_chars:
++        return "<response clipped>\n" + text[-max_chars:]
++    return text
++
++
++def tool_function(solution_path, test_cases, timeout_seconds=DEFAULT_TIMEOUT_SECONDS):
++    # Validate the solution path
++    if not isinstance(solution_path, str) or not solution_path.strip():
++        return "Error: solution_path must be a non-empty string."
++    if not solution_path.endswith(".py"):
++        return f"Error: solution_path must be a .py file, got: {solution_path}"
++    if not os.path.isfile(solution_path):
++        return f"Error: solution file does not exist: {solution_path}"
++
++    # Validate the timeout
++    try:
++        timeout = float(timeout_seconds) if timeout_seconds is not None else DEFAULT_TIMEOUT_SECONDS
++    except (TypeError, ValueError):
++        return f"Error: timeout_seconds must be a number, got: {timeout_seconds!r}"
++    if timeout <= 0:
++        return "Error: timeout_seconds must be positive."
++
++    # Parse the test cases
++    try:
++        cases = json.loads(test_cases) if isinstance(test_cases, str) else test_cases
++    except json.JSONDecodeError as e:
++        return f"Error: test_cases is not valid JSON: {e}"
++    if not isinstance(cases, list):
++        return "Error: test_cases must be a JSON list of objects with 'input' and 'expected_output'."
++    if len(cases) == 0:
++        return "Error: test_cases is empty; provide at least one test case."
++
++    for idx, case in enumerate(cases):
++        if not isinstance(case, dict) or "input" not in case or "expected_output" not in case:
++            return f"Error: test case #{idx + 1} must be an object with 'input' and 'expected_output' keys."
++        if not isinstance(case["input"], str) or not isinstance(case["expected_output"], str):
++            return f"Error: test case #{idx + 1} 'input' and 'expected_output' must be strings."
++
++    total = len(cases)
++    passed = 0
++    failures = []
++
++    for idx, case in enumerate(cases):
++        case_input = case["input"]
++        expected = case["expected_output"]
++        try:
++            proc = subprocess.run(
++                [sys.executable, solution_path],
++                input=case_input,
++                capture_output=True,
++                text=True,
++                timeout=timeout,
++            )
++        except subprocess.TimeoutExpired as e:
++            stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
++            stderr = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
++            failures.append(
++                f"--- Case {idx + 1}: TIMEOUT after {timeout}s\n"
++                f"Input:\n{_truncate(case_input)}\n"
++                f"Expected:\n{_truncate(expected)}\n"
++                f"Actual (partial stdout):\n{_truncate(stdout)}\n"
++                f"stderr tail:\n{_tail(stderr)}"
++            )
++            continue
++        except Exception as e:
++            failures.append(f"--- Case {idx + 1}: failed to run solution: {e}")
++            continue
++
++        actual = proc.stdout or ""
++        ok = actual.split() == expected.split()
++        if ok and proc.returncode == 0:
++            passed += 1
++            continue
++
++        status = "exit code {}".format(proc.returncode) if proc.returncode != 0 else "wrong output"
++        failures.append(
++            f"--- Case {idx + 1}: FAIL ({status})\n"
++            f"Input:\n{_truncate(case_input)}\n"
++            f"Expected:\n{_truncate(expected)}\n"
++            f"Actual:\n{_truncate(actual)}\n"
++            f"stderr tail:\n{_tail(proc.stderr or '')}"
++        )
++
++    summary = f"PASS {passed}/{total}"
++    if not failures:
++        return summary
++    return summary + "\n" + "\n".join(failures)

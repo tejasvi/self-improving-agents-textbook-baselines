@@ -1,0 +1,269 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a1f9435..db25cd2 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -9,6 +9,7 @@ import time
+ import uuid
+ from logging.handlers import RotatingFileHandler
+ import os
++import tempfile
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -89,6 +90,30 @@ Create these three files in {d}:
+ 
+ Then check brute.py by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Finish by making sure all three files exist."""
+ 
++CHECKER_TEMPLATE = """You are writing an independent answer checker for the competitive programming problem below. Work in the directory {d}.
++Do NOT read or use solution.py; write the checker independently from the statement only.
++
++<problem_description>
++{statement}
++</problem_description>
++
++The statement accepts more than one correct output for some inputs, so exact text comparison is not enough.
++Create checker.py in {d}. Usage: `python3 checker.py INPUT_FILE OUTPUT_FILE`, where INPUT_FILE holds one test input and OUTPUT_FILE holds a candidate output.
++It must print a single line starting with `OK` if the candidate output is a valid answer for that input under the statement's rules, or `BAD` followed by a short reason otherwise. Verify the constraints and the answer's validity (not whether it equals a particular text). Exit with code 0 in both cases.
++Test checker.py by hand on the sample inputs in the statement with the sample expected outputs (it must print OK for them) and on at least one obviously wrong output (it must print BAD). Finish by making sure checker.py exists."""
++
++# Phrases that indicate the statement accepts any of several correct outputs.
++MULTI_ANSWER_PATTERNS = [
++    r"any of them will be accepted",
++    r"any of (?:them|these|those) (?:is|are) (?:acceptable|accepted|correct|valid)",
++    r"multiple (?:solutions|answers|outputs)",
++    r"any valid",
++    r"other acceptable",
++    r"(?:print|output|find) any (?:of them|one|such|valid|answer|solution)",
++]
++
++MULTI_ANSWER_NOTE = ("valid but differs from sample text; this is acceptable, do not change the output to match")
++
+ 
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+@@ -274,17 +299,69 @@ class AgenticSystem:
+             samples.append((int(m.group(1)), inp + '\n', out))
+         return samples
+ 
++    def _is_multi_answer(self):
++        """True if the statement says several different outputs may be correct (exact text is not the only answer)."""
++        text = self.problem_statement or ''
++        return any(re.search(p, text, re.I) for p in MULTI_ANSWER_PATTERNS)
++
++    def _checker_path(self):
++        return os.path.join(self.git_tempdir, 'checker.py')
++
++    def _run_checker(self, inp, out):
++        """Run checker.py on (input text, output text). Returns (is_ok, reason_text)."""
++        in_fd, in_path = tempfile.mkstemp(suffix='.in', dir='/tmp')
++        out_fd, out_path = tempfile.mkstemp(suffix='.out', dir='/tmp')
++        try:
++            with os.fdopen(in_fd, 'w') as f:
++                f.write(inp)
++            with os.fdopen(out_fd, 'w') as f:
++                f.write(out)
++            p = subprocess.run(['python3', 'checker.py', in_path, out_path], cwd=self.git_tempdir,
++                               capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            first = (p.stdout or '').strip().splitlines()
++            line = first[0].strip() if first else ''
++            if p.returncode == 0 and line.startswith('OK'):
++                return True, line
++            return False, (line or (p.stderr or '').strip() or f"checker exit {p.returncode}")[:REPORT_CLIP]
++        except subprocess.TimeoutExpired:
++            return False, f"checker.py timed out after {RUN_TIMEOUT_S}s"
++        finally:
++            for pth in (in_path, out_path):
++                try:
++                    os.remove(pth)
++                except OSError:
++                    pass
++
++    def _checker_usable(self, samples):
++        """checker.py exists and accepts every sample's expected output (verified once per call)."""
++        if not os.path.isfile(self._checker_path()):
++            return False
++        for _, inp, exp in samples:
++            try:
++                ok, _ = self._run_checker(inp, exp + '\n')
++            except OSError:
++                return False
++            if not ok:
++                return False
++        return True
++
+     def _run_samples(self):
+         """
+         Run solution.py on each parsed sample. Returns (passed, total, timed_out, report).
++        passed counts exact-text matches and, for multi-answer statements with a verified checker.py,
++        outputs the checker accepts. Per-sample status is kept in self._last_status ('exact', 'valid', 'fail',
++        'timeout') and the exact-match count in self._last_exact, for scoring and the regression guard.
+         For Solution-class tasks nothing is run; the report tells the agent to check samples itself.
+         """
++        self._last_status, self._last_exact = {}, 0
+         if self._is_class_task():
+             return 0, 0, False, ("This is a Solution-class task, so the harness did not run the samples. "
+                                  "Check every sample yourself with a driver script that calls Solution.")
+         samples = self._parse_samples()
+         if not samples:
+             return 0, 0, False, "No 'Sample Input N' / 'Sample Output N' blocks were found in the statement."
++        multi = self._is_multi_answer()
++        use_checker = multi and self._checker_usable(samples)
+         passed, timed_out, parts = 0, False, []
+         for idx, inp, exp in samples:
+             try:
+@@ -292,16 +369,33 @@ class AgenticSystem:
+                                    capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+             except subprocess.TimeoutExpired:
+                 timed_out = True
++                self._last_status[idx] = 'timeout'
+                 parts.append(f"Sample {idx}: TIMEOUT after {RUN_TIMEOUT_S}s\n"
+                              f"input:\n{inp[:REPORT_CLIP]}\nexpected:\n{exp[:REPORT_CLIP]}")
+                 continue
+             actual = p.stdout
+             if actual.split() == exp.split():
+                 passed += 1
++                self._last_exact += 1
++                self._last_status[idx] = 'exact'
++                continue
++            if use_checker:
++                ok, reason = self._run_checker(inp, actual)
++                if ok:
++                    passed += 1
++                    self._last_status[idx] = 'valid'
++                    parts.append(f"Sample {idx}: {MULTI_ANSWER_NOTE}.\ninput:\n{inp[:REPORT_CLIP]}"
++                                 f"expected (sample text):\n{exp[:REPORT_CLIP]}\n"
++                                 f"actual:\n{actual[:REPORT_CLIP]}\nchecker: {reason}")
++                    continue
++                checker_note = f"\nchecker.py verdict: {reason}"
+             else:
+-                parts.append(f"Sample {idx}: FAILED\ninput:\n{inp[:REPORT_CLIP]}"
+-                             f"expected:\n{exp[:REPORT_CLIP]}\nactual:\n{actual[:REPORT_CLIP]}"
+-                             f"stderr:\n{(p.stderr or '')[-REPORT_CLIP:]}\n(exit code {p.returncode})")
++                checker_note = ""
++            self._last_status[idx] = 'fail'
++            parts.append(f"Sample {idx}: FAILED\ninput:\n{inp[:REPORT_CLIP]}"
++                         f"expected:\n{exp[:REPORT_CLIP]}\nactual:\n{actual[:REPORT_CLIP]}"
++                         f"stderr:\n{(p.stderr or '')[-REPORT_CLIP:]}\n(exit code {p.returncode})"
++                         f"{checker_note}")
+         report = f"Samples passed: {passed}/{len(samples)}."
+         if parts:
+             report += "\n" + "\n".join(parts)
+@@ -401,6 +495,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 
+     def _method_text(self):
+         return """Work like a careful competitive programmer. Keep every reply short (a few sentences plus tool calls) so that your output is not cut off.
++If the statement allows multiple answers, never alter output (bit shifts, offsets, orderings) merely to match sample text; pick the simplest canonical answer, and validate with a checker.
+ 
+ Phase 1 (baseline first, before any exploration):
+ 1. Read the statement and constraints.
+@@ -431,6 +526,8 @@ What you learned so far (from your earlier calls; do not redo these experiments
+ {getattr(self, '_last_notes', '') or '(no earlier notes)'}
+ 
+ Diagnose the root cause first. If your algorithm is fundamentally wrong, derive a different one; do not just patch special cases.
++If the statement allows multiple answers, never alter output (bit shifts, offsets, orderings) merely to match sample text; pick the simplest canonical answer, and validate with a checker. A sample marked "valid but differs from sample text" is acceptable: do not change it.
++If the report says REGRESSION, a sample that passed before now fails; restore that behaviour.
+ Keep every reply short so that your output is not cut off.
+ Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
+ """
+@@ -501,7 +598,8 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+     def forward(self):
+         """
+         Bounded multi-attempt loop. Each attempt is judged by the harness; the best snapshot wins.
+-        Score = (samples_passed, stress_ok, no_timeout); ties go to the later attempt.
++        Score = (samples_passed_by_exact_or_checker, stress_ok, timing_ok, exact_matches); ties go to the later attempt.
++        An attempt that makes a sample worse than the best attempt so far (an OK sample now fails) is never selected.
+         """
+         self._run_id = uuid.uuid4().hex[:12]
+         self._stub = self._read_solution()
+@@ -510,6 +608,9 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+         feedback = None
+         prev_code = self._read_solution()
+         class_task = self._is_class_task()
++        multi = (not class_task) and self._is_multi_answer()
++        checker_asked = False
++        best_status = None  # per-sample status ('exact'/'valid'/'fail'/'timeout') of the best attempt
+ 
+         for k in range(MAX_ATTEMPTS):
+             before = self._read_solution() if k > 0 else None
+@@ -523,13 +624,19 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+ 
+             ok, basic_msg = self._check_basic()
+             if not ok:
+-                score = (-1, False, False)
++                score = (-1, False, False, 0)
+                 feedback = f"Basic check FAILED: {basic_msg}\nWrite solution.py now."
+                 safe_log(f"Attempt {k} score={score}\n{feedback}")
+                 prev_code = self._read_solution()
+                 continue
+ 
++            if multi and not checker_asked and not os.path.isfile(self._checker_path()):
++                # Multi-answer statement: ask once for an independent checker.py (usage: INPUT OUTPUT -> OK/BAD).
++                checker_asked = True
++                self._ask(CHECKER_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement))
+             passed, total, samples_timeout, sample_report = self._run_samples()
++            status = dict(getattr(self, '_last_status', {}) or {})
++            exact_n = getattr(self, '_last_exact', 0)
+             report_parts = [basic_msg, sample_report]
+             stress_mismatch = False
+             timing_ok = True
+@@ -553,16 +660,35 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                 report_parts.append("Oracle/stress phase skipped until all samples pass.")
+ 
+             if class_task:
+-                score = (0, True, True)
++                score = (0, True, True, 0)
+             else:
+-                score = (passed, not stress_mismatch, not samples_timeout and timing_ok)
++                score = (passed, not stress_mismatch, not samples_timeout and timing_ok, exact_n)
++            # Regression guard: a sample that was OK in the best attempt must still be OK.
++            regressed = []
++            if best_status is not None:
++                for idx, prev in sorted(best_status.items()):
++                    now = status.get(idx, 'fail')
++                    if prev in ('exact', 'valid') and now not in ('exact', 'valid'):
++                        regressed.append(idx)
+             snap = self._snapshot(k)
+             safe_log(f"Attempt {k} score={score} snapshot={snap}\n" + "\n".join(report_parts))
+ 
+-            # ">=" so a later attempt wins ties, but never loses to a better earlier one.
+-            if snap is not None and (best is None or score >= best[0]):
++            if regressed:
++                report_parts.append("REGRESSION: " + "; ".join(
++                    f"sample {i} previously OK now differs ({status.get(i, 'fail')})" for i in regressed)
++                    + ". The earlier best attempt is kept; do not break samples that already passed.")
++                safe_log(f"Attempt {k} rejected: regression on samples {regressed}")
++            elif snap is not None and (best is None or score >= best[0]):
++                # ">=" so a later attempt wins ties, but never loses to a better earlier one.
+                 best = (score, k, snap)
++                best_status = status
+             prev_code = self._read_solution()
++            if regressed and best is not None:
++                try:
++                    with open(best[2]) as f:
++                        prev_code = f.read()  # show the retry the best attempt, not the regressed one
++                except OSError:
++                    pass
+             feedback = "\n\n".join(p for p in report_parts if p)
+ 
+             clean = class_task or (samples_all_pass and not stress_mismatch and timing_ok and not samples_timeout)
+diff --git a/solution.py b/solution.py
+index f9c4803..09d9e23 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,13 +1,11 @@
+-# NOTE: The problem statement and samples are not available in /dgm, so this file is a
+-# minimal, valid stdin/stdout program rather than a solution to a specific problem.
+-# Replace main() with the real algorithm once the statement is provided.
+ import sys
+ 
+ 
+ def main():
++    # Placeholder first version: the problem statement was not provided,
++    # so this only reads the input and produces no output.
+     data = sys.stdin.read().split()
+-    # Placeholder behaviour: echo the input tokens back, space-separated.
+-    sys.stdout.write(" ".join(data) + ("\n" if data else ""))
++    _ = data
+ 
+ 
+ if __name__ == "__main__":

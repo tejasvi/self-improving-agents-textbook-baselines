@@ -1,0 +1,216 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3ad5b67..6b7bcfd 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -96,6 +96,10 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++PERF_GEN_PATH = '/tmp/perf_gen.py'
++PERF_DRIVER_PATH = '/tmp/perf_driver.py'
++PERF_TIMEOUT_SECONDS = 10
++
+ def _is_test_file(path):
+     """
+     Return True if `path` looks like a test file (test directories, test_*.py,
+@@ -285,6 +289,106 @@ Copy the sample inputs and outputs exactly, preserving line breaks. If there are
+                 return os.path.join(self.git_tempdir, f)
+         return os.path.join(self.git_tempdir, candidates[0])
+ 
++    def _extract_code_blocks(self, text):
++        """
++        Return the bodies of all fenced code blocks in `text`, in order.
++        """
++        return [m.group(1) for m in re.finditer(r"```[A-Za-z0-9_+-]*[ \t]*\n(.*?)```", text or "", re.DOTALL)]
++
++    def _generate_max_input(self):
++        """
++        Ask the LLM to write two scripts under /tmp (never in the repo):
++        PERF_GEN_PATH prints a worst-case (max-constraint) input to stdout, and
++        PERF_DRIVER_PATH takes the solution path as argv[1], builds max-size input
++        (stdin program or Solution-class method call), runs the solution with a timing,
++        and prints the elapsed time. Returns (gen_path, driver_path) or None on failure.
++        """
++        solution_path = self._solution_path()
++        if not solution_path or not os.path.exists(solution_path):
++            safe_log("[perf] no solution file; cannot generate max-size input.")
++            return None
++        try:
++            with open(solution_path, 'r') as f:
++                code = f.read()
++        except OSError:
++            code = ''
++        if len(code) > 6000:
++            code = code[:6000] + "\n...(truncated)..."
++
++        prompt = f"""Write a performance stress driver for the competitive programming problem below.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++Starter code / current solution file ({solution_path}). Read its function or class signature carefully:
++<solution_file>
++{code if code.strip() else '(empty)'}
++</solution_file>
++
++Return EXACTLY two fenced ```python code blocks and nothing else that contains code.
++
++Block 1 = generator script, saved to {PERF_GEN_PATH}:
++- Prints ONE worst-case input to stdout that uses the MAXIMUM sizes allowed by the constraints (e.g. maximal n, maximal k, maximal values), chosen to be as expensive as possible for typical algorithms (e.g. many distinct values, no early termination, deep structures).
++- Use a fixed random seed. Input format must match the problem's stdin format exactly.
++- If the problem is a Solution-class method task (no stdin), it may just print a short description of the worst-case parameters.
++
++Block 2 = driver script, saved to {PERF_DRIVER_PATH}. It is run as `python3 {PERF_DRIVER_PATH} <solution_path>` with the solution file path as sys.argv[1]:
++- If the solution reads stdin: build the max-size input (by running `python3 {PERF_GEN_PATH}` via subprocess, or by generating it directly), run `python3 <solution_path>` on it via subprocess with the input piped to stdin, and time only that run.
++- If the solution defines a `Solution` class with a method: import the solution file dynamically with importlib (spec_from_file_location), build max-size arguments matching the method signature, call the method, and time only the call.
++- Print exactly one line `ELAPSED <seconds>` to stdout when done. Let exceptions propagate (non-zero exit) so errors show up in stderr.
++- Use only the Python standard library. Do NOT write anything inside the repository; only use /tmp.
++- Do not check correctness of the answer; only measure time. Keep the input generation itself fast (under a few seconds).
++"""
++        text = simple_chat(prompt, model=self.code_model, max_tokens=8192, logging=safe_log)
++        blocks = self._extract_code_blocks(text)
++        if len(blocks) < 2:
++            safe_log(f"[perf] expected 2 code blocks from the generator prompt, got {len(blocks)}.")
++            return None
++        with open(PERF_GEN_PATH, 'w') as f:
++            f.write(blocks[0])
++        with open(PERF_DRIVER_PATH, 'w') as f:
++            f.write(blocks[1])
++        safe_log(f"[perf] wrote {PERF_GEN_PATH} and {PERF_DRIVER_PATH}.")
++        return PERF_GEN_PATH, PERF_DRIVER_PATH
++
++    def _run_perf(self, solution_path, driver_path, timeout=PERF_TIMEOUT_SECONDS):
++        """
++        Run the perf driver on the solution with a hard timeout (the whole process group is
++        killed on timeout). Returns (raw_report, passed): passed is True only if the driver
++        finished within the timeout with exit code 0. The report is raw text, not parsed.
++        """
++        if not solution_path or not os.path.exists(solution_path):
++            return f"Solution file not found: {solution_path}", False
++        if not driver_path or not os.path.exists(driver_path):
++            return f"Perf driver not found: {driver_path}", False
++        start = time.time()
++        proc = subprocess.Popen(
++            ["python3", driver_path, solution_path],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
++            cwd=self.git_tempdir, start_new_session=True,
++        )
++        try:
++            stdout, stderr = proc.communicate(timeout=timeout)
++            elapsed = time.time() - start
++            passed = proc.returncode == 0
++            status = "OK" if passed else f"FAILED (exit code {proc.returncode})"
++        except subprocess.TimeoutExpired:
++            try:
++                os.killpg(proc.pid, 9)
++            except OSError:
++                proc.kill()
++            stdout, stderr = proc.communicate()
++            elapsed = time.time() - start
++            passed = False
++            status = f"TIMEOUT: exceeded {timeout} seconds"
++        report = (
++            f"=== Max-size perf run ({status}, elapsed {elapsed:.3f}s) ===\n"
++            f"--- driver stdout ---\n{stdout}\n"
++            f"--- driver stderr ---\n{stderr}\n"
++        )
++        return report, passed
++
+     def _briefing(self, max_chars=6000):
+         """
+         Summarize prior progress for a fresh session: the notes file content and the
+@@ -339,6 +443,7 @@ Follow this step-by-step workflow:
+    If the statement allows multiple valid outputs (e.g. "if there are multiple solutions, print any"), do NOT assume any valid output is accepted. Assume the grader compares against the reference output, and choose the lexicographically smallest / first-in-natural-enumeration-order answer as the canonical answer. Design the algorithm so that this canonical answer is produced efficiently at max constraints, controlling tie-breaking explicitly.
+ 3) BEFORE exploring, write a straightforward correct brute-force/baseline solution (it may be slow) to the solution file with the editor tool, verify it on small samples, and record that in the notes file. Only then explore faster ideas.
+    Never spend more than ~15 tool calls without updating the solution file; when a new idea is verified against the baseline, overwrite the solution file with it. Do not print large tables or long exploratory output.
++   The baseline is a FALLBACK only. After writing the baseline, you MUST replace it with a solution whose complexity fits the constraints; the baseline is not an acceptable final answer if its worst case exceeds ~10^8 simple operations.
+    The file MUST be written to disk.
+ 4) Run the program on every sample input in the problem statement with bash and compare its output with the expected output. Fix any mismatch and re-run until all samples pass. If the statement allows multiple valid outputs, verify that every sample expected output equals your canonical answer; if it does not, your choice of canonical order is wrong, so revise it.
+ 5) For tricky or hard problems, write brute.py that returns the canonical answer by exhaustive enumeration in canonical order, and stress-test solution.py by EXACT output comparison on at least 1000 random small inputs (small value ranges to force duplicates and ties). Only fall back to a validity checker if the exact rule is impossible to match. Fix any differences.
+@@ -405,6 +510,45 @@ Instructions:
+             chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[verify round {round_idx}] repair chat finished.")
+ 
++        # Performance verification and repair phase: time a max-constraint input and repair if slow.
++        perf_files = self._generate_max_input()
++        if perf_files is None:
++            safe_log("[perf] no max-size driver available; skipping perf repair rounds.")
++        for perf_round in range(3 if perf_files else 0):
++            solution_path = self._solution_path()
++            if not solution_path:
++                safe_log("[perf] no solution file found; skipping perf check.")
++                break
++            perf_report, fast = self._run_perf(solution_path, perf_files[1])
++            safe_log(f"[perf round {perf_round}] solution: {solution_path}\n{perf_report}")
++            if fast:
++                safe_log(f"[perf round {perf_round}] finished in time; stopping.")
++                break
++            current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            perf_msg = f"""{self._briefing()}{task}
++
++The solution passed the samples, but it is TOO SLOW on a max-constraint input (perf round {perf_round + 1}). Raw perf report:
++
++{perf_report}
++
++Driver script: {perf_files[1]} (generator: {perf_files[0]}). If the stderr above comes from the driver or generator rather than the solution, fix that script first.
++
++Current diff:
++{current_diff if current_diff.strip() else '(empty)'}
++
++Instructions:
++- State the maximum n/k (and value ranges) from the constraints, and the target complexity that fits within roughly 10^8 simple operations in Python.
++- Reject exponential or high-polynomial brute force (e.g. enumerating all k-subsets, or O(n^2) or worse when n is large). Do not keep the brute force as the final solution.
++- Consider these techniques: binary search on the answer (for max-min or min-max objectives); reducing geometric or circular structures to 1D; greedy with two pointers, pointer jumping or binary lifting; sorting; and DP.
++- Keep the old brute force as /tmp/brute.py (an oracle). Compare exactly with the new solution on 500+ small random inputs (small value ranges to force duplicates and ties) and fix any mismatch.
++- Re-time the solution at max size with {perf_files[1]} and confirm it finishes well within 10 seconds.
++- Overwrite the solution file with the efficient version using the editor tool (`create` or `edit`).
++- Re-run the solution on all sample inputs with bash and confirm they still pass.
++- Record findings in {self.notes_path}. Do not reply with text only.
++"""
++            chat_with_agent(perf_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"[perf round {perf_round}] repair chat finished.")
++
+         # Canonical stress-test phase: runs even when samples pass, because samples
+         # cannot distinguish valid-but-different answers from the canonical one.
+         for canon_idx in range(2):
+@@ -434,16 +578,34 @@ Samples may not reveal differences between valid-but-different answers, so the g
+ 
+         # Final guarantee: if the solution is still a stub or unchanged, ask once more for the baseline from the notes.
+         solution_path = self._solution_path()
+-        if not solution_path or self._is_stub_solution(solution_path):
+-            safe_log("[final] solution is still a stub or missing; requesting the baseline from the notes now.")
+-            final_msg = f"""{self._briefing()}{task}
++        is_stub = not solution_path or self._is_stub_solution(solution_path)
++        perf_failed = False
++        perf_report = ''
++        if not is_stub and perf_files:
++            perf_report, fast = self._run_perf(solution_path, perf_files[1])
++            perf_failed = not fast
++            safe_log(f"[final] perf check: {'PASS' if fast else 'FAIL'}\n{perf_report}")
++        if is_stub or perf_failed:
++            if is_stub:
++                safe_log("[final] solution is still a stub or missing; requesting the baseline from the notes now.")
++                final_msg = f"""{self._briefing()}{task}
+ 
+ STRICT FINAL INSTRUCTION: the solution file is still a stub or missing. Write the baseline solution NOW from the notes above (or, if the notes contain no baseline, a straightforward correct brute-force solution for the problem) to the solution file with the editor tool. Do not run any exploration first. Then run it on the sample inputs with bash and fix only crashes. Do not reply with text only.
++"""
++            else:
++                safe_log("[final] solution fails the max-size perf check; requesting an efficient solution now.")
++                final_msg = f"""{self._briefing()}{task}
++
++STRICT FINAL INSTRUCTION: the current solution file ({solution_path}) still FAILS the max-constraint timing check, so it is NOT complete. Raw perf report:
++
++{perf_report}
++
++Replace it NOW with an algorithm whose complexity fits the constraints (state the maximum n/k and target complexity first). Do not keep the brute force or the baseline as the answer. Keep the old brute force as /tmp/brute.py for exact comparison on 500+ small random inputs, re-time at max size with {perf_files[1]}, and re-run the samples with bash. Overwrite the solution file with the editor tool. Do not reply with text only.
+ """
+             chat_with_agent(final_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log("[final] final baseline chat finished.")
++            safe_log("[final] final fallback chat finished.")
+         else:
+-            safe_log("[final] solution file is non-stub; no final fallback needed.")
++            safe_log("[final] solution file is non-stub and passes perf; no final fallback needed.")
+ 
+     def _is_stub_solution(self, solution_path):
+         """

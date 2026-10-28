@@ -1,0 +1,216 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a8bdc35..e743a1a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -190,7 +190,8 @@ Follow this workflow step by step:
+ 3. Keep experiments, brute-force checkers, and scratch tests OUTSIDE the repo (e.g. in /tmp) or in clearly separate scratch files. Test the repo solution against the examples from the problem and against a brute-force solution on many random small inputs.
+ 4. Refine the solution by editing the repo file in place with the editor tool. Re-run the checks after each change.
+ 5. Before finishing, run `git status` and `git diff` to confirm the main source file was modified.
+-6. Never end your turn with an empty message or with only a plan. Your final message should summarize what you changed in the source file.
++6. Performance phase (mandatory when constraints are large): read the constraints, state the worst-case complexity of your solution and the estimated operation count for max-size inputs (Python handles ~1e7-5e7 simple ops/sec). Write a max-size generator in /tmp and run the benchmark tool with a 2-4 s limit. If it is too slow, design a faster algorithm, keep the old one as an oracle, and compare both on random small inputs again. Do not finish until the max-size run completes within the limit.
++7. Never end your turn with an empty message or with only a plan. Your final message should summarize what you changed in the source file.
+ 
+ Prefer the editor tool (`create`/`edit`) for writing file contents instead of long bash heredocs, whose output can get garbled.
+ """
+@@ -217,6 +218,21 @@ Implement your best solution in the main source file NOW (the file the problem e
+             safe_log(f"[patch check] retry {attempt + 1}/3: {status}", level=logging.INFO)
+             msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
++        # Bounded follow-up: ensure the final message reports a measured max-size runtime
++        for _ in range(2):
++            last = msg_history[-1] if msg_history else {}
++            content = last.get("content", "")
++            if isinstance(content, list):
++                content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
++            text = str(content).lower()
++            has_timing = re.search(r"\d+(\.\d+)?\s*(s|sec|secs|seconds|ms)\b", text) is not None
++            if has_timing and ("benchmark" in text or "runtime" in text or "wall" in text):
++                break
++            msg_history = chat_with_agent(
++                "List the constraints, the complexity of the current solution, and the measured max-size runtime. If any is over budget, fix it now.",
++                model=self.code_model, msg_history=msg_history, logging=safe_log,
++            )
++
+         # Final check after the last retry (if any)
+         ok, _, _ = self._patch_is_acceptable()
+         if not ok:
+diff --git a/tools/edit.py b/tools/edit.py
+index 244d440..5f36ba9 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -9,7 +9,7 @@ def tool_info():
+ * If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+ * The `create` command cannot be used if the specified `path` already exists as a file.\n
+ * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+-* The `edit` command overwrites the entire file with the provided `file_text`.\n
++* The `edit` command overwrites the entire file with the provided `file_text`. Only whole-file `edit` is supported; `str_replace` and other partial-edit commands are NOT supported, so to change a small part of a file, view it and then `edit` it with the full new content.\n
+ * No partial/line-range edits or partial viewing are supported.""",
+         "input_schema": {
+             "type": "object",
+diff --git a/tools/benchmark.py b/tools/benchmark.py
+new file mode 100644
+index 0000000..7681004
+--- /dev/null
++++ b/tools/benchmark.py
+@@ -0,0 +1,161 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import textwrap
++
++# Runner executed in a fresh subprocess. It imports the target module from a
++# file path, builds inputs with the user-supplied generator snippet, calls the
++# target, and prints a JSON result line on stdout.
++RUNNER_TEMPLATE = r'''
++import importlib.util, json, sys, time, traceback
++result = {"ok": False}
++try:
++    import resource
++except Exception:
++    resource = None
++try:
++    spec = importlib.util.spec_from_file_location("target_module", %(module_path)r)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++
++    gen_ns = {}
++    exec(compile(%(generator_code)r, "<generator>", "exec"), gen_ns)
++
++    class_name = %(class_name)r
++    method_name = %(method_name)r
++    repeats = %(repeats)d
++
++    if class_name:
++        target = getattr(module, class_name)()
++        func = getattr(target, method_name)
++    else:
++        func = getattr(module, method_name)
++
++    if "make_args" not in gen_ns:
++        raise RuntimeError("generator code must define make_args()")
++    args = gen_ns["make_args"]()
++    if not isinstance(args, tuple):
++        args = (args,)
++
++    times = []
++    for _ in range(repeats):
++        call_args = args
++        start = time.perf_counter()
++        out = func(*call_args)
++        times.append(time.perf_counter() - start)
++    result.update({
++        "ok": True,
++        "best_sec": min(times),
++        "avg_sec": sum(times) / len(times),
++        "output_preview": repr(out)[:200],
++    })
++except BaseException:
++    result["error"] = traceback.format_exc()
++
++if resource is not None:
++    try:
++        result["peak_mem_mb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
++    except Exception:
++        pass
++print("__BENCH_RESULT__" + json.dumps(result, default=str))
++'''
++
++def tool_info():
++    return {
++        "name": "benchmark",
++        "description": """Benchmark a Python solution on large inputs with a time limit.\n
++* Runs the solution in a separate subprocess. The subprocess imports `module_path`, runs `input_generator_code` (which must define `make_args()` returning a tuple of arguments for the method, or the function arguments), then calls `class_name.method_name(*args)` (or the module-level function `method_name` when class_name is empty).\n
++* Use `repeats` > 1 to get a more stable timing (the best time is reported).\n
++* Reports wall-clock time, peak memory (if available), any exception traceback, or 'TIMEOUT' if the run exceeds `timeout_sec`.\n
++* Generate max-size inputs inside `input_generator_code` (e.g. with `random`, seeded for reproducibility). Keep generation itself reasonably fast.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "module_path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python file containing the solution."
++                },
++                "class_name": {
++                    "type": "string",
++                    "description": "Name of the Solution class to instantiate. Use an empty string if the target is a module-level function."
++                },
++                "method_name": {
++                    "type": "string",
++                    "description": "Name of the method (or module-level function) to call with the generated arguments."
++                },
++                "input_generator_code": {
++                    "type": "string",
++                    "description": "Python source defining `make_args()` that returns a tuple of positional arguments for the method (a single non-tuple value is passed as one argument)."
++                },
++                "timeout_sec": {
++                    "type": "number",
++                    "description": "Time limit in seconds for the whole subprocess (generation plus timed calls). The run is killed after this."
++                },
++                "repeats": {
++                    "type": "integer",
++                    "description": "How many times to call the method; the best time is reported. Use 1 for very slow solutions."
++                }
++            },
++            "required": ["module_path", "class_name", "method_name", "input_generator_code", "timeout_sec", "repeats"]
++        }
++    }
++
++def tool_function(module_path, class_name, method_name, input_generator_code, timeout_sec, repeats) -> str:
++    try:
++        if not os.path.isfile(module_path):
++            return f"Error: module file not found: {module_path}"
++        timeout_sec = float(timeout_sec)
++        repeats = max(1, int(repeats))
++        script = RUNNER_TEMPLATE % {
++            "module_path": os.path.abspath(module_path),
++            "generator_code": input_generator_code,
++            "class_name": class_name or "",
++            "method_name": method_name,
++            "repeats": repeats,
++        }
++        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
++            f.write(script)
++            runner_path = f.name
++        try:
++            proc = subprocess.run(
++                [sys.executable, runner_path],
++                capture_output=True,
++                text=True,
++                timeout=timeout_sec,
++                cwd=os.path.dirname(os.path.abspath(module_path)),
++            )
++        except subprocess.TimeoutExpired:
++            return f"TIMEOUT after {timeout_sec} s: the solution did not finish within the limit."
++        finally:
++            try:
++                os.remove(runner_path)
++            except OSError:
++                pass
++
++        marker = "__BENCH_RESULT__"
++        payload = None
++        for line in proc.stdout.splitlines():
++            if line.startswith(marker):
++                payload = json.loads(line[len(marker):])
++        if payload is None:
++            return (
++                f"Error: benchmark runner produced no result (exit code {proc.returncode}).\n"
++                f"stderr:\n{proc.stderr[-3000:]}"
++            )
++        if not payload.get("ok"):
++            return f"Exception during benchmark:\n{payload.get('error', 'unknown error')}"
++
++        lines = [
++            f"Best wall time: {payload['best_sec']:.3f} s (avg {payload['avg_sec']:.3f} s over {repeats} run(s))",
++        ]
++        if "peak_mem_mb" in payload:
++            lines.append(f"Peak memory (process, approx): {payload['peak_mem_mb']:.1f} MB")
++        lines.append(f"Output preview: {payload.get('output_preview', '')}")
++        return "\n".join(lines)
++    except Exception as e:
++        return f"Error: {e}"
++
++if __name__ == "__main__":
++    print(textwrap.dedent(tool_info()["description"]))

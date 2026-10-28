@@ -1,0 +1,272 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 69a27bc..d2d8362 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -93,6 +93,32 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++MAX_ATTEMPTS = 3
++MAX_DIFF_CHARS = 8000
++MAX_TEST_OUTPUT_CHARS = 6000
++TEST_TIMEOUT_SECONDS = 600
++
++def truncate_text(text, max_chars):
++    """Keep the head and tail of long text, with a marker in between."""
++    if len(text) <= max_chars:
++        return text
++    half = max_chars // 2
++    return text[:half] + f"\n... <{len(text) - max_chars} chars clipped> ...\n" + text[-half:]
++
++def build_retry_context(failed_attempts):
++    """Summarize previous failed attempts (diff + raw test output) for the next retry."""
++    parts = [
++        "Previous attempts FAILED the tests. Review them below, then fix the code. "
++        "Do not repeat the same mistakes; analyze the test output carefully."
++    ]
++    for a in failed_attempts:
++        parts.append(
++            f"## Failed attempt {a['attempt']} (test return code {a['returncode']})\n"
++            f"### Diff produced in that attempt\n{a['diff'] or '(empty diff)'}\n"
++            f"### Test output\n{a['test_output'] or '(no output)'}"
++        )
++    return "\n\n".join(parts)
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -167,18 +193,75 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             analysis_instruction, model=self.code_model, msg_history=[], logging=safe_log
+         )
+ 
+-        # Phase 2: implementation call that follows the plan from phase 1.
+-        implementation_instruction = (
+-            f"{task}\n\n"
+-            "Phase 2 of 2: IMPLEMENTATION.\n"
+-            "Follow the plan you produced above. Make the edits to the code files now. "
+-            "Implement the solution, write and run tests to verify it against the problem's examples and edge cases, "
+-            "and refine the solution until the tests pass. Make sure the final code reads input and writes output "
+-            "exactly as the problem requires (or implements the requested Solution method)."
+-        )
+-        init_edit = chat_with_agent(
+-            implementation_instruction, model=self.code_model, msg_history=analysis_history, logging=safe_log
+-        )
++        # Phase 2: implementation attempts. Each failed attempt's diff and test
++        # output is fed into the next attempt so the agent can learn from it.
++        # The loop is bounded by MAX_ATTEMPTS (no unbounded loops).
++        msg_history = analysis_history
++        failed_attempts = []
++        for attempt in range(1, MAX_ATTEMPTS + 1):
++            implementation_instruction = (
++                f"{task}\n\n"
++                "Phase 2 of 2: IMPLEMENTATION.\n"
++                "Follow the plan you produced above. Make the edits to the code files now. "
++                "Implement the solution, write and run tests to verify it against the problem's examples and edge cases, "
++                "and refine the solution until the tests pass. Make sure the final code reads input and writes output "
++                "exactly as the problem requires (or implements the requested Solution method)."
++            )
++            if failed_attempts:
++                implementation_instruction += "\n\n" + build_retry_context(failed_attempts)
++
++            safe_log(f"=== Implementation attempt {attempt}/{MAX_ATTEMPTS} ===")
++            msg_history = chat_with_agent(
++                implementation_instruction, model=self.code_model, msg_history=msg_history, logging=safe_log
++            )
++
++            test_result = self.run_tests()
++            if test_result is None:
++                safe_log("No test command configured for this language; skipping test run.")
++                break
++            if test_result['returncode'] == 0:
++                safe_log(f"Tests passed on attempt {attempt}.")
++                break
++
++            safe_log(f"Tests failed on attempt {attempt} (return code {test_result['returncode']}).")
++            failed_attempts.append({
++                'attempt': attempt,
++                'diff': truncate_text(str(diff_versus_commit(self.git_tempdir, self.base_commit)), MAX_DIFF_CHARS),
++                'test_output': truncate_text(test_result['output'], MAX_TEST_OUTPUT_CHARS),
++                'returncode': test_result['returncode'],
++            })
++
++        return msg_history
++
++    def run_tests(self):
++        """
++        Run the language's test commands in git_tempdir.
++        Returns None if no test commands are configured for the language,
++        otherwise a dict with 'returncode' and 'output' (raw stdout+stderr).
++        """
++        commands = TEST_COMMANDS.get(self.language)
++        if not commands:
++            return None
++        output_parts = []
++        returncode = 0
++        for cmd in commands:
++            try:
++                proc = subprocess.run(
++                    cmd, cwd=self.git_tempdir, capture_output=True, text=True,
++                    timeout=TEST_TIMEOUT_SECONDS,
++                )
++                output_parts.append(f"$ {' '.join(cmd)}\n{proc.stdout}{proc.stderr}")
++                returncode = proc.returncode
++            except subprocess.TimeoutExpired as e:
++                out = e.stdout.decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
++                output_parts.append(f"$ {' '.join(cmd)}\nTimed out after {TEST_TIMEOUT_SECONDS} seconds.\n{out}")
++                returncode = -1
++            except Exception as e:
++                output_parts.append(f"$ {' '.join(cmd)}\nError running command: {e}")
++                returncode = -1
++            if returncode != 0:
++                break
++        return {'returncode': returncode, 'output': "\n".join(output_parts)}
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tests/test_coding_agent_retry.py b/tests/test_coding_agent_retry.py
+new file mode 100644
+index 0000000..8ee4cb3
+--- /dev/null
++++ b/tests/test_coding_agent_retry.py
+@@ -0,0 +1,141 @@
++import coding_agent
++from coding_agent import (
++    AgenticSystem,
++    build_retry_context,
++    truncate_text,
++    MAX_ATTEMPTS,
++    MAX_TEST_OUTPUT_CHARS,
++    MAX_DIFF_CHARS,
++)
++
++
++class FakeChat:
++    """Records every chat_with_agent call and returns a growing history."""
++
++    def __init__(self):
++        self.calls = []
++
++    def __call__(self, msg, model=None, msg_history=None, logging=print):
++        self.calls.append({"msg": msg, "history_len": len(msg_history or [])})
++        return list(msg_history or []) + [{"role": "assistant", "content": f"reply {len(self.calls)}"}]
++
++
++def make_system(tmp_path, monkeypatch, language="python"):
++    monkeypatch.setattr(coding_agent, "setup_logger", lambda *a, **k: None)
++    monkeypatch.setattr(coding_agent, "safe_log", lambda *a, **k: None)
++    return AgenticSystem(
++        problem_statement="double the input",
++        git_tempdir=str(tmp_path),
++        base_commit="abc",
++        chat_history_file=str(tmp_path / "log.md"),
++        language=language,
++    )
++
++
++def test_truncate_text_short_passthrough():
++    assert truncate_text("abc", 10) == "abc"
++
++
++def test_truncate_text_long_keeps_head_and_tail():
++    text = "H" * 500 + "T" * 500
++    out = truncate_text(text, 100)
++    assert len(out) < len(text)
++    assert out.startswith("H")
++    assert out.endswith("T")
++    assert "clipped" in out
++
++
++def test_build_retry_context_contains_all_attempts():
++    attempts = [
++        {"attempt": 1, "diff": "DIFF_ONE", "test_output": "FAIL_ONE", "returncode": 1},
++        {"attempt": 2, "diff": "", "test_output": "", "returncode": 2},
++    ]
++    ctx = build_retry_context(attempts)
++    assert "Failed attempt 1" in ctx and "DIFF_ONE" in ctx and "FAIL_ONE" in ctx
++    assert "Failed attempt 2" in ctx
++    assert "(empty diff)" in ctx and "(no output)" in ctx
++
++
++def test_passes_first_try_single_impl_call(tmp_path, monkeypatch):
++    sys_ = make_system(tmp_path, monkeypatch)
++    fake = FakeChat()
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake)
++    monkeypatch.setattr(sys_, "run_tests", lambda: {"returncode": 0, "output": "ok"})
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda *a: "")
++    sys_.forward()
++    # 1 analysis call + 1 implementation call
++    assert len(fake.calls) == 2
++    assert "Failed attempt" not in fake.calls[1]["msg"]
++
++
++def test_retries_bounded_and_include_previous_failures(tmp_path, monkeypatch):
++    sys_ = make_system(tmp_path, monkeypatch)
++    fake = FakeChat()
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake)
++    monkeypatch.setattr(sys_, "run_tests", lambda: {"returncode": 1, "output": "AssertionError XYZ"})
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda *a: "DIFF_MARK")
++    sys_.forward()
++    # 1 analysis + MAX_ATTEMPTS implementation calls, never more
++    assert len(fake.calls) == 1 + MAX_ATTEMPTS
++    # first impl attempt has no failure context
++    assert "Failed attempt" not in fake.calls[1]["msg"]
++    # later attempts see earlier diffs and test output
++    last = fake.calls[-1]["msg"]
++    assert "Failed attempt 1" in last and "AssertionError XYZ" in last and "DIFF_MARK" in last
++    assert f"Failed attempt {MAX_ATTEMPTS - 1}" in last
++    # history grows with each call (context carried forward)
++    lens = [c["history_len"] for c in fake.calls]
++    assert lens == sorted(lens) and lens[-1] > lens[0]
++
++
++def test_stops_when_tests_pass_on_retry(tmp_path, monkeypatch):
++    sys_ = make_system(tmp_path, monkeypatch)
++    fake = FakeChat()
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake)
++    results = iter([{"returncode": 1, "output": "bad"}, {"returncode": 0, "output": "ok"}])
++    monkeypatch.setattr(sys_, "run_tests", lambda: next(results))
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda *a: "")
++    sys_.forward()
++    assert len(fake.calls) == 3  # analysis + 2 impl attempts
++
++
++def test_no_test_command_skips_retries(tmp_path, monkeypatch):
++    sys_ = make_system(tmp_path, monkeypatch, language="brainfuck")
++    fake = FakeChat()
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake)
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda *a: "")
++    sys_.forward()
++    assert len(fake.calls) == 2  # analysis + one impl, no test-driven retries
++
++
++def test_run_tests_reports_failure_output(tmp_path, monkeypatch):
++    (tmp_path / "test_fail.py").write_text("def test_x():\n    assert 1 == 2\n")
++    sys_ = make_system(tmp_path, monkeypatch)
++    res = sys_.run_tests()
++    assert res["returncode"] != 0
++    assert "assert 1 == 2" in res["output"] or "AssertionError" in res["output"]
++
++
++def test_run_tests_passing(tmp_path, monkeypatch):
++    (tmp_path / "test_ok.py").write_text("def test_x():\n    assert True\n")
++    sys_ = make_system(tmp_path, monkeypatch)
++    res = sys_.run_tests()
++    assert res["returncode"] == 0
++
++
++def test_run_tests_unknown_language_returns_none(tmp_path, monkeypatch):
++    sys_ = make_system(tmp_path, monkeypatch, language="nope")
++    assert sys_.run_tests() is None
++
++
++def test_huge_output_is_bounded(tmp_path, monkeypatch):
++    sys_ = make_system(tmp_path, monkeypatch)
++    fake = FakeChat()
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake)
++    monkeypatch.setattr(sys_, "run_tests", lambda: {"returncode": 1, "output": "x" * 200000})
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda *a: "d" * 200000)
++    sys_.forward()
++    last = fake.calls[-1]["msg"]
++    per_attempt_cap = MAX_TEST_OUTPUT_CHARS + MAX_DIFF_CHARS + 500
++    assert len(last) < (MAX_ATTEMPTS - 1) * per_attempt_cap + 5000
++    assert "chars clipped" in last

@@ -1,0 +1,199 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 44c7f60..e727869 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm import create_client, get_response_from_llm
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ from tools.run_samples import tool_function as run_samples_tool
+ 
+@@ -170,20 +171,107 @@ class AgenticSystem:
+         """
+         return re.findall(r'`([\w./-]+\.py)`', self.problem_statement or '')
+ 
++    def _file_is_nonempty(self, rel_path, min_chars=20):
++        """True if the file exists under git_tempdir and has more than a few characters of content."""
++        full = os.path.join(self.git_tempdir, rel_path)
++        if not os.path.isfile(full):
++            return False
++        try:
++            with open(full, 'r', errors='ignore') as f:
++                return len(f.read().strip()) >= min_chars
++        except OSError:
++            return False
++
+     def _has_meaningful_edit(self):
+         """
+-        True only if at least one changed file is not a test file, and any deliverable
+-        file explicitly named in the problem statement appears among the changed files.
++        True only if at least one changed file is a non-empty non-test file, and any deliverable
++        file explicitly named in the problem statement appears among the changed files and is non-empty.
+         """
+         changed = self._changed_files()
+-        if not any(not self._is_test_file(f) for f in changed):
++        if not any(not self._is_test_file(f) and self._file_is_nonempty(f) for f in changed):
+             return False
+         for deliverable in self._mentioned_deliverables():
+             deliverable = deliverable.lstrip('./')
+-            if not any(f == deliverable or f.endswith('/' + deliverable) for f in changed):
++            matches = [f for f in changed if f == deliverable or f.endswith('/' + deliverable)]
++            if not matches or not any(self._file_is_nonempty(f) for f in matches):
+                 return False
+         return True
+ 
++    @staticmethod
++    def _sanitize_history(msg_history):
++        """
++        Drop trailing assistant messages whose content blocks are all empty text (no tool_use).
++        Returns [] if nothing meaningful is left.
++        """
++        if not isinstance(msg_history, list):
++            return []
++        history = list(msg_history)
++
++        def is_empty_assistant(msg):
++            if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++                return False
++            content = msg.get('content', [])
++            if isinstance(content, str):
++                return content.strip() == ''
++            if not isinstance(content, list):
++                return True
++            for block in content:
++                if isinstance(block, dict):
++                    if block.get('type') == 'tool_use':
++                        return False
++                    if block.get('type') == 'text' and str(block.get('text', '')).strip():
++                        return False
++                    if block.get('type') not in (None, 'text'):
++                        return False
++                elif block:
++                    return False
++            return True
++
++        while history and is_empty_assistant(history[-1]):
++            history.pop()
++        return history if history else []
++
++    def _fallback_write_solution(self):
++        """
++        Last resort: ask the model directly for only the Python program and write it to solution.py.
++        """
++        if self._has_meaningful_edit():
++            return
++        if self._mentioned_deliverables():
++            safe_log("[fallback] Problem names a deliverable file; skipping direct solution write.")
++            return
++        safe_log("[fallback] No meaningful edit after retries; requesting complete program directly.")
++        prompt = (
++            "Solve the following competitive programming problem in Python 3.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            "Output ONLY the full Python 3 program in one ```python fenced block. "
++            "The program must read standard input and write standard output. No explanation."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer.",
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"[fallback] LLM request failed: {e}")
++            return
++        matches = re.findall(r'```python\s*\n(.*?)```', content or '', flags=re.DOTALL)
++        if not matches:
++            safe_log("[fallback] No ```python fenced block found in model response.")
++            return
++        code = matches[-1]
++        target = os.path.join(self.git_tempdir, 'solution.py')
++        try:
++            with open(target, 'w') as f:
++                f.write(code)
++            safe_log(f"[fallback] Wrote {len(code)} chars to {target}")
++        except OSError as e:
++            safe_log(f"[fallback] Could not write {target}: {e}")
++
+     def _diff_summary(self):
+         changed = self._changed_files()
+         if not changed:
+@@ -198,7 +286,11 @@ class AgenticSystem:
+         solution_path = os.path.join(self.git_tempdir, 'solution.py')
+         if not os.path.exists(solution_path):
+             return False, f"{solution_path} does not exist; no samples could be run."
+-        report = run_samples_tool(problem_text=self.problem_statement, solution_path=solution_path)
++        try:
++            report = run_samples_tool(problem_text=self.problem_statement, solution_path=solution_path)
++        except Exception as e:
++            safe_log(f"[samples] run_samples failed: {e}")
++            return False, f"run_samples could not be executed: {e}"
+         all_pass = 'DIFFERS' not in report and 'No sample input/output pairs' not in report
+         return all_pass, report
+ 
+@@ -244,28 +336,41 @@ Important: Replying without calling tools, or ending your turn without having wr
+         if not isinstance(msg_history, list):
+             msg_history = []
+ 
++        condensed_task = (
++            f"{task}\n"
++            "Step 1: immediately create a draft solution.py with the editor tool.\n"
++            "Step 2: test it with bash on the sample inputs.\n"
++            "Step 3: refine it until it is correct and efficient.\n"
++            "Do not reply without editing solution.py."
++        )
+         for attempt in range(1, 4):
+             if self._has_meaningful_edit():
+                 break
+             reason = (
+                 f"no meaningful source edits detected (changed files: {self._diff_summary()}); "
+-                "the diff is empty, touches only test files, or is missing a deliverable file named in the problem"
++                "the diff is empty, touches only test files, is empty, or is missing a deliverable file named in the problem"
+             )
+             safe_log(f"[retry {attempt}/3] Retrying: {reason}")
+-            retry_message = (
+-                f"No source edits were made, or the edits only touch test files, so the task is not complete.\n"
+-                f"Current repository diff summary versus the base commit:\n{self._diff_summary()}\n\n"
+-                f"You must now use the editor tool to write a complete implementation of the solution in the "
+-                f"source/deliverable file (e.g. solution.py in {self.git_tempdir}), then test it: run it on the sample "
+-                f"inputs with bash and compare against a brute force on small random inputs where feasible. "
+-                f"Fix and optimize as needed. Do not reply without editing the source file."
+-            )
+-            new_history = chat_with_agent(retry_message, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            if attempt == 1:
++                retry_message = (
++                    "FORCEFUL INSTRUCTION: the task is not complete because no source edits exist.\n"
++                    f"Current repository diff summary versus the base commit:\n{self._diff_summary()}\n\n"
++                    f"Your FIRST action must be an editor tool call with command 'create' or 'edit' that writes a "
++                    f"complete implementation to solution.py in {self.git_tempdir} (or to the deliverable file named in "
++                    "the problem). Replying without a tool call is a failure."
++                )
++                history = self._sanitize_history(msg_history)
++                new_history = chat_with_agent(retry_message, model=self.code_model, msg_history=history, logging=safe_log)
++            else:
++                new_history = chat_with_agent(condensed_task, model=self.code_model, msg_history=[], logging=safe_log)
+             if isinstance(new_history, list):
+                 msg_history = new_history
+ 
+         if not self._has_meaningful_edit():
+-            safe_log("[retry] Giving up after 3 retries; no meaningful source edit was produced.")
++            safe_log("[retry] No meaningful source edit after retries; trying fallback.")
++        self._fallback_write_solution()
++        if not self._has_meaningful_edit():
++            safe_log("[retry] Still no meaningful source edit after fallback.")
+ 
+         # Bounded post-run sample check: feed any DIFFERS output back to the agent
+         for attempt in range(1, 3):
+@@ -282,7 +387,7 @@ Important: Replying without calling tools, or ending your turn without having wr
+                 "then re-run the samples. If no natural deterministic construction reproduces the samples, keep the best answer "
+                 "and explain in your reply why it cannot be matched."
+             )
+-            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=self._sanitize_history(msg_history), logging=safe_log)
+             if not isinstance(msg_history, list):
+                 break
+ 

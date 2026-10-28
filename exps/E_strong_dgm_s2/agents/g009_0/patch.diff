@@ -1,0 +1,433 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 90e11dd..9d4cd27 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,9 @@
+ import argparse
++import glob
++import shutil
+ import subprocess
++import sys
++import time
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -7,6 +11,14 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.stress_test import run_differential, _clip_lines
++
++# Harness evaluation settings
++MAX_ATTEMPTS = 4
++NUM_DIFF_TESTS = 200
++FAST_LIMIT_SECONDS = 2.0
++RUN_TIMEOUT = 10
++MAX_NOTES_CHARS = 4000
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -190,6 +202,8 @@ class AgenticSystem:
+         has_edit = False
+         for path, n_added in added.items():
+             base = os.path.basename(path)
++            if path.startswith(('dev/', 'candidates/')):
++                continue
+             if any(fnmatch.fnmatch(base, pat) for pat in self._NON_SOURCE_PATTERNS):
+                 continue
+             if n_added > 0:
+@@ -201,9 +215,157 @@ class AgenticSystem:
+             return False
+         return True
+ 
++    # ---------------------------------------------------------------
++    # Harness-run evaluation (no LLM involved)
++    # ---------------------------------------------------------------
++    def _dev_path(self, *parts):
++        return os.path.join(self.git_tempdir, 'dev', *parts)
++
++    @staticmethod
++    def _canon(text):
++        """Exact comparison, ignoring only trailing whitespace on each line and at the end."""
++        return "\n".join(line.rstrip() for line in text.strip().splitlines())
++
++    @staticmethod
++    def _run_candidate(path, data, timeout):
++        """Run a python candidate on stdin data. Returns (stdout, stderr, returncode, timed_out, elapsed)."""
++        start = time.time()
++        try:
++            p = subprocess.run(
++                [sys.executable, "-I", path], input=data, capture_output=True, text=True,
++                timeout=timeout, env={"PATH": os.environ.get("PATH", "")},
++            )
++            return p.stdout, p.stderr, p.returncode, False, time.time() - start
++        except subprocess.TimeoutExpired as e:
++            out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
++            err = e.stderr if isinstance(e.stderr, str) else (e.stderr or b"").decode(errors="replace")
++            return out, err, None, True, time.time() - start
++
++    def _evaluate_candidate(self, path):
++        """Evaluate a candidate solution file against the dev/ workspace.
++
++        (a) dev/samples/*.in vs *.out (exact match), (b) differential test vs dev/brute.py using
++        dev/gen.py over NUM_DIFF_TESTS seeds, (c) timing on dev/max.in.
++        Returns dict: n_pass, n_total, max_time (seconds, inf on timeout), failure_text (None if all pass).
++        """
++        result = {"n_pass": 0, "n_total": 0, "max_time": 0.0, "failure_text": None}
++        failures = []
++        if not os.path.isfile(path):
++            result["failure_text"] = f"Candidate file {path} does not exist."
++            return result
++
++        # (a) samples
++        in_files = sorted(glob.glob(self._dev_path('samples', '*.in')))
++        sample_max_time = 0.0
++        for in_file in in_files:
++            out_file = in_file[:-3] + '.out'
++            if not os.path.isfile(out_file):
++                continue
++            result["n_total"] += 1
++            with open(in_file) as f:
++                data = f.read()
++            with open(out_file) as f:
++                expected = f.read()
++            out, err, rc, to, elapsed = self._run_candidate(path, data, RUN_TIMEOUT)
++            sample_max_time = max(sample_max_time, elapsed)
++            if not to and rc == 0 and self._canon(out) == self._canon(expected):
++                result["n_pass"] += 1
++            else:
++                reason = "timed out" if to else (f"runtime error (exit code {rc})" if rc != 0 else "wrong answer")
++                failures.append(
++                    f"SAMPLE {os.path.basename(in_file)} failed: {reason}.\n"
++                    f"INPUT:\n{_clip_lines(data, 40)}\n"
++                    f"EXPECTED:\n{_clip_lines(expected, 40)}\n"
++                    f"ACTUAL:\n{_clip_lines(out, 40)}\n"
++                    + (f"STDERR:\n{_clip_lines(err, 40)}\n" if err.strip() else ""))
++                break  # one concrete failing sample is enough to guide the next attempt
++        result["max_time"] = sample_max_time
++
++        # (b) differential test
++        brute = self._dev_path('brute.py')
++        gen = self._dev_path('gen.py')
++        if os.path.isfile(brute) and os.path.isfile(gen):
++            n_pass, n_total, diff_time, diff_failure = run_differential(
++                path, brute, gen, num_tests=NUM_DIFF_TESTS, timeout=RUN_TIMEOUT, max_output_lines=40)
++            result["n_total"] += n_total
++            result["n_pass"] += n_pass
++            result["max_time"] = max(result["max_time"], diff_time)
++            if diff_failure is not None:
++                failures.append(diff_failure)
++
++        # (c) timing on the max-size input
++        max_in = self._dev_path('max.in')
++        if os.path.isfile(max_in):
++            with open(max_in) as f:
++                data = f.read()
++            out, err, rc, to, elapsed = self._run_candidate(path, data, 20)
++            if to:
++                result["max_time"] = float('inf')
++                failures.append("TIMING: dev/max.in timed out after 20 seconds.")
++            else:
++                result["max_time"] = max(result["max_time"], elapsed)
++                if rc != 0:
++                    failures.append(f"TIMING: dev/max.in run failed (exit code {rc}).\nSTDERR:\n{_clip_lines(err, 40)}")
++            if result["max_time"] > FAST_LIMIT_SECONDS:
++                failures.append(f"SPEED: slowest run took {result['max_time']:.2f}s; limit is {FAST_LIMIT_SECONDS}s.")
++
++        if result["n_total"] == 0:
++            failures.append("No dev/samples/*.in and *.out files found; the harness could not test anything.")
++        if failures:
++            result["failure_text"] = "\n".join(failures)
++        return result
++
++    @staticmethod
++    def _is_passing(ev):
++        return ev["n_total"] > 0 and ev["n_pass"] == ev["n_total"] and ev["failure_text"] is None
++
++    def _read_notes(self):
++        path = self._dev_path('NOTES.md')
++        if not os.path.isfile(path):
++            return "(dev/NOTES.md does not exist yet)"
++        with open(path) as f:
++            text = f.read()
++        if len(text) > MAX_NOTES_CHARS:
++            text = "...(earlier notes clipped)...\n" + text[-MAX_NOTES_CHARS:]
++        return text
++
++    def _followup_prompt(self, task, has_solution, eval_report):
++        """Short, self-contained prompt for attempts 2..N. Replaces the full previous message history."""
++        brute_exists = os.path.isfile(self._dev_path('brute.py'))
++        notes = self._read_notes()
++        if not has_solution:
++            if brute_exists:
++                directive = ("solution.py still has no implementation. Immediately write a solution into solution.py "
++                             "based on dev/brute.py (read it first; it already contains the reference logic). "
++                             "Make it correct first, then check it against dev/brute.py. Do not explore further.")
++            else:
++                directive = ("solution.py still has no implementation and dev/brute.py does not exist. Immediately write "
++                             "dev/brute.py (a simple correct brute force), then write a correct but possibly slow "
++                             "solution.py based on it. Do not explore further.")
++        else:
++            directive = ("continue from the existing dev/ files; do not redo exploration; fix the failures or try a "
++                         "different approach. Reuse dev/ files (brute.py, gen.py, samples/, max.in, NOTES.md).")
++        return f"""{task}
++
++Previous attempt summary (earlier conversation is not available; this is all you get):
++
++<dev_notes file="dev/NOTES.md">
++{notes}
++</dev_notes>
++
++<evaluation_report>
++{eval_report}
++</evaluation_report>
++
++{directive}
++
++Working rules: never print more than 40 lines from any command; summarize tables instead of printing them.
++Keep reasoning brief, and after each fix re-run the samples and dev/gen.py-based differential test."""
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Runs up to MAX_ATTEMPTS attempts, evaluates each candidate with the harness, and keeps the best one.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -216,6 +378,13 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         method = """FIRST ACTION: view solution.py and immediately write a complete first-draft implementation using the editor tool; refine afterwards.
+ Keep each reply short; do not write long analyses before making a tool call.
+ 
++Dev workspace (persistent across attempts, keep helper artifacts here, under <repo>/dev/):
++- Within your first 5 tool calls, write a brute force at dev/brute.py and a working (even if slow) solution.py. Save the samples from the statement to dev/samples/N.in and dev/samples/N.out (exact text).
++- Write dev/gen.py that takes a seed argument and prints one small random input. Write dev/max.in with a maximum-size input.
++- Keep running findings, hypotheses and what failed in dev/NOTES.md, updated as you go.
++- Never print more than 40 lines from any command. Summarize tables instead of printing them.
++- Stop exploring after a bounded budget (about 15 tool calls of investigation) and write code.
++
+ Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Complexity check before coding: write the worst-case operation count as a formula in n (and any other parameters, e.g. alphabet size, number of queries), evaluated at the maximum constraints. If it is above roughly 3*10^7 simple operations, find a better algorithm before writing code. Early-exit pruning, memoization shortcuts, and sorting candidates do NOT bound the worst case, so they do not count as a fix.
+@@ -223,32 +392,53 @@ Work like a careful competitive programmer:
+ 4. Write the solution in solution.py with the editor tool.
+ 5. Run it on every sample in the statement and compare with the expected outputs exactly (exact string equality, not just validity). For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 6. Write a generator with structured adversarial kinds, including all-identical elements, a single dominant value, the maximum number of distinct values, sorted and reverse-sorted inputs, and the inputs that are worst for your algorithm. Run `scaling_test` on solution.py at max size (and a few smaller sizes) and read the times and log-log slope yourself. Fix any run over 1.5s, and fix any slope near 2 at n=2*10^4 (it means the algorithm is quadratic). Do this on the final solution.
+-7. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. If the answer is not unique, the brute force must output the canonical answer chosen in step 3, and the comparison must be exact string equality, not a validity check. The `stress_test` tool does this: it takes solution_path, brute_path, a generator script that takes a seed argument and prints one input, and num_tests. Fix every mismatch.
++7. Write a brute-force reference for small inputs and a random small-input generator, then run the `diff_test` tool (or `stress_test`) with a few hundred cases comparing solution.py with the brute force. If the answer is not unique, the brute force must output the canonical answer chosen in step 3, and the comparison must be exact string equality, not a validity check. Fix every mismatch.
+ 8. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+ 9. Keep iterating until all checks pass.
+ 10. Before finishing, run the final solution through the run_clean tool on all samples AND on a max-size input (run_clean runs it in a clean isolated subprocess like the grader does), and compare each output to the sample's exact expected output. Read all stderr carefully and fix any crash or traceback it shows.
+ 11. Avoid environment-fragile constructs: do not use 3-argument pow (e.g. pow(a, MOD-2, MOD)); write a small hand-written modular power helper `def mpow(b, e, m)` with a loop instead. Avoid threading and recursion-limit tricks; prefer iterative code.
+ 12. Do a last re-read of solution.py for edge cases such as N=1, empty input, and the smallest/largest constraints.
+ The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        candidate_dir = os.path.join(self.git_tempdir, 'candidates')
++        os.makedirs(candidate_dir, exist_ok=True)
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
++
++        best = None  # (key, path, attempt)
++        eval_report = ""
++        for attempt in range(MAX_ATTEMPTS):
++            num = attempt + 1
++            if attempt == 0:
++                prompt = f"{task}\n\n{method}"
++            else:
++                prompt = self._followup_prompt(task, self._has_source_edit(), eval_report)
++            safe_log(f"[attempt {num}/{MAX_ATTEMPTS}] starting")
++            chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Edit guard: retry with a directive prompt if no substantive source edit exists yet.
+-        for attempt in range(3):
+-            if self._has_source_edit():
+-                safe_log(f"[edit guard] source edit present after attempt {attempt}")
++            has_solution = self._has_source_edit()
++            if not has_solution:
++                safe_log(f"[attempt {num}] no usable solution.py written")
++                eval_report = ("solution.py was not written with a real implementation in this attempt. "
++                               "Write the brute-force-based fallback immediately.")
++                continue
++
++            cand_path = os.path.join(candidate_dir, f"attempt{num}.py")
++            shutil.copyfile(solution_path, cand_path)
++            ev = self._evaluate_candidate(cand_path)
++            safe_log(f"[attempt {num}] harness: pass {ev['n_pass']}/{ev['n_total']}, max_time {ev['max_time']:.3f}s")
++            key = (ev["n_pass"], -ev["max_time"])
++            if best is None or key > best[0]:
++                best = (key, cand_path, num)
++            if self._is_passing(ev) and ev["max_time"] <= FAST_LIMIT_SECONDS:
++                safe_log(f"[attempt {num}] passing and fast; stopping")
+                 break
+-            safe_log(f"[edit guard] no source edit detected; retry {attempt + 1}/3")
+-            retry_msg = (
+-                f"{task}\n"
+-                "solution.py currently contains no implementation. Your very next action must be an editor "
+-                "`create`/`str_replace` call that writes a complete solution to solution.py. Keep reasoning brief. "
+-                "Do not run exploration commands first. After writing, run the samples and fix issues."
+-            )
+-            init_edit = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            eval_report = (f"Harness pass count: {ev['n_pass']}/{ev['n_total']}, slowest run {ev['max_time']:.2f}s.\n"
++                           + (ev["failure_text"] or "All checks passed, but the run was too slow."))
++
++        if best is not None:
++            shutil.copyfile(best[1], solution_path)
++            safe_log(f"[final] solution.py set to attempt {best[2]} (pass count {best[0][0]}, max_time {-best[0][1]:.3f}s)")
+         else:
+-            if not self._has_source_edit():
+-                safe_log("[edit guard] gave up: no source edit after retries")
++            safe_log("[final] no candidate was produced; solution.py left unchanged")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/bash.py b/tools/bash.py
+index 748998e..11b245e 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -21,7 +21,7 @@ def tool_info():
+         }
+     }
+ 
+-def _clip(s, n=12000):
++def _clip(s, n=4000):
+     if len(s) <= n:
+         return s
+     return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index add126d..0bed440 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -34,6 +34,10 @@ def tool_info():
+                 "timeout": {
+                     "type": "integer",
+                     "description": "Per-run time limit in seconds. Default 10."
++                },
++                "max_output_lines": {
++                    "type": "integer",
++                    "description": "Maximum number of lines shown for each printed block in a failure report. Default 40."
+                 }
+             },
+             "required": ["solution_path", "brute_path", "generator_path"]
+@@ -59,21 +63,61 @@ def _norm(s):
+     return " ".join(s.split())
+ 
+ 
+-def tool_function(solution_path, brute_path, generator_path, num_tests=200, timeout=10):
++def _clip_lines(text, max_lines):
++    """Keep at most max_lines lines (head and tail) so failure reports stay compact."""
++    lines = text.splitlines()
++    if max_lines is None or max_lines <= 0 or len(lines) <= max_lines:
++        return text
++    head = max_lines // 2
++    tail = max_lines - head
++    omitted = len(lines) - head - tail
++    return "\n".join(lines[:head] + [f"... <{omitted} lines omitted> ..."] + lines[-tail:])
++
++
++def run_differential(solution_path, brute_path, generator_path, num_tests=200, timeout=10, max_output_lines=40):
++    """Run the differential test over seeds 0..num_tests-1.
++
++    Returns (n_pass, n_total, max_solution_time, failure_text). failure_text is None when all seeds pass.
++    Reusable by other tools (e.g. the harness evaluation in coding_agent.py).
++    """
++    import time
+     num_tests = int(num_tests)
+     timeout = int(timeout)
++    max_time = 0.0
+     for i in range(num_tests):
+         gen_out, gen_err, gen_rc, gen_to = _run_py(generator_path, "", timeout, args=(str(i),))
+         if gen_to or gen_rc != 0:
+-            return f"Generator failed for seed {i}: timeout={gen_to}, exit code={gen_rc}\nstderr:\n{gen_err}"
++            return i, num_tests, max_time, (
++                f"Generator failed for seed {i}: timeout={gen_to}, exit code={gen_rc}\n"
++                f"stderr:\n{_clip_lines(gen_err, max_output_lines)}")
+         inp = gen_out
+         b_out, b_err, b_rc, b_to = _run_py(brute_path, inp, timeout)
++        t0 = time.time()
+         s_out, s_err, s_rc, s_to = _run_py(solution_path, inp, timeout)
+-        if b_to or b_rc != 0 or s_to or s_rc != 0 or _norm(s_out) != _norm(b_out):
+-            return (
+-                f"Mismatch at seed {i} (of {num_tests}).\n"
+-                f"INPUT:\n{inp}\n"
+-                f"BRUTE stdout:\n{b_out}\nBRUTE stderr:\n{b_err}\nBRUTE exit code: {b_rc}, timed out: {b_to}\n"
+-                f"SOLUTION stdout:\n{s_out}\nSOLUTION stderr:\n{s_err}\nSOLUTION exit code: {s_rc}, timed out: {s_to}\n"
++        max_time = max(max_time, time.time() - t0)
++        if b_to or b_rc != 0:
++            return i, num_tests, max_time, (
++                f"Brute force failed at seed {i}: timeout={b_to}, exit code={b_rc}\n"
++                f"INPUT:\n{_clip_lines(inp, max_output_lines)}\n"
++                f"BRUTE stderr:\n{_clip_lines(b_err, max_output_lines)}")
++        if s_to or s_rc != 0 or _norm(s_out) != _norm(b_out):
++            reason = "timed out" if s_to else (f"runtime error (exit code {s_rc})" if s_rc != 0 else "wrong answer")
++            text = (
++                f"Mismatch at seed {i} (of {num_tests}): {reason}.\n"
++                f"INPUT:\n{_clip_lines(inp, max_output_lines)}\n"
++                f"EXPECTED (brute) stdout:\n{_clip_lines(b_out, max_output_lines)}\n"
++                f"ACTUAL (solution) stdout:\n{_clip_lines(s_out, max_output_lines)}\n"
+             )
+-    return f"All {num_tests} tests passed (exact match after whitespace normalization)."
++            if s_err.strip():
++                text += f"ACTUAL stderr:\n{_clip_lines(s_err, max_output_lines)}\n"
++            return i, num_tests, max_time, text
++    return num_tests, num_tests, max_time, None
++
++
++def tool_function(solution_path, brute_path, generator_path, num_tests=200, timeout=10, max_output_lines=40):
++    n_pass, n_total, _, failure = run_differential(
++        solution_path, brute_path, generator_path, num_tests=num_tests, timeout=timeout,
++        max_output_lines=max_output_lines)
++    if failure is not None:
++        return failure
++    return f"All {n_total} tests passed (exact match after whitespace normalization)."
+diff --git a/tools/diff_test.py b/tools/diff_test.py
+new file mode 100644
+index 0000000..c4c96b3
+--- /dev/null
++++ b/tools/diff_test.py
+@@ -0,0 +1,47 @@
++from tools import stress_test
++
++
++def tool_info():
++    return {
++        "name": "diff_test",
++        "description": """Differential test: compare a solution against a brute-force reference on generated random inputs, using exact output equality (whitespace-normalized).
++* `generator_path` is a Python script that takes one integer argument (the seed) and prints one input to stdout. It is run for seeds 0..num_tests-1.
++* `solution_path` and `brute_path` are Python programs that read stdin and write stdout.
++* Reports the first mismatch (INPUT, EXPECTED from brute, ACTUAL from solution) or an all-pass count. Output is kept compact by `max_output_lines`.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution Python file under test."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference Python file."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to a generator script taking a seed integer and printing one input."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of seeds to test (seeds 0..num_tests-1). Default 200."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-run time limit in seconds. Default 10."
++                },
++                "max_output_lines": {
++                    "type": "integer",
++                    "description": "Maximum number of lines shown per printed block in a failure report. Default 40."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++def tool_function(solution_path, brute_path, generator_path, num_tests=200, timeout=10, max_output_lines=40):
++    return stress_test.tool_function(
++        solution_path, brute_path, generator_path,
++        num_tests=num_tests, timeout=timeout, max_output_lines=max_output_lines)

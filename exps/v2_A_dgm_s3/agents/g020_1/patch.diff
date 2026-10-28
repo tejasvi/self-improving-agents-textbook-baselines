@@ -1,0 +1,329 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e9066d8..d89dc7b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -335,21 +335,39 @@ IMPORTANT RULES:
+             f"{task}\n{workflow}\n"
+             f"Current repository contents:\n{snapshot}\n\n"
+         )
+-        msg_history = []
+-        msg_history = chat_with_agent(self._design_prompt(instruction), model=self.code_model,
+-                                      msg_history=msg_history, logging=safe_log)
+-        safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
++        # Step 1: short baseline call (forced editor tool, thinking disabled).
++        msg_history = chat_with_agent(self._baseline_prompt(), model=self.code_model,
++                                      msg_history=[], logging=safe_log)
++        safe_log(f"Baseline attempt finished. Changed files: {self._get_changed_files()}")
+ 
+-        if self._has_source_patch():
+-            safe_log("Source patch detected after initial attempt; skipping retries.")
+-        else:
+-            # Do not reuse a history that may end with an empty assistant turn: escalate with a
+-            # compact prompt, first on the primary model then on the alternate model/API path.
+-            safe_log("No source patch after initial attempt; escalating with a compact prompt.")
++        # Step 2: if the editor was still not called, request a code block and write it from Python.
++        if not self._has_source_patch():
++            safe_log("No source patch after baseline; requesting the baseline as a code block.")
++            self._write_baseline_from_code_block()
++        if not self._has_source_patch():
++            safe_log("No source patch after baseline; escalating with a compact prompt.")
+             msg_history = self._attempt_with_models(self._compact_prompt(), msg_history)
+ 
+-        msg_history = self._complexity_gate(msg_history)
+-        self._run_verification(msg_history)
++        # Keep a copy of the baseline so refinements can be reverted if they break it.
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        baseline_backup = '/tmp/stress/baseline_solution.py'
++        has_baseline = self._has_source_patch()
++        if has_baseline and os.path.isfile(target_path):
++            os.makedirs('/tmp/stress', exist_ok=True)
++            shutil.copyfile(target_path, baseline_backup)
++
++        # Step 3: refinements on the same history (design, complexity gate, verification).
++        if has_baseline:
++            msg_history = chat_with_agent(self._design_prompt(instruction), model=self.code_model,
++                                          msg_history=msg_history, logging=safe_log)
++            msg_history = self._complexity_gate(msg_history)
++            self._run_verification(msg_history)
++            if not self._has_source_patch() and os.path.isfile(baseline_backup):
++                safe_log("Refinement broke the baseline; restoring the baseline solution.")
++                shutil.copyfile(baseline_backup, target_path)
++        else:
++            msg_history = self._complexity_gate(msg_history)
++            self._run_verification(msg_history)
+ 
+         if not self._has_source_patch():
+             safe_log("Last-resort attempt: requesting the complete solution as a code block (no tools).")
+@@ -357,6 +375,56 @@ IMPORTANT RULES:
+             safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
+                      f"source patch: {self._has_source_patch()}")
+ 
++    def _baseline_prompt(self):
++        """Short first-turn prompt: task, target path and current target file only."""
++        target = self._target_file()
++        target_path = os.path.join(self.git_tempdir, target)
++        existing = ''
++        if os.path.isfile(target_path):
++            with open(target_path, 'r', errors='replace') as fh:
++                existing = fh.read()
++        return (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Target file: {target_path}\n"
++            f"Current contents of the target file:\n```python\n{existing}\n```\n\n"
++            "Write a simple correct baseline solution now; efficiency comes later. "
++            f"Your first action must be an editor create/edit call on {target_path} with the full program "
++            "(read stdin, write stdout exactly as the problem requires). Then finish with a one-line summary."
++        )
++
++    def _write_baseline_from_code_block(self):
++        """
++        Ask the primary model (thinking disabled, 4096 max tokens) for only the code block of the
++        target file and write it from Python. Never raises; no-op if no code block is returned.
++        """
++        target = self._target_file()
++        target_path = os.path.join(self.git_tempdir, target)
++        prompt = (
++            f"Problem:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Write a simple correct baseline solution for `{target}`; efficiency comes later. "
++            "It must read stdin and write stdout exactly as the problem requires. "
++            "Reply with ONLY the complete file in a single ```python code block."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer.",
++                msg_history=[],
++                max_tokens=4096,
++                disable_thinking=True,
++            )
++            code = self._extract_code(content if isinstance(content, str) else '')
++            if code:
++                self._write_target_code(target_path, code, f"{self.code_model} (baseline code block)")
++            else:
++                safe_log("Baseline code-block request returned no code block.")
++        except Exception as e:
++            safe_log(f"Baseline code-block request failed: {e}\n{traceback.format_exc()}")
++
+     def _model_usable(self, model):
+         """True if a client can be created for the model (required API key/SDK present)."""
+         try:
+@@ -597,6 +665,8 @@ When everything is done, end your reply with a short report that includes the st
+                 model=client_model,
+                 system_message=system_message,
+                 msg_history=[],
++                max_tokens=4096,
++                disable_thinking=True,
+             )
+             return content if isinstance(content, str) else ''
+         except Exception as e:
+diff --git a/llm.py b/llm.py
+index 70f3399..1ef3e4e 100644
+--- a/llm.py
++++ b/llm.py
+@@ -73,9 +73,12 @@ def _extract_text(response) -> str:
+ def _log_response(response, max_tokens, log=print):
+     usage = getattr(response, "usage", None)
+     output_tokens = getattr(usage, "output_tokens", None)
++    details = getattr(usage, "output_tokens_details", None)
++    thinking_tokens = getattr(details, "thinking_tokens", None)
+     log(
+         f"LLM response: stop_reason={getattr(response, 'stop_reason', None)}, "
+-        f"max_tokens={max_tokens}, output_tokens={output_tokens}, usage={usage}"
++        f"max_tokens={max_tokens}, thinking_tokens={thinking_tokens}, "
++        f"output_tokens={output_tokens}, usage={usage}"
+     )
+ 
+ 
+@@ -84,31 +87,59 @@ def _thinking_enabled(kwargs) -> bool:
+     return isinstance(thinking, dict) and thinking.get("type") == "enabled"
+ 
+ 
++THINKING_BUDGET_FRACTION = 0.25  # thinking budget <= 25% of max_tokens
++
++
+ def _capped_thinking(thinking, max_tokens):
+-    """Thinking config with budget_tokens <= 50% of max_tokens (never below the floor)."""
+-    budget = thinking.get("budget_tokens", max_tokens // 2)
+-    budget = min(budget, max_tokens // 2)
++    """Thinking config with budget_tokens <= 25% of max_tokens (never below the floor)."""
++    budget = thinking.get("budget_tokens", max_tokens // 4)
++    budget = min(budget, int(max_tokens * THINKING_BUDGET_FRACTION))
+     budget = max(THINKING_BUDGET_FLOOR, budget)
+     # The floor must never push the budget to or above max_tokens.
+     budget = min(budget, max(1, max_tokens - 1))
+     return {"type": "enabled", "budget_tokens": budget}
+ 
+ 
+-def _call_with_token_escalation(create_fn, max_tokens_list=(4096, 8192, 16384, 32000), log=print, **kwargs):
++def _is_thinking_param_rejected(exc) -> bool:
++    """True if the API error says the thinking parameter itself is not accepted."""
++    return "thinking" in str(exc).lower() and getattr(exc, "status_code", 400) in (400, None)
++
++
++def _create_with_thinking_disabled(create_fn, max_tokens, log=print, **call_kwargs):
++    """
++    Call create_fn with thinking={'type': 'disabled'}. If the API rejects that parameter, retry
++    once without it (bounded). Logs which variant was used.
++    """
++    try:
++        response = create_fn(max_tokens=max_tokens, thinking={"type": "disabled"}, **call_kwargs)
++        log(f"Thinking variant used: disabled (max_tokens={max_tokens}).")
++        return response
++    except Exception as e:
++        if not _is_thinking_param_rejected(e):
++            raise
++        log(f"API rejected thinking={{'type': 'disabled'}} ({e}); retrying without the thinking parameter.")
++        response = create_fn(max_tokens=max_tokens, **call_kwargs)
++        log(f"Thinking variant used: omitted (max_tokens={max_tokens}).")
++        return response
++
++
++def _call_with_token_escalation(create_fn, max_tokens_list=(4096, 8192, 16384, 32000), log=print,
++                                disable_thinking=False, **kwargs):
+     """
+     Call create_fn(max_tokens=..., **kwargs) (kwargs include model=...). If the response was cut
+     off at max_tokens with no text/tool_use content:
+-      * with extended thinking enabled, retry once at the same max_tokens with thinking disabled
+-        (the thinking-only output exhausted the budget, so a smaller budget will not help);
++      * retry once at the same max_tokens with thinking explicitly disabled (even if the caller did
++        not pass thinking, since the backend may enable it by default); if the API rejects the
++        parameter, retry without it;
+       * otherwise retry with the next larger max_tokens (bounded by the model cap).
+-    The thinking budget is always kept at <= 50% of max_tokens. Never loops unboundedly.
++    Thinking budgets are kept at <= 25% of max_tokens. Never loops unboundedly.
+     """
+     cap = _max_tokens_cap(str(kwargs.get("model", "")))
+     budgets = [t for t in max_tokens_list if t <= cap] or [min(max_tokens_list[0], cap)]
+     response = None
+-    thinking_on = _thinking_enabled(kwargs)
++    thinking_on = _thinking_enabled(kwargs) and not disable_thinking
+     idx = 0
+-    tried_without_thinking = False
++    tried_without_thinking = disable_thinking
+     while idx < len(budgets):
+         max_tokens = budgets[idx]
+         call_kwargs = dict(kwargs)
+@@ -116,14 +147,18 @@ def _call_with_token_escalation(create_fn, max_tokens_list=(4096, 8192, 16384, 3
+             call_kwargs["thinking"] = _capped_thinking(kwargs["thinking"], max_tokens)
+         else:
+             call_kwargs.pop("thinking", None)
+-        response = create_fn(max_tokens=max_tokens, **call_kwargs)
++        if tried_without_thinking:
++            # Thinking explicitly disabled (even when the caller did not set it).
++            response = _create_with_thinking_disabled(create_fn, max_tokens, log=log, **call_kwargs)
++        else:
++            response = create_fn(max_tokens=max_tokens, **call_kwargs)
+         _log_response(response, max_tokens, log=log)
+         if getattr(response, "stop_reason", None) != "max_tokens" or _has_text_or_tool_block(response):
+             return response
+-        if thinking_on and not tried_without_thinking:
++        if not tried_without_thinking:
+             tried_without_thinking = True
+             thinking_on = False
+-            log(f"Empty response at max_tokens={max_tokens} with thinking; retrying once with thinking disabled.")
++            log(f"Empty response at max_tokens={max_tokens}; retrying once with thinking disabled.")
+             continue
+         idx += 1
+         if idx < len(budgets):
+@@ -269,6 +304,7 @@ def get_response_from_llm(
+         print_debug=False,
+         msg_history=None,
+         temperature=0.7,
++        disable_thinking=False,
+ ):
+     if msg_history is None:
+         msg_history = []
+@@ -289,6 +325,7 @@ def get_response_from_llm(
+             client.messages.create,
+             max_tokens_list=TOKEN_ESCALATION,
+             log=print,
++            disable_thinking=disable_thinking,
+             model=model,
+             temperature=temperature,
+             system=system_message,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 7434fed..9efee14 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -40,14 +40,23 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+ )
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=None, max_retry=3, force_tool=None, disable_thinking=False,
+ ):
++    """
++    force_tool: name of a tool the model must call on this turn. Sets tool_choice to that tool and
++    disables thinking, so the output budget goes to the tool call rather than hidden reasoning.
++    disable_thinking: run with thinking disabled even if the caller did not request it.
++    """
++    if force_tool:
++        tool_choice = {'type': 'tool', 'name': force_tool}
++        disable_thinking = True
+     try:
+         if 'claude' in model:
+             response = _call_with_token_escalation(
+                 client.messages.create,
+                 max_tokens_list=TOKEN_ESCALATION,
+                 log=logging or print,
++                disable_thinking=disable_thinking,
+                 model=model,
+                 messages=messages,
+                 tool_choice=tool_choice,
+@@ -68,7 +77,8 @@ def get_response_withtools(
+     except Exception as e:
+         logging(f"Error in get_response_withtools: {str(e)}")
+         if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
++            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1,
++                                          force_tool=force_tool, disable_thinking=disable_thinking)
+ 
+         # Hitting the context window limit
+         if 'Input is too long for requested model' in str(e):
+@@ -485,6 +495,7 @@ def chat_with_agent_claude(
+         model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+         msg_history=None,
+         logging=print,
++        first_turn_force_tool='editor',
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -510,7 +521,9 @@ def chat_with_agent_claude(
+         tools_dict = {tool['info']['name']: tool for tool in all_tools}
+         tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+ 
+-        # Call API
++        # Call API. The first request of a fresh conversation may force the given tool
++        # (thinking disabled) so the first turn ends with an edit instead of hidden reasoning.
++        first_turn = not msg_history
+         response = get_response_withtools(
+             client=client,
+             model=client_model,
+@@ -518,6 +531,7 @@ def chat_with_agent_claude(
+             tool_choice={"type": "auto"},
+             tools=tools,
+             logging=logging,
++            force_tool=first_turn_force_tool if first_turn else None,
+         )
+ 
+         final_response = None
+@@ -578,6 +592,7 @@ def chat_with_agent_claude(
+             else:
+                 nudge = EMPTY_NUDGES[attempt]
+             _append_nudge(new_msg_history, nudge)
++            # Nudges go out with a forced tool choice and thinking disabled, so the retry is an edit.
+             response = get_response_withtools(
+                 client=client,
+                 model=client_model,
+@@ -585,6 +600,7 @@ def chat_with_agent_claude(
+                 tool_choice={"type": "auto"},
+                 tools=tools,
+                 logging=logging,
++                force_tool=first_turn_force_tool,
+             )
+         if final_response is not None and not gave_up:
+             new_msg_history.append({

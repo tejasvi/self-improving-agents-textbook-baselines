@@ -1,0 +1,170 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d2201fb..517e485 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,8 +3,10 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -134,6 +136,17 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++LANGUAGE_EXTENSIONS = {
++    "python": (".py",),
++    "javascript": (".js",),
++    "go": (".go",),
++    "rust": (".rs",),
++    "java": (".java",),
++    "cpp": (".cpp", ".cc", ".h", ".hpp"),
++}
++
++STUB_MARKERS = ("pass", "TODO", "unimplemented", "todo!", "NotImplementedError")
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -205,30 +218,121 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ Please follow this workflow:
+ 1. Explore the repository with simple, quick commands (e.g. `ls`, `git status`, `cat` on a specific file). Avoid long-running or complex pipelines such as `find ... | cat $(...)`.
+ 2. Read the starter/stub file that needs to be implemented (it may contain only `pass` or a placeholder).
+-3. Implement the solution in the non-test source file using the editor tool. Do not put the solution only in test files.
+-4. Write a small test script (or test file) that checks the examples from the problem statement, and run it. Refine the implementation until the examples pass and the logic is correct for edge cases.
+-5. Make sure your final changes are saved in the source file.
++3. Keep your plan brief (a few sentences at most). Write the solution into the non-test source file early using the editor tool, then refine it. Do not put the solution only in test files.
++4. If the stub uses names that are not imported (e.g. `List`, `Optional`), add the necessary imports (e.g. `from typing import List`) at the top of the file.
++5. Write a small test script (or test file) that checks the examples from the problem statement, and run it. Refine the implementation until the examples pass and the logic is correct for edge cases.
++6. Make sure your final changes are saved in the source file.
+ 
+ Important: ending your turn without modifying a source file is a failure. Changing only test files is also a failure. Finishing with no edits counts as failure.
+ """
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Retry (bounded) until a valid, non-test source patch exists
+-        for attempt in range(3):
++        # Retry (bounded to 3 attempts) reusing the conversation state, until a valid non-test source patch exists
++        max_attempts = 3
++        for attempt in range(max_attempts):
+             if self._patch_is_valid():
+                 break
+-            current_diff = self.get_current_edits()
+-            diff_text = current_diff[0]["content"][0]["text"] if current_diff else ""
+-            follow_up = f"""No valid source patch was found: the repository has no changes, or only test files were changed. This is attempt {attempt + 1} of 3.
++            follow_up = (
++                "You have not edited any source file. Do not explore further. "
++                "Call the editor tool now with command=edit (or command=create) on the main source file "
++                "(the non-test file containing the stub), with the full final content of the solution. "
++                f"This is attempt {attempt + 1} of {max_attempts}."
++            )
++            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        if not self._patch_is_valid():
++            safe_log("Retries did not produce a valid patch; using direct write fallback.")
++            self._fallback_direct_write()
++
++        return msg_history
++
++    def _find_target_file(self):
++        """Pick the primary non-test source file to write the solution into."""
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        changed = [f for f in get_changed_files(diff) if not _is_test_path(f)]
++        exts = LANGUAGE_EXTENSIONS.get(self.language, (".py",))
++
++        def is_candidate(f):
++            name = f.replace("\\", "/").split("/")[-1].lower()
++            return (
++                f.endswith(exts)
++                and not _is_test_path(f)
++                and not name.startswith("readme")
++            )
++
++        changed = [f for f in changed if is_candidate(f)]
++        if changed:
++            return changed[0]
++
++        result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        tracked = [f for f in result.stdout.decode().splitlines() if is_candidate(f)]
++        if not tracked:
++            return None
++
++        def full_path(f):
++            return os.path.join(self.git_tempdir, f)
++
++        def has_marker(f):
++            try:
++                with open(full_path(f), 'r', encoding='utf-8', errors='ignore') as fh:
++                    text = fh.read()
++                return any(m in text for m in STUB_MARKERS)
++            except OSError:
++                return False
++
++        with_marker = [f for f in tracked if has_marker(f)]
++        return (with_marker or tracked)[0]
++
++    def _fallback_direct_write(self):
++        """Deterministic fallback: ask the model for the full file and write it directly from Python."""
++        target = self._find_target_file()
++        if target is None:
++            safe_log("Fallback: no candidate source file found.")
++            return False
++        path = os.path.join(self.git_tempdir, target)
++        try:
++            with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
++                current_content = fh.read()
++        except OSError:
++            return False
+ 
+-Original task:
+-{task}
++        prompt = f"""Solve the following competitive programming problem by completing the file `{target}`.
+ 
+-Current repo edits (diff):
+-{diff_text}
++<problem_description>
++{self.problem_statement}
++</problem_description>
+ 
+-Now open the primary source file (the stub containing `pass` or the placeholder for the solution) and implement the solution there using the editor tool. Do not only edit tests. After editing, run a quick check on the problem's examples to verify it works, and then stop."""
+-            init_edit = chat_with_agent(follow_up, model=self.code_model, msg_history=[], logging=safe_log)
++Current content of `{target}`:
++```
++{current_content}
++```
++
++Reply with ONLY the complete updated file in one ```code``` block, including all needed imports."""
++        try:
++            client, client_model = create_client(self.code_model)
++            response, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer and Python developer.",
++                print_debug=False,
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"Fallback LLM call failed: {e}")
++            return False
++
++        blocks = re.findall(r"```[^\n]*\n(.*?)```", response or "", flags=re.DOTALL)
++        if not blocks:
++            safe_log("Fallback: no fenced code block in model response.")
++            return False
++        code = max(blocks, key=len)
++        with open(path, 'w', encoding='utf-8') as fh:
++            fh.write(code)
++        return self._patch_is_valid()
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

@@ -1,0 +1,170 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 276ed04..d2d28f1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -252,6 +252,102 @@ class AgenticSystem:
+             safe_log(f"[safe_chat] exception from chat_with_agent: {type(e).__name__}: {e}", level=logging.ERROR)
+             return self._sanitize_history(history)
+ 
++    _FAILURE_MARKERS = ('MISMATCH', 'Traceback', 'AssertionError', 'FAILED', 'wrong answer',
++                        'Wrong Answer', 'wrong', 'Error:')
++    _BENIGN_PATTERNS = (
++        r'\b0\s+(failed|failures?|errors?|mismatch(es)?)\b',
++        r'\bno\s+mismatch(es)?\b',
++        r'\bmismatches?:\s*0\b',
++        r'\ball\s+(tests\s+)?passed\b',
++        r'\b\d+\s+passed\b(?!.*\bfailed\b)',
++    )
++
++    def _history_events(self, msg_history):
++        """
++        Flatten the message history into ('call', name, text) and ('result', name, text) events,
++        supporting structured tool_use/tool_result blocks and text blocks with '<tool_use>' or
++        'Tool Used:' / 'Tool Result:' markers.
++        """
++        events = []
++        last_call = None
++        for msg in msg_history or []:
++            if not isinstance(msg, dict):
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                content = [{"type": "text", "text": content}]
++            if not isinstance(content, list):
++                continue
++            for block in content:
++                if isinstance(block, dict):
++                    btype = block.get('type')
++                    if btype == 'tool_use':
++                        last_call = block.get('name')
++                        events.append(('call', last_call, str(block.get('input', ''))))
++                        continue
++                    if btype == 'tool_result':
++                        events.append(('result', last_call, str(block.get('content', ''))))
++                        continue
++                    text = block.get('text') if btype == 'text' else None
++                else:
++                    if getattr(block, 'type', None) == 'tool_use':
++                        last_call = getattr(block, 'name', None)
++                        events.append(('call', last_call, str(getattr(block, 'input', ''))))
++                    continue
++                if not isinstance(text, str):
++                    continue
++                if '<tool_use>' in text:
++                    m = re.search(r"tool_name['\"]?\s*:\s*['\"]?(\w+)", text)
++                    last_call = m.group(1) if m else None
++                    events.append(('call', last_call, text))
++                    continue
++                used = re.search(r'Tool Used:\s*(\w+)', text)
++                if used:
++                    last_call = used.group(1)
++                    before, _, after = text.partition('Tool Result:')
++                    events.append(('call', last_call, before))
++                    if 'Tool Result:' in text:
++                        events.append(('result', last_call, after))
++                    continue
++                if 'Tool Result:' in text:
++                    events.append(('result', last_call, text.split('Tool Result:', 1)[1]))
++        return events
++
++    def _last_verification_failed(self, msg_history):
++        """
++        Inspect the history after the last file-writing editor call. Returns (failed, excerpt):
++        - failed is True if a bash result after that edit contains a failure marker, or if no
++          bash result follows the edit (unverified), or if the final assistant turn is text-only
++          and the last verification failed.
++        - excerpt is a short piece of the failing output (or a note about missing verification).
++        """
++        events = self._history_events(msg_history)
++        last_edit = None
++        for i, (kind, name, text) in enumerate(events):
++            if kind == 'call' and name == 'editor' and re.search(
++                    r"command['\"]?\s*:\s*['\"](create|edit)['\"]", text):
++                last_edit = i
++        if last_edit is None:
++            return False, ''
++
++        later_results = [text for kind, name, text in events[last_edit + 1:]
++                         if kind == 'result' and name == 'bash']
++        if not later_results:
++            return True, 'no verification run after last edit'
++
++        failed_excerpt = None
++        for text in later_results:
++            cleaned = text
++            for pat in self._BENIGN_PATTERNS:
++                cleaned = re.sub(pat, ' ', cleaned, flags=re.IGNORECASE)
++            if any(marker in cleaned for marker in self._FAILURE_MARKERS):
++                failed_excerpt = text
++        if failed_excerpt is not None:
++            return True, failed_excerpt.strip()[-1500:]
++
++        # Last verification passed; a text-only final assistant turn after it is still fine.
++        return False, ''
++
+     def _output_filename(self):
+         match = re.search(r'`([\w./-]+\.py)`', self.problem_statement)
+         return match.group(1) if match else None
+@@ -271,6 +367,36 @@ class AgenticSystem:
+             f.write(stub)
+         safe_log(f"[forward] wrote stub program to {filename}")
+ 
++    def _verify_and_repair(self, msg_history, task, max_rounds=5):
++        """
++        Bounded verify-and-repair loop. While the last verification failed or is missing,
++        resume the agent with the failure excerpt. Never loops unboundedly.
++        """
++        final_failed, final_excerpt = True, 'not checked'
++        for rnd in range(1, max_rounds + 1):
++            failed, excerpt = self._last_verification_failed(msg_history)
++            if not failed:
++                final_failed, final_excerpt = False, ''
++                break
++            safe_log(f"[forward] verify round {rnd}: verification failed/missing: {excerpt[:200]!r}")
++            repair_prompt = (
++                "The solution is known to be wrong or unverified.\n"
++                f"Latest verification output:\n<verification>\n{excerpt[:1500]}\n</verification>\n\n"
++                "Diagnose the root cause by reasoning about the algorithm (use the counterexample if one "
++                "is shown). Rewrite the solution file with the editor tool (use `edit`, after viewing it). "
++                "Then re-run the sample inputs and the brute-force stress test. Do not stop until there "
++                "are zero mismatches and all samples pass. Always make the tool call rather than "
++                "announcing a next step.\n\n"
++                f"Original task:\n{task}"
++            )
++            msg_history = self._safe_chat(repair_prompt, self._sanitize_history(msg_history))
++            final_failed, final_excerpt = True, excerpt
++        else:
++            final_failed, final_excerpt = self._last_verification_failed(msg_history)
++        state = 'FAILED' if final_failed else 'PASSED'
++        safe_log(f"[forward] final verification state: {state} {final_excerpt[:200]!r}")
++        return not final_failed
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -286,13 +412,14 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         workflow = """
+ Follow this workflow:
+ 1. Explore the repository: look at the relevant files, the existing tests and the sample inputs/outputs in the problem statement.
+-2. Write a first implementation early, using the editor tool. Do not wait until you have a perfect understanding.
++2. Write the brute force first (a simple, obviously-correct reference), and design the algorithm with a short correctness argument before coding it. Then write a first implementation early, using the editor tool. Do not wait until you have a perfect understanding.
+ 3. Run the implementation on ALL sample inputs with bash and compare with the expected outputs.
+-4. Write a brute-force reference checker and a stress test that compares your implementation against it on many small random inputs.
++4. Write a stress test that compares your implementation against the brute force on many small random inputs. If the brute force disagrees with your solution, you must fix the solution rather than stop.
+ 5. Check performance on maximum-size inputs (time limits matter). Optimize if needed.
+ 6. Fix any discrepancies and re-verify everything from steps 3-5.
+ 
+-Your very first action must be an editor tool call that writes a draft implementation to the target file; refine it afterwards.
++Your very first action must be an editor tool call that writes a draft implementation to the target file; refine it afterwards. If the stub file already exists, view it first and then use the editor `edit` command (not `create`) to overwrite it.
++Never end your turn after announcing a next step; always perform the tool call. Only stop once the stress test shows zero mismatches and the samples pass.
+ 
+ Important rules:
+ - Ending your turn without editing a file is a failure.
+@@ -328,6 +455,7 @@ Important rules:
+             safe_log(f"[forward] retry {attempt} patch status: {status}")
+ 
+         if status == 'ok':
++            self._verify_and_repair(msg_history, task)
+             return
+ 
+         safe_log(f"[forward] status '{status}' after retries; starting a fresh conversation")

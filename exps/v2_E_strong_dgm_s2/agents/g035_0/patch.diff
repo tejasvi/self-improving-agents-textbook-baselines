@@ -1,0 +1,440 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7819c9d..92659d6 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,9 @@
+ import argparse
++import ast
++import json
++import random
+ import subprocess
++import sys
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -107,6 +111,135 @@ def _strip_fences(s):
+         lines.pop()
+     return '\n'.join(lines)
+ 
++CLASS_SAMPLE_RE = re.compile(
++    r'Example\s*\d*:\s*\n?Input:\s*(.*?)\n\s*Output:\s*(.*?)'
++    r'(?=\n\s*Explanation|\n\s*Example|\n\s*Constraints|\Z)',
++    re.S,
++)
++METHOD_NAME_RE = re.compile(r'(method `(\w+)`)')
++BIG_TIME_LIMIT = 2.0
++REGRESSION_CASE_LIMIT = 500
++
++CLASS_CONVENTIONS_PROMPT = """Task type: LeetCode-style Solution class method (NOT stdin).
++Conventions (follow exactly):
++- solution.py must define `class Solution` with the method `{method}` (keep the signature from the statement's starter code). Include `from typing import *` and any other imports at the top.
++- Tests call `Solution().{method}(*args)` directly with the positional args; samples are in samples/*.json as {{"args": [...], "expected": ...}}.
++- Write brute.py defining `class Solution` with the same method `{method}` (a plain brute force written from the statement).
++- Write gen.py with `gen(rng, size)` returning a TUPLE of positional args, e.g. `([3, 1, 2],)`, and optionally `enumerate_all()` yielding such tuples. Use `rng` (a random.Random) for randomness; include degenerate cases (minimum size, equal values, extremes).
++- Optionally write big_gen.py with `gen_big(rng)` returning a max-size args tuple for a timing check.
++- Do not write stdin-reading code, 'N L R' text, or interactive-judge logic for this task.
++- Use the stress harness on the candidate in your own tests by calling Solution().{method} against brute.py on random args from gen.py.
++"""
++
++def detect_task_type(statement):
++    """Return ('class', method_name) for LeetCode-style Solution tasks, else ('stdin', None)."""
++    text = statement or ""
++    m = METHOD_NAME_RE.search(text)
++    if m or 'class Solution' in text:
++        name = m.group(2) if m else None
++        if name is None:
++            dm = re.search(r'def\s+(\w+)\s*\(\s*self', text)
++            name = dm.group(1) if dm else None
++        return 'class', name
++    return 'stdin', None
++
++
++def _split_top_level_commas(s):
++    """Split on commas that are not nested in brackets or quotes."""
++    parts, depth, cur, quote = [], 0, [], None
++    for ch in s:
++        if quote:
++            cur.append(ch)
++            if ch == quote:
++                quote = None
++            continue
++        if ch in '\'"':
++            quote = ch
++        elif ch in '([{':
++            depth += 1
++        elif ch in ')]}':
++            depth -= 1
++        if ch == ',' and depth == 0:
++            parts.append(''.join(cur))
++            cur = []
++        else:
++            cur.append(ch)
++    parts.append(''.join(cur))
++    return [p.strip() for p in parts if p.strip()]
++
++
++def parse_class_input(text):
++    """'nums = [1, 2], k = 3' -> [[1, 2], 3]; positional values are kept in order."""
++    args = []
++    for piece in _split_top_level_commas(text):
++        if re.match(r'^\w+\s*=(?!=)', piece):
++            piece = piece.split('=', 1)[1]
++        args.append(ast.literal_eval(piece.strip()))
++    return args
++
++
++def extract_class_samples(statement):
++    """Parse 'Example N: Input: ... Output: ...' blocks into [{'args': [...], 'expected': ...}]."""
++    out = []
++    for m in CLASS_SAMPLE_RE.finditer(statement or ""):
++        try:
++            args = parse_class_input(m.group(1).strip())
++            expected = ast.literal_eval(m.group(2).strip())
++        except Exception:
++            continue
++        out.append({'args': args, 'expected': expected})
++    return out
++
++
++CLASS_RUNNER_SRC = r'''
++import importlib.util, json, sys
++path, method, cases_path = sys.argv[1], sys.argv[2], sys.argv[3]
++cases = json.load(open(cases_path))
++spec = importlib.util.spec_from_file_location("cand_mod", path)
++mod = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(mod)
++out = []
++for c in cases:
++    try:
++        r = getattr(mod.Solution(), method)(*c["args"])
++        out.append({"ok": True, "value": r})
++    except Exception as e:
++        out.append({"ok": False, "error": repr(e)})
++print(json.dumps(out, default=str))
++'''
++
++
++def run_class_calls(path, method, args_list, timeout=10):
++    """Run Solution().method(*args) for each args tuple in a subprocess. Returns (results, error)."""
++    with tempfile.TemporaryDirectory() as td:
++        cases_path = os.path.join(td, 'cases.json')
++        runner_path = os.path.join(td, 'runner.py')
++        with open(cases_path, 'w') as f:
++            json.dump([{'args': list(a)} for a in args_list], f)
++        with open(runner_path, 'w') as f:
++            f.write(CLASS_RUNNER_SRC)
++        try:
++            proc = subprocess.run([sys.executable, runner_path, path, method, cases_path],
++                                  capture_output=True, text=True, timeout=timeout)
++        except subprocess.TimeoutExpired:
++            return None, f"TIMEOUT after {timeout}s"
++        if proc.returncode != 0:
++            return None, (proc.stderr or '')[-800:]
++        try:
++            return json.loads(proc.stdout.strip().splitlines()[-1]), ''
++        except Exception as e:
++            return None, f"bad runner output: {e}"
++
++
++def class_values_equal(actual, expected):
++    if isinstance(expected, float) or isinstance(actual, float):
++        try:
++            return abs(float(actual) - float(expected)) <= 1e-5 * max(1.0, abs(float(expected)))
++        except Exception:
++            return False
++    return actual == expected
++
++
+ MAX_ATTEMPTS = 4
+ 
+ STRATEGY_HINTS = [
+@@ -183,6 +316,9 @@ class AgenticSystem:
+         self.language = language
+         self.samples_dir = os.path.join(git_tempdir, 'samples')
+         self.sample_names = []
++        self.task_type, self.method_name = detect_task_type(problem_statement)
++        self.last_failures = []
++        self.regression_path = os.path.join(tempfile.mkdtemp(prefix='regress_'), 'regression.jsonl')
+         self.lessons = []
+         self.last_report = None
+         self.notes_text = ""
+@@ -254,6 +390,22 @@ class AgenticSystem:
+         Returns [] (and logs) when nothing is found, in which case verification is skipped.
+         """
+         text = self.problem_statement or ""
++        self.task_type, self.method_name = detect_task_type(text)
++        if self.task_type == 'class':
++            class_samples = extract_class_samples(text)
++            self.sample_names = []
++            if not class_samples:
++                safe_log("_extract_samples: no class samples found; skipping sample verification",
++                         level=logging.WARNING)
++                return self.sample_names
++            os.makedirs(self.samples_dir, exist_ok=True)
++            for k, s in enumerate(class_samples, start=1):
++                with open(os.path.join(self.samples_dir, f"{k}.json"), 'w') as f:
++                    json.dump(s, f, default=str)
++                self.sample_names.append(str(k))
++            safe_log(f"_extract_samples: wrote {len(self.sample_names)} class sample(s)")
++            return self.sample_names
++
+         pattern = re.compile(
+             r"Sample\s+Input\s*(\d+)\s*:?[ \t]*\n(.*?)Sample\s+Output\s*\1\s*:?[ \t]*\n"
+             r"(?:```[^\n]*\n)?(.*?)(?=\n[ \t]*\n|```|Sample\s+Input|Explanation|\Z)",
+@@ -288,6 +440,131 @@ class AgenticSystem:
+         safe_log(f"_extract_samples: wrote {len(self.sample_names)} sample(s) to {self.samples_dir}")
+         return self.sample_names
+ 
++    def _run_class_samples(self, timeout=10):
++        """Check samples/*.json against Solution().method. Returns (results, report)."""
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        cases = []
++        for name in self.sample_names:
++            with open(os.path.join(self.samples_dir, f"{name}.json")) as f:
++                cases.append(json.load(f))
++        raw, err = run_class_calls(path, self.method_name, [c['args'] for c in cases], timeout)
++        results = []
++        lines = []
++        for i, c in enumerate(cases):
++            name = self.sample_names[i]
++            if raw is None:
++                ok, actual = False, err
++            else:
++                r = raw[i]
++                ok = r['ok'] and class_values_equal(r.get('value'), c['expected'])
++                actual = r.get('value') if r['ok'] else r.get('error')
++            results.append({'name': name, 'ok': ok})
++            lines.append(f"[{'PASS' if ok else 'FAIL'}] sample {name}: input={c['args']!r} "
++                         f"expected={c['expected']!r} actual={actual!r}")
++        passed = sum(1 for r in results if r['ok'])
++        lines.append(f"{passed}/{len(results)} samples passed")
++        return results, "\n".join(lines)
++
++    def _load_regressions(self):
++        cases = []
++        if os.path.exists(self.regression_path):
++            with open(self.regression_path) as f:
++                for line in f:
++                    line = line.strip()
++                    if line:
++                        try:
++                            cases.append(json.loads(line))
++                        except Exception:
++                            pass
++        return cases[-REGRESSION_CASE_LIMIT:]
++
++    def _run_regressions(self, path):
++        """Re-run stored counterexamples; returns (passed, total, first_failures)."""
++        cases = self._load_regressions()
++        if not cases:
++            return 0, 0, []
++        raw, err = run_class_calls(path, self.method_name, [c['args'] for c in cases], timeout=20)
++        passed, fails = 0, []
++        for i, c in enumerate(cases):
++            ok = raw is not None and raw[i]['ok'] and class_values_equal(raw[i].get('value'), c['expected'])
++            if ok:
++                passed += 1
++            elif len(fails) < 3:
++                actual = (raw[i].get('value') if raw[i]['ok'] else raw[i].get('error')) if raw else err
++                fails.append({'args': c['args'], 'expected': c['expected'], 'actual': actual})
++        return passed, len(cases), fails
++
++    def _stress_class_against_brute(self, cases=200):
++        """Differential test of Solution().method in solution.py vs brute.py on gen.py inputs.
++        Returns (agree_fraction, report, failing_inputs)."""
++        root = self.git_tempdir
++        sol_path = os.path.join(root, 'solution.py')
++        brute_path = os.path.join(root, 'brute.py')
++        gen_path = os.path.join(root, 'gen.py')
++        if not (os.path.exists(brute_path) and os.path.exists(gen_path)):
++            return 0.0, "stress vs brute: skipped (need brute.py and gen.py)", []
++        driver = r'''
++import importlib.util, json, sys
++mode, path, gen_path, n, method = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
++spec = importlib.util.spec_from_file_location("g", gen_path)
++g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
++import random
++rng = random.Random(12345)
++inputs = []
++if hasattr(g, "enumerate_all"):
++    for i, x in enumerate(g.enumerate_all()):
++        if len(inputs) >= n: break
++        inputs.append(list(x))
++size = 1
++while len(inputs) < n:
++    inputs.append(list(g.gen(rng, size)))
++    size = min(size + 1, 12)
++spec2 = importlib.util.spec_from_file_location("m", path)
++m = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(m)
++sol = m.Solution()
++out = []
++for args in inputs:
++    try:
++        out.append({"args": args, "ok": True, "value": getattr(sol, method)(*args)})
++    except Exception as e:
++        out.append({"args": args, "ok": False, "value": repr(e)})
++print(json.dumps(out, default=str))
++'''
++        def run_driver(p):
++            with tempfile.TemporaryDirectory() as td:
++                dp = os.path.join(td, 'drv.py')
++                with open(dp, 'w') as f:
++                    f.write(driver)
++                try:
++                    proc = subprocess.run([sys.executable, dp, 'x', p, gen_path, str(cases),
++                                           self.method_name or 'solve'],
++                                          capture_output=True, text=True, timeout=60, cwd=root)
++                except subprocess.TimeoutExpired:
++                    return None, "timeout"
++                if proc.returncode != 0:
++                    return None, (proc.stderr or '')[-400:]
++                return json.loads(proc.stdout.strip().splitlines()[-1]), ''
++
++        cand, err1 = run_driver(sol_path)
++        ref, err2 = run_driver(brute_path)
++        if cand is None or ref is None:
++            return 0.0, f"stress vs brute: runner failed (cand: {err1!r}, brute: {err2!r})", []
++        same, fails = 0, []
++        for c, b in zip(cand, ref):
++            ok = c['ok'] and b['ok'] and class_values_equal(c['value'], b['value'])
++            if ok:
++                same += 1
++            else:
++                fails.append({'args': c['args'], 'expected': b.get('value'), 'actual': c.get('value')})
++        frac = same / max(1, len(cand))
++        # Persist counterexamples so later attempts re-run them.
++        os.makedirs(os.path.dirname(self.regression_path), exist_ok=True)
++        with open(self.regression_path, 'a') as f:
++            for x in fails[:50]:
++                f.write(json.dumps(x, default=str) + "\n")
++        rep = f"stress vs brute: {same}/{len(cand)} agree"
++        return frac, rep, fails
++
+     def _run_samples(self, timeout=10):
+         """
+         Deterministic verifier (no LLM involved). For each extracted sample runs
+@@ -411,6 +688,9 @@ class AgenticSystem:
+         except Exception as e:
+             return None, f"solution.py does not compile: {e}", False
+ 
++        if self.task_type == 'class':
++            return self._evaluate_class_candidate(path)
++
+         if not self.sample_names:
+             smoke = self._smoke_check()
+             return (0, 0, 0), ("no samples extracted; NOT verified (all_pass=False)\n" + smoke), False
+@@ -424,6 +704,54 @@ class AgenticSystem:
+         # score = (sample passes, agreement with brute on random small inputs, -max runtime)
+         return (passed, agree, -max_rt), report, passed == len(results)
+ 
++    def _evaluate_class_candidate(self, path):
++        """Score a class-method candidate. Returns (score, report, all_pass, fails)."""
++        if not self.sample_names:
++            return (0, 0, 0.0, 0.0), "no class samples extracted; NOT verified", False, []
++        results, sample_report = self._run_class_samples()
++        samples_passed = sum(1 for r in results if r['ok'])
++        reg_passed, reg_total, reg_fails = self._run_regressions(path)
++        agree, stress_report, fails = self._stress_class_against_brute()
++        self.last_failures = fails[:3] + reg_fails[:3]
++        max_rt = 0.0
++        bigp = os.path.join(self.git_tempdir, 'big_gen.py')
++        if os.path.exists(bigp) and os.path.exists(os.path.join(self.git_tempdir, 'brute.py')):
++            max_rt, big_report = self._timing_check(bigp)
++            stress_report += "\n" + big_report
++        all_pass = samples_passed == len(results) and reg_passed == reg_total and agree >= 1.0 and max_rt <= BIG_TIME_LIMIT
++        report = "\n".join([sample_report,
++                            f"regressions: {reg_passed}/{reg_total} passed",
++                            stress_report])
++        score = (samples_passed, reg_passed, round(agree, 6), -max_rt)
++        return score, report, all_pass, fails
++
++    def _timing_check(self, big_path, timeout=BIG_TIME_LIMIT * 5):
++        """Time Solution().method on one max-size args tuple from big_gen.gen_big(rng)."""
++        driver = r'''
++import importlib.util, json, sys, random, time
++path, big_path, method = sys.argv[1], sys.argv[2], sys.argv[3]
++spec = importlib.util.spec_from_file_location("bg", big_path)
++bg = importlib.util.module_from_spec(spec); spec.loader.exec_module(bg)
++args = list(bg.gen_big(random.Random(99)))
++spec2 = importlib.util.spec_from_file_location("m", path)
++m = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(m)
++t = time.time(); getattr(m.Solution(), method)(*args); print(time.time() - t)
++'''
++        with tempfile.TemporaryDirectory() as td:
++            dp = os.path.join(td, 'big.py')
++            with open(dp, 'w') as f:
++                f.write(driver)
++            try:
++                proc = subprocess.run([sys.executable, dp, os.path.join(self.git_tempdir, 'solution.py'),
++                                       big_path, self.method_name or 'solve'],
++                                      capture_output=True, text=True, timeout=timeout, cwd=self.git_tempdir)
++            except subprocess.TimeoutExpired:
++                return timeout, f"timing: TIMEOUT after {timeout}s"
++        if proc.returncode != 0:
++            return timeout, f"timing: failed: {(proc.stderr or '')[-300:]!r}"
++        secs = float(proc.stdout.strip().splitlines()[-1])
++        return secs, f"timing: {secs:.3f}s on max-size input (limit {BIG_TIME_LIMIT}s)"
++
+     def _smoke_check(self, timeout=10):
+         """
+         Deterministic smoke test: run solution.py once on a synthetic input (the first extracted
+@@ -553,13 +881,20 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         solution_path = os.path.join(self.git_tempdir, 'solution.py')
+ 
+         for attempt in range(MAX_ATTEMPTS):
++            if best is not None and best['all_pass'] and self.task_type == 'class':
++                safe_log("forward: class candidate passed samples, regressions, brute agreement and timing; stopping")
++                break
+             if best is not None and best['all_pass'] and adversarial_done:
+                 safe_log("forward: samples pass and adversarial review completed; stopping")
+                 break
+-            if best is not None and best['all_pass'] and self.sample_names:
++            if best is not None and best['all_pass'] and self.sample_names and self.task_type != 'class':
+                 mode = "adversarial"
+                 adversarial_done = True
+                 extra = ADVERSARIAL_PROMPT.format(git_tempdir=self.git_tempdir)
++            elif self.task_type == 'class':
++                mode = "class"
++                extra = CLASS_CONVENTIONS_PROMPT.format(method=self.method_name or 'solve')
++                extra += STRATEGY_HINTS[attempt % len(STRATEGY_HINTS)]
+             elif not self.sample_names:
+                 mode = "contract"
+                 extra = CONTRACT_PROMPT
+@@ -572,6 +907,12 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                 with open(best['path']) as f:
+                     best_src = f.read()
+             last_report = self.last_report or "(no verifier report yet; no attempt has produced a valid solution.py)"
++            if self.task_type == 'class' and self.last_failures:
++                shown = "\n".join(f"- input={f['args']!r} expected={f['expected']!r} actual={f['actual']!r}"
++                                  for f in self.last_failures[:3])
++                last_report += f"\nTop failing cases (previous attempt):\n{shown}"
++            if self.task_type == 'class' and best is not None:
++                last_report += f"\nPrevious best score: {best['score']}"
+             lessons_text = "\n".join(f"- {x}" for x in self.lessons) or "(none yet)"
+             notes_block = ""
+             if attempt > 0:
+@@ -603,8 +944,14 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             safe_log(f"forward: attempt {attempt + 1} finished")
+             self._update_notes_and_summary(hist, attempt + 1, mode)
+ 
+-            score, report, all_pass = self._evaluate_candidate()
++            fails = []
++            evaluated = self._evaluate_candidate()
++            if len(evaluated) == 4:
++                score, report, all_pass, fails = evaluated
++            else:
++                score, report, all_pass = evaluated
+             self.last_report = report
++            self.last_failures = fails
+             safe_log(f"forward: attempt {attempt + 1} verifier:\n{report}")
+             if score is None:
+                 self.lessons.append(f"Attempt {attempt + 1}: {report}")
+@@ -615,7 +962,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 
+             snap = os.path.join(cand_dir, f"attempt_{attempt + 1}.py")
+             shutil.copyfile(solution_path, snap)
+-            if best is None or score > best['score']:
++            if best is None or score >= best['score']:
+                 best = {'score': score, 'path': snap, 'attempt': attempt + 1, 'all_pass': all_pass}
+ 
+         if best is not None:

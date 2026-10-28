@@ -1,0 +1,365 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 6727f24..2e1a3a1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,10 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ import tempfile
++import re
++import ast
++import shutil
++import sys
+ 
+ from tools.stress_test import tool_function as stress_test
+ 
+@@ -42,6 +46,80 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++SAMPLE_RE = re.compile(
++    r'Sample Input\s*(\d+)\s*\n(.*?)\n\s*Sample Output\s*\1\s*\n(.*?)(?=\n\s*Sample Input|\n## Task|\Z)',
++    re.S)
++N_CAND = 2      # candidates generated in Phase A
++MAX_CAND = 3    # extended to this many if no candidate passes the samples
++MAX_FIX_ITERS = 4
++
++
++def _extract_samples(problem_statement):
++    """Return a list of (input_text, expected_output_text) from 'Sample Input N / Sample Output N' blocks."""
++    samples = []
++    for m in SAMPLE_RE.finditer(problem_statement or ''):
++        inp = m.group(2).strip('\n') + '\n'
++        exp = m.group(3).strip()
++        samples.append((inp, exp))
++    return samples
++
++
++def _validate_solution(sol_path, stub_text, samples):
++    """Deterministic check of a solution file. Returns (n_passed, n_total, raw_report).
++    raw_report is '' when the file exists, differs from the stub, parses and passes every sample."""
++    n_total = len(samples)
++    if not os.path.isfile(sol_path):
++        return 0, n_total, f"missing file: {sol_path} does not exist"
++    with open(sol_path) as f:
++        text = f.read()
++    if text.strip() == (stub_text or '').strip():
++        return 0, n_total, f"{sol_path} is still the original stub (no solution written)"
++    try:
++        ast.parse(text)
++    except SyntaxError as e:
++        return 0, n_total, f"syntax error in {sol_path}:\n{type(e).__name__}: {e}"
++    sol_abs = os.path.abspath(sol_path)
++    n_pass = 0
++    reports = []
++    for i, (inp, exp) in enumerate(samples, 1):
++        try:
++            p = subprocess.run([sys.executable, '-I', sol_abs], input=inp, capture_output=True,
++                               text=True, timeout=10, cwd=os.path.dirname(sol_abs), errors='replace')
++            out, err, rc = p.stdout, p.stderr, p.returncode
++        except subprocess.TimeoutExpired as e:
++            out = e.stdout if isinstance(e.stdout, str) else ''
++            err = (e.stderr if isinstance(e.stderr, str) else '') + '\n(timed out after 10 seconds)'
++            rc = 'TIMEOUT'
++        if rc == 0 and out.split() == exp.split():
++            n_pass += 1
++        else:
++            reports.append(f"sample {i} FAILED (rc={rc})\n--- stdin\n{inp}--- expected\n{exp}\n"
++                           f"--- stdout\n{out}\n--- stderr\n{err}")
++    if n_pass == n_total:
++        return n_pass, n_total, ''
++    return n_pass, n_total, "\n".join(reports)
++
++
++def _last_reply_empty(msg_history):
++    """True if there is no history or the last assistant message has no non-whitespace text."""
++    if not msg_history:
++        return True
++    last = msg_history[-1]
++    if last.get('role') != 'assistant':
++        return False
++    content = last.get('content')
++    if isinstance(content, str):
++        return content.strip() == ''
++    texts = [b.get('text') or '' for b in (content or []) if isinstance(b, dict)]
++    return ''.join(texts).strip() == ''
++
++
++def _fail_count(stress_report):
++    """Failure total from the stress_test summary line; unknown counts as worst."""
++    found = re.findall(r'total failures: (\d+)', stress_report or '')
++    return sum(int(x) for x in found) if found else 10 ** 9
++
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -140,25 +218,68 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _ensure_solution(self, sol_path, stub_text, samples, task, msg_history, helper_dir, label):
++        """Bounded repair loop: validate solution.py deterministically, re-prompt with the raw report.
++        Returns (msg_history, n_pass, n_total, report)."""
++        n_pass, n_total, report = _validate_solution(sol_path, stub_text, samples)
++        for i in range(MAX_FIX_ITERS):
++            if not report:
++                safe_log(f"[{label}] solution passes all {n_total} samples")
++                return msg_history, n_pass, n_total, report
++            safe_log(f"[{label}] attempt {i + 1}: {n_pass}/{n_total} samples passed, re-prompting")
++            if i >= 2 or _last_reply_empty(msg_history):
++                # fresh history: only the task and the raw failure report
++                msg_history = []
++                prompt = (f"{task}\n\nWrite {sol_path} NOW with the editor tool, then stop. "
++                          f"Keep the reply under 200 words.\n\nValidation report (raw):\n{report}")
++            else:
++                prompt = (f"Create or fix {sol_path} now with the editor tool so it passes the samples. "
++                          f"Reply in under 200 words.\n\nValidation report (raw):\n{report}")
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            n_pass, n_total, report = _validate_solution(sol_path, stub_text, samples)
++        if not report:
++            safe_log(f"[{label}] solution passes all {n_total} samples")
++        else:
++            safe_log(f"[{label}] gave up after {MAX_FIX_ITERS} repair iterations: {n_pass}/{n_total} samples passed")
++        return msg_history, n_pass, n_total, report
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+ 
+         Phases:
+-          A. solve the problem and pass the samples;
++          A. best-of-N candidates (N_CAND, up to MAX_CAND): each starts from the base commit,
++             is validated deterministically against the statement samples, and is saved as
++             helper_dir/cand_k.py. Stops early on the first candidate passing all samples;
+           B. build independent self-tests outside the repo (brute, alt solution,
+-             generator with named modes, checker);
+-          C. bounded rounds (K=3): run the stress test, and if anything fails feed the
+-             raw report and a summary of earlier rounds back to the agent;
++             generator with named modes, checker), in two smaller chat calls;
++          C. bounded rounds (K=3): run the stress test (also comparing extra candidates), and if
++             anything fails feed the raw report and a summary of earlier rounds back to the agent;
+           Final. verify max-size YES instances with the checker and run run_clean.
++        Phases B/C run only when a candidate passes the samples; otherwise a best-effort
++        candidate is used.
+         """
+         helper_dir = tempfile.mkdtemp(prefix='agent_helpers_')
++        samples_dir = os.path.join(helper_dir, 'samples')
++        os.makedirs(samples_dir, exist_ok=True)
+         attempts_file = os.path.join(helper_dir, 'attempts.md')
+         with open(attempts_file, 'w') as f:
+             f.write('# Attempts log\n')
+         modes_file = os.path.join(helper_dir, 'modes.txt')
+         sol_path = os.path.join(self.git_tempdir, 'solution.py')
+ 
++        samples = _extract_samples(self.problem_statement)
++        for i, (inp, exp) in enumerate(samples, 1):
++            with open(os.path.join(samples_dir, f'sample{i}.in'), 'w') as f:
++                f.write(inp)
++            with open(os.path.join(samples_dir, f'sample{i}.out'), 'w') as f:
++                f.write(exp + '\n')
++        safe_log(f"[samples] extracted {len(samples)} sample(s) from the statement")
++
++        # The stub is the repo's solution.py at the base commit (empty if absent there).
++        stub_text = subprocess.run(['git', '-C', self.git_tempdir, 'show', f'{self.base_commit}:solution.py'],
++                                   capture_output=True, text=True).stdout
++
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -174,51 +295,96 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 4. Avoid environment-fragile constructs: do not use 3-argument pow (e.g. pow(a, MOD-2, MOD)); write a small hand-written modular power helper `def mpow(b, e, m)` with a loop instead. Avoid threading and recursion-limit tricks; prefer iterative code. Never use `while True` loops.
+ 5. Do a last re-read of solution.py for edge cases such as N=1, empty input, and the smallest/largest constraints.
+ The final solution.py is what gets graded; helper files are ignored."""
+-        phase_a = f"{task}\n\n{method}\n\nFor now do only steps 1-3 and 5 (write solution.py and pass all samples). Do not write any stress tests yet; that comes in the next step."
+-        msg_history = chat_with_agent(phase_a, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        phase_b = f"""Phase B: build an independent self-testing harness. Put ALL helper files in the directory {helper_dir} (NOT inside {self.git_tempdir}, do not modify any other repo file). Write these files there:
+-
+-1. Before writing gen.py, state your explicit list of edge-case classes for THIS problem (e.g. minimal N, N=1, heavy duplicates, all-equal values, extreme values at the bounds, planted solution at the first/last position, no solution by construction, maximal answers, overflow-prone sums, etc.). Write that list in your reply.
+-
+-2. `brute.py`: a simple, obviously-correct brute force that reads stdin and prints the output in the exact format of the statement. It must work for small inputs. Verify it on the samples.
+-
+-3. `alt_solution.py`: a DIFFERENT, efficient algorithm (not a tweak of solution.py) that reads stdin and prints the same format. It must be fast enough for max-size inputs. Check that it agrees with brute.py on many small random inputs before trusting it.
+ 
+-4. `gen.py`: usage `python3 gen.py MODE SEED`; it prints exactly ONE valid input to stdout, using random.Random(SEED) only (deterministic). Required modes (create one for each edge-case class of your list, using names of the form):
+-   - small-value random tiny inputs (e.g. `tiny_random`)
+-   - heavy duplicates (`duplicates`)
+-   - all values equal (`all_equal`)
+-   - boundary values (`boundary`)
+-   - planted answer: a valid YES instance built by construction (`planted`)
+-   - no answer by construction when the statement allows NO answers (`no_answer`)
+-   - a max-size variant of each of the above, named with the prefix `max_` (e.g. `max_duplicates`, `max_planted`). Max-size means the largest constraints in the statement, and the generator must still produce VALID inputs.
+-   Write the list of mode names, one per line, into {modes_file}. Do not put the max_ modes in any other place.
+-
+-5. `checker.py`: usage `python3 checker.py INPUT_FILE SOLUTION_OUTPUT_FILE REFERENCE_OUTPUT_FILE`. Exit 0 if the solution output is acceptable for the input according to the statement, otherwise exit non-zero and print the reason. If many outputs are valid (e.g. any valid construction), check validity against the statement rather than exact equality. If the answer is unique, compare exactly with the reference output. The checker must be independent of solution.py.
+-
+-Then check that gen.py produces valid inputs in every mode, that brute.py and alt_solution.py agree on tiny inputs, and that the checker accepts the reference output on them.
+-
+-Rules for the final tests: for every max-size YES instance, the expected answer must be verified by the checker (not only timed). Reject any max-size test whose expected answer you have not computed. Do not treat a max-size test as valid just because solution.py runs fast on it.
+-
+-Do not modify solution.py in this phase unless you find a real bug in it."""
+-        msg_history = chat_with_agent(phase_b, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        # ---- Phase A: best-of-N candidates ----
++        candidates = []  # (n_pass, k, path) for each attempt
++        chosen = None
++        n_attempts = N_CAND
++        for k in range(MAX_CAND):
++            if k >= n_attempts:
++                break
++            if k > 0:
++                reset_to_commit(self.git_tempdir, self.base_commit)  # clean copy of the base commit
++            phase_a = f"{task}\n\n{method}\n\nFor now do only steps 1-3 and 5 (write solution.py and pass all samples). Do not write any stress tests yet; that comes in the next step. Keep replies concise and write files with the editor tool immediately."
++            msg_history = chat_with_agent(phase_a, model=self.code_model, msg_history=[], logging=safe_log)
++            msg_history, n_pass, n_total, _ = self._ensure_solution(
++                sol_path, stub_text, samples, task, msg_history, helper_dir, f"cand {k + 1}")
++            cand_path = os.path.join(helper_dir, f'cand_{k + 1}.py')
++            if os.path.isfile(sol_path):
++                shutil.copyfile(sol_path, cand_path)
++            candidates.append((n_pass, k + 1, cand_path))
++            if n_pass == n_total and n_total > 0:
++                chosen = candidates[-1]
++                break
++            if k == 0 and N_CAND < MAX_CAND:
++                n_attempts = MAX_CAND  # first candidate failed the samples: allow one more
++
++        # Best-effort candidate: highest sample pass count, earliest on ties.
++        best = max(candidates, key=lambda c: (c[0], -c[1])) if candidates else None
++        if chosen is not None:
++            shutil.copyfile(chosen[2], sol_path)
++            extra_cands = [c[2] for c in candidates if c is not chosen]
++        else:
++            if best is not None:
++                shutil.copyfile(best[2], sol_path)
++            extra_cands = [c[2] for c in candidates if c is not best]
++            safe_log(f"[phase A] no candidate passed all samples; best pass count "
++                     f"{best[0] if best else 0}/{len(samples)}")
++            # bounded final retry: one fresh chat asking for any best-effort solution
++            msg_history, n_pass, n_total, report = self._ensure_solution(
++                sol_path, stub_text, samples, task, [], helper_dir, "final retry")
++            if report:
++                if best is not None:
++                    shutil.copyfile(best[2], sol_path)  # keep the best-effort candidate
++                safe_log("[phase A] still no passing solution; Phases B/C skipped")
++                return
++            chosen = (n_pass, 0, sol_path)
++
++        # ---- Phase B part 1: brute.py + gen.py + modes file ----
++        base_b = f"""Phase B: build an independent self-testing harness. Put ALL helper files in the directory {helper_dir} (NOT inside {self.git_tempdir}, do not modify any other repo file). Sample inputs/outputs are in {samples_dir} (sampleN.in / sampleN.out). Keep replies concise and write files with the editor tool immediately.
++"""
++        phase_b1 = base_b + f"""
++1. Before writing gen.py, state a short explicit list of edge-case classes for THIS problem in your reply.
++2. `brute.py` in {helper_dir}: a simple, obviously-correct brute force that reads stdin and prints the output in the exact format of the statement. Verify it on the samples.
++3. `gen.py` in {helper_dir}: usage `python3 gen.py MODE SEED`; prints exactly ONE valid input to stdout, using random.Random(SEED) only. Modes: `tiny_random`, `duplicates`, `all_equal`, `boundary`, `planted` (valid YES instance by construction), `no_answer` (if the statement allows NO), and a max-size variant of each with the prefix `max_` (e.g. `max_duplicates`). Max-size inputs must still be valid.
++4. Write the mode names, one per line, into {modes_file}.
++Check that gen.py produces valid inputs in every mode and that brute.py matches the samples. Do not modify solution.py."""
++        msg_history = chat_with_agent(phase_b1, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        for name in ('brute.py', 'gen.py'):
++            if not os.path.isfile(os.path.join(helper_dir, name)):
++                msg_history = chat_with_agent(
++                    f"{name} is missing from {helper_dir}. Write it now with the editor tool. Reply in under 100 words.",
++                    model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        # ---- Phase B part 2: alt_solution.py + checker.py ----
++        phase_b2 = f"""Phase B, part 2. Using the same {helper_dir} directory:
++5. `alt_solution.py`: a DIFFERENT efficient algorithm (not a tweak of solution.py) that reads stdin and prints the same format; fast enough for max-size inputs. Check it agrees with brute.py on small random inputs.
++6. `checker.py`: usage `python3 checker.py INPUT_FILE SOLUTION_OUTPUT_FILE REFERENCE_OUTPUT_FILE`. Exit 0 if the solution output is valid for the input, otherwise exit non-zero and print the reason. Check validity against the statement when many answers are valid; otherwise compare exactly with the reference output. It must not depend on solution.py.
++Write both files with the editor tool immediately; keep the reply under 150 words. Do not modify solution.py."""
++        msg_history = chat_with_agent(phase_b2, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        for name in ('alt_solution.py', 'checker.py'):
++            if not os.path.isfile(os.path.join(helper_dir, name)):
++                msg_history = chat_with_agent(
++                    f"{name} is missing from {helper_dir}. Write it now with the editor tool. Reply in under 100 words.",
++                    model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+         K = 3
++        cand_fails, cur_fail = {}, 10 ** 9
+         for rnd in range(K):
+-            report, failed = self._run_stress_round(helper_dir, sol_path, modes_file)
++            report, failed, cand_fails = self._run_stress_round(helper_dir, sol_path, modes_file, extra_cands)
+             with open(attempts_file, 'a') as f:
+                 f.write(f"\n## Round {rnd + 1}\n")
+                 f.write((report or 'stress test could not run').strip()[:4000] + "\n")
+             if not failed:
+                 safe_log(f"[stress] round {rnd + 1}: all cases passed")
+                 break
++            cur_fail = _fail_count(report)  # last round's sum of failures (main modes)
+             if rnd == K - 1:
+                 safe_log(f"[stress] round {rnd + 1}: failures remain after the last round")
+                 break
+             with open(attempts_file) as f:
+                 attempts = f.read()
+-            phase_c = f"""Phase C, round {rnd + 1} of {K}: the stress test found failures. Here is the raw report produced by the stress_test tool (solution_path={sol_path}, helpers in {helper_dir}):
++            phase_c = f"""Phase C, round {rnd + 1} of {K}: the stress test found failures. Here is the raw report produced by the stress_test tool (solution_path={sol_path}, helpers in {helper_dir}). Extra candidates {', '.join(extra_cands) or '(none)'} are independent solutions; disagreements with brute.py are listed in the report.
+ 
+ <stress_report>
+ {report}
+@@ -234,9 +400,17 @@ Instructions:
+ - Fix solution.py (the repo file) so that it is correct. Do not weaken checker.py or the reference to hide a real bug.
+ - Re-run the samples, and then re-run the stress_test tool on all modes (the modes are listed in {modes_file}; use ref_path=brute.py for small modes and ref_path=alt_solution.py for max_ modes, with checker_path=checker.py).
+ - Do not repeat an approach that already failed according to the summary above.
+-- Reply with a short summary of what you changed."""
++- Keep the reply under 200 words, a short summary of what you changed."""
+             msg_history = chat_with_agent(phase_c, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
++        # Final selection: if the repaired solution still fails and an extra candidate disagrees less
++        # with brute.py, use that candidate (earliest on ties).
++        if extra_cands and cand_fails:
++            best_c = min(extra_cands, key=lambda c: (cand_fails.get(c, 10 ** 9), extra_cands.index(c)))
++            if cand_fails.get(best_c, 10 ** 9) < cur_fail and cur_fail > 0:
++                shutil.copyfile(best_c, sol_path)
++                safe_log(f"[final] copied {os.path.basename(best_c)} to solution.py (fewer mismatches)")
++
+         final = f"""Final verification. Do all of the following before finishing:
+ 1. Re-run the stress tests on all modes (modes in {modes_file}) and make sure there are no failures. Every max-size YES instance must have been verified with checker.py, not only timed.
+ 2. Confirm that for every max-size test the expected answer was computed (by alt_solution.py or by reasoning) and that it is not a test that was assumed to be valid.
+@@ -245,8 +419,9 @@ Instructions:
+ Then give a short final summary."""
+         msg_history = chat_with_agent(final, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+-    def _run_stress_round(self, helper_dir, sol_path, modes_file):
+-        """Run the stress test tool on the current solution. Returns (raw_report, failed_flag)."""
++    def _run_stress_round(self, helper_dir, sol_path, modes_file, extra_cands=()):
++        """Run the stress test tool on the current solution, and on each extra candidate on the
++        small modes. Returns (raw_report, failed_flag, cand_fail_counts)."""
+         gen = os.path.join(helper_dir, 'gen.py')
+         brute = os.path.join(helper_dir, 'brute.py')
+         alt = os.path.join(helper_dir, 'alt_solution.py')
+@@ -255,10 +430,11 @@ Then give a short final summary."""
+             with open(modes_file) as f:
+                 modes = [line.strip() for line in f if line.strip()]
+         except OSError:
+-            return "modes file missing", True
++            return "modes file missing", True, {}
+         small = [m for m in modes if not m.startswith('max_')]
+         big = [m for m in modes if m.startswith('max_')]
+         parts = []
++        cand_fails = {}
+         try:
+             if small:
+                 parts.append("### small modes (reference: brute.py)\n" + stress_test(
+@@ -268,12 +444,21 @@ Then give a short final summary."""
+                 parts.append("### max modes (reference: alt_solution.py)\n" + stress_test(
+                     solution_path=sol_path, gen_path=gen, ref_path=alt, checker_path=checker,
+                     modes=big, seeds_per_mode=1, timeout=60))
++            # differential check: each extra candidate against brute.py on the small modes
++            for cand in extra_cands:
++                if small and os.path.isfile(cand):
++                    out = stress_test(solution_path=cand, gen_path=gen, ref_path=brute, checker_path=checker,
++                                  modes=small, seeds_per_mode=10, timeout=10)
++                cand_fails[cand] = _fail_count(out)
++                parts.append(f"### extra candidate {os.path.basename(cand)} vs brute.py (small modes)\n" + out)
+         except Exception as e:
+             parts.append(f"stress test raised: {type(e).__name__}: {e}")
+-            return "\n".join(parts), True
++            return "\n".join(parts), True, cand_fails
+         report = "\n".join(parts)
+-        failed = any(p.strip() == '' or 'ALL CASES PASSED' not in p for p in parts)
+-        return report, failed
++        main_parts = [p for p in parts if not p.startswith('### extra candidate')]
++        failed = any(p.strip() == '' or 'ALL CASES PASSED' not in p for p in main_parts)
++        return report, failed, cand_fails
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

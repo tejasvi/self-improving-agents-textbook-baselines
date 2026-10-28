@@ -1,0 +1,460 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index afcfacb..7ab0d01 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,8 @@ import threading
+ import re
+ import shutil
+ import tempfile
++import time
++import traceback
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -126,6 +128,10 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.regression_pool = []  # list of (input, expected) from brute.py failures
++        self.regress_dir = os.path.join(self.git_tempdir, 'tests', 'regress')
++        self.budget_total = 3000.0  # seconds for the whole forward()
++        self.t0 = time.monotonic()
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -247,7 +253,7 @@ class AgenticSystem:
+         result = {
+             'samples_passed': 0, 'samples_total': 0,
+             'stress_passed': 0, 'stress_total': 0,
+-            'failures': [], 'max_time': 0.0, 'crashed': False,
++            'failures': [], 'max_time': 0.0, 'crashed': False, 'pool_passed': 0, 'pool_total': len(self.regression_pool),
+         }
+         if not os.path.exists(solution_path):
+             result['crashed'] = True
+@@ -309,6 +315,20 @@ class AgenticSystem:
+                     result['failures'].append((inp.strip(), expected.strip(),
+                                                (out + ('\n[stderr]\n' + err if err else '')
+                                                 + ('\n[timeout]' if timed_out else '')).strip()))
++                    self._add_to_pool(inp, expected.strip())
++
++        # 2b) regression pool: every candidate must also pass all previously failing inputs
++        for idx, (pinp, pexp) in enumerate(list(self.regression_pool)):
++            rc, out, err, timed_out, dt = timed_run([py, solution_path], pinp)
++            result['max_time'] = max(result['max_time'], dt)
++            if rc != 0 or timed_out:
++                result['crashed'] = True
++            if rc == 0 and not timed_out and out.strip() == pexp.strip():
++                result['pool_passed'] += 1
++            else:
++                result['failures'].append((pinp.strip(), pexp.strip(),
++                                           (out + ('\n[stderr]\n' + err if err else '')
++                                            + ('\n[timeout]' if timed_out else '')).strip()))
+ 
+         # 3) max-size timing check
+         gen_max = os.path.join(tests_dir, 'gen_max.py')
+@@ -321,9 +341,50 @@ class AgenticSystem:
+                     result['crashed'] = True
+         return result
+ 
++    def _add_to_pool(self, inp, expected):
++        """Add a failing (input, expected) pair to the regression pool (dedup, short inputs only)."""
++        inp = inp.strip()
++        expected = expected.strip()
++        if not inp or len(inp) > 2000 or any(p[0] == inp for p in self.regression_pool):
++            return
++        self.regression_pool.append((inp, expected))
++        try:
++            os.makedirs(self.regress_dir, exist_ok=True)
++            n = len(self.regression_pool)
++            with open(os.path.join(self.regress_dir, f'{n:03d}.in'), 'w') as f:
++                f.write(inp + '\n')
++            with open(os.path.join(self.regress_dir, f'{n:03d}.out'), 'w') as f:
++                f.write(expected + '\n')
++        except OSError as e:
++            safe_log(f"[pool] could not persist regression case: {e}")
++
++    def _budget_left(self):
++        return self.budget_total - (time.monotonic() - self.t0)
++
++    def _snapshot_if_valid(self, attempts_dir, label):
++        """Copy solution.py to attempts_dir/best_so_far.py if it compiles. Returns True if snapshotted."""
++        sol = self._solution_path()
++        if not os.path.exists(sol):
++            return False
++        rc, _, err, _ = self._run_cmd(['python3', '-m', 'py_compile', sol], timeout=10)
++        if rc != 0:
++            safe_log(f"[snapshot] {label}: solution.py does not compile; not snapshotted")
++            return False
++        shutil.copyfile(sol, os.path.join(attempts_dir, 'best_so_far.py'))
++        safe_log(f"[snapshot] {label}: solution.py compiles; saved best_so_far.py")
++        return True
++
++    def _guarded(self, label, fn, *args):
++        """Run fn(*args); on any exception log the traceback and return None."""
++        try:
++            return fn(*args)
++        except Exception:
++            safe_log(f"[guard] {label} failed:\n{traceback.format_exc()}", logging.ERROR)
++            return None
++
+     @staticmethod
+     def _score_key(ev):
+-        return (ev['samples_passed'], ev['stress_passed'], -int(ev['crashed']), -ev['max_time'])
++        return (ev.get('pool_passed', 0), ev['stress_passed'], ev['samples_passed'], -int(ev['crashed']), -ev['max_time'])
+ 
+     @staticmethod
+     def _is_perfect(ev):
+@@ -362,6 +423,8 @@ class AgenticSystem:
+         """Call the agent. Returns (new_history, ok). ok=False if the reply was empty / '(no output)'."""
+         prev_len = len(msg_history)
+         new_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        n_new = len(new_history) - prev_len if isinstance(new_history, list) else 0
++        safe_log(f"[agent] returned type={type(new_history).__name__} new_messages={n_new}")
+         if not isinstance(new_history, list):
+             return msg_history, False
+         if self._is_bad_reply(new_history, prev_len):
+@@ -381,19 +444,126 @@ class AgenticSystem:
+     def _solution_path(self):
+         return os.path.join(self.git_tempdir, 'solution.py')
+ 
++    def _attempt_prompt(self, task, best_code, best_ev, prior_summary):
++        """Prompt for attempt k>1: best earlier code (clipped) + its failures; no full history."""
++        code = self._clip(best_code, 4000) if best_code else '(no earlier solution available)'
++        fails = self._format_failures(best_ev) if best_ev else '(none)'
++        return (task + "\n\nAn earlier attempt was tried in a fresh context. Its best code:\n```python\n"
++                + code + "\n```\nIts top failing cases (input, expected, got):\n" + fails
++                + "\n\nSummary of earlier attempts: " + (prior_summary or '(none)')
++                + "\n\nBefore editing, either (a) find the root cause of these failures by reasoning on the failing inputs with tests/brute.py, "
++                  "or (b) switch to a different algorithm if the approach looks wrong. Then write the corrected solution.py with the editor, "
++                  "run the samples, and keep command outputs short.")
++
++    def _fallback_draft(self, task, attempts_dir):
++        """Minimal one-shot draft used only when no snapshot exists at the end."""
++        sol = self._solution_path()
++        self._guarded('fallback draft', self._stage,
++                      task + "\nWrite a minimal solution.py now with the editor. No tests needed.", [], 'fallback')
++        self._snapshot_if_valid(attempts_dir, 'fallback')
++
++    def _cross_check(self, candidates, attempts_dir, sol):
++        """
++        candidates: list of (attempt_no, snapshot_path, ev). Pools validated generator inputs from every
++        attempt, runs all candidates on them, and selects by
++        (regression-pool passes, stress passes, samples, not crashed, -time).
++        Disagreements are resolved by brute.py when available, else by one short adjudication call.
++        Returns the chosen snapshot path or None.
++        """
++        py = 'python3'
++        tests_dir = os.path.join(self.git_tempdir, 'tests')
++        brute = os.path.join(tests_dir, 'brute.py')
++        have_brute = os.path.exists(brute)
++
++        # 1) gather inputs from each attempt's gen.py snapshot
++        pooled = []
++        gen_src = os.path.join(attempts_dir, 'gen_snapshots')
++        if os.path.isdir(gen_src):
++            for name in sorted(os.listdir(gen_src)):
++                if not name.endswith('.py'):
++                    continue
++                for seed in range(20):
++                    rc, inp, _, to = self._run_cmd([py, os.path.join(gen_src, name), str(seed)], timeout=5)
++                    if rc != 0 or to or not inp.strip() or len(inp) > 4000:
++                        continue
++                    if have_brute:
++                        rc, _, _, to = self._run_cmd([py, brute], input=inp, timeout=5)
++                        if rc != 0 or to:
++                            continue
++                    pooled.append(inp)
++        pooled = list(dict.fromkeys(pooled))[:60]
++        safe_log(f"[cross] pooled {len(pooled)} validated input(s) from {len(candidates)} candidate(s)")
++
++        # 2) run every candidate on pooled inputs
++        outputs = {}   # snapshot -> list of (out or None)
++        times = {}
++        for _, snap, _ in candidates:
++            outs = []
++            tmax = 0.0
++            for inp in pooled:
++                t0 = time.monotonic()
++                rc, out, _, to = self._run_cmd([py, snap], input=inp, timeout=5)
++                tmax = max(tmax, time.monotonic() - t0)
++                outs.append(out.strip() if rc == 0 and not to else None)
++            outputs[snap] = outs
++            times[snap] = tmax
++
++        # 3) disagreements
++        disagree = [i for i in range(len(pooled))
++                    if len({outputs[s][i] for _, s, _ in candidates}) > 1]
++        safe_log(f"[cross] {len(disagree)} disagreeing input(s)")
++        brute_wins = {}
++        if disagree and have_brute:
++            for i in disagree:
++                rc, exp, _, to = self._run_cmd([py, brute], input=pooled[i], timeout=5)
++                exp = exp.strip() if rc == 0 and not to else None
++                for _, s, _ in candidates:
++                    brute_wins[s] = brute_wins.get(s, 0) + (1 if outputs[s][i] == exp else 0)
++        elif disagree:
++            # no brute: one short adjudication call
++            self._guarded('cross adjudication', self._stage,
++                          "Several candidate solutions disagree on these inputs. Briefly decide which one is right "
++                          "by reasoning about the problem; do not edit solution.py.\n\n"
++                          + '\n'.join(f"Input: {self._clip(pooled[i], 300)}\n" + '\n'.join(
++                              f"  {os.path.basename(s)} -> {self._clip(outputs[s][i], 120)}" for _, s, _ in candidates)
++                              for i in disagree[:3]),
++                          [], 'cross')
++
++        # 4) rank: (pool passes, stress passes, samples, not crashed, -time)
++        best = None
++        for att, snap, ev in candidates:
++            key = (ev.get('pool_passed', 0), ev['stress_passed'], ev['samples_passed'],
++                   not ev['crashed'], -times.get(snap, ev['max_time']), brute_wins.get(snap, 0))
++            safe_log(f"[cross] attempt {att} key={key}")
++            if best is None or key > best[0]:
++                best = (key, snap)
++        return best[1] if best else None
++
+     def forward(self):
+         """
+-        Staged, multi-attempt, framework-verified pipeline.
+-        Each attempt starts with a fresh history: DRAFT -> TEST -> bounded FIX rounds evaluated by the framework.
+-        The best attempt (by score) is copied to solution.py.
++        Staged, multi-attempt, framework-verified pipeline with budgets and guarded stages.
++        Each attempt: DRAFT -> TEST -> bounded FIX rounds evaluated by the framework.
++        Later attempts receive the best earlier code and failures. Final choice via cross-check.
++        A solution.py is always left behind (best snapshot, or a fallback draft).
+         """
+         K = 3   # attempts
+         R = 4   # fix rounds per attempt
+-        # Snapshots live outside the repo so they never leak into the graded diff.
+-        attempts_dir = tempfile.mkdtemp(prefix='attempts_')
++        attempts_dir = tempfile.mkdtemp(prefix='attempts_')  # outside the repo
++        os.makedirs(os.path.join(attempts_dir, 'gen_snapshots'), exist_ok=True)
+         sol = self._solution_path()
+-        n_samples = self._extract_samples(self.problem_statement)
++        self.t0 = time.monotonic()
++        safe_log(f"[pipeline] start budget={self.budget_total:.0f}s attempts_dir={attempts_dir}")
++
++        n_samples = self._guarded('extract samples', self._extract_samples, self.problem_statement) or 0
+         safe_log(f"[pipeline] extracted {n_samples} sample(s) from statement")
++        if n_samples == 0:
++            self._guarded('sample fallback', self._stage,
++                          "Write tests/samples/1.in and tests/samples/1.out (and more k if the statement has them) "
++                          "with the sample inputs and expected outputs from the problem statement below. Use the editor. "
++                          "Only sample data, no commentary.\n\n" + self.problem_statement, [], 'samples')
++            n_samples = len([n for n in os.listdir(os.path.join(self.git_tempdir, 'tests', 'samples'))
++                             if n.endswith('.in')]) if os.path.isdir(os.path.join(self.git_tempdir, 'tests', 'samples')) else 0
++            safe_log(f"[pipeline] sample fallback produced {n_samples} sample(s)")
+ 
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -403,70 +573,108 @@ class AgenticSystem:
+ 
+ Your task is to write {self.git_tempdir}/solution.py to address the <problem_description>. The solution is a competitive programming program in Python that reads standard input and writes standard output (or a method of a given `Solution` class if the statement says so; then add `from typing import *` and the needed imports at the top). Sample tests are in {self.git_tempdir}/tests/samples/ as k.in / k.out.
+ """
+-        results = []   # (attempt index, score tuple, ev summary)
+-        best = None    # (key, attempt_path)
++        candidates = []    # (attempt_no, snapshot_path, ev)
+         prior_summary = ''
++        best_code, best_ev = None, None
+         done = False
++        try:
++            for k in range(K):
++                if done:
++                    break
++                budget_left = self._budget_left()
++                if budget_left < 300:
++                    safe_log(f"[pipeline] budget low ({budget_left:.0f}s); skipping attempt {k + 1}")
++                    break
++                safe_log(f"[attempt {k + 1}/{K}] starting with fresh history (budget left {budget_left:.0f}s)")
++                if os.path.exists(sol):
++                    os.remove(sol)
++                history = []
++                if k == 0:
++                    prompt = task + '\n' + DRAFT_PROMPT
++                else:
++                    prompt = self._attempt_prompt(task, best_code, best_ev, prior_summary) + '\n' + DRAFT_PROMPT
++
++                history = self._guarded(f'attempt {k + 1} draft', self._stage, prompt, history, f'attempt {k + 1} draft') or []
++                if not os.path.exists(sol) or not self._solution_edited():
++                    safe_log(f"[attempt {k + 1}] solution.py missing after draft; re-prompting in a fresh history")
++                    history = self._guarded(f'attempt {k + 1} draft-retry', self._stage,
++                        task + "\nCall the editor tool now to create solution.py with your best current solution, then run it on the samples.",
++                        [], f'attempt {k + 1} draft-retry') or []
++                self._snapshot_if_valid(attempts_dir, f'attempt {k + 1} draft')
++
++                if self._budget_left() > 200:
++                    history = self._guarded(f'attempt {k + 1} test', self._stage, TEST_PROMPT, history,
++                                            f'attempt {k + 1} test') or history
++                    gen_path = os.path.join(self.git_tempdir, 'tests', 'gen.py')
++                    if os.path.exists(gen_path):
++                        shutil.copyfile(gen_path, os.path.join(attempts_dir, 'gen_snapshots', f'attempt_{k + 1}_gen.py'))
++                else:
++                    safe_log(f"[attempt {k + 1}] budget low; skipping test stage")
++
++                ev = self._guarded(f'attempt {k + 1} evaluate', self._evaluate, sol) if os.path.exists(sol) else None
++                for r in range(R):
++                    if ev is None:
++                        ev = {'samples_passed': 0, 'samples_total': n_samples, 'stress_passed': 0,
++                              'stress_total': 0, 'failures': [('', '', 'solution.py missing or evaluation failed')],
++                              'max_time': 0.0, 'crashed': True, 'pool_passed': 0}
++                    safe_log(f"[attempt {k + 1} round {r}] samples {ev['samples_passed']}/{ev['samples_total']} "
++                             f"stress {ev['stress_passed']}/{ev['stress_total']} crashed={ev['crashed']} "
++                             f"max_time={ev['max_time']:.2f}s")
++                    if self._is_perfect(ev) or r == R - 1:
++                        break
++                    if self._budget_left() < 200:
++                        safe_log(f"[attempt {k + 1}] budget low; skipping remaining fix rounds")
++                        break
++                    fix_msg = FIX_PROMPT.format(failures=self._format_failures(ev),
++                                                prior=prior_summary or '(first fix round)')
++                    history = self._guarded(f'attempt {k + 1} fix {r}', self._stage, fix_msg, history,
++                                            f'attempt {k + 1} fix {r}') or history
++                    self._snapshot_if_valid(attempts_dir, f'attempt {k + 1} fix {r}')
++                    ev = self._guarded(f'attempt {k + 1} re-evaluate', self._evaluate, sol) if os.path.exists(sol) else None
+ 
+-        for k in range(K):
+-            if done:
+-                break
+-            safe_log(f"[attempt {k + 1}/{K}] starting with fresh history")
+-            history = []
+-            if os.path.exists(sol):
+-                os.remove(sol)
+-
+-            history = self._stage(task + '\n' + DRAFT_PROMPT, history, f'attempt {k + 1} draft')
+-            if not os.path.exists(sol) or not self._solution_edited():
+-                safe_log(f"[attempt {k + 1}] solution.py missing after draft; re-prompting in a fresh history")
+-                history = self._stage(
+-                    task + "\nCall the editor tool now to create solution.py with your best current solution, then run it on the samples.",
+-                    [], f'attempt {k + 1} draft-retry')
+-
+-            history = self._stage(TEST_PROMPT, history, f'attempt {k + 1} test')
+-
+-            ev = self._evaluate(sol) if os.path.exists(sol) else None
+-            for r in range(R):
+                 if ev is None:
+                     ev = {'samples_passed': 0, 'samples_total': n_samples, 'stress_passed': 0,
+-                          'stress_total': 0, 'failures': [('', '', 'solution.py missing')],
+-                          'max_time': 0.0, 'crashed': True}
+-                safe_log(f"[attempt {k + 1} round {r}] samples {ev['samples_passed']}/{ev['samples_total']} "
+-                         f"stress {ev['stress_passed']}/{ev['stress_total']} crashed={ev['crashed']} "
+-                         f"max_time={ev['max_time']:.2f}s")
+-                if self._is_perfect(ev):
+-                    break
+-                if r == R - 1:
+-                    break
+-                fix_msg = FIX_PROMPT.format(
+-                    failures=self._format_failures(ev),
+-                    prior=prior_summary or '(first fix round)',
+-                )
+-                history = self._stage(fix_msg, history, f'attempt {k + 1} fix {r}')
+-                ev = self._evaluate(sol) if os.path.exists(sol) else None
+-
+-            if ev is None:
+-                ev = {'samples_passed': 0, 'samples_total': n_samples, 'stress_passed': 0,
+-                      'stress_total': 0, 'failures': [], 'max_time': 0.0, 'crashed': True}
+-            key = self._score_key(ev)
+-            snap = os.path.join(attempts_dir, f'attempt_{k + 1}.py')
+-            if os.path.exists(sol):
+-                shutil.copyfile(sol, snap)
+-            results.append((k + 1, key, ev))
+-            safe_log(f"[attempt {k + 1}] final score key={key} perfect={self._is_perfect(ev)}")
+-            prior_summary += (f"Attempt {k + 1}: samples {ev['samples_passed']}/{ev['samples_total']}, "
+-                              f"stress {ev['stress_passed']}/{ev['stress_total']}, crashed={ev['crashed']}. ")
+-            if os.path.exists(snap) and (best is None or key > best[0]):
+-                best = (key, snap)
+-            if self._is_perfect(ev):
+-                done = True
+-
+-        # Select best candidate and write it to solution.py
+-        if best is not None:
+-            shutil.copyfile(best[1], sol)
+-            safe_log(f"[pipeline] chosen candidate: {os.path.basename(best[1])} key={best[0]}")
+-        else:
+-            safe_log("[pipeline] no attempt produced solution.py")
++                          'stress_total': 0, 'failures': [], 'max_time': 0.0, 'crashed': True, 'pool_passed': 0}
++                snap = os.path.join(attempts_dir, f'attempt_{k + 1}.py')
++                if os.path.exists(sol):
++                    shutil.copyfile(sol, snap)
++                    candidates.append((k + 1, snap, ev))
++                    if best_ev is None or self._score_key(ev) > self._score_key(best_ev):
++                        best_code = open(snap).read()
++                        best_ev = ev
++                key = self._score_key(ev)
++                safe_log(f"[attempt {k + 1}] final score key={key} perfect={self._is_perfect(ev)}")
++                prior_summary += (f"Attempt {k + 1}: samples {ev['samples_passed']}/{ev['samples_total']}, "
++                                  f"stress {ev['stress_passed']}/{ev['stress_total']}, crashed={ev['crashed']}. ")
++                done = self._is_perfect(ev)
++        except Exception:
++            safe_log(f"[pipeline] attempt loop failed:\n{traceback.format_exc()}", logging.ERROR)
++        finally:
++            # Selection and guaranteed deliverable.
++            chosen = None
++            try:
++                if candidates:
++                    if self._budget_left() > 60 and len(candidates) > 1:
++                        chosen = self._guarded('cross check', self._cross_check, candidates, attempts_dir, sol)
++                    if chosen is None:
++                        chosen = max(candidates, key=lambda c: self._score_key(c[2]))[1]
++                    safe_log(f"[pipeline] chosen candidate: {os.path.basename(chosen)}")
++                    shutil.copyfile(chosen, sol)
++                else:
++                    best_snap = os.path.join(attempts_dir, 'best_so_far.py')
++                    if os.path.exists(best_snap):
++                        shutil.copyfile(best_snap, sol)
++                        safe_log("[pipeline] restored best_so_far.py to solution.py")
++                    else:
++                        self._fallback_draft(task, attempts_dir)
++                        if os.path.exists(os.path.join(attempts_dir, 'best_so_far.py')):
++                            shutil.copyfile(os.path.join(attempts_dir, 'best_so_far.py'), sol)
++                        safe_log("[pipeline] no candidate; used fallback draft")
++            except Exception:
++                safe_log(f"[pipeline] selection failed:\n{traceback.format_exc()}", logging.ERROR)
++                if candidates and not os.path.exists(sol):
++                    shutil.copyfile(candidates[0][1], sol)
++            safe_log("[pipeline] done")
+ 
+ 
+ def main():
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..352e067
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,10 @@
++import sys
++
++
++def main():
++    # Assumed problem: read integers from stdin and print their sum (matches tests/brute.py).
++    print(sum(map(int, sys.stdin.read().split())))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/brute.py b/tests/brute.py
+new file mode 100644
+index 0000000..831f12e
+--- /dev/null
++++ b/tests/brute.py
+@@ -0,0 +1,2 @@
++# Assumed problem (unconfirmed): read integers from stdin, print their sum.
++print(sum(map(int, open(0).read().split())))
+diff --git a/tests/gen.py b/tests/gen.py
+new file mode 100644
+index 0000000..968b033
+--- /dev/null
++++ b/tests/gen.py
+@@ -0,0 +1,6 @@
++# usage: python3 gen.py SEED -> prints two small integers on one line (sample format "1 2")
++import random, sys
++
++rng = random.Random(int(sys.argv[1]))
++vals = [rng.choice([0, 1, -1, 10**9, -10**9, rng.randint(-10**9, 10**9)]) for _ in range(2)]
++print(*vals)
+diff --git a/tests/gen_max.py b/tests/gen_max.py
+new file mode 100644
+index 0000000..e634c39
+--- /dev/null
++++ b/tests/gen_max.py
+@@ -0,0 +1,2 @@
++# prints one maximum-size valid input: 2*10^5 integers of magnitude 10^9 on one line
++print(*([10**9] * 200000))

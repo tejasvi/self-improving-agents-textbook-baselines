@@ -1,0 +1,214 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ce3e764..2b17956 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ import fnmatch
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -61,6 +62,95 @@ def _is_test_path(path):
+     base = parts[-1]
+     return any(fnmatch.fnmatch(base, pat) for pat in TEST_PATH_PATTERNS)
+ 
++def _block_text(block):
++    """
++    Return the text of a content block (dict or SDK object), or '' if it has none.
++    """
++    if isinstance(block, dict):
++        if block.get("type") != "text":
++            return ""
++        text = block.get("text")
++    else:
++        if getattr(block, "type", None) != "text":
++            return ""
++        text = getattr(block, "text", None)
++    return text if isinstance(text, str) else ""
++
++
++def _message_text(msg):
++    """
++    Return the concatenated text of a message's content (string or list of blocks).
++    """
++    content = msg.get("content") if isinstance(msg, dict) else None
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "".join(_block_text(b) for b in content)
++    return ""
++
++
++def _is_empty_assistant_turn(msg):
++    """
++    Return True if msg is an assistant turn with no tool calls and only empty/whitespace text.
++    """
++    if not isinstance(msg, dict) or msg.get("role") != "assistant":
++        return False
++    content = msg.get("content")
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return content.strip() == ""
++    if isinstance(content, list):
++        for block in content:
++            if isinstance(block, dict):
++                btype = block.get("type")
++            else:
++                btype = getattr(block, "type", None)
++            if btype != "text":
++                return False  # e.g. tool_use blocks: a real turn
++        return _message_text(msg).strip() == ""
++    return False
++
++
++def _strip_empty_assistant_turns(msg_history):
++    """
++    Return a copy of msg_history with trailing empty assistant turns removed.
++    """
++    history = list(msg_history or [])
++    for _ in range(len(history)):
++        if history and _is_empty_assistant_turn(history[-1]):
++            history.pop()
++        else:
++            break
++    return history
++
++
++def _extract_last_assistant_text(msg_history):
++    """
++    Return the text of the last assistant message that has non-empty text, or ''.
++    """
++    for msg in reversed(list(msg_history or [])):
++        if isinstance(msg, dict) and msg.get("role") == "assistant":
++            text = _message_text(msg)
++            if text.strip():
++                return text
++    return ""
++
++
++CODE_BLOCK_RE = re.compile(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```", re.DOTALL)
++
++
++def _extract_last_code_block(text):
++    """
++    Return the content of the last fenced code block in text, or None.
++    """
++    matches = CODE_BLOCK_RE.findall(text or "")
++    if not matches:
++        return None
++    code = matches[-1]
++    return code if code.strip() else None
++
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -170,6 +260,55 @@ class AgenticSystem:
+         """
+         return any(not _is_test_path(f) for f in self._changed_files())
+ 
++    def _tracked_python_files(self):
++        """
++        Return tracked .py files in git_tempdir (via git ls-files).
++        """
++        result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        files = [f.strip() for f in result.stdout.decode(errors="replace").splitlines()]
++        return [f for f in files if f.endswith(".py")]
++
++    def _target_solution_path(self):
++        """
++        Choose the file the solution should be written to (relative to git_tempdir):
++        existing solution.py, else first tracked non-test .py file, else solution.py.
++        """
++        if os.path.isfile(os.path.join(self.git_tempdir, "solution.py")):
++            return "solution.py"
++        for f in self._tracked_python_files():
++            if not _is_test_path(f):
++                return f
++        return "solution.py"
++
++    def _fallback_write_solution(self):
++        """
++        Deterministic fallback: ask for only the solution in a python code block and write it to the target file.
++        Returns True if a file was written.
++        """
++        target = self._target_solution_path()
++        prompt = f"""Solve the following competitive programming problem in Python.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Reply with ONLY the complete solution program inside a single ```python fenced code block. It must read from stdin and write to stdout (or implement the required Solution class if the problem specifies one). No other text."""
++        safe_log(f"[patch guard] fallback: requesting code block for {target}")
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        code = _extract_last_code_block(_extract_last_assistant_text(msg_history))
++        if code is None:
++            safe_log("[patch guard] fallback: no python code block found in response")
++            return False
++        path = os.path.join(self.git_tempdir, target)
++        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++        with open(path, "w") as f:
++            f.write(code if code.endswith("\n") else code + "\n")
++        safe_log(f"[patch guard] fallback: wrote solution to {target}")
++        return True
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -237,25 +376,38 @@ Step 5 - If anything fails in an unexpected way, investigate the environment rat
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         # Patch guard: make sure at least one non-test source file was modified.
+-        for attempt in range(3):
++        target = self._target_solution_path()
++        for attempt in range(2):
+             if self._has_source_edit():
+                 break
+-            changed = self._changed_files()
+-            changed_str = "\n".join(f"- {f}" for f in changed) if changed else "no changes"
+-            follow_up = f"""You have not modified any non-test source file. Do not explore further.
++            if attempt == 0:
++                # Sanitize history (drop empty assistant turns) and send a short tool-forcing follow-up.
++                safe_log("[patch guard] attempt 1: no source edit detected; retrying on sanitized history")
++                history = _strip_empty_assistant_turns(msg_history)
++                follow_up = (
++                    f"Your previous reply was empty. Reply only by calling a tool. "
++                    f"First run `ls -la {self.git_tempdir}` with bash, then create/overwrite the solution file "
++                    f"({target}) with the editor tool, containing a complete implementation of the problem."
++                )
++                msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=history, logging=safe_log)
++            else:
++                # Fresh conversation with a compact, tool-forcing prompt.
++                safe_log("[patch guard] attempt 2: no source edit detected; restarting with a fresh compact prompt")
++                compact = f"""Repository: {self.git_tempdir}
++Target file: {target}
+ 
+-Original task:
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+ 
+-Current changed files in {self.git_tempdir}:
+-{changed_str}
++You MUST call the editor tool to write the complete solution file {target}; do not answer with text only.
++Then run it on the sample input with bash to verify."""
++                msg_history = chat_with_agent(compact, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-Using the editor tool (or bash), write your complete implementation into the target file now (for stdin/stdout tasks this is solution.py, or the file containing the given Solution class), then run it on the sample input to verify.
+-Completion criteria: the target file must be modified on disk with your final solution. Brute-force exploration output is not a deliverable. Never end your turn with an empty message; always finish by writing/verifying the file."""
+-            safe_log(f"[patch guard] attempt {attempt + 1}: no source edit detected, re-prompting")
+-            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        # Final deterministic fallback if still no non-test source edit.
++        if not self._has_source_edit():
++            safe_log("[patch guard] fallback: still no source edit after retries")
++            self._fallback_write_solution()
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

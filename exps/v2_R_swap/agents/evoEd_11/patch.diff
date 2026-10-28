@@ -1,0 +1,247 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 39bfae0..73d74d9 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,8 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
++import py_compile
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -39,6 +41,12 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++# Location of the generated test suite. Kept outside the repo so it never ends up in the patch.
++TEST_DIR = "/tmp/agent_tests"
++TEST_FILE = os.path.join(TEST_DIR, "test_solution.py")
++TEST_TIMEOUT = 300          # seconds for the test suite run (includes perf test)
++MAX_OUTPUT_CHARS = 6000     # tail of raw test output passed back to the agent
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -102,7 +110,8 @@ class AgenticSystem:
+             chat_history_file='./chat_history.md',
+             test_description=None,
+             self_improve=False,
+-            language='python'
++            language='python',
++            max_attempts=4,
+         ):
+         self.problem_statement = problem_statement
+         self.git_tempdir = git_tempdir
+@@ -111,6 +120,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.max_attempts = max(3, min(5, max_attempts))
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -137,9 +147,84 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    # ------------------------------------------------------------------
++    # Helpers
++    # ------------------------------------------------------------------
++    def _run_tests(self, test_cmd, timeout):
++        """
++        Run the test command under git_tempdir with a timeout.
++        Returns (passed: bool, output: str) where output is the raw combined
++        stdout/stderr truncated to its last ~MAX_OUTPUT_CHARS characters.
++        No error parsing is performed; the raw text is handed to the agent.
++        """
++        try:
++            proc = subprocess.run(
++                test_cmd,
++                cwd=self.git_tempdir,
++                capture_output=True,
++                text=True,
++                timeout=timeout,
++            )
++            passed = proc.returncode == 0
++            output = (proc.stdout or "") + (proc.stderr or "")
++        except subprocess.TimeoutExpired as e:
++            passed = False
++            out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
++            err = e.stderr if isinstance(e.stderr, str) else (e.stderr or b"").decode(errors="replace")
++            output = f"TIMEOUT after {timeout}s\n" + out + err
++        except Exception as e:  # e.g. pytest not installed
++            passed = False
++            output = f"Failed to run test command {test_cmd}: {e}"
++        if len(output) > MAX_OUTPUT_CHARS:
++            output = "...(truncated)...\n" + output[-MAX_OUTPUT_CHARS:]
++        return passed, output
++
++    def _run_test_suite(self):
++        """Run the generated test file. Returns (passed, n_passed, output)."""
++        if not os.path.exists(TEST_FILE):
++            return False, 0, f"Test file {TEST_FILE} does not exist."
++        passed, output = self._run_tests(["python3", "-m", "pytest", "-q", "--tb=short", TEST_FILE], TEST_TIMEOUT)
++        m = re.findall(r"(\d+) passed", output)
++        n_passed = int(m[-1]) if m else 0
++        return passed, n_passed, output
++
++    def _solution_path(self):
++        return os.path.join(self.git_tempdir, "solution.py")
++
++    def _is_stub_or_empty(self, diff):
++        if not diff or not diff.strip():
++            return True
++        path = self._solution_path()
++        if not os.path.exists(path):
++            return False
++        with open(path) as f:
++            content = f.read()
++        return any(line.strip() == "pass" for line in content.splitlines())
++
++    def _compile_check(self):
++        path = self._solution_path()
++        if not os.path.exists(path):
++            return "solution.py does not exist in the repo."
++        try:
++            py_compile.compile(path, doraise=True)
++            return "solution.py compiles."
++        except py_compile.PyCompileError as e:
++            return f"solution.py fails to compile:\n{e.msg}"
++
++    def _restore(self, diff):
++        reset_to_commit(self.git_tempdir, self.base_commit)
++        if diff and diff.strip():
++            apply_patch(self.git_tempdir, diff)
++
++    # ------------------------------------------------------------------
++    # Main workflow
++    # ------------------------------------------------------------------
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        The forward function for the AgenticSystem:
++        1. generate a standalone test suite (outside the repo),
++        2. run up to max_attempts implement/test/reflect attempts,
++        3. restore the best patch found.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -149,8 +234,114 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        os.makedirs(TEST_DIR, exist_ok=True)
++
++        # ---- Phase 1: test generation -------------------------------------
++        test_prompt = f"""{task}
++
++Before any implementation, write a standalone pytest test file at exactly {TEST_FILE}.
++Do NOT create or modify any files inside {self.git_tempdir} in this step.
++
++The test file must:
++- Start with: `import sys, random, time` and `sys.path.insert(0, "{self.git_tempdir}")`, then import the solution from the repo's solution.py (if the problem requires a `Solution` class, use `from solution import Solution`; if it is a complete program that reads stdin, run it with subprocess using `sys.executable` and pipe the input).
++- Handle imports the solution will need, e.g. `from typing import List, Optional` (the test file itself must not fail because of missing typing names).
++- Contain ALL examples from the problem statement as explicit test cases with their expected outputs.
++- Contain a simple brute-force reference implementation that is obviously correct for small inputs. First verify the brute force against all examples; if it disagrees with an example, fix the brute force, not the example.
++- Contain a seeded randomized stress test (fixed `random.seed(...)`) comparing the solution against the brute force on many (e.g. 500+) small random inputs that respect the constraints.
++- Contain boundary/edge cases derived from the constraints (minimum sizes, empty-like inputs if allowed, equal values, maximum values).
++- Contain a worst-case-size performance test: generate an input at the maximum constraint size and assert the solution finishes within about 2 seconds (use time.time()).
++Use plain asserts and small, readable helper functions. Make sure the file is valid Python: run `python3 -m py_compile {TEST_FILE}` and `python3 -m pytest -q {TEST_FILE}` is allowed to fail right now (the solution is not written yet). Then stop and summarize what the tests cover in a few lines. Do not implement the solution in this step.
++"""
++        safe_log("##### TEST GENERATION #####")
++        chat_with_agent(test_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        if not os.path.exists(TEST_FILE):
++            safe_log("WARNING: test file was not created; attempts will run without a test suite result.")
++
++        # ---- Phase 2: bounded attempt loop ---------------------------------
++        records = []  # list of dicts: idx, passed, n_passed, diff, output
++        prev_diff = ""
++        prev_output = ""
++        prev_notes = ""
++        for attempt in range(self.max_attempts):
++            safe_log(f"##### ATTEMPT {attempt + 1}/{self.max_attempts} #####")
++            if attempt == 0:
++                prompt = f"""{task}
++
++Test suite (already written, do not weaken it): {TEST_FILE}
++Run it with: `python3 -m pytest -q {TEST_FILE}`
++
++Implement the solution now in the repo (do not stop at a plan or an idea; write the actual code into the repository files).
++Then run the tests with pytest and fix failures. Keep the solution efficient for the largest constraints, avoid reading from stdin if the problem expects a function, and do not leave debug prints.
++Do not modify the test file. Put scratch files outside {self.git_tempdir} if you need them (e.g. /tmp).
++"""
++            else:
++                last = records[-1]
++                diff_text = prev_diff if prev_diff.strip() else "(EMPTY: no changes were made to the repo)"
++                stub_note = ""
++                if self._is_stub_or_empty(prev_diff):
++                    stub_note = ("WARNING: The previous attempt did NOT write an implementation: the repo diff is empty "
++                                 "or solution.py still contains a `pass` stub. You MUST write the full implementation this time, "
++                                 "directly into the repo files, before you finish.\n\n")
++                prompt = f"""{task}
++
++Test suite: {TEST_FILE} (run with `python3 -m pytest -q {TEST_FILE}`). Do not modify it.
++
++{stub_note}Previous attempt ({attempt} of {self.max_attempts} done) result: {last['n_passed']} tests passed, overall passed={last['passed']}.
++
++Previous diff against the base commit:
++<previous_diff>
++{diff_text}
++</previous_diff>
++
++Raw failing test output (tail):
++<test_output>
++{prev_output}
++</test_output>
++
++{prev_notes}Reflect on the root cause before editing: is the algorithm fundamentally wrong, is it an implementation bug, or is it too slow for the largest constraints? If the approach is fundamentally wrong, consider a different algorithm. Then edit the repo files to fix the solution, run the tests, and iterate until they pass.
++Do not modify the test file. Put scratch files outside {self.git_tempdir} (e.g. /tmp).
++"""
++            chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++            diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            passed, n_passed, output = self._run_test_suite()
++            safe_log(f"Attempt {attempt + 1}: passed={passed}, tests_passed={n_passed}, diff_chars={len(diff)}")
++            records.append({"idx": attempt, "passed": passed, "n_passed": n_passed, "diff": diff, "output": output})
++            prev_diff = diff
++            prev_output = output
++            prev_notes = ""
++            if passed:
++                break
++
++        # ---- Phase 3: selection --------------------------------------------
++        best = max(records, key=lambda r: (r["passed"], r["n_passed"], r["idx"])) if records else None
++        if best is not None:
++            current = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            if current != best["diff"]:
++                safe_log(f"Restoring best attempt {best['idx'] + 1} (passed={best['passed']}, tests_passed={best['n_passed']}).")
++                self._restore(best["diff"])
++            if best["passed"]:
++                # ---- Phase 4: final checks / optional review -------------
++                compile_msg = self._compile_check()
++                review_prompt = f"""{task}
++
++The test suite {TEST_FILE} passes. Review the current solution in the repo ({self.git_tempdir}).
++Compile status: {compile_msg}
++Check: edge cases from the constraints, time complexity against the largest input, that required imports (e.g. `from typing import List`) are present, that there is no stdin reading if the problem wants a function, and no debug printing.
++If you find a real problem, fix it in the repo and re-run `python3 -m pytest -q {TEST_FILE}`. Do not modify the test file. If everything is fine, make no changes and say so.
++"""
++                safe_log("##### REVIEW #####")
++                chat_with_agent(review_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++                ok, n_ok, _ = self._run_test_suite()
++                if not ok or n_ok < best["n_passed"]:
++                    safe_log("Review broke the tests; restoring best passing patch.")
++                    self._restore(best["diff"])
++            else:
++                safe_log("No attempt fully passed the tests; keeping the best partial patch.")
++
++        # Make sure the final diff never contains test artifacts from the repo side.
++        final = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        safe_log(f"Final diff chars: {len(final)}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

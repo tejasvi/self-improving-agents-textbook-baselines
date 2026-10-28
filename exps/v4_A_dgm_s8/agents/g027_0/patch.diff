@@ -1,0 +1,296 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3c15539..88f973f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,5 @@
+ import argparse
++import re
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -153,6 +154,10 @@ def _last_assistant_text(msg_history):
+         return ""
+     return ""
+ 
++def _reports_measured_runtime(text):
++    """True if the assistant text reports a measured runtime in seconds (e.g. '0.42 s', '1.5 seconds')."""
++    return bool(re.search(r"\d+(?:\.\d+)?\s*(?:s|sec|secs|seconds)\b", text or "", re.IGNORECASE))
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -207,6 +212,57 @@ class AgenticSystem:
+             return False
+         return any(not _is_test_path(f) for f in changed)
+ 
++    def _last_tool_outputs(self, msg_history, limit=3, max_chars=1500):
++        """Collect the most recent tool results/errors from msg_history (truncated)."""
++        outputs = []
++        for msg in reversed(msg_history or []):
++            if not isinstance(msg, dict):
++                continue
++            content = msg.get("content", "")
++            blocks = content if isinstance(content, list) else [content]
++            for block in reversed(blocks):
++                text = None
++                if isinstance(block, dict):
++                    if block.get("type") == "tool_result":
++                        text = str(block.get("content", ""))
++                    elif isinstance(block.get("text"), str) and block["text"].startswith("Tool Result:"):
++                        text = block["text"]
++                elif isinstance(block, str) and block.startswith("Tool Result:"):
++                    text = block
++                if text is not None:
++                    outputs.append(text[-max_chars:])
++                    if len(outputs) >= limit:
++                        return list(reversed(outputs))
++        return list(reversed(outputs))
++
++    def _ensure_valid_patch(self, msg_history, task, max_attempts=4):
++        """Bounded loop: follow up until a valid non-test patch exists and the agent gives a non-empty reply."""
++        for attempt in range(max_attempts):
++            valid = self._patch_is_valid()
++            last_text = _last_assistant_text(msg_history).strip()
++            if valid and last_text:
++                break
++            diff_text = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            tool_outputs = self._last_tool_outputs(msg_history)
++            tool_text = "\n---\n".join(tool_outputs) if tool_outputs else "(no tool outputs found)"
++            reasons = []
++            if not valid:
++                reasons.append("No source file has been modified yet (the patch is empty or only touches test files).")
++            if not last_text:
++                reasons.append("Your previous message was empty, so you stopped without finishing the work.")
++            follow_up = (
++                f"Continue the work; do not summarize yet. Follow-up attempt {attempt + 1} of {max_attempts}.\n"
++                + " ".join(reasons) + "\n\n"
++                + f"Last tool outputs/errors (truncated):\n{tool_text}\n\n"
++                + f"Current repo diff:\n{diff_text if diff_text.strip() else '(empty)'}\n\n"
++                + "Your next action MUST be an editor tool call: use `view` on the stub file (the file containing `pass` or the placeholder, e.g. solution.py), "
++                "then `edit` it to contain a real, complete implementation of the solution. "
++                "Do not edit only test files, and do not start with brute-force or test scripts. "
++                "After the edit, continue with testing as described in the original workflow."
++            )
++            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        return msg_history
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -225,48 +281,56 @@ Please follow this workflow:
+ 1. Explore the repository with simple, quick commands (e.g. `ls`, `git status`, `cat` on a specific file). Avoid long-running or complex pipelines such as `find ... | cat $(...)`.
+ 2. Read the starter/stub file that needs to be implemented (it may contain only `pass` or a placeholder).
+ 3. Before coding, extract the constraints (n, k, value ranges, time limit if given) and compute the required complexity. Write down the intended algorithm and its worst-case operation count. Reject anything above roughly 3e7 Python-level operations and choose a faster algorithm instead (e.g. better data structures, binary search with an O(n log n) or O(n) check, prefix sums, DP with pruning, avoiding nested loops over n).
+-4. Implement the solution in the non-test source file using the editor tool. Do not put the solution only in test files.
+-5. Write a small test script (or test file) that checks the examples from the problem statement, and run it. Also compare against a simple brute-force solution on many small random inputs. Refine the implementation until the examples pass and the logic is correct for edge cases.
++4. Implement the solution in the non-test source file (the stub file) using the editor tool. Do not put the solution only in test files. Write the first implementation of the solution into the source file BEFORE writing brute-force or test scripts, so a patch always exists.
++5. Create and edit files ONLY with the editor tool (never `cat > file <<EOF` in bash). Write a small test script (or test file) that checks the examples from the problem statement, and run it. Also compare against a simple brute-force solution on many small random inputs. Refine the implementation until the examples pass and the logic is correct for edge cases.
+ 6. After brute-force validation, run a worst-case benchmark (max-size constraints, adversarial inputs) using the `timed_run` tool with a timeout of about 5-10 seconds. If it exceeds roughly 2-5 seconds, optimize or change the algorithm, and do not finish until it passes. Write benchmark scripts to files with the editor tool rather than using long heredocs.
+ 7. Make sure your final changes are saved in the source file.
+ 
+ Important: ending your turn without modifying a source file is a failure. Changing only test files is also a failure. Finishing with no edits counts as failure.
+ """
++        # Phase 1: the agent solves the task
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Bounded verification loop: require a measured worst-case runtime, optimize if needed
+-        for verify_attempt in range(3):
+-            empty_note = ""
+-            if not _last_assistant_text(msg_history).strip():
+-                empty_note = "Your previous final message was empty. Please write a proper final summary.\n"
++        # Phase 2: guarantee a valid, non-test patch (bounded), reusing the message history
++        msg_history = self._ensure_valid_patch(msg_history, task)
++
++        # Optional final safety net: ask only for the simplest correct implementation
++        if not self._patch_is_valid():
++            diff_text = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+             follow_up = (
+-                f"Verification step {verify_attempt + 1} of 3.\n\n"
+-                + empty_note
+-                + "Before finishing, state the measured worst-case runtime (in seconds) of your final solution on a max-size input, "
+-                "as measured with the `timed_run` tool.\n"
+-                "- If the benchmark was never run, timed out, or took more than about 2-5 seconds, optimize or redesign the algorithm, "
+-                "re-check correctness against the brute-force comparison, and re-run the max-size benchmark with `timed_run`.\n"
+-                "- Only finish once the source file is saved and the measured worst-case runtime is within the limit.\n"
+-                "Reply with a short final summary that includes the measured worst-case runtime."
++                "The repository still has no valid source patch. Final request: do not run any more tests or benchmarks. "
++                "Open the stub source file (the file containing `pass` or the placeholder) with the editor tool and write "
++                "the simplest correct implementation of the solution there using the editor tool. "
++                f"Current repo diff:\n{diff_text if diff_text.strip() else '(empty)'}"
+             )
+             msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+-        # Retry (bounded) until a valid, non-test source patch exists
+-        for attempt in range(3):
+-            if self._patch_is_valid():
+-                break
+-            current_diff = self.get_current_edits()
+-            diff_text = current_diff[0]["content"][0]["text"] if current_diff else ""
+-            follow_up = f"""No valid source patch was found: the repository has no changes, or only test files were changed. This is attempt {attempt + 1} of 3.
+-
+-Original task:
+-{task}
++        # Phase 3: verification loop, only when a valid patch exists
++        if self._patch_is_valid():
++            diff_before_verify = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            for verify_attempt in range(3):
++                empty_note = ""
++                if not _last_assistant_text(msg_history).strip():
++                    empty_note = "Your previous final message was empty. Please write a proper final summary.\n"
++                follow_up = (
++                    f"Verification step {verify_attempt + 1} of 3.\n\n"
++                    + empty_note
++                    + "Before finishing, state the measured worst-case runtime (in seconds) of your final solution on a max-size input, "
++                    "as measured with the `timed_run` tool.\n"
++                    "- If the benchmark was never run, timed out, or took more than about 2-5 seconds, optimize or redesign the algorithm, "
++                    "re-check correctness against the brute-force comparison, and re-run the max-size benchmark with `timed_run`.\n"
++                    "- Only finish once the source file is saved and the measured worst-case runtime is within the limit.\n"
++                    "Reply with a short final summary that includes the measured worst-case runtime."
++                )
++                msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                if _reports_measured_runtime(_last_assistant_text(msg_history)):
++                    break
++
++            # Re-check: if verification changed or reverted files, make sure a valid patch still exists
++            diff_after_verify = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            if diff_after_verify != diff_before_verify or not self._patch_is_valid():
++                msg_history = self._ensure_valid_patch(msg_history, task)
+ 
+-Current repo edits (diff):
+-{diff_text}
+-
+-Now open the primary source file (the stub containing `pass` or the placeholder for the solution) and implement the solution there using the editor tool. Do not only edit tests. After editing, run a quick check on the problem's examples to verify it works, and then stop."""
+-            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/bash.py b/tools/bash.py
+index 44dfb31..4444629 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,6 +1,8 @@
+ import asyncio
+ import os
++import shlex
+ import signal
++import tempfile
+ 
+ def tool_info():
+     return {
+@@ -82,12 +84,25 @@ class BashSession:
+                 f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+             )
+         
+-        # Send command
+-        self._process.stdin.write(
+-            # Subshell with stdin redirected from /dev/null so commands waiting on input cannot hang the session
+-            f"( {command} ) < /dev/null; echo '{self._sentinel}'\n".encode()
+-        )
+-        await self._process.stdin.drain()
++        # Write the command to a temporary script so multi-line commands and heredocs
++        # run exactly as they would in a normal script (no subshell wrapping, no PS2 prompts).
++        script = tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False)
++        try:
++            script.write(command)
++            script.close()
++            # stdin redirected from /dev/null so commands waiting on input cannot hang the session
++            self._process.stdin.write(
++                f"bash {shlex.quote(script.name)} < /dev/null; echo '{self._sentinel}'\n".encode()
++            )
++            await self._process.stdin.drain()
++            return await self._read_until_sentinel()
++        finally:
++            try:
++                os.remove(script.name)
++            except OSError:
++                pass
++
++    async def _read_until_sentinel(self):
+ 
+         # Read output until sentinel
+         try:
+@@ -120,7 +135,7 @@ class BashSession:
+             self._process.stderr._buffer.clear()
+ 
+             output = output.strip()
+-            error = stderr_data.strip()
++            error = '\n'.join(l for l in stderr_data.splitlines() if not l.startswith('> ')).strip()
+ 
+             return output, error
+ 
+diff --git a/tests/test_forward_flow.py b/tests/test_forward_flow.py
+new file mode 100644
+index 0000000..191d090
+--- /dev/null
++++ b/tests/test_forward_flow.py
+@@ -0,0 +1,70 @@
++import coding_agent as ca
++
++
++class FakeRepo:
++    """Stands in for git state: `diff` is what diff_versus_commit returns."""
++
++    def __init__(self):
++        self.diff = ""
++
++
++def make_system(monkeypatch, repo):
++    monkeypatch.setattr(ca, "diff_versus_commit", lambda d, c: repo.diff)
++    system = ca.AgenticSystem.__new__(ca.AgenticSystem)
++    system.problem_statement = "p"
++    system.git_tempdir = "/tmp/none"
++    system.base_commit = "HEAD"
++    system.code_model = "m"
++    system.logger = None
++    return system
++
++
++def test_empty_patch_triggers_followups_and_skips_verification(monkeypatch):
++    repo = FakeRepo()
++    system = make_system(monkeypatch, repo)
++    calls = []
++
++    def fake_chat(msg, model=None, msg_history=None, logging=None):
++        calls.append((msg, list(msg_history or [])))
++        # Agent never edits anything and ends with an empty message.
++        return list(msg_history or []) + [{"role": "assistant", "content": ""}]
++
++    monkeypatch.setattr(ca, "chat_with_agent", fake_chat)
++    system.forward()
++
++    # 1 initial call + 4 ensure-patch follow-ups + 1 safety net; no verification prompts.
++    assert len(calls) == 6
++    assert all("Verification step" not in m for m, _ in calls)
++    # Follow-ups reuse the accumulated history (not []).
++    assert calls[1][1], "follow-up should carry msg_history"
++    assert "editor" in calls[1][0]
++
++
++def test_valid_patch_runs_verification_and_stops_on_runtime(monkeypatch):
++    repo = FakeRepo()
++    system = make_system(monkeypatch, repo)
++    calls = []
++
++    def fake_chat(msg, model=None, msg_history=None, logging=None):
++        calls.append(msg)
++        if len(calls) == 1:
++            repo.diff = "diff --git a/solution.py b/solution.py\n+x = 1\n"
++        return list(msg_history or []) + [
++            {"role": "assistant", "content": "Done. Worst case 0.31 seconds."}
++        ]
++
++    monkeypatch.setattr(ca, "chat_with_agent", fake_chat)
++    system.forward()
++
++    verify = [m for m in calls if "Verification step" in m]
++    # Breaks as soon as the assistant reports a measured runtime.
++    assert len(verify) == 1
++
++
++def test_test_only_patch_is_invalid(monkeypatch):
++    repo = FakeRepo()
++    system = make_system(monkeypatch, repo)
++    repo.diff = "diff --git a/tests/test_x.py b/tests/test_x.py\n+assert True\n"
++    assert system._patch_is_valid() is False
++    repo.diff = "diff --git a/solution.py b/solution.py\n+x\n"
++    assert system._patch_is_valid() is True

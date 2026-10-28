@@ -1,0 +1,374 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f62b384..0a26eaa 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,10 +1,10 @@
+-
+ import argparse
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -143,12 +143,57 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    # Helper to determine if there is any git diff compared to base commit
+-    def _has_progress(self):
++    # New helper: detect if there is a meaningful source edit
++    def _has_source_edit(self):
++        """Return True if diff contains added non‑comment, non‑blank lines in a primary source file.
++        Ignores test/harness files matching patterns like test*, *_test.py, brute.py, gen.py.
++        """
+         diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-        return bool(diff.strip())
++        if not diff:
++            return False
++        # Split diff into lines and look for added lines starting with '+'
++        added_lines = []
++        current_file = None
++        for line in diff.splitlines():
++            if line.startswith('+++ b/'):
++                current_file = line[6:]
++                continue
++            if line.startswith('+') and not line.startswith('+++'):
++                # Remove leading '+'
++                content = line[1:]
++                if content.strip() == '' or content.strip().startswith('#'):
++                    continue
++                added_lines.append((current_file, content))
++        if not added_lines:
++            return False
++        # Filter out test/harness files
++        def is_test_path(p):
++            if p is None:
++                return True
++            low = p.lower()
++            return (low.startswith('test') or low.endswith('_test.py') or "brute.py" in low or "gen.py" in low)
++        source_added = [c for f, c in added_lines if not is_test_path(f)]
++        # Require at least 3 meaningful added lines
++        return len(source_added) >= 3
++
++    def _detect_target_file(self):
++        """Return path to primary solution file: solution.py if exists, else the only top‑level .py file.
++        """
++        # Look for solution.py at repo root
++        candidate = os.path.join(self.git_tempdir, 'solution.py')
++        if os.path.isfile(candidate):
++            return candidate
++        # Otherwise, list .py files at root (non‑test)
++        py_files = [f for f in os.listdir(self.git_tempdir) if f.endswith('.py')]
++        non_test = [f for f in py_files if not (f.startswith('test') or f.endswith('_test.py'))]
++        if len(non_test) == 1:
++            return os.path.join(self.git_tempdir, non_test[0])
++        # Fallback to first .py file
++        if py_files:
++            return os.path.join(self.git_tempdir, py_files[0])
++        # As ultimate fallback, use solution.py path (may be created later)
++        return candidate
+ 
+-    # Helper to run the external test suite and capture result
+     def _run_checks(self):
+         test_path = '/tmp/agent_tests/run_tests.py'
+         if not os.path.exists(test_path):
+@@ -160,12 +205,10 @@ class AgenticSystem:
+                 stderr=subprocess.STDOUT,
+                 timeout=self.CHECK_TIMEOUT,
+                 text=True,
+-                cwd=self.git_tempdir  # ensure repo context if needed
++                cwd=self.git_tempdir
+             )
+             output = result.stdout
+-            # Determine pass/fail by looking for a marker; assume the script prints 'ALL CHECKS PASSED' on success
+             passed = 'ALL CHECKS PASSED' in output
+-            # Return only the tail (last 500 chars) to keep size reasonable
+             tail = output[-500:]
+             return passed, tail
+         except subprocess.TimeoutExpired:
+@@ -173,7 +216,6 @@ class AgenticSystem:
+         except Exception as e:
+             return False, f'test execution error: {str(e)}'
+ 
+-    # Helper to snapshot current diff and store with result info
+     def _snapshot_patch(self, attempts, passed, output_tail):
+         diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+         attempts.append({
+@@ -182,129 +224,69 @@ class AgenticSystem:
+             'output_tail': output_tail,
+         })
+ 
+-    # Helper to reset repository to base commit (clean state)
+-    def _reset(self):
+-        reset_to_commit(self.git_tempdir, self.base_commit)
+-
+     def forward(self):
+-        """Main orchestrator implementing bounded attempts, progress checks, and test verification."""
++        """Main orchestrator implementing staged approach with bounded retries."""
+         attempts = []
+-        best_patch = None
+-
+-        for attempt_idx in range(self.MAX_ATTEMPTS):
+-            safe_log(f"--- Attempt {attempt_idx + 1} ---")
+-            # Build the prompt for this attempt
+-            if attempt_idx == 0:
+-                instruction = (
+-                    "You have uploaded a code repository. Solve the problem described below. "
+-                    "Immediately edit `solution.py` (or the appropriate file) to implement the solution. "
+-                    "Also create the following test harness files under `/tmp/agent_tests/` with the exact paths: "
+-                    "`brute.py` (a correct but slow reference), `gen.py` (random test generator), and `run_tests.py` (which runs sample cases, 200 random comparisons, and a performance test). "
+-                    "After writing those files, run them to verify correctness."
+-                )
+-            else:
+-                # Include prior diff and failing output for context
+-                prev = attempts[-1]
+-                instruction = (
+-                    f"Previous attempt diff:\n{prev['diff']}\n\n"
+-                    f"Previous test output (first failure):\n{prev['output_tail']}\n\n"
+-                    "Fix the root cause of the failure instead of adding special‑case code."
++        target_file = self._detect_target_file()
++        safe_log(f"Target file resolved to: {target_file}")
++        # Stage 1: direct editor request
++        stage1_prompt = f"{self.problem_statement}\n\nUse the editor tool NOW to write the full solution into {target_file}. Do not write tests yet. Reply only with tool calls."
++        msg_history = []
++        safe_log("--- Stage 1: initial editor request ---")
++        msg_history = chat_with_agent(stage1_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        if not self._has_source_edit():
++            # Stage 2: escalation with fresh histories up to 2 attempts
++            for esc_attempt in range(2):
++                safe_log(f"--- Stage 2 escalation attempt {esc_attempt+1} ---")
++                esc_prompt = (
++                    f"Problem:\n{self.problem_statement}\n\n"
++                    f"Please edit the file {target_file} to implement the solution. Example tool call:\n"
++                    f"{{\"tool_name\": \"editor\", \"tool_input\": {{\"command\": \"edit\", \"path\": \"{target_file}\", \"file_text\": \"# your code here\"}}}}"
+                 )
+-            task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-{instruction}
+-"""
+-            # Start fresh message history for each attempt
++                msg_history = []
++                msg_history = chat_with_agent(esc_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                if self._has_source_edit():
++                    break
++        if not self._has_source_edit():
++            # Stage 3: fallback to fenced code extraction
++            safe_log("--- Stage 3: fallback to extracting fenced python code ---")
++            fallback_prompt = (
++                f"{self.problem_statement}\n\nProvide the complete solution as a single ```python``` fenced code block."
++            )
+             msg_history = []
+-            # Initial call
+-            msg_history = chat_with_agent(task, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-
+-            # Ensure the assistant actually edited something
+-            nudges_sent = 0
+-            while nudges_sent < self.NUDGE_LIMIT and not self._has_progress():
+-                nudge = "You have not edited the solution file yet. Please use the editor tool now to write the implementation."
+-                msg_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-                nudges_sent += 1
+-
+-            # Run checks after initial edit (or after nudges)
++            msg_history = chat_with_agent(fallback_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            # Extract the last python fenced block
++            content = ''
++            # msg_history may be list of dicts or a string
++            if isinstance(msg_history, list):
++                # concatenate all assistant messages
++                for m in msg_history:
++                    if m.get('role') == 'assistant':
++                        for part in m.get('content', []):
++                            if part.get('type') == 'text':
++                                content += part.get('text', '') + '\n'
++            elif isinstance(msg_history, str):
++                content = msg_history
++            # regex extract
++            matches = re.findall(r'```python\n(.*?)```', content, re.DOTALL)
++            if matches:
++                code_block = matches[-1]
++                # Write to target file directly
++                with open(target_file, 'w') as f:
++                    f.write(code_block.strip() + '\n')
++                safe_log(f"Wrote fallback code to {target_file}")
++        # After ensuring some source edit, proceed to verification rounds (max 2)
++        safe_log("--- Verification rounds ---")
++        for verify_round in range(self.REPAIR_LIMIT):
+             passed, output_tail = self._run_checks()
+-            self._snapshot_patch(attempts, passed, output_tail)
+-
+-            # If checks failed, allow repair rounds
+-            repair_round = 0
+-            while not passed and repair_round < self.REPAIR_LIMIT:
+-                repair_prompt = f"The tests failed with the following output:\n{output_tail}\nPlease modify the code to fix the issue and then re‑run the tests."
+-                msg_history = chat_with_agent(repair_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-                # After repair, ensure progress (in case the model still didn't edit)
+-                if not self._has_progress():
+-                    # send a single nudge without counting toward NUDGE_LIMIT (already used earlier)
+-                    msg_history = chat_with_agent("Please edit the solution file to address the failure.", model=self.code_model, msg_history=msg_history, logging=safe_log)
+-                passed, output_tail = self._run_checks()
+-                # Update latest attempt record
+-                attempts[-1]['passed'] = passed
+-                attempts[-1]['output_tail'] = output_tail
+-                attempts[-1]['diff'] = diff_versus_commit(self.git_tempdir, self.base_commit)
+-                repair_round += 1
+-
++            safe_log(f"Verification round {verify_round+1}: passed={passed}")
++            attempts.append({'passed': passed, 'output_tail': output_tail})
+             if passed:
+-                safe_log('All checks passed on this attempt.')
+-                best_patch = attempts[-1]['diff']
+                 break
+-            else:
+-                safe_log('Attempt failed; resetting repository for next attempt.')
+-                # Keep the latest diff as candidate if it's non‑empty
+-                if attempts[-1]['diff'].strip():
+-                    best_patch = attempts[-1]['diff']
+-                # Reset repo before next attempt
+-                self._reset()
+-                # Continue to next attempt loop
+-                continue
+-
+-        # After attempts, apply the best patch (if any) on a clean base
+-        self._reset()
+-        if best_patch:
+-            safe_log('Applying best patch to repository.')
+-            apply_patch(self.git_tempdir, best_patch)
+-        else:
+-            safe_log('No patch to apply; repository remains unchanged.')
+-
+-        return msg_history
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
+-    main()
++            # Ask agent to fix issues, but do not reset history
++            repair_prompt = f"The tests failed with the following output:\n{output_tail}\nPlease modify the code to fix the issue and then re‑run the tests."
++            msg_history = chat_with_agent(repair_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            # continue loop; _run_checks will re‑evaluate
++        # Return final attempts summary
++        return attempts
+diff --git a/solution.py b/solution.py
+index b1cd358..6c49878 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,6 +1,14 @@
+ # Solution placeholder
++
+ def solve():
+-    pass
++    """Read input and output a placeholder result."""
++    import sys
++    data = sys.stdin.read().strip().split()
++    # Simple echo of first token or 0
++    if data:
++        print(data[0])
++    else:
++        print(0)
+ 
+ if __name__ == "__main__":
+     solve()
+diff --git a/tools/edit.py b/tools/edit.py
+index 244d440..4134a7c 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -4,12 +4,13 @@ import subprocess
+ def tool_info():
+     return {
+         "name": "editor",
+-        "description": """Custom editing tool for viewing, creating, and editing files\n
+-* State is persistent across command calls and discussions with the user.\n
+-* If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+-* The `create` command cannot be used if the specified `path` already exists as a file.\n
+-* If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+-* The `edit` command overwrites the entire file with the provided `file_text`.\n
++        "description": """Custom editing tool for viewing, creating, and editing files
++
++* State is persistent across command calls and discussions with the user.
++* If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.
++* The `create` command cannot be used if the specified `path` already exists as a file.
++* If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.
++* The `edit` command overwrites the entire file with the provided `file_text`.
+ * No partial/line-range edits or partial viewing are supported.""",
+         "input_schema": {
+             "type": "object",
+@@ -119,13 +120,15 @@ def view_path(path_obj: Path) -> str:
+     content = read_file(path_obj)
+     return format_output(content, str(path_obj))
+ 
+-def tool_function(command: str, path: str, file_text: str = None) -> str:
++def tool_function(command: str, path: str, file_text: str = None, **kwargs) -> str:
+     """
+     Main tool function that handles:
+       - 'view'  : View the entire file or directory listing
+       - 'create': Create a new file with the given file_text
+       - 'edit'  : Overwrite an existing file with file_text
+     """
++    # Ignore any unexpected keyword arguments
++    _ = kwargs
+     try:
+         path_obj = validate_path(path, command)
+ 
+@@ -134,18 +137,20 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
+ 
+         elif command == "create":
+             if file_text is None:
+-                raise ValueError("Missing required `file_text` for 'create' command.")
++                return "Error: Missing required `file_text` for 'create' command."
+             write_file(path_obj, file_text)
+             return f"File created successfully at: {path}"
+ 
+         elif command == "edit":
+             if file_text is None:
+-                raise ValueError("Missing required `file_text` for 'edit' command.")
++                return "Error: Missing required `file_text` for 'edit' command."
+             write_file(path_obj, file_text)
+             return f"File at {path} has been overwritten with new content."
+ 
+         else:
+-            raise ValueError(f"Unknown command: {command}")
++            # Provide helpful usage guidance
++            return ("Error: Unknown command. Valid commands are 'view', 'create', 'edit'. "
++                    "Example usage: {\"command\": \"edit\", \"path\": \"/repo/solution.py\", \"file_text\": \"print(\\\"hi\\\")\"}")
+ 
+     except Exception as e:
+         return f"Error: {str(e)}"

@@ -1,0 +1,208 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1e67d5a..422c4c2 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,8 +3,10 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -106,6 +108,49 @@ def _is_test_path(path):
+     parts = normalized.split('/')[:-1]
+     return 'tests' in parts or 'test' in parts
+ 
++
++DOC_SUFFIXES = ('.md', '.rst', '.txt', '.adoc')
++
++def _is_empty_content(content):
++    """
++    Return True if a message content has no usable text and no tool calls.
++    """
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return not content.strip()
++    if isinstance(content, list):
++        for block in content:
++            if isinstance(block, dict):
++                if block.get('type') == 'text':
++                    if str(block.get('text', '')).strip():
++                        return False
++                else:
++                    # tool_use, tool_result, images, etc. count as real content
++                    return False
++            elif block is not None:
++                return False
++        return True
++    return False
++
++def _sanitize_history(msg_history):
++    """
++    Drop trailing assistant messages that have empty/whitespace-only content
++    (no tool calls). If nothing usable remains, or the history does not end with
++    a user message, return a fresh empty history.
++    """
++    if not isinstance(msg_history, list):
++        return []
++    history = list(msg_history)
++    while history and history[-1].get('role') == 'assistant' and _is_empty_content(history[-1].get('content')):
++        history.pop()
++    if not history:
++        return []
++    if history[-1].get('role') != 'user':
++        return []
++    return history
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -198,18 +243,137 @@ Do not stop until the source file contains your implementation and you have veri
+             if self._has_source_edits():
+                 break
+             current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-            retry_msg = f"""No non-test source files have been modified yet (the current diff is empty or only touches test files).
+-
+-# Current Repo Edits
+-{current_diff if current_diff.strip() else "(empty diff)"}
++            primary = self._find_primary_source_file()
++            last_text_empty = self._last_assistant_empty(msg_history)
++            if last_text_empty:
++                reason = "empty model response"
++            elif current_diff.strip():
++                reason = "only test files modified"
++            else:
++                reason = "empty diff"
++            safe_log(f"[retry {attempt + 1}/3] No source edits yet; reason: {reason}; primary file: {primary}")
+ 
+-You must now implement the solution in the primary source file using the editor tool (create or edit). Do not reply with only a plan or explanation. After editing, run the examples/tests with bash, fix any failures, and confirm with `git diff` or `git status` that the source file was changed."""
++            msg_history = _sanitize_history(msg_history)
++            retry_msg = self._build_retry_prompt(primary, current_diff)
+             retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+             if isinstance(retry_history, list):
+                 msg_history = retry_history
+             else:
+                 msg_history = []
+ 
++        if not self._has_source_edits():
++            self._fallback_write_primary_file()
++
++    def _last_assistant_empty(self, msg_history):
++        if not isinstance(msg_history, list):
++            return True
++        for message in reversed(msg_history):
++            if message.get('role') == 'assistant':
++                return _is_empty_content(message.get('content'))
++        return False
++
++    def _find_primary_source_file(self):
++        """
++        Return the repo-relative path of the primary (non-test, non-doc) source file, or None.
++        Prefers solution.py, then main.py, then the smallest candidate (likely a stub).
++        """
++        try:
++            result = subprocess.run(
++                ["git", "-C", self.git_tempdir, "ls-files"],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++            )
++            files = result.stdout.decode().splitlines()
++        except Exception as e:
++            safe_log(f"_find_primary_source_file failed: {e}", level=logging.WARNING)
++            return None
++
++        candidates = []
++        for path in files:
++            normalized = path.replace('\\', '/')
++            basename = normalized.split('/')[-1]
++            lower = basename.lower()
++            if _is_test_path(normalized):
++                continue
++            if lower.startswith('readme') or lower.endswith(DOC_SUFFIXES):
++                continue
++            if 'docs' in normalized.split('/')[:-1] or 'doc' in normalized.split('/')[:-1]:
++                continue
++            full = os.path.join(self.git_tempdir, path)
++            if not os.path.isfile(full):
++                continue
++            candidates.append((normalized, basename, os.path.getsize(full)))
++
++        if not candidates:
++            return None
++        for preferred in ('solution.py', 'main.py'):
++            for normalized, basename, _ in candidates:
++                if basename == preferred:
++                    return normalized
++        candidates.sort(key=lambda c: (c[2], c[0]))
++        return candidates[0][0]
++
++    def _build_retry_prompt(self, primary, current_diff):
++        if primary is not None:
++            full = os.path.join(self.git_tempdir, primary)
++            try:
++                with open(full, 'r', errors='replace') as f:
++                    file_content = f.read()
++            except Exception as e:
++                file_content = f"(could not read file: {e})"
++            target = primary
++            file_section = f"# Current content of {primary}\n```\n{file_content}\n```"
++        else:
++            target = "the primary source file"
++            file_section = "(no primary source file was identified; choose the main solution file in the repo)"
++        return f"""No non-test source files have been modified yet (the current diff is empty or only touches test files).
++
++# Current Repo Edits
++{current_diff if current_diff.strip() else "(empty diff)"}
++
++{file_section}
++
++# Problem statement
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Your next action MUST be a call to the editor tool with command `edit` (or `create`) on {target}. Do not reply with text only.
++Write the complete solution into {target}. After editing, run the sample tests/examples with bash, fix any failures by editing {target} again, and confirm with `git diff` that {target} was changed."""
++
++    def _fallback_write_primary_file(self):
++        """
++        Deterministic fallback: ask the LLM (no tools) for the full file contents and write them.
++        """
++        try:
++            primary = self._find_primary_source_file()
++            if primary is None:
++                safe_log("Fallback: no primary source file found; skipping.", level=logging.WARNING)
++                return
++            prompt = f"""Output ONLY the complete contents of {primary} inside a ```python block that solves the problem.
++
++# Problem statement
++<problem_description>
++{self.problem_statement}
++</problem_description>"""
++            client, client_model = create_client(self.code_model)
++            response, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer. Respond with exactly one ```python code block.",
++                msg_history=[],
++            )
++            match = re.search(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", str(response or ''), re.DOTALL)
++            if not match:
++                safe_log("Fallback: no python code block found in model response.", level=logging.WARNING)
++                return
++            code = match.group(1)
++            with open(os.path.join(self.git_tempdir, primary), 'w') as f:
++                f.write(code)
++            safe_log(f"Fallback: wrote {len(code)} chars to {primary}.")
++        except Exception as e:
++            safe_log(f"Fallback failed: {e}", level=logging.ERROR)
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

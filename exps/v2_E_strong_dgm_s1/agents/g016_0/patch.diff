@@ -1,0 +1,658 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 4d455c5..f70cc4f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,6 @@
+ import argparse
++import json
++import shutil
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -8,6 +10,9 @@ import threading
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++# Number of independent solution attempts in the multi-attempt pipeline.
++MAX_ATTEMPTS = 3
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -111,6 +116,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.attempt_log = []
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -191,9 +197,174 @@ class AgenticSystem:
+         )
+         return compile_result.returncode == 0
+ 
++    # ------------------------------------------------------------------
++    # Multi-attempt pipeline helpers
++    # ------------------------------------------------------------------
++    def _suite_dir(self):
++        """Persistent test suite directory, outside the graded repository."""
++        return os.path.abspath(os.path.join(self.git_tempdir, '..', 'tests'))
++
++    def _attempt_dir(self):
++        return os.path.join(self._suite_dir(), 'attempts')
++
++    def _run_suite_stats(self, candidate_path):
++        """Run the suite on one candidate via a direct subprocess; returns a dict or an error dict."""
++        cfg = self._suite_config()
++        args = {
++            'solution_path': candidate_path,
++            'mode': cfg.get('mode', 'class_method'),
++            'method_name': cfg.get('method_name'),
++            'tests_dir': self._suite_dir(),
++            'num_random': 100,
++            'timeout_s': 5,
++        }
++        return self._subprocess_json(args)
++
++    def _compare_stats(self, candidate_path, other_path):
++        cfg = self._suite_config()
++        args = {
++            'solution_path': candidate_path,
++            'other_path': other_path,
++            'mode': cfg.get('mode', 'class_method'),
++            'method_name': cfg.get('method_name'),
++            'tests_dir': self._suite_dir(),
++            'num_random': 100,
++            'timeout_s': 5,
++        }
++        return self._subprocess_json(args)
++
++    def _suite_config(self):
++        """config.json written in the test-building phase: {"mode": ..., "method_name": ...}."""
++        path = os.path.join(self._suite_dir(), 'config.json')
++        try:
++            with open(path) as f:
++                cfg = json.load(f)
++            if isinstance(cfg, dict):
++                if cfg.get('mode') not in ('class_method', 'stdin'):
++                    cfg['mode'] = 'class_method'
++                return cfg
++        except Exception:
++            pass
++        return {'mode': 'class_method', 'method_name': 'solve'}
++
++    def _subprocess_json(self, args):
++        """Run tools/run_suite.py with a JSON argument; returns the parsed dict or {'error': ...}."""
++        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'run_suite.py')
++        try:
++            proc = subprocess.run(
++                ['python3', tool, json.dumps(args)],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900, check=False,
++            )
++        except subprocess.TimeoutExpired:
++            return {'error': 'suite run timed out'}
++        out = proc.stdout.decode(errors='replace').strip().splitlines()
++        if proc.returncode != 0 or not out:
++            return {'error': (proc.stderr.decode(errors='replace') or 'no output')[-800:]}
++        try:
++            return json.loads(out[-1])
++        except Exception:
++            return {'error': out[-1][:800]}
++
++    @staticmethod
++    def _score(stats):
++        """Lower is better: (failures, max_time). Errors rank last."""
++        if not isinstance(stats, dict) or 'error' in stats or stats.get('setup_error'):
++            return (float('inf'), float('inf'))
++        return (stats.get('failed', 0), round(stats.get('max_time', 0.0), 3))
++
++    @staticmethod
++    def _summarize_failures(stats, limit=3):
++        if not isinstance(stats, dict):
++            return 'no stats'
++        if 'error' in stats or stats.get('setup_error'):
++            return f"suite error: {stats.get('error') or stats.get('setup_error')}"
++        fails = stats.get('failures', [])[:limit]
++        if not fails:
++            return f"passed {stats.get('passed')}/{stats.get('total')}"
++        lines = [f"failed {stats.get('failed')}/{stats.get('total')}, max_time {stats.get('max_time', 0):.3f}s"]
++        sm = stats.get('smallest_failure')
++        if sm:
++            lines.append(f"  smallest failing input: {str(sm.get('input'))[:200]!r} expected {str(sm.get('expected'))[:120]!r} got {str(sm.get('actual'))[:120]!r}")
++        for f in fails:
++            lines.append(f"  input {str(f.get('input'))[:200]!r}: expected {str(f.get('expected'))[:120]!r}, got {str(f.get('actual'))[:120]!r}")
++        return "\n".join(lines)
++
++    def _attempt_summary_text(self):
++        if not self.attempt_log:
++            return "No earlier attempts."
++        parts = []
++        for rec in self.attempt_log:
++            parts.append(
++                f"Attempt {rec['attempt']} ({rec['file']}): score (failures, max_time) = {rec['score']}\n"
++                f"  approach: {rec.get('approach', 'unknown')}\n"
++                f"  results:\n{rec['summary']}"
++            )
++        return "\n\n".join(parts)
++
++    def _test_building_prompt(self):
++        suite = self._suite_dir()
++        return f"""PHASE 1: BUILD A REUSABLE TEST SUITE (do not write the final solution yet).
++
++Create the directory {suite} (outside the repository; do not put these files inside {self.git_tempdir}). Build:
++1. `{suite}/config.json`: JSON {{"mode": "class_method" or "stdin", "method_name": "<method name or null>"}}, matching how the graded program is called (use "class_method" if the problem asks for a `Solution` class method, otherwise "stdin").
++2. `{suite}/cases.jsonl`: one JSON object per line with the statement samples. For class_method use {{"args": "<python expression of the method arguments>", "expected": "<exact expected output as a string>"}}; for stdin use {{"input": "<raw stdin text>", "expected": "<exact stdout>"}}.
++3. `{suite}/brute.py`: an exhaustive brute force that is trivially correct, in the same mode and input format as the solution. It must enumerate a PROVABLY SUFFICIENT search space: derive from the statement why the enumerated range (values, lengths, positions) cannot miss an answer, and write that justification as a comment at the top of brute.py. Do not pick a range just because it is small.
++4. `{suite}/ref2.py` (when feasible): a second independent reference with a different method (e.g. a DP or formula, or a smarter enumeration), same format as brute.py.
++5. `{suite}/gen.py`: takes an integer seed as sys.argv[1] and prints ONE input (stdin text for stdin mode, or the argument expression for class_method). It must mix several modes chosen by seed: (a) exhaustive tiny inputs enumerated by index (seed < some bound maps to the i-th tiny case, covering all small n and small values), (b) random tiny and medium inputs, (c) structural edge cases: minimum n, n=1, all equal values, sorted and reverse sorted, long gaps, large values at the constraint limits, zeros, negatives where allowed, (d) constraint-extreme values at the maximum allowed size for timing.
++6. Validate: run brute.py and ref2.py on every case in cases.jsonl and on several generator seeds. They must match the samples exactly and each other. If they disagree, find the minimal disagreeing input, decide which one is wrong against the statement, and fix it. Do not proceed with a suite whose references disagree.
++
++Use the bash and editor tools. Keep the suite small and fast (each reference run should take well under a second on typical inputs). When finished, reply with a short description of the suite and the brute-force search-space justification. Do not write solution.py in this phase.
++"""
++
++    def _attempt_prompt(self, attempt, solution_path):
++        suite = self._suite_dir()
++        return f"""PHASE 2, ATTEMPT {attempt + 1}: write an independent solution and test it.
++
++The problem description is given above in this message.
++Test suite (already built, do not modify its files): {suite}
++  - cases.jsonl (samples), brute.py (exhaustive reference, used by run_suite), gen.py (generator, seeds as argv[1]), config.json (mode and method name), ref2.py (second reference, used for validation only if present).
++
++Earlier attempts (approach, scores and failing inputs):
++{self._attempt_summary_text()}
++
++Requirements:
++- If earlier attempts failed, do NOT repeat their approach. Consider the failing inputs, derive the mistake, and try a different method or formula, verified against brute.py.
++- Write your solution to the file {solution_path} with the editor tool (create it now as a first checkpoint, then refine).
++- Run it on the samples in cases.jsonl first.
++- Run the suite with the run_suite tool: solution_path={solution_path}, mode and method_name from config.json, tests_dir={suite}. If anything fails, shrink the failing input to a minimal case (the tool prints a SMALLEST FAILING INPUT) and debug that case before anything else.
++- Check the performance at maximum constraints (max-size inputs from gen.py) with the bench_solution tool. Anything over about 1s is a failure.
++- Stop when the suite passes fully and timing is fine.
++
++Save your final version to {solution_path} and reply with the approach in two or three sentences.
++"""
++
++    def _repair_prompt(self, best_file, best_stats, disagreements):
++        suite = self._suite_dir()
++        return f"""PHASE 4: REPAIR AND FINAL REVIEW.
++
++Best candidate so far: {best_file}
++Its suite result:
++{self._summarize_failures(best_stats, limit=5)}
++
++Disagreements with other candidates:
++{disagreements}
++
++Steps:
++1. If there are failing inputs, shrink each one to a minimal failing case and debug it. Fix the mismatch against brute.py (the reference is the authority, unless the statement says otherwise).
++2. Final review: list the hypotheses your solution relies on (input format, ties, uniqueness, empty cases, constraint limits). For each hypothesis, add a test to {suite}/cases.jsonl or check it against brute.py.
++3. Test the constraint boundaries: minimum n, maximum n, minimum and maximum values, and the max-size timing case.
++4. Write the final version to {self.git_tempdir}/solution.py (edit the best candidate {best_file} or write it directly), then run the suite on it once more.
++
++Reply with the final verdict and the suite result.
++"""
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Multi-attempt pipeline:
++          1. build a persistent test suite (outside the repository),
++          2. up to MAX_ATTEMPTS independent attempts, each scored by the suite,
++          3. copy the best candidate to solution.py,
++          4. repair/final review with the best candidate.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -207,7 +378,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool within your first few tool calls. A correct-but-slow or best-guess version (even a brute force) is acceptable as a checkpoint; refine it afterwards. Exploration scripts must not replace this file. Keep long derivations in files or tool calls rather than long replies, so your replies are not cut off by the output limit.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
++4. Write a brute-force reference that enumerates a provably sufficient search space (state in a comment why the range cannot miss an answer; do not just pick a small range), and a generator that mixes tiny exhaustive cases with structural edge cases (minimum n, all equal, long gaps, sorted and reversed) and constraint-extreme values. Stress test a few hundred cases comparing solution.py with the brute force. When a case fails, shrink it to a minimal failing input before debugging, then fix every mismatch.
+ 5. Adversarial performance check (do this after correctness passes):
+    a. Write the worst-case operation count of solution.py as a number at maximum constraints (e.g. n=2*10^5 with a nested loop gives about 4*10^10). Show the estimate.
+    b. List at least 5 adversarial max-size inputs, including inputs that defeat any pruning or early-break logic in your solution: all identical elements (e.g. `'a'*20000`), a single value repeated the maximum number of times, all distinct values, skewed sizes, sorted or reverse-sorted input, and inputs with maximum distinct values so that every loop runs to its maximum.
+@@ -216,15 +387,70 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+    e. Pruning/early-break heuristics do not count as a complexity guarantee; test inputs that defeat them.
+    f. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
+ 6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored. Do not stop until solution.py contains a real solution (not just a placeholder comment)."""
+-        instruction = f"{task}\n\n{method}"
+-        history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        os.makedirs(self._attempt_dir(), exist_ok=True)
++
++        # Phase 1: test suite construction.
++        build_msg = f"{task}\n\n{method}\n\n{self._test_building_prompt()}"
++        history = chat_with_agent(build_msg, model=self.code_model, msg_history=[], logging=safe_log)
++
++        # Phase 2: bounded attempts, each with a fresh chat and summaries of earlier attempts.
++        self.attempt_log = []
++        candidates = []  # (score, path, stats)
++        perfect_agreed = False
++        for attempt in range(MAX_ATTEMPTS):
++            solution_file = os.path.join(self._attempt_dir(), f'solution_attempt_{attempt}.py')
++            attempt_msg = f"{task}\n\n{method}\n\n{self._attempt_prompt(attempt, solution_file)}"
++            chat_with_agent(attempt_msg, model=self.code_model, msg_history=[], logging=safe_log)
++
++            # Scoring, a direct subprocess call (not left to the agent).
++            if not os.path.isfile(solution_file):
++                stats = {'error': f'{solution_file} was not written'}
++            else:
++                stats = self._run_suite_stats(solution_file)
++            score = self._score(stats)
++            rec = {'attempt': attempt, 'file': solution_file, 'score': score, 'stats': stats,
++                   'summary': self._summarize_failures(stats),
++                   'approach': self._approach_of(solution_file)}
++            self.attempt_log.append(rec)
++            if score[0] != float('inf'):
++                candidates.append((score, solution_file, stats, attempt))
++
++            # Early stop: perfect score and agreement with an earlier candidate.
++            if score[0] == 0 and score[1] != float('inf') and candidates[:-1]:
++                agreed = False
++                for _, other, _, _ in candidates[:-1]:
++                    cmp = self._compare_stats(solution_file, other)
++                    if isinstance(cmp, dict) and not cmp.get('error') and not cmp.get('setup_error') \
++                            and cmp.get('disagree', 1) == 0 and cmp.get('total', 0) > 0:
++                        agreed = True
++                        break
++                if agreed:
++                    perfect_agreed = True
++                    break
++
++        # Phase 3: select the best candidate (score is lexicographic: failures, then time).
++        if candidates:
++            candidates.sort(key=lambda c: (c[0], c[3]))
++            best_score, best_file, best_stats, _ = candidates[0]
++            shutil.copyfile(best_file, os.path.join(self.git_tempdir, 'solution.py'))
++        else:
++            best_file, best_stats, best_score = None, None, None
++
++        # Phase 4: repair and final review (bounded: one chat), with the disagreements found.
++        disagreements = self._disagreement_text(candidates)
++        if best_file is not None:
++            repair = self._repair_prompt(best_file, best_stats, disagreements)
++        else:
++            repair = (f"PHASE 4: no attempt produced a runnable candidate.\n"
++                      f"Write {self.git_tempdir}/solution.py now using the test suite in {self._suite_dir()}, "
++                      f"and run the suite on it.\n\nProblem:\n{self.problem_statement}")
++        history = chat_with_agent(f"{task}\n\n{repair}", model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         # Guard: ensure solution.py was really edited; retry a bounded number of times.
+-        solution_path = os.path.join(self.git_tempdir, 'solution.py')
+-        for attempt in range(3):
++        for _ in range(3):
+             if self._has_primary_edit():
+                 break
+-            retry_msg = f"""No valid solution.py edit exists yet (the patch is empty, only helper/test files changed, or solution.py does not compile). Do not analyze further. Using the editor tool, write {solution_path} now with your best current algorithm (a brute force is acceptable if nothing better), then run the samples and improve it.
++            retry_msg = f"""No valid solution.py edit exists yet (the patch is empty, only helper/test files changed, or solution.py does not compile). Do not analyze further. Using the editor tool, write {os.path.join(self.git_tempdir, 'solution.py')} now with your best current algorithm (a brute force is acceptable if nothing better), then run the samples and improve it.
+ 
+ Reminder of the problem:
+ <problem_description>
+@@ -232,6 +458,33 @@ Reminder of the problem:
+ </problem_description>"""
+             history = chat_with_agent(retry_msg, model=self.code_model, msg_history=history or [], logging=safe_log)
+ 
++    def _approach_of(self, solution_file):
++        """First docstring/comment lines of a candidate, used as its approach summary."""
++        try:
++            with open(solution_file, errors='replace') as f:
++                lines = [l.strip() for l in f.read().splitlines() if l.strip().startswith('#')]
++            return ' '.join(lines[:3])[:300] or 'unknown'
++        except OSError:
++            return 'unknown'
++
++    def _disagreement_text(self, candidates):
++        if len(candidates) < 2:
++            return "(only one candidate)"
++        best = candidates[0][1]
++        out = []
++        for _, other, _, _ in candidates[1:3]:
++            cmp = self._compare_stats(best, other)
++            if isinstance(cmp, dict) and cmp.get('smallest'):
++                sm = cmp['smallest']
++                out.append(f"vs {other}: smallest disagreeing input {str(sm.get('input'))[:200]!r}, "
++                           f"best gives {str(sm.get('output_a'))[:120]!r}, other gives {str(sm.get('output_b'))[:120]!r}")
++            elif isinstance(cmp, dict) and cmp.get('error'):
++                out.append(f"vs {other}: compare error {str(cmp.get('error'))[:200]}")
++            else:
++                out.append(f"vs {other}: no disagreement found")
++        return "\n".join(out)
++
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tools/run_suite.py b/tools/run_suite.py
+new file mode 100644
+index 0000000..60dd4ab
+--- /dev/null
++++ b/tools/run_suite.py
+@@ -0,0 +1,328 @@
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++
++# Harness used for class_method candidates: loads the file, builds Solution(),
++# evaluates the argument expression in the module globals and prints the result.
++_HARNESS = r'''
++import sys, json, importlib.util, os
++spec = json.loads(sys.stdin.read())
++sys.setrecursionlimit(10000)
++sys.path.insert(0, os.path.dirname(os.path.abspath(spec["path"])))
++mod_spec = importlib.util.spec_from_file_location("sol_under_test", spec["path"])
++mod = importlib.util.module_from_spec(mod_spec)
++mod_spec.loader.exec_module(mod)
++args = eval("(" + spec["expr"] + ",)", vars(mod))
++obj = mod.Solution()
++res = getattr(obj, spec["method"])(*args)
++print(res)
++'''
++
++MAX_CASES_PER_RUN = 2000
++
++
++def tool_info():
++    return {
++        "name": "run_suite",
++        "description": """Run a candidate solution against a persistent test suite directory.
++* mode 'class_method' or 'stdin' runs the candidate (same meaning as bench_solution).
++* mode 'compare' runs two candidates (solution_path and other_path) on the same inputs and reports the first disagreement.
++* tests_dir contains optional cases.jsonl (one JSON object per line: {"args": "<python arg expression>", "expected": "<output>"} for class_method, or {"input": "<stdin text>", "expected": "<output>"} for stdin), optional gen.py (run as `python3 gen.py <seed>`, prints one input) and optional brute.py (reference solution, same mode and input format as the candidate; its output is the expected answer).
++* num_random: number of gen.py seeds to run (0..num_random-1). Ignored when there is no gen.py.
++* Output: pass/fail counts, the first failing inputs with expected and actual output (raw error text included), the smallest failing input found (for shrinking), and the slowest case time. Compare mode reports the first disagreement and the smallest disagreeing input.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the candidate solution Python file."},
++                "mode": {"type": "string", "description": "One of 'class_method', 'stdin', or 'compare'. In compare mode, the inputs are run as class_method if method_name is given, otherwise as stdin."},
++                "method_name": {"type": "string", "description": "Name of the Solution method (required for class_method mode; optional for compare)."},
++                "tests_dir": {"type": "string", "description": "Directory holding cases.jsonl, gen.py and brute.py (any may be missing)."},
++                "num_random": {"type": "integer", "description": "How many gen.py seeds to run (default 100)."},
++                "other_path": {"type": "string", "description": "Second candidate file, used only in compare mode."},
++                "max_report": {"type": "integer", "description": "Maximum number of failing inputs to print in full (default 5)."},
++                "timeout_s": {"type": "integer", "description": "Per-input hard timeout in seconds (default 5)."}
++            },
++            "required": ["solution_path", "mode", "tests_dir"]
++        }
++    }
++
++
++def _clip(s, n=400):
++    s = (s or '').strip()
++    return s if len(s) <= n else s[: n // 2] + " ... " + s[-n // 2:]
++
++
++def _run(cmd, stdin_text, cwd, timeout_s):
++    """Run a command in its own process group; returns (status, elapsed, stdout, stderr)."""
++    t0 = time.time()
++    try:
++        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                             text=True, cwd=cwd, start_new_session=True)
++    except Exception as e:
++        return 'ERROR', time.time() - t0, '', f'failed to start: {e}'
++    try:
++        out, err = p.communicate(stdin_text, timeout=timeout_s)
++        el = time.time() - t0
++        if p.returncode != 0:
++            return 'ERROR', el, out or '', (err or '') + f'\n(exit code {p.returncode})'
++        return 'OK', el, out or '', err or ''
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(p.pid, signal.SIGKILL)
++        except Exception:
++            p.kill()
++        try:
++            p.communicate(timeout=5)
++        except Exception:
++            pass
++        return 'TIMEOUT', time.time() - t0, '', f'killed after {timeout_s}s'
++
++
++def _run_candidate(path, mode, method_name, payload, timeout_s):
++    """Run one candidate on one input. payload is an args expression (class_method) or stdin text."""
++    cwd = os.path.dirname(os.path.abspath(path))
++    if mode == 'class_method':
++        req = json.dumps({'path': os.path.abspath(path), 'method': method_name, 'expr': payload})
++        return _run([sys.executable, '-c', _HARNESS], req, cwd, timeout_s)
++    return _run([sys.executable, os.path.abspath(path)], payload, cwd, timeout_s)
++
++
++def _norm(s):
++    """Whitespace-insensitive comparison: strip each line's trailing spaces and the outer blank lines."""
++    if not isinstance(s, str):
++        s = str(s)
++    return '\n'.join(line.rstrip() for line in s.strip().splitlines())
++
++
++def _load_cases(tests_dir, mode):
++    """Return list of (source, payload, expected_or_None) from cases.jsonl."""
++    path = os.path.join(tests_dir, 'cases.jsonl')
++    cases = []
++    if not os.path.isfile(path):
++        return cases, None
++    with open(path) as f:
++        for lineno, line in enumerate(f, 1):
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                obj = json.loads(line)
++            except Exception as e:
++                return cases, f'cases.jsonl line {lineno} is not valid JSON: {e}'
++            key = 'args' if mode == 'class_method' else 'input'
++            if key not in obj:
++                key = 'args' if 'args' in obj else 'input'
++            if key not in obj:
++                return cases, f'cases.jsonl line {lineno} has no "args"/"input" field'
++            exp = obj.get('expected', None)
++            cases.append((f'cases.jsonl:{lineno}', str(obj[key]), None if exp is None else exp))
++    return cases, None
++
++
++def _gen_inputs(tests_dir, num_random, timeout_s):
++    """Run gen.py with seeds 0..num_random-1; returns (list of (source, payload), error_text)."""
++    gen = os.path.join(tests_dir, 'gen.py')
++    if not os.path.isfile(gen) or num_random <= 0:
++        return [], None
++    items = []
++    for seed in range(num_random):
++        status, _, out, err = _run([sys.executable, os.path.abspath(gen), str(seed)], '', tests_dir, timeout_s)
++        if status != 'OK':
++            return items, f'gen.py failed for seed {seed}: {_clip(err)}'
++        items.append((f'gen.py seed {seed}', out))
++    return items, None
++
++
++def _evaluate(solution_path, mode, method_name, tests_dir, num_random, timeout_s, max_report):
++    """Core evaluation. Returns a dict with counts, failures and timing."""
++    result = {'passed': 0, 'failed': 0, 'total': 0, 'max_time': 0.0, 'max_time_source': None,
++              'failures': [], 'smallest_failure': None, 'setup_error': None}
++    cases, err = _load_cases(tests_dir, mode)
++    if err:
++        result['setup_error'] = err
++        return result
++    gen_items, err = _gen_inputs(tests_dir, num_random, timeout_s)
++    if err:
++        result['setup_error'] = err
++        return result
++    brute = os.path.join(tests_dir, 'brute.py')
++    have_brute = os.path.isfile(brute)
++    items = [(s, p, e) for s, p, e in cases] + [(s, p, None) for s, p in gen_items]
++    items = items[:MAX_CASES_PER_RUN]
++    if not items:
++        result['setup_error'] = 'no test cases: add cases.jsonl or gen.py in ' + tests_dir
++        return result
++
++    for source, payload, expected in items:
++        result['total'] += 1
++        if expected is None:
++            if not have_brute:
++                result['total'] -= 1
++                continue
++            rs, _, rout, rerr = _run_candidate(brute, mode, method_name, payload, timeout_s)
++            if rs != 'OK':
++                # The reference itself failed on this input: report it, do not count the candidate.
++                result['total'] -= 1
++                result.setdefault('reference_errors', []).append(
++                    {'source': source, 'input': payload, 'error': _clip(rerr)})
++                continue
++            expected = rout
++        status, el, out, err = _run_candidate(solution_path, mode, method_name, payload, timeout_s)
++        if el > result['max_time']:
++            result['max_time'] = el
++            result['max_time_source'] = source
++        if status == 'OK' and _norm(out) == _norm(expected):
++            result['passed'] += 1
++            continue
++        result['failed'] += 1
++        fail = {'source': source, 'input': payload, 'expected': _clip(_norm(expected), 300),
++                'actual': _clip(out if status == 'OK' else (err or status), 300), 'status': status,
++                'time': round(el, 3)}
++        if status != 'OK':
++            fail['actual'] = f'{status}: ' + _clip(err or '', 300)
++        result['failures'].append(fail)
++        if result['smallest_failure'] is None or len(payload) < len(result['smallest_failure']['input']):
++            result['smallest_failure'] = fail
++    return result
++
++
++def _evaluate_compare(sol_a, sol_b, mode, method_name, tests_dir, num_random, timeout_s, max_report):
++    """Run two candidates on the same inputs; report disagreements (no reference needed)."""
++    result = {'total': 0, 'agree': 0, 'disagree': 0, 'first': None, 'smallest': None,
++              'max_time': 0.0, 'setup_error': None}
++    cases, err = _load_cases(tests_dir, mode)
++    gen_items, gerr = _gen_inputs(tests_dir, num_random, timeout_s)
++    if err or gerr:
++        result['setup_error'] = err or gerr
++        return result
++    items = [(s, p) for s, p, _ in cases] + gen_items
++    if not items:
++        result['setup_error'] = 'no inputs: add cases.jsonl or gen.py in ' + tests_dir
++        return result
++    for source, payload in items[:MAX_CASES_PER_RUN]:
++        result['total'] += 1
++        sa, ea, oa, era = _run_candidate(sol_a, mode, method_name, payload, timeout_s)
++        sb, eb, ob, erb = _run_candidate(sol_b, mode, method_name, payload, timeout_s)
++        result['max_time'] = max(result['max_time'], ea, eb)
++        ra = _norm(oa) if sa == 'OK' else f'{sa}: {_clip(era, 200)}'
++        rb = _norm(ob) if sb == 'OK' else f'{sb}: {_clip(erb, 200)}'
++        if ra == rb:
++            result['agree'] += 1
++            continue
++        result['disagree'] += 1
++        rec = {'source': source, 'input': payload, 'output_a': _clip(ra, 300), 'output_b': _clip(rb, 300)}
++        if result['first'] is None:
++            result['first'] = rec
++        if result['smallest'] is None or len(payload) < len(result['smallest']['input']):
++            result['smallest'] = rec
++    return result
++
++
++def _format_fail(i, f):
++    return (f"  [{i}] {f['source']} time={f.get('time', 0)}s status={f['status']}\n"
++            f"      input:    {_clip(f['input'], 300)!r}\n"
++            f"      expected: {f['expected']!r}\n"
++            f"      actual:   {f['actual']!r}")
++
++
++def _format_report(solution_path, mode, method_name, r, max_report):
++    if r['setup_error']:
++        return f"Error: {r['setup_error']}"
++    lines = [f"Suite run of {solution_path} ({mode}{', ' + method_name if method_name else ''})",
++             f"PASS {r['passed']}/{r['total']}  FAIL {r['failed']}  max_time {r['max_time']:.3f}s"
++             + (f" (on {r['max_time_source']})" if r['max_time_source'] else '')]
++    if r.get('reference_errors'):
++        lines.append(f"Reference (brute.py) errors on {len(r['reference_errors'])} inputs, e.g.:")
++        for e in r['reference_errors'][:2]:
++            lines.append(f"  input {_clip(e['input'], 120)!r}: {e['error']}")
++    if r['failures']:
++        lines.append(f"First {min(max_report, len(r['failures']))} failing inputs:")
++        for i, f in enumerate(r['failures'][:max_report]):
++            lines.append(_format_fail(i, f))
++        sm = r['smallest_failure']
++        lines.append("SMALLEST FAILING INPUT (shrink this first):")
++        lines.append(_format_fail('min', sm))
++    else:
++        lines.append("All tests passed." if r['total'] else "No tests ran.")
++    return "\n".join(lines)
++
++
++def _format_compare(sol_a, sol_b, r, max_report):
++    if r['setup_error']:
++        return f"Error: {r['setup_error']}"
++    lines = [f"Compare {sol_a} vs {sol_b}: agree {r['agree']}/{r['total']}, disagree {r['disagree']}, "
++             f"max_time {r['max_time']:.3f}s"]
++    if r['first']:
++        f = r['first']
++        lines.append(f"FIRST DISAGREEMENT ({f['source']}):\n  input: {_clip(f['input'], 300)!r}\n"
++                     f"  A: {f['output_a']!r}\n  B: {f['output_b']!r}")
++        s = r['smallest']
++        lines.append(f"SMALLEST DISAGREEING INPUT (shrink this first): {_clip(s['input'], 300)!r}\n"
++                     f"  A: {s['output_a']!r}\n  B: {s['output_b']!r}")
++    else:
++        lines.append("Candidates agree on all inputs.")
++    return "\n".join(lines)
++
++
++def tool_function(solution_path, mode, tests_dir, method_name=None, num_random=100,
++                  other_path=None, max_report=5, timeout_s=5):
++    try:
++        num_random = max(0, min(int(num_random if num_random is not None else 100), 1000))
++        max_report = max(1, min(int(max_report or 5), 20))
++        timeout_s = max(1, min(int(timeout_s or 5), 60))
++    except Exception as e:
++        return f"Error: invalid numeric argument: {e}"
++    if mode not in ('class_method', 'stdin', 'compare'):
++        return "Error: mode must be 'class_method', 'stdin' or 'compare'."
++    if mode == 'class_method' and not method_name:
++        return "Error: method_name is required in class_method mode."
++    solution_path = os.path.abspath(str(solution_path))
++    tests_dir = os.path.abspath(str(tests_dir))
++    if not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    if not os.path.isdir(tests_dir):
++        return f"Error: tests directory not found: {tests_dir}"
++    if mode == 'compare':
++        if not other_path or not os.path.isfile(str(other_path)):
++            return "Error: compare mode needs an existing other_path."
++        other = os.path.abspath(str(other_path))
++        base_mode = 'class_method' if method_name else 'stdin'
++        r = _evaluate_compare(solution_path, other, base_mode, method_name, tests_dir,
++                              num_random, timeout_s, max_report)
++        return _format_compare(solution_path, other, r, max_report)
++    r = _evaluate(solution_path, mode, method_name, tests_dir, num_random, timeout_s, max_report)
++    return _format_report(solution_path, mode, method_name, r, max_report)
++
++
++def evaluate_for_pipeline(solution_path, mode, method_name, tests_dir, num_random=100, timeout_s=5):
++    """Machine-readable summary used by coding_agent.py: score = (failures, max_time)."""
++    r = _evaluate(os.path.abspath(solution_path), mode, method_name, os.path.abspath(tests_dir),
++                  num_random, timeout_s, 5)
++    return r
++
++
++def evaluate_compare_for_pipeline(solution_path, other_path, mode, method_name, tests_dir,
++                                  num_random=100, timeout_s=5):
++    """Machine-readable compare summary used by coding_agent.py."""
++    base_mode = 'class_method' if method_name else 'stdin'
++    return _evaluate_compare(os.path.abspath(solution_path), os.path.abspath(other_path), base_mode,
++                             method_name, os.path.abspath(tests_dir), num_random, timeout_s, 5)
++
++
++if __name__ == '__main__':
++    # CLI used by coding_agent.py (prints one JSON line):
++    #   suite:   {"solution_path", "mode", "method_name", "tests_dir", "num_random", "timeout_s"}
++    #   compare: same keys plus "other_path"
++    args = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
++    mode = args.get('mode', 'class_method')
++    if args.get('other_path'):
++        stats = evaluate_compare_for_pipeline(args['solution_path'], args['other_path'], mode,
++                                              args.get('method_name'), args['tests_dir'],
++                                              args.get('num_random', 100), args.get('timeout_s', 5))
++    else:
++        stats = evaluate_for_pipeline(args['solution_path'], mode, args.get('method_name'),
++                                      args['tests_dir'], args.get('num_random', 100), args.get('timeout_s', 5))
++    print(json.dumps(stats, default=str))

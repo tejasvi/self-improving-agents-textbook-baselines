@@ -1,0 +1,161 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 9c14273..69e9106 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ import os
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm import create_client, get_response_from_llm
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -204,6 +205,55 @@ class AgenticSystem:
+             return True
+         return False
+ 
++    def _infer_target_filename(self):
++        """
++        Infer the target file name from the problem statement.
++        Uses a backticked *.py name if present; defaults to solution.py.
++        """
++        m = re.search(r'`([\w\-./]+\.py)`', self.problem_statement)
++        if m:
++            return m.group(1)
++        return 'solution.py'
++
++    def _fallback_write_solution(self):
++        """
++        Last-resort: make a tool-free LLM call asking for the full solution file contents,
++        extract the code block and write it to the git_tempdir.
++        """
++        filename = self._infer_target_filename()
++        safe_log(f"[forward] Fallback: requesting full contents of {filename} (tool-free).")
++        prompt = (
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Output ONLY the full contents of {filename} in a single ```python block. "
++            "The file must be a complete, runnable Python program or implementation that solves the problem above. "
++            "Do not include any other text."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            response, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer. Respond only with the requested code.",
++                print_debug=False,
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"[forward] Fallback LLM call failed: {e}")
++            return False
++
++        match = re.search(r'```(?:python|py)?[ \t]*\n(.*?)```', response or '', flags=re.DOTALL)
++        if not match:
++            safe_log(f"[forward] Fallback: no ```python code block found in response.")
++            return False
++        code = match.group(1)
++        target = os.path.join(self.git_tempdir, filename)
++        os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
++        with open(target, 'w') as f:
++            f.write(code)
++        safe_log(f"[forward] Fallback: wrote {len(code)} chars to {target}")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -219,47 +269,71 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         instruction = f"""{task}
+ 
+ The task is NOT complete until the primary source file contains your implementation. Follow this workflow:
+-1. Identify the target source file(s) that the problem requires you to change (e.g. the file containing the starter code or the class/function to implement). Read it and any relevant files in the repo.
+-2. Write a complete first implementation into the source file early, using the editor tool. Do not wait until you have finished experimenting.
++1. Identify the target source file(s) that the problem requires you to change (e.g. the file containing the starter code or the class/function to implement). Read it and any relevant files in the repo. If the task names a file that does not exist, create it.
++2. Write a complete first implementation into the source file immediately, using the editor tool. Do not wait until you have finished experimenting. For interactive problems, write the program anyway, and test it with a small local judge/simulator script in /tmp.
+ 3. Test and refine the solution with bash while editing the source file in place. Run the provided examples or write your own checks.
+ 4. Scratch and experiment scripts must be placed in /tmp. They are NOT the deliverable and do not count as the solution. Do not leave scratch files inside the repository.
+ 5. If the starter code needs them, add any missing imports (e.g. `from typing import List`) to the source file.
+ 6. Before finishing, run `git -C {self.git_tempdir} diff` to confirm that the source file has been modified with your implementation. If it has not, edit it now.
++7. Never end a turn without a tool call before the file has been written.
+ 
+ Please analyze the problem description carefully. Then make edits to the code files to complete the instruction."""
+ 
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        max_retries = 3
+-        for attempt in range(max_retries):
++        max_attempts = 3
++        for attempt in range(max_attempts):
+             changed_files = self._changed_files()
+             source_files = [f for f in changed_files if not self._is_test_path(f)]
+-            empty_final = self._last_assistant_is_empty(msg_history)
+-
+-            if source_files and not empty_final:
++            if source_files:
+                 safe_log(f"[forward] Attempt {attempt}: valid source edit found: {source_files}")
+                 break
+ 
++            # Failure: no non-test file changed. Decide the recovery strategy.
++            last_empty = self._last_assistant_is_empty(msg_history)
+             if not changed_files:
++                failure = "empty patch"
+                 reason = "Your patch is EMPTY: you have not modified any file in the repository."
+-            elif not source_files:
++            else:
++                failure = "test-only changes"
+                 reason = (f"Your patch only modifies test files ({', '.join(changed_files)}). "
+                           "Tests do not count as the solution.")
++            degenerate = (not changed_files) or last_empty
++            strategy = "fresh-restart" if degenerate else "corrective-message"
++            safe_log(f"[forward] Attempt {attempt}: failure={failure}, last_assistant_empty={last_empty}, "
++                     f"changed_files={changed_files}, strategy={strategy}")
++
++            if degenerate:
++                restart = (
++                    f"{task}\n"
++                    "Your first action must be a tool call that creates or edits the solution file with a complete implementation. "
++                    "If the target file (e.g. solution.py) does not exist, create it with the editor tool right away, "
++                    "then refine it and test it.\n"
++                    "Do not end a turn without a tool call before the file has been written."
++                )
++                msg_history = chat_with_agent(restart, model=self.code_model, msg_history=[], logging=safe_log)
+             else:
+-                reason = "Your last message ended without a tool call or a final result, so the task is not finished."
+-            safe_log(f"[forward] Attempt {attempt}: invalid patch -> {reason}")
+-
+-            corrective = (
+-                f"{reason}\n\n"
+-                "You have not modified any source file. Do not run more experiments; "
+-                "use the editor tool now to write your best current solution to the primary source file, "
+-                "then run the examples to verify. Add any missing imports to that file. "
+-                "The task is not complete until the source file contains the implementation."
+-            )
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        else:
++                corrective = (
++                    f"{reason}\n\n"
++                    "Here is the problem again:\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                    "You have not modified any source file. Do not run more experiments; "
++                    "use the editor tool now to write your best current solution to the primary source file "
++                    "(create it if it does not exist), then run the examples to verify. Add any missing imports to that file. "
++                    "The task is not complete until the source file contains the implementation."
++                )
++                msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        changed_files = self._changed_files()
++        source_files = [f for f in changed_files if not self._is_test_path(f)]
++        if not source_files:
++            safe_log(f"[forward] Retries exhausted without a source change. Changed files: {changed_files}. Running fallback.")
++            wrote = self._fallback_write_solution()
+             changed_files = self._changed_files()
+-            safe_log(f"[forward] Retries exhausted. Changed files: {changed_files}")
++            safe_log(f"[forward] After fallback (wrote={wrote}). Changed files: {changed_files}")
++        else:
++            safe_log(f"[forward] Final changed files: {changed_files}")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

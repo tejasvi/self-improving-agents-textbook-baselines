@@ -1,0 +1,375 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index bc84627..085c694 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,8 +1,10 @@
+ import argparse
++import ast
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import sys
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -96,6 +98,56 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++SUBPROCESS_FUNCS = {'run', 'Popen', 'call', 'check_call', 'check_output'}
++
++
++def _hits_of_code(code):
++    """Set of suspicious constructs in `code`, as stable strings. Empty set if it does not parse."""
++    try:
++        tree = ast.parse(code)
++    except (SyntaxError, ValueError):
++        return None
++    stdlib = set(getattr(sys, 'stdlib_module_names', ())) | set(sys.builtin_module_names)
++    hits = set()
++    if 'sys.path.insert' in code:
++        hits.add('sys.path.insert')
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ImportFrom):
++            top = (node.module or '').split('.')[0]
++            if node.level > 0 or (top and top not in stdlib):
++                hits.add(f"from-import:{'.' * node.level}{node.module}")
++        elif isinstance(node, ast.Import):
++            for alias in node.names:
++                top = alias.name.split('.')[0]
++                if top not in stdlib:
++                    hits.add(f"import:{alias.name}")
++        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
++            if node.value.startswith('/work/') or node.value.startswith('/tmp/'):
++                hits.add(f"path-literal:{node.value}")
++        elif isinstance(node, ast.Call):
++            fn = node.func
++            name = fn.attr if isinstance(fn, ast.Attribute) else (fn.id if isinstance(fn, ast.Name) else '')
++            if name in SUBPROCESS_FUNCS:
++                for sub in ast.walk(node):
++                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.endswith('.py'):
++                        hits.add(f"subprocess-py:{sub.value}")
++    return hits
++
++
++def sanity_gate(code, original_code=''):
++    """True if `code` may replace solution.py.
++
++    It must parse, and must not contain any suspicious construct (sys.path.insert,
++    non-stdlib imports, /work or /tmp literals, subprocess launches of .py files)
++    unless the same construct already appeared in the original solution at the start of the run.
++    """
++    hits = _hits_of_code(code)
++    if hits is None:
++        return False
++    base = _hits_of_code(original_code or '') or set()
++    return not (hits - base)
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -184,7 +236,9 @@ class AgenticSystem:
+         missing = []
+ 
+         samples = self._latest_record('check_samples', sha)
+-        if samples is None:
++        if samples is not None and samples.get('no_samples'):
++            pass  # statement has no samples; recorded explicitly
++        elif samples is None:
+             missing.append("(a) samples not mechanically checked on the current solution.py: "
+                            "run check_samples with every sample from the statement")
+         elif not samples.get('samples_ok') or samples.get('samples_total', 0) <= 0:
+@@ -217,6 +271,8 @@ class AgenticSystem:
+         """Score tuple for the solution version with hash `sha` (higher is better)."""
+         samples = self._latest_record('check_samples', sha)
+         samples_passing = samples.get('samples_passed', 0) if samples else 0
++        if samples and samples.get('no_samples'):
++            samples_passing = 1
+         stress = self._latest_record('stress_compare', sha)
+         if stress is None:
+             mismatches = 10 ** 9
+@@ -230,7 +286,7 @@ class AgenticSystem:
+     def _is_complete_for_sha(self, sha):
+         """True if the evidence for hash `sha` alone satisfies every requirement."""
+         samples = self._latest_record('check_samples', sha)
+-        if samples is None or not samples.get('samples_ok'):
++        if samples is None or not (samples.get('samples_ok') or samples.get('no_samples')):
+             return False
+         stress = self._latest_record('stress_compare', sha, lambda r: r.get('num_tests', 0) >= 100)
+         if stress is None or stress.get('mismatches', 1) != 0 or stress.get('crashes', 1) != 0:
+@@ -263,34 +319,65 @@ class AgenticSystem:
+     def _restore_best(self, snapshots):
+         """Write the best-scoring verified version back to solution.py.
+ 
+-        Candidates are the round-end snapshots plus every solution version that a
+-        verification tool recorded during this run (tools may have verified a version
+-        that was overwritten before the round ended). Ties go to the latest candidate.
++        Candidates are the round-end snapshots of solution.py plus the verified versions
++        recorded for solution.py itself (records whose solution_path is this file). Helper
++        files passed to verification tools (wrappers, references) are never candidates.
++        A candidate replaces the file on disk only if it scores strictly higher than the
++        current file and passes sanity_gate. The current file is backed up before any write.
+         """
++        target = self._solution_path()
+         candidates = []
+         seen = set()
+         for snap in snapshots:
+-            candidates.append({'label': snap['label'], 'sha': snap['sha']})
+-            seen.add(snap['sha'])
++            if snap['sha'] not in seen:
++                seen.add(snap['sha'])
++                candidates.append({'label': snap['label'], 'sha': snap['sha']})
+         for rec in load_records():
+             sha = rec.get('solution_sha256')
+-            if sha and sha not in seen and os.path.isfile(candidate_path(sha)):
++            src = rec.get('solution_path')
++            if not sha or not src or os.path.abspath(src) != os.path.abspath(target):
++                continue
++            if sha not in seen and os.path.isfile(candidate_path(sha)):
+                 seen.add(sha)
+                 candidates.append({'label': f"{rec.get('tool')} record", 'sha': sha})
+-        best = None
++        scored = []
+         for cand in candidates:
+-            if not os.path.isfile(candidate_path(cand['sha'])):
++            if os.path.isfile(candidate_path(cand['sha'])):
++                scored.append({**cand, 'score': self._score_for_sha(cand['sha'])})
++        if not scored:
++            return
++        # Highest score first; ties go to the latest candidate (candidates are in age order).
++        order = list(range(len(scored)))
++        order.sort(key=lambda i: (scored[i]['score'], i), reverse=True)
++
++        current_sha = file_sha256(target)
++        current_code = None
++        current_score = None
++        if current_sha is not None:
++            with open(target, 'r', errors='replace') as f:
++                current_code = f.read()
++            current_score = self._score_for_sha(current_sha)
++            backup = os.path.join(candidate_dir(), f"backup_before_restore_{current_sha}.py")
++            os.makedirs(candidate_dir(), exist_ok=True)
++            with open(backup, 'w') as f:
++                f.write(current_code)
++
++        for i in order:
++            best = scored[i]
++            if current_score is not None and not best['score'] > current_score:
++                break  # sorted descending: nothing later can beat the file on disk
++            with open(candidate_path(best['sha']), 'r', errors='replace') as f:
++                code = f.read()
++            if code == current_code:
++                return
++            if not sanity_gate(code, getattr(self, '_initial_code', '')):
++                safe_log(f"[forward] candidate '{best['label']}' sha={best['sha'][:12]} failed the sanity gate")
+                 continue
+-            score = self._score_for_sha(cand['sha'])
+-            if best is None or score >= best['score']:
+-                best = {'label': cand['label'], 'sha': cand['sha'], 'score': score}
+-        if best is None:
++            with open(target, 'w') as f:
++                f.write(code)
++            safe_log(f"[forward] restored '{best['label']}' sha={best['sha'][:12]} score={best['score']}")
+             return
+-        with open(candidate_path(best['sha']), 'r', errors='replace') as f:
+-            code = f.read()
+-        with open(self._solution_path(), 'w') as f:
+-            f.write(code)
+-        safe_log(f"[forward] restored '{best['label']}' sha={best['sha'][:12]} score={best['score']}")
++        safe_log("[forward] kept solution.py on disk (no candidate beat it and passed the sanity gate)")
+ 
+     def _recent_evidence_text(self):
+         """Short text summary of the latest tool evidence for the current solution.py."""
+@@ -322,7 +409,10 @@ class AgenticSystem:
+                 + "\n\nLatest tool evidence for the current solution.py:\n"
+                 + self._recent_evidence_text()
+                 + "\n\nDo the following now, using the tools:\n"
+-                "1. Run check_samples with EVERY sample from the statement (exact expected outputs). Fix any failure.\n"
++                "1. Run check_samples with EVERY sample from the statement (exact expected outputs). Fix any failure. "
++                "If the statement has no samples or the problem is interactive, call check_samples with no_samples=true "
++                "instead. Never write judge or wrapper code into solution.py; if you need one, build it in a separate "
++                "directory and use it only as the generator or reference side of stress_compare.\n"
+                 "2. Write an INDEPENDENT reference in a separate file (e.g. /tmp/ref.py). It must use a different "
+                 "algorithm or formulation from solution.py: exact fractions.Fraction arithmetic, exhaustive "
+                 "enumeration / brute force, or a different DP direction. Do not copy solution.py.\n"
+@@ -364,6 +454,12 @@ class AgenticSystem:
+         """
+         The forward function for the AgenticSystem.
+         """
++        # Only this file's evidence is kept as a restorable candidate (see utils.verify_common.append_record).
++        os.environ['AGENT_SOLUTION_PATH'] = os.path.abspath(self._solution_path())
++        self._initial_code = ''
++        if os.path.isfile(self._solution_path()):
++            with open(self._solution_path(), 'r', errors='replace') as f:
++                self._initial_code = f.read()
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+diff --git a/tools/check_samples.py b/tools/check_samples.py
+index 22a80c9..e650fbd 100644
+--- a/tools/check_samples.py
++++ b/tools/check_samples.py
+@@ -40,6 +40,10 @@ def tool_info():
+                         "required": ["input", "expected_output"]
+                     }
+                 },
++                "no_samples": {
++                    "type": "boolean",
++                    "description": "Set to true only when the statement contains no sample tests (or the problem is interactive). Records that no samples exist instead of checking any."
++                },
+                 "tolerance": {
+                     "type": "number",
+                     "description": "Relative/absolute tolerance for numeric tokens (default 0, i.e. exact match). Use e.g. 1e-6 only when the statement allows an error."
+@@ -49,7 +53,7 @@ def tool_info():
+                     "description": "Per-sample time limit in seconds (default 10)."
+                 }
+             },
+-            "required": ["solution_path", "samples"]
++            "required": ["solution_path"]
+         }
+     }
+ 
+@@ -73,7 +77,7 @@ def _run_one(path, data, timeout):
+         return out, err + f"\n(timed out after {timeout}s)", 'TIMEOUT', round(time.time() - start, 3)
+ 
+ 
+-def tool_function(solution_path, samples=None, tolerance=0.0, timeout=10):
++def tool_function(solution_path, samples=None, tolerance=0.0, timeout=10, no_samples=False):
+     try:
+         timeout = max(1, min(int(timeout or 10), 120))
+     except (TypeError, ValueError):
+@@ -84,8 +88,22 @@ def tool_function(solution_path, samples=None, tolerance=0.0, timeout=10):
+         tolerance = 0.0
+     if not os.path.isfile(solution_path):
+         return f"Error: file not found: {solution_path}"
++    if no_samples is True:
++        sha = file_sha256(solution_path)
++        append_record({
++            'tool': 'check_samples',
++            'solution_path': os.path.abspath(solution_path),
++            'solution_sha256': sha,
++            'samples_total': 0,
++            'samples_passed': 0,
++            'samples_ok': True,
++            'no_samples': True,
++            'tolerance': tolerance,
++            'first_failure': None,
++        })
++        return "no_samples: statement has no sample tests; recorded as satisfied."
+     if not samples or not isinstance(samples, list):
+-        return "Error: 'samples' must be a non-empty list of {input, expected_output} objects."
++        return "Error: 'samples' must be a non-empty list of {input, expected_output} objects, or set no_samples=true if the statement has none."
+ 
+     lines = []
+     passed = 0
+diff --git a/utils/verify_common.py b/utils/verify_common.py
+index 3588a72..6d7410d 100644
+--- a/utils/verify_common.py
++++ b/utils/verify_common.py
+@@ -52,13 +52,17 @@ def candidate_path(sha):
+ def append_record(record):
+     """Append one record (adds a timestamp) to the evidence file. Never raises.
+ 
+-    If the record names a solution file and its hash, a copy of that file is kept
+-    in the candidate directory so the exact verified version can be restored later.
++    If the record names the registered solution file (env AGENT_SOLUTION_PATH) and its
++    hash, a copy of that file is kept in the candidate directory so the exact verified
++    version can be restored later. Helper files (wrappers, references) are never copied.
+     """
+     try:
+         sha = record.get('solution_sha256')
+         src = record.get('solution_path')
+-        if sha and src and os.path.isfile(src):
++        registered = os.environ.get('AGENT_SOLUTION_PATH')
++        is_registered = bool(registered) and bool(src) and \
++            os.path.abspath(src) == os.path.abspath(registered)
++        if sha and is_registered and os.path.isfile(src):
+             os.makedirs(candidate_dir(), exist_ok=True)
+             dst = candidate_path(sha)
+             if not os.path.isfile(dst):
+diff --git a/tests/test_restore_best.py b/tests/test_restore_best.py
+new file mode 100644
+index 0000000..8382b0d
+--- /dev/null
++++ b/tests/test_restore_best.py
+@@ -0,0 +1,78 @@
++import json
++import os
++import sys
++
++import pytest
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if ROOT not in sys.path:
++    sys.path.insert(0, ROOT)
++
++import coding_agent  # noqa: E402
++from utils.verify_common import file_sha256, candidate_dir, candidate_path  # noqa: E402
++
++REAL_CODE = "import sys\nprint(sys.stdin.read().strip())\n"
++HELPER_CODE = "from hidden import judge\nprint(judge())\n"
++
++
++def _make_agent(tmp_path):
++    agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
++    agent.git_tempdir = str(tmp_path / 'repo')
++    os.makedirs(agent.git_tempdir)
++    agent._initial_code = REAL_CODE
++    return agent
++
++
++def _write_state(tmp_path, records):
++    state = tmp_path / 'state.json'
++    state.write_text(json.dumps(records))
++    return state
++
++
++def _store_candidate(code):
++    import hashlib
++    sha = hashlib.sha256(code.encode()).hexdigest()
++    os.makedirs(candidate_dir(), exist_ok=True)
++    with open(candidate_path(sha), 'w') as f:
++        f.write(code)
++    return sha
++
++
++def test_restore_ignores_helper_record(tmp_path, monkeypatch):
++    state = _write_state(tmp_path, [])
++    monkeypatch.setenv('AGENT_VERIFY_STATE', str(state))
++    agent = _make_agent(tmp_path)
++    sol = agent._solution_path()
++    helper = tmp_path / 'wrap.py'
++    helper.write_text(HELPER_CODE)
++    with open(sol, 'w') as f:
++        f.write(REAL_CODE)
++    real_sha = _store_candidate(REAL_CODE)
++    helper_sha = _store_candidate(HELPER_CODE)
++
++    records = [
++        # real solution: stress_compare with a harness failure (1 crash)
++        {'tool': 'stress_compare', 'solution_path': os.path.abspath(sol), 'solution_sha256': real_sha,
++         'num_tests': 100, 'mismatches': 0, 'crashes': 1, 'reference_path': '/nonexistent'},
++        # helper wrapper: looks perfect, but is not the solution file
++        {'tool': 'stress_compare', 'solution_path': os.path.abspath(helper), 'solution_sha256': helper_sha,
++         'num_tests': 100, 'mismatches': 0, 'crashes': 0, 'reference_path': '/nonexistent'},
++    ]
++    state.write_text(json.dumps(records))
++
++    before = open(sol).read()
++    snapshots = [{'label': 'initial', 'sha': real_sha, 'code': REAL_CODE, 'score': None}]
++    agent._restore_best(snapshots)
++    assert open(sol).read() == before
++    assert file_sha256(sol) == real_sha
++
++
++def test_sanity_gate_rejects_helper_code():
++    assert not coding_agent.sanity_gate(HELPER_CODE, REAL_CODE)
++    assert not coding_agent.sanity_gate("import sys\nsys.path.insert(0, '/x')\n", REAL_CODE)
++    assert not coding_agent.sanity_gate("x = '/tmp/data.txt'\n", REAL_CODE)
++    assert not coding_agent.sanity_gate("def f(:\n", REAL_CODE)
++    assert coding_agent.sanity_gate(REAL_CODE, REAL_CODE)
++    # a construct already present in the original file is allowed
++    original = "from hidden import judge\n"
++    assert coding_agent.sanity_gate(original + "print(1)\n", original)

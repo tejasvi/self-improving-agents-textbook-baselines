@@ -1,0 +1,754 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ba1274c..5ae98fa 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,10 @@
+ import argparse
++import json
++import shutil
+ import subprocess
++import sys
++import tempfile
++import time
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -7,6 +12,9 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools import cross_check as cross_check_tool
++
++WORK_DIR = '/work'
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -137,9 +145,211 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _ensure_work_dirs(self):
++        """Create the scratch area (candidates, tests) outside the repo. Falls back to a temp dir."""
++        for base in (WORK_DIR, os.path.join(tempfile.gettempdir(), 'work')):
++            try:
++                os.makedirs(os.path.join(base, 'cands'), exist_ok=True)
++                os.makedirs(os.path.join(base, 'tests'), exist_ok=True)
++                self.work_dir = base
++                return
++            except OSError:
++                continue
++        self.work_dir = WORK_DIR
++
++    def _cands_dir(self):
++        return os.path.join(self.work_dir, 'cands')
++
++    def _tests_path(self, *parts):
++        return os.path.join(self.work_dir, 'tests', *parts)
++
++    def _candidate_prompt(self, task, method, idx, hint):
++        cand = os.path.join(self._cands_dir(), f'cand_{idx}.py')
++        return f"""{task}
++
++{method}
++
++## Your role: candidate solver #{idx} (of 3)
++Strategy hint for this attempt: {hint}
++
++Write your complete solution to {cand} using the editor tool (create). Your very first reply MUST be a tool call that writes {cand}, even if it is a rough version. Then run it on every sample in the statement and compare with the expected outputs exactly. Refine it until it passes the samples and your own small stress tests. Do not write to {self.git_tempdir}/solution.py; the orchestrator copies the best candidate there after cross-checking all candidates. Scratch files go in {self.work_dir}/scratch_{idx}/.
++End your reply with a short summary of the approach and its worst-case complexity."""
++
++    def _tester_prompt(self):
++        gen = self._tests_path('gen.py')
++        checker = self._tests_path('checker.py')
++        exh = self._tests_path('exhaustive')
++        return f"""You are an independent tester for the competitive programming problem below. You have NOT seen any candidate solution; use only the problem statement. Your goal is to find bugs in candidate solutions by building independent tests, so do not try to solve the problem with a shortcut you cannot justify from the statement.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Write the following files (use the editor tool; scratch work goes in {self.work_dir}/tests_scratch/):
++1. {checker} : a checker run as `python3 -I checker.py <input_file> <output_file>`. It must exit 0 if the output is valid for the input and exit non-zero with a short message on stderr otherwise.
++   - If several answers can be valid (phrases like "any", "one of", "multiple", "arbitrary"), the checker must verify the properties the statement requires, not compare text.
++   - If the answer is unique, the checker should recompute the answer with a simple brute force (only when the input is small enough to be fast, otherwise accept the output after checking its format and constraints) and compare exactly.
++   - Verify the checker accepts the correct answers on the samples in the statement and rejects a deliberately wrong output.
++2. {gen} : a generator run as `python3 -I gen.py <seed>` that prints ONE valid input (respecting every constraint of the statement) to stdout. Seeds 0..59 must be deterministic and cover several families: random small inputs, structured inputs (chains, stars, all-equal values, sorted/reversed, alternating, etc. where relevant), boundary inputs (smallest sizes such as N=1, extreme values), and medium random inputs. Keep small seeds small enough for a brute force.
++3. {exh} (directory, optional): if the input space is small enough, write {self.work_dir}/tests/exhaustive.py that writes every small valid input as a separate file into that directory ({exh}/000.txt, 001.txt, ...). Cap it at about 300 files. Skip this step if it is not feasible.
++4. {self._tests_path('max_gen.py')} : a generator run as `python3 -I max_gen.py` (no arguments) that prints one maximum-size valid input with adversarial structure (worst case for typical wrong or slow solutions).
++5. {self._tests_path('ops.txt')} : a single line containing the estimated worst-case operation count for the intended efficient algorithm, written as a plain number (for example 2000000 for N=10^3 with an O(N^2) algorithm). Use the largest constraints.
++
++Check each file by running it: the generator must print a valid input for several seeds, and the checker must accept the correct answers you computed by brute force on small generated inputs. End your reply with a short summary of the test families you wrote."""
++
++    def _refine_prompt(self, best_path, report, round_idx):
++        try:
++            with open(best_path) as f:
++                best_code = f.read()
++        except OSError:
++            best_code = '(unreadable)'
++        out = os.path.join(self._cands_dir(), f'refine_{round_idx}.py')
++        return f"""Fix the solution to the problem below. A fresh attempt is needed because the current best candidate fails some tests.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Current best candidate (file {best_path}):
++```python
++{best_code}
++```
++
++Cross-check report (raw output from running every candidate on the generated and fixed tests; the failing inputs show the expected behaviour via the checker messages or the other candidates' outputs):
++```
++{report}
++```
++
++Steps:
++1. Read the failing inputs and outputs carefully and find the misreading or bug. If a checker message is given, use it to see exactly which property is violated. Check whether the failing inputs are valid under the constraints of the statement; if not, fix your generator, not the solution.
++2. Reproduce the failing case by hand or with a small script under {self.work_dir}/scratch_refine_{round_idx}/.
++3. Write the corrected complete solution to {out} using the editor tool (create). Run it on the samples and on the failing inputs. Keep it fast enough for the constraints.
++Do not write to {self.git_tempdir}/solution.py. End with a short summary of the bug and the fix."""
++
++    def _perf_prompt(self, best_path, elapsed, ops_text, round_idx):
++        try:
++            with open(best_path) as f:
++                best_code = f.read()
++        except OSError:
++            best_code = '(unreadable)'
++        out = os.path.join(self._cands_dir(), f'perf_{round_idx}.py')
++        return f"""Performance check for the solution below. It is correct on the tests but may be too slow at maximum size.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Current solution ({best_path}):
++```python
++{best_code}
++```
++Measured time on the max-size input {self._tests_path('max_gen.py')}: {elapsed:.2f} s. Estimated worst-case operation count from the tester: {ops_text or 'unknown'}.
++
++If the solution is too slow (more than about 1 s at max size, or more than about 3e7 operations), design a faster algorithm. Keep the current solution as the reference: stress-test the new one against it with the stress_test tool (exact mode, brute_path = the current solution). Write the faster version to {out} using the editor tool. Do not write to {self.git_tempdir}/solution.py. If the current solution is already fast enough, just write the same code to {out} and say so. End with a short summary."""
++
++    def _candidate_files(self):
++        d = self._cands_dir()
++        try:
++            names = sorted(n for n in os.listdir(d) if n.endswith('.py'))
++        except OSError:
++            return []
++        return [os.path.join(d, n) for n in names]
++
++    def _fixed_inputs_from_dir(self, dir_path, max_files=300, max_chars=200000):
++        fixed, total = [], 0
++        if not os.path.isdir(dir_path):
++            return fixed
++        for name in sorted(os.listdir(dir_path))[:max_files]:
++            p = os.path.join(dir_path, name)
++            if not os.path.isfile(p):
++                continue
++            with open(p) as f:
++                text = f.read()
++            total += len(text)
++            if total > max_chars:
++                break
++            fixed.append(text)
++        return fixed
++
++    def _cross_check(self):
++        """
++        Run cross_check over all candidate files. Returns (best_path, summary, report).
++        summary is the parsed CROSS_CHECK_JSON dict (or None). best_path is None if no candidate exists.
++        Pick: most passes, ties broken by smaller total time. The chosen file is copied to solution.py.
++        """
++        cands = self._candidate_files()
++        if not cands:
++            return None, None, 'no candidate files found'
++        gen = self._tests_path('gen.py')
++        checker = self._tests_path('checker.py')
++        if not os.path.isfile(gen):
++            # Without a generator we cannot score; keep the first candidate that compiles.
++            for p in cands:
++                if subprocess.run([sys.executable, '-m', 'py_compile', p], capture_output=True).returncode == 0:
++                    return p, None, 'no generator; picked first compiling candidate'
++            return None, None, 'no generator and no compiling candidate'
++        fixed = self._fixed_inputs_from_dir(self._tests_path('exhaustive'))
++        report = cross_check_tool.tool_function(
++            solution_paths=cands,
++            generator_path=gen,
++            num_tests=60,
++            checker_path=checker if os.path.isfile(checker) else None,
++            fixed_inputs=fixed,
++            timeout=5,
++        )
++        summary = None
++        for line in reversed(report.splitlines()):
++            if line.startswith('CROSS_CHECK_JSON '):
++                try:
++                    summary = json.loads(line[len('CROSS_CHECK_JSON '):])
++                except ValueError:
++                    summary = None
++                break
++        if not summary or not summary.get('candidates'):
++            return None, summary, report
++        ranked = sorted(
++            summary['candidates'].items(),
++            key=lambda kv: (-kv[1]['passes'], kv[1]['total_time']),
++        )
++        best_name, best_info = ranked[0]
++        best_path = best_info['path']
++        shutil.copyfile(best_path, os.path.join(self.git_tempdir, 'solution.py'))
++        return best_path, best_info, report
++
++    def _run_max_test(self, sol_path):
++        """Time solution.py on the max-size generator. Returns (seconds or None, ok)."""
++        mg = self._tests_path('max_gen.py')
++        if not os.path.isfile(mg):
++            return None, False
++        try:
++            gen = subprocess.run([sys.executable, '-I', mg], capture_output=True, text=True, timeout=20)
++            if gen.returncode != 0:
++                return None, False
++            t0 = time.time()
++            run = subprocess.run([sys.executable, '-I', sol_path], input=gen.stdout, capture_output=True,
++                                 text=True, timeout=20, env={'PATH': os.environ.get('PATH', '')})
++            elapsed = time.time() - t0
++            return elapsed, run.returncode == 0
++        except subprocess.TimeoutExpired:
++            return 20.0, False
++
++    def _ops_value(self):
++        try:
++            with open(self._tests_path('ops.txt')) as f:
++                return float(f.read().split()[0])
++        except (OSError, ValueError, IndexError):
++            return None
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++
++        Phase A: 3 fresh-context candidates (different strategy hints).
++        Phase B: 1 fresh-context independent tester (statement only): checker, generator, exhaustive, max-size.
++        Phase C: cross-check all candidates; copy the best (most passes, ties by speed) to solution.py.
++        Phase D: up to 2 reflection rounds with a fresh context when the best still fails.
++        Phase E: performance check, only when the operation estimate or max-size time is large.
++        Fallbacks: recovery prompts and the skeleton, as before.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -149,32 +359,68 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer. Your very first reply MUST be a tool call (editor create on solution.py) containing a simple baseline solution; do not write long analysis before it.
+-1. BEFORE doing any exploration, write a simple correct solution (even a slow brute force that reads the input format and prints answers) to solution.py in the repo directory using the editor tool. Do not leave solution.py as the placeholder at any point. Then refine it step by step, always keeping solution.py the best runnable version. Experiments and scratch scripts go in a separate directory, never as a replacement for editing solution.py.
+-2. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that. Before writing any baseline, write down the worst-case operation count from the constraints. If the baseline is above 3e7 operations, it is only a reference for stress tests, and you must keep working on a faster algorithm. Never end your turn with only a baseline or an empty message.
+-3. Decide whether multiple outputs can be valid (look for phrases like "any", "one of", "multiple solutions", "arbitrary", "in any order"). If so, assume the grader compares the output as exact text with a single reference output. Write a brute force that lists all valid answers for each sample and determine which tie-break rule reproduces ALL sample outputs (try: lexicographically smallest, smallest indices first, first found in natural order). Implement exactly that rule in solution.py, even if it requires extra work, as long as complexity stays within limits. Never stop at a merely valid answer.
+-4. Write the solution in solution.py with the editor tool.
+-5. Run it on every sample in the statement and compare with the expected outputs exactly (exact string equality, not just validity). For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-6. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. If the answer is not unique, the brute force must output the canonical answer chosen in step 3, and the comparison must be exact string equality, not a validity check. The `stress_test` tool does this: it takes solution_path, brute_path, a generator script that takes a seed argument and prints one input, and num_tests. Fix every mismatch.
+-7. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-8. Keep iterating until all checks pass.
+-9. Before finishing, run the final solution through the run_clean tool on all samples AND on a max-size input (run_clean runs it in a clean isolated subprocess like the grader does), and compare each output to the sample's exact expected output. Read all stderr carefully and fix any crash or traceback it shows.
+-10. Avoid environment-fragile constructs: do not use 3-argument pow (e.g. pow(a, MOD-2, MOD)); write a small hand-written modular power helper `def mpow(b, e, m)` with a loop instead. Avoid threading and recursion-limit tricks; prefer iterative code.
+-11. Do a last re-read of solution.py for edge cases such as N=1, empty input, and the smallest/largest constraints.
+-12. Performance verification: generate a max-size input (every size parameter at its upper constraint, with adversarial variety) and run it through the benchmark tool. The final solution must run in about 2 seconds or less at max size. If it does not, design a faster algorithm, keep the old solution as the brute-force reference, stress-test the new one against it, and overwrite solution.py.
+-The final solution.py is what gets graded; helper files are ignored.
+-
+-Keep each reply short: one tool call at a time and brief reasoning; put long derivations into scratch files so replies are not truncated by the output limit."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # Empty final reply: re-prompt within the same conversation.
+-        if not self._last_assistant_text(init_edit).strip():
+-            init_edit = chat_with_agent(
+-                "Continue: you have not yet verified performance. Finish the remaining steps (max-size benchmark, stress test, faster algorithm if needed) and end with a short summary.",
+-                model=self.code_model, msg_history=init_edit, logging=safe_log)
+-
+-        # Safety net: bounded fresh-context recovery attempts, escalating in scope.
++        method = """Work like a careful competitive programmer.
++1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that. Before writing any baseline, write down the worst-case operation count from the constraints. If the baseline is above 3e7 operations, it is only a reference for stress tests; keep working on a faster algorithm.
++2. Decide whether multiple outputs can be valid (look for phrases like "any", "one of", "multiple solutions", "arbitrary", "in any order").
++   - If the statement says any valid answer is accepted: write a checker that validates the properties the statement requires, and validate your solution with it (do not compare text). Optionally, check whether a cheap canonical rule (for example lexicographically smallest, smallest indices first, or first found in natural order) reproduces ALL sample outputs; if one does, use that rule so the output matches the samples exactly. Do not block on this: if no cheap rule matches the samples, keep the valid answer and state the residual risk of a text mismatch in your final message.
++   - If the answer is unique, the output must match the expected text exactly.
++3. Write a brute force that is obviously correct for small inputs, and run your solution against it with the stress_test tool (use checker_path instead of brute_path when a checker is used). Use structured inputs (chains, stars, all-equal, extremes, N=1) in addition to random ones, and fix every mismatch.
++4. Run the solution on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++5. Generate a maximum-size input (every size parameter at its upper constraint, with adversarial structure) and check the running time. The solution must finish well under 2 seconds.
++6. Avoid environment-fragile constructs: do not use 3-argument pow; write a helper with a loop. Avoid threading and recursion-limit tricks; prefer iterative code. Do not use `while True` loops.
++7. Re-read the solution for edge cases such as N=1, empty input, and the smallest and largest constraints.
++Finish with a short final message: the approach, its complexity, the tests you ran, and any residual risk."""
++        self._ensure_work_dirs()
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++
++        # Phase A: three independent candidates, each with a fresh context.
++        hints = [
++            "use the optimal algorithm that fits the constraints (the efficient intended approach).",
++            "start from the simplest correct brute force (or a direct simulation) that is clearly right, then speed it up only if needed.",
++            "use an alternative formulation or decomposition of the problem (e.g. a different invariant, reversal, or counting argument) and verify it against the samples.",
++        ]
++        for i in range(3):
++            hist = chat_with_agent(self._candidate_prompt(task, method, i, hints[i]),
++                                   model=self.code_model, msg_history=[], logging=safe_log)
++            # Empty final reply: re-prompt within the same conversation.
++            if not self._last_assistant_text(hist).strip():
++                chat_with_agent(
++                    f"Continue: make sure {self._cands_dir()}/cand_{i}.py exists, passes all samples exactly, and end with a short summary.",
++                    model=self.code_model, msg_history=hist, logging=safe_log)
++
++        # Phase B: independent tester with a fresh context (statement only).
++        chat_with_agent(self._tester_prompt(), model=self.code_model, msg_history=[], logging=safe_log)
++
++        # Phase C: cross-check all candidates and select the best.
++        best_path, best_info, report = self._cross_check()
++        self._last_report = report
++
++        # Phase D: reflection rounds, bounded.
++        for r in range(2):
++            if best_path is None or best_info is None:
++                break
++            if best_info['fails'] == 0 and best_info['passes'] > 0:
++                break
++            chat_with_agent(self._refine_prompt(best_path, report, r),
++                            model=self.code_model, msg_history=[], logging=safe_log)
++            best_path, best_info, report = self._cross_check()
++
++        # Phase E: performance check, only when the estimate or the max-size run is large.
++        if best_path is not None and os.path.isfile(sol_path):
++            elapsed, ok = self._run_max_test(sol_path)
++            ops = self._ops_value()
++            slow = (elapsed is not None and elapsed > 1.0) or (ops is not None and ops > 3e7)
++            for r in range(2):
++                if not slow:
++                    break
++                ops_text = f"{ops:.3g}" if ops is not None else None
++                chat_with_agent(self._perf_prompt(sol_path, elapsed or 0.0, ops_text, r),
++                                model=self.code_model, msg_history=[], logging=safe_log)
++                best_path, best_info, report = self._cross_check()
++                elapsed, ok = self._run_max_test(sol_path)
++                slow = elapsed is not None and elapsed > 1.0
++
++        # Recovery when no usable solution exists (unchanged behaviour).
+         recovery_prompts = [
+             f"""Write a best-effort complete solution for the problem below. The first and only immediate action must be a single editor `create` call writing the full solution to solution.py in {self.git_tempdir}. Do not write any analysis before that call.
+ 
+@@ -197,17 +443,7 @@ Keep each reply short: one tool call at a time and brief reasoning; put long der
+                 break
+             chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Performance verification loop: bounded to 3 continuation rounds.
+-        bench_history = init_edit
+-        for _ in range(3):
+-            reply_text = self._last_assistant_text(bench_history)
+-            if 'BENCH_OK' in reply_text:
+-                break
+-            bench_history = chat_with_agent(self._bench_prompt(), model=self.code_model,
+-                                            msg_history=bench_history, logging=safe_log)
+-
+         # Last-resort fallback so the diff is never empty.
+-        sol_path = os.path.join(self.git_tempdir, 'solution.py')
+         if self._is_placeholder():
+             skeleton = (
+                 "import sys\n\n\n"
+@@ -220,16 +456,6 @@ Keep each reply short: one tool call at a time and brief reasoning; put long der
+             with open(sol_path, 'w') as f:
+                 f.write(skeleton)
+ 
+-    def _bench_prompt(self):
+-        return f"""Performance check for the solution in {self.git_tempdir}/solution.py.
+-
+-1. Compute the worst-case operation count from the constraints of the problem below (write the formula and the number).
+-2. Generate a max-size input (every size parameter at its upper constraint, with adversarial variety such as worst-case structure, duplicates, extreme values) and run solution.py on it with the benchmark tool (use generator_path with a seed, or input_text).
+-3. If the elapsed time is over about 2 seconds, or the operation count is over about 3e7, design a faster algorithm. Keep the current solution as the brute-force reference (copy it to a scratch file), stress-test the new solution against it with the stress_test tool, and then overwrite solution.py with the faster one. Re-run the max-size benchmark.
+-4. Do not stop with only a baseline. Do not end with an empty message.
+-
+-When you are satisfied (solution.py is correct on the stress tests and fast enough at max size), end your reply with a final line of the form `BENCH_OK <seconds>` where <seconds> is the measured max-size time. Only write BENCH_OK when satisfied."""
+-
+     @staticmethod
+     def _last_assistant_text(msg_history):
+         """Return the text of the last assistant message in msg_history ('' if none)."""
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index add126d..e3af74e 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -7,11 +7,13 @@ import tempfile
+ def tool_info():
+     return {
+         "name": "stress_test",
+-        "description": """Compare a solution against a canonical brute force on generated inputs, using exact output equality (whitespace-normalized).
+-* `generator_path` is a Python script that takes one integer argument (the seed) and prints one test input to stdout. It is run for seeds 0..num_tests-1.
+-* `solution_path` and `brute_path` are Python programs that read stdin and write stdout. Both are run with `python3 -I` on each generated input.
+-* The brute force should print the canonical answer (the same tie-break rule as the reference), since outputs are compared for exact equality.
+-* Returns raw data only: on the first mismatch, the input, both outputs, and raw stderr / timeout info. If all tests match, returns a success message with the number of tests run.""",
++        "description": """Stress-test a solution on generated and fixed inputs. Two modes:
++* Exact mode (default, needs `brute_path`): compares the solution's stdout with the brute force's stdout using whitespace-normalized exact equality. The brute force should print the canonical answer (the same tie-break rule as the reference).
++* Checker mode (when `checker_path` is given): the checker is run as `python3 -I <checker_path> <input_file> <output_file>` and must exit 0 if the solution's output is valid for the input, non-zero otherwise (print a message to stderr). `brute_path` is not needed in this mode. Use this when several answers are valid.
++* `generator_path` is a Python script that takes one integer argument (the seed) and prints one input to stdout. It is run for seeds 0..num_tests-1.
++* `fixed_inputs` is an optional list of inputs (strings) that are always tested in addition to the generated ones. `exhaustive_inputs_dir` is an optional directory; every regular file in it is used as one input (sorted by name).
++* All solutions and brute forces are run with `python3 -I` on each input.
++* Returns raw data only: on the first failure, the input, the solution stdout/stderr/exit code/timeout flag, and the brute or checker output/stderr. If all tests pass, returns a success message with the number of tests run.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+@@ -19,13 +21,26 @@ def tool_info():
+                     "type": "string",
+                     "description": "Path to the solution Python file under test."
+                 },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to a Python script that takes a seed integer as its argument and prints one input to stdout."
++                },
+                 "brute_path": {
+                     "type": "string",
+-                    "description": "Path to the brute-force reference Python file that prints the canonical answer."
++                    "description": "Optional. Path to the brute-force reference Python file that prints the canonical answer. Required for exact mode (when checker_path is not given)."
+                 },
+-                "generator_path": {
++                "checker_path": {
+                     "type": "string",
+-                    "description": "Path to a Python script that takes a seed integer as its argument and prints one input to stdout."
++                    "description": "Optional. Path to a checker Python script run as `python3 -I checker.py <input_file> <output_file>`; exits 0 if the output is valid for the input, non-zero with a message otherwise."
++                },
++                "fixed_inputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Optional. List of fixed input texts that are always tested in addition to the generated inputs."
++                },
++                "exhaustive_inputs_dir": {
++                    "type": "string",
++                    "description": "Optional. Directory whose regular files are each used as one fixed input (sorted by file name)."
+                 },
+                 "num_tests": {
+                     "type": "integer",
+@@ -36,7 +51,7 @@ def tool_info():
+                     "description": "Per-run time limit in seconds. Default 10."
+                 }
+             },
+-            "required": ["solution_path", "brute_path", "generator_path"]
++            "required": ["solution_path", "generator_path"]
+         }
+     }
+ 
+@@ -59,21 +74,82 @@ def _norm(s):
+     return " ".join(s.split())
+ 
+ 
+-def tool_function(solution_path, brute_path, generator_path, num_tests=200, timeout=10):
+-    num_tests = int(num_tests)
+-    timeout = int(timeout)
++def _check_output(checker_path, inp, out, timeout):
++    """Run checker on (input, output) via temp files. Returns (ok, stdout, stderr, rc, timed_out)."""
++    with tempfile.TemporaryDirectory() as td:
++        in_f = os.path.join(td, "input.txt")
++        out_f = os.path.join(td, "output.txt")
++        with open(in_f, "w") as f:
++            f.write(inp)
++        with open(out_f, "w") as f:
++            f.write(out)
++        try:
++            p = subprocess.run(
++                [sys.executable, "-I", checker_path, in_f, out_f],
++                capture_output=True, text=True, timeout=timeout,
++                env={"PATH": os.environ.get("PATH", "")},
++            )
++            return p.returncode == 0, p.stdout, p.stderr, p.returncode, False
++        except subprocess.TimeoutExpired as e:
++            out_s = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
++            err_s = e.stderr if isinstance(e.stderr, str) else (e.stderr or b"").decode(errors="replace")
++            return False, out_s, err_s, None, True
++
++
++def _collect_inputs(generator_path, num_tests, timeout, fixed_inputs, exhaustive_inputs_dir):
++    """Yield (label, input_text) pairs. Returns (items, error_message)."""
++    items = []
+     for i in range(num_tests):
+         gen_out, gen_err, gen_rc, gen_to = _run_py(generator_path, "", timeout, args=(str(i),))
+         if gen_to or gen_rc != 0:
+-            return f"Generator failed for seed {i}: timeout={gen_to}, exit code={gen_rc}\nstderr:\n{gen_err}"
+-        inp = gen_out
+-        b_out, b_err, b_rc, b_to = _run_py(brute_path, inp, timeout)
++            return None, f"Generator failed for seed {i}: timeout={gen_to}, exit code={gen_rc}\nstderr:\n{gen_err}"
++        items.append((f"seed {i}", gen_out))
++    for j, text in enumerate(fixed_inputs or []):
++        items.append((f"fixed input #{j}", str(text)))
++    if exhaustive_inputs_dir:
++        if not os.path.isdir(exhaustive_inputs_dir):
++            return None, f"exhaustive_inputs_dir not found: {exhaustive_inputs_dir}"
++        for name in sorted(os.listdir(exhaustive_inputs_dir)):
++            path = os.path.join(exhaustive_inputs_dir, name)
++            if os.path.isfile(path):
++                with open(path) as f:
++                    items.append((f"exhaustive file {name}", f.read()))
++    return items, None
++
++
++def tool_function(solution_path, generator_path, brute_path=None, checker_path=None,
++                  fixed_inputs=None, exhaustive_inputs_dir=None, num_tests=200, timeout=10):
++    num_tests = int(num_tests)
++    timeout = int(timeout)
++    if checker_path is None and brute_path is None:
++        return "Error: provide brute_path (exact mode) or checker_path (checker mode)."
++    items, err = _collect_inputs(generator_path, num_tests, timeout, fixed_inputs, exhaustive_inputs_dir)
++    if err is not None:
++        return err
++    total = len(items)
++    for label, inp in items:
+         s_out, s_err, s_rc, s_to = _run_py(solution_path, inp, timeout)
+-        if b_to or b_rc != 0 or s_to or s_rc != 0 or _norm(s_out) != _norm(b_out):
+-            return (
+-                f"Mismatch at seed {i} (of {num_tests}).\n"
+-                f"INPUT:\n{inp}\n"
+-                f"BRUTE stdout:\n{b_out}\nBRUTE stderr:\n{b_err}\nBRUTE exit code: {b_rc}, timed out: {b_to}\n"
+-                f"SOLUTION stdout:\n{s_out}\nSOLUTION stderr:\n{s_err}\nSOLUTION exit code: {s_rc}, timed out: {s_to}\n"
+-            )
+-    return f"All {num_tests} tests passed (exact match after whitespace normalization)."
++        if checker_path is not None:
++            if s_to or s_rc != 0:
++                return (
++                    f"Solution failed on {label} (of {total} inputs): timed out={s_to}, exit code={s_rc}.\n"
++                    f"INPUT:\n{inp}\nSOLUTION stdout:\n{s_out}\nSOLUTION stderr:\n{s_err}\n"
++                )
++            ok, c_out, c_err, c_rc, c_to = _check_output(checker_path, inp, s_out, timeout)
++            if not ok:
++                return (
++                    f"Checker rejected output on {label} (of {total} inputs): checker exit code={c_rc}, timed out={c_to}.\n"
++                    f"INPUT:\n{inp}\nSOLUTION stdout:\n{s_out}\nSOLUTION stderr:\n{s_err}\n"
++                    f"CHECKER stdout:\n{c_out}\nCHECKER stderr:\n{c_err}\n"
++                )
++        else:
++            b_out, b_err, b_rc, b_to = _run_py(brute_path, inp, timeout)
++            if b_to or b_rc != 0 or s_to or s_rc != 0 or _norm(s_out) != _norm(b_out):
++                return (
++                    f"Mismatch on {label} (of {total} inputs).\n"
++                    f"INPUT:\n{inp}\n"
++                    f"BRUTE stdout:\n{b_out}\nBRUTE stderr:\n{b_err}\nBRUTE exit code: {b_rc}, timed out: {b_to}\n"
++                    f"SOLUTION stdout:\n{s_out}\nSOLUTION stderr:\n{s_err}\nSOLUTION exit code: {s_rc}, timed out: {s_to}\n"
++                )
++    mode = "checker-validated" if checker_path is not None else "exact match after whitespace normalization"
++    return f"All {total} tests passed ({mode})."
+diff --git a/tools/cross_check.py b/tools/cross_check.py
+new file mode 100644
+index 0000000..8d74729
+--- /dev/null
++++ b/tools/cross_check.py
+@@ -0,0 +1,222 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import time
++
++MAX_CLIP = 1500
++MAX_SHOWN_FAILURES = 3
++
++
++def tool_info():
++    return {
++        "name": "cross_check",
++        "description": """Cross-check several candidate solutions on the same generated and fixed inputs. Returns raw data only.
++* `solution_paths`: list of candidate Python files. Each is run as `python3 -I <file>` with the input on stdin, for every input.
++* `generator_path`: Python script run as `python3 -I <generator_path> <seed>`; its stdout is one input. Seeds 0..num_tests-1 are used.
++* `fixed_inputs`: optional list of input texts that are always tested too (e.g. the samples and hand-made edge cases).
++* `checker_path`: optional checker run as `python3 -I <checker_path> <input_file> <output_file>`; exit 0 means the output is valid. If given, pass/fail is decided by the checker (valid output). If not given, pass means: exit code 0, no timeout, and the output agrees with the output group that most candidates produced for that input (exact mode, whitespace-normalized).
++* Returns a per-candidate table: passes, fails, total time, max time, and exit codes; the output-equality groups per input (exact mode); the first few failing cases with each candidate's raw stdout, stderr, and exit code; and a final line `CROSS_CHECK_JSON {...}` with per-candidate pass counts and total times, so the best candidate can be chosen (most passes, ties broken by smaller total time).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_paths": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of candidate Python solution file paths to cross-check."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to a Python generator script that takes a seed integer argument and prints one input to stdout."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of generated inputs (seeds 0..num_tests-1). Default 50."
++                },
++                "checker_path": {
++                    "type": "string",
++                    "description": "Optional. Path to a checker script run as `python3 -I checker.py <input_file> <output_file>`; exit 0 if the output is valid for the input, non-zero otherwise."
++                },
++                "fixed_inputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Optional. List of fixed input texts tested in addition to the generated ones."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-run time limit in seconds for each candidate, generator and checker. Default 5."
++                }
++            },
++            "required": ["solution_paths", "generator_path"]
++        }
++    }
++
++
++def _env():
++    return {"PATH": os.environ.get("PATH", "")}
++
++
++def _text(x):
++    if x is None:
++        return ""
++    if isinstance(x, bytes):
++        return x.decode(errors="replace")
++    return x
++
++
++def _clip(s, n=MAX_CLIP):
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n...[clipped {len(s) - n} chars]...\n" + s[-n // 2:]
++
++
++def _run(cmd, data, timeout):
++    """Returns (stdout, stderr, returncode, timed_out, elapsed)."""
++    t0 = time.time()
++    try:
++        p = subprocess.run(cmd, input=data, capture_output=True, text=True,
++                           timeout=timeout, env=_env())
++        return p.stdout, p.stderr, p.returncode, False, time.time() - t0
++    except subprocess.TimeoutExpired as e:
++        return _text(e.stdout), _text(e.stderr), None, True, time.time() - t0
++
++
++def _norm(s):
++    return " ".join(s.split())
++
++
++def _checker_ok(checker_path, inp, out, timeout):
++    with tempfile.TemporaryDirectory() as td:
++        in_f = os.path.join(td, "input.txt")
++        out_f = os.path.join(td, "output.txt")
++        with open(in_f, "w") as f:
++            f.write(inp)
++        with open(out_f, "w") as f:
++            f.write(out)
++        so, se, rc, to, _ = _run([sys.executable, "-I", checker_path, in_f, out_f], None, timeout)
++        return rc == 0, so, se, rc, to
++
++
++def tool_function(solution_paths, generator_path, num_tests=50, checker_path=None,
++                  fixed_inputs=None, timeout=5):
++    num_tests = int(num_tests)
++    timeout = int(timeout)
++    if isinstance(solution_paths, str):
++        solution_paths = [solution_paths]
++    solution_paths = list(solution_paths or [])
++    if not solution_paths:
++        return "Error: solution_paths is empty."
++    for p in solution_paths:
++        if not os.path.isfile(p):
++            return f"Error: solution file not found: {p}"
++
++    inputs = []
++    for i in range(num_tests):
++        so, se, rc, to, _ = _run([sys.executable, "-I", generator_path, str(i)], None, timeout)
++        if to or rc != 0:
++            return f"Generator failed for seed {i}: timeout={to}, exit code={rc}\nstderr:\n{se}"
++        inputs.append((f"seed {i}", so))
++    for j, text in enumerate(fixed_inputs or []):
++        inputs.append((f"fixed input #{j}", str(text)))
++
++    n = len(solution_paths)
++    names = [os.path.basename(p) for p in solution_paths]
++    passes = [0] * n
++    fails = [0] * n
++    total_time = [0.0] * n
++    max_time = [0.0] * n
++    failures = []          # raw records for the first few failing cases
++    group_lines = []       # exact-mode output groups per input (only groups with >1 candidate or all)
++    mode = "checker" if checker_path else "exact"
++
++    for label, inp in inputs:
++        results = []
++        for k, path in enumerate(solution_paths):
++            so, se, rc, to, el = _run([sys.executable, "-I", path], inp, timeout)
++            total_time[k] += el
++            max_time[k] = max(max_time[k], el)
++            results.append({"out": so, "err": se, "rc": rc, "to": to, "el": el})
++
++        if checker_path is None:
++            # Majority output group among clean runs (exact mode reference).
++            groups = {}
++            for k, r in enumerate(results):
++                if r["rc"] == 0 and not r["to"]:
++                    groups.setdefault(_norm(r["out"]), []).append(k)
++            ref = None
++            if groups:
++                ref = max(groups.items(), key=lambda kv: (len(kv[1]), -min(kv[1])))[0]
++            oks = [r["rc"] == 0 and not r["to"] and ref is not None and _norm(r["out"]) == ref for r in results]
++            if groups:
++                desc = "; ".join(
++                    f"[{', '.join(names[k] for k in ks)}] -> {len(_norm(o))} chars"
++                    for o, ks in groups.items()
++                )
++                group_lines.append(f"{label}: {len(groups)} output group(s): {desc}")
++            else:
++                group_lines.append(f"{label}: no candidate ran cleanly")
++        else:
++            oks = []
++            for r in results:
++                if r["rc"] != 0 or r["to"]:
++                    oks.append(False)
++                    r["check"] = None
++                    continue
++                ok, co, ce, crc, cto = _checker_ok(checker_path, inp, r["out"], timeout)
++                r["check"] = {"out": co, "err": ce, "rc": crc, "to": cto}
++                oks.append(ok)
++
++        for k, ok in enumerate(oks):
++            if ok:
++                passes[k] += 1
++            else:
++                fails[k] += 1
++        if not all(oks) and len(failures) < MAX_SHOWN_FAILURES:
++            failures.append((label, inp, results, oks))
++
++    lines = []
++    lines.append(f"Cross-check: {len(inputs)} inputs ({num_tests} generated, {len(fixed_inputs or [])} fixed), mode={mode}, timeout={timeout}s")
++    lines.append("")
++    lines.append(f"{'candidate':<24}{'passes':>8}{'fails':>8}{'total_s':>10}{'max_s':>10}")
++    for k in range(n):
++        lines.append(f"{names[k]:<24}{passes[k]:>8}{fails[k]:>8}{total_time[k]:>10.3f}{max_time[k]:>10.3f}")
++    lines.append("")
++
++    if mode == "exact":
++        lines.append("Output-equality groups per input (exact mode, whitespace-normalized):")
++        lines.extend(group_lines[:50])
++        if len(group_lines) > 50:
++            lines.append(f"...({len(group_lines) - 50} more inputs)")
++        lines.append("")
++
++    if failures:
++        lines.append(f"First {len(failures)} failing input(s):")
++        for label, inp, results, oks in failures:
++            lines.append(f"=== {label} ===")
++            lines.append("INPUT:")
++            lines.append(_clip(inp, 800))
++            for k, r in enumerate(results):
++                status = "PASS" if oks[k] else "FAIL"
++                lines.append(f"--- {names[k]}: {status}, exit code={r['rc']}, timed out={r['to']}, time={r['el']:.3f}s")
++                lines.append("stdout:")
++                lines.append(_clip(r["out"]))
++                lines.append("stderr:")
++                lines.append(_clip(r["err"]))
++                if r.get("check") is not None:
++                    lines.append(f"checker exit code={r['check']['rc']}, timed out={r['check']['to']}")
++                    lines.append("checker stdout:")
++                    lines.append(_clip(r["check"]["out"]))
++                    lines.append("checker stderr:")
++                    lines.append(_clip(r["check"]["err"]))
++            lines.append("")
++    else:
++        lines.append("No failing inputs.")
++
++    summary = {
++        "candidates": {names[k]: {"path": solution_paths[k], "passes": passes[k], "fails": fails[k],
++                                  "total_time": round(total_time[k], 3)} for k in range(n)},
++        "num_inputs": len(inputs),
++    }
++    lines.append("CROSS_CHECK_JSON " + json.dumps(summary, sort_keys=True))
++    return "\n".join(lines)

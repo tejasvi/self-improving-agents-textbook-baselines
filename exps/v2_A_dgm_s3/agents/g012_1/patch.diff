@@ -1,0 +1,289 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index c1cbdd9..3d61dc4 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,6 @@
+ import argparse
+ import subprocess
++import sys
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -95,6 +96,74 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++GIVE_UP_PHRASES = [
++    'fallback',
++    'too slow',
++    'time out',
++    'timed out',
++    'not efficient',
++    'does not meet',
++]
++
++SAMPLE_PATTERN = re.compile(
++    r'Sample Input\s*(\d*)\s*:?[ \t]*\n(.*?)\n[ \t]*Sample Output\s*\1\s*:?[ \t]*\n(.*?)(?=\n[ \t]*Sample Input|\n#{1,6} |\Z)',
++    re.DOTALL,
++)
++
++
++def _strip_fences(text):
++    """Remove markdown code fences and surrounding blank lines from a sample block."""
++    lines = [l for l in (text or '').strip('\n').split('\n') if not l.strip().startswith('```')]
++    return '\n'.join(lines).strip() + '\n'
++
++
++def parse_sample_tests(problem_statement):
++    """
++    Extract (input, expected_output) pairs from 'Sample Input N' / 'Sample Output N' blocks.
++    Returns a list of tuples; empty if none are found.
++    """
++    samples = []
++    for match in SAMPLE_PATTERN.finditer(problem_statement or ''):
++        sample_input = _strip_fences(match.group(2))
++        sample_output = _strip_fences(match.group(3))
++        if sample_input.strip() and sample_output.strip():
++            samples.append((sample_input, sample_output))
++    return samples
++
++
++def _normalize_output(text):
++    """Compare outputs ignoring trailing whitespace on each line and at the end."""
++    return [line.rstrip() for line in (text or '').strip().splitlines()]
++
++
++def _last_assistant_text(msg_history):
++    """
++    Return the text of the last assistant message in a message history.
++    Handles both string content and list-of-block content formats.
++    """
++    for msg in reversed(msg_history or []):
++        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++            continue
++        content = msg.get('content')
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            parts = []
++            for block in content:
++                if isinstance(block, str):
++                    parts.append(block)
++                elif isinstance(block, dict) and isinstance(block.get('text'), str):
++                    parts.append(block['text'])
++            return '\n'.join(parts)
++        return ''
++    return ''
++
++
++def find_give_up_phrases(text):
++    lowered = (text or '').lower()
++    return [p for p in GIVE_UP_PHRASES if p in lowered]
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -263,6 +332,7 @@ Follow this workflow step by step:
+ 1. Explore the repository: list the files and read the relevant code, tests, and any README or specification.
+ 2. Identify the primary source file that must be changed. If the task names a file (e.g. solution.py) and it does not exist, create it.
+ 3. Implement the solution by actually calling the editor tool (command=create or command=edit) on the source file. Do not only describe the code in text.
++2b. Complexity analysis (mandatory): from the constraints, state the required time complexity. If a brute force is too slow, you must still derive an efficient solution. Keep the brute force in a separate file (e.g. /tmp/brute.py) as an oracle and compare against it on at least 200 random small cases, then run a max-constraint input and make sure it runs in under 2 seconds. Never leave a brute-force fallback as the final solution.
+ 4. Test it: run the program via bash with the sample inputs from the problem statement and with your own edge cases. For interactive problems, write a small local judge/simulator and run your solution against it.
+ 5. Finally verify with `git status` and `git diff` that the source file has actually changed. Fix any problems you find.
+ 
+@@ -277,6 +347,19 @@ IMPORTANT RULES:
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
+ 
++        # Verification-and-escalation loop: check the solution on the sample tests and the
++        # agent's final message for give-up wording; escalate with feedback if it fails.
++        for round_idx in range(4):
++            if not self._has_source_patch():
++                break
++            feedback = self._verify_solution(msg_history)
++            if feedback is None:
++                safe_log(f"Verification round {round_idx + 1}/4 passed.")
++                break
++            safe_log(f"Verification round {round_idx + 1}/4 failed; escalating.")
++            msg_history = chat_with_agent(feedback, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            safe_log(f"Verification round {round_idx + 1}/4 finished. Changed files: {self._get_changed_files()}")
++
+         for attempt in range(3):
+             if self._has_source_patch():
+                 safe_log(f"Source patch detected before retry {attempt + 1}; stopping retries.")
+@@ -316,6 +399,63 @@ IMPORTANT RULES:
+             safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
+                      f"source patch: {self._has_source_patch()}")
+ 
++    def _verify_solution(self, msg_history):
++        """
++        Run the target solution on the sample tests and scan the agent's last message for
++        give-up wording. Returns None if everything passes, otherwise a feedback message.
++        """
++        problems = []
++        target = self._target_file()
++        samples = parse_sample_tests(self.problem_statement)
++        if not os.path.isfile(os.path.join(self.git_tempdir, target)):
++            problems.append(f"The primary source file `{target}` does not exist.")
++        elif samples:
++            for idx, (sample_in, sample_out) in enumerate(samples, start=1):
++                try:
++                    proc = subprocess.run(
++                        [sys.executable, target],
++                        input=sample_in, cwd=self.git_tempdir,
++                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                        text=True, timeout=10, check=False,
++                    )
++                except subprocess.TimeoutExpired:
++                    problems.append(f"Sample {idx}: TIMEOUT (exceeded 10 seconds) on input:\n{sample_in}")
++                    continue
++                except Exception as e:
++                    problems.append(f"Sample {idx}: failed to run `python {target}`: {e}")
++                    continue
++                got = _normalize_output(proc.stdout)
++                want = _normalize_output(sample_out)
++                if proc.returncode != 0:
++                    problems.append(
++                        f"Sample {idx}: runtime error (exit {proc.returncode}) on input:\n{sample_in}"
++                        f"stderr:\n{proc.stderr.strip()[-1500:]}"
++                    )
++                elif got != want:
++                    problems.append(
++                        f"Sample {idx}: WRONG ANSWER on input:\n{sample_in}"
++                        f"expected:\n{sample_out}got:\n{proc.stdout}"
++                    )
++
++        last_text = _last_assistant_text(msg_history)
++        phrases = find_give_up_phrases(last_text)
++        if phrases:
++            problems.append(
++                f"Your last message contains give-up wording ({', '.join(repr(p) for p in phrases)}), "
++                f"which suggests a brute-force or slow solution."
++            )
++
++        if not problems:
++            return None
++        details = "\n\n".join(problems)
++        return (
++            f"Verification failed:\n\n{details}\n\n"
++            f"Your solution is not acceptable. Do not give up; derive the efficient algorithm. "
++            f"Use the brute force to print small tables, find the pattern or formula, and validate it with a "
++            f"randomized comparison against the brute force. Then fix `{target}`, run it on the samples and on a "
++            f"max-size input to check timing, and finish with a summary."
++        )
++
+     def _last_resort_write(self):
+         """
+         Tool-free fallback: ask the LLM for the complete target file in a fenced code block,
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..4936e2e
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,105 @@
++import os
++import subprocess
++import sys
++import time
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Stress-test a candidate program against a reference (brute-force) program.
++
++* A generator script is run with the case index as its single argument (e.g. `python gen.py 17`) and must print one random test input to stdout.
++* The reference and candidate programs are each run on that input (stdin -> stdout) with a timeout.
++* Outputs are compared after stripping trailing whitespace per line.
++* Returns 'PASS' with the number of cases if all cases match, otherwise the first mismatching input with both outputs (or the error/timeout).
++* Use small inputs for the reference; use this tool to validate an efficient solution against a brute-force oracle.
++* Paths are relative to the working directory or absolute.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "reference_path": {
++                    "type": "string",
++                    "description": "Path to the reference (brute-force) program, e.g. /tmp/brute.py."
++                },
++                "candidate_path": {
++                    "type": "string",
++                    "description": "Path to the candidate (efficient) program, e.g. solution.py."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to a generator script that takes an integer case index as argv[1] and prints one test input to stdout."
++                },
++                "n_cases": {
++                    "type": "integer",
++                    "description": "Number of random cases to run (e.g. 200)."
++                },
++                "timeout": {
++                    "type": "number",
++                    "description": "Per-run timeout in seconds for each program invocation (e.g. 10)."
++                }
++            },
++            "required": ["reference_path", "candidate_path", "generator_path", "n_cases", "timeout"]
++        }
++    }
++
++
++def _run(path, stdin_text, timeout):
++    """Run a python script; return (status, stdout, stderr) with status in ok/timeout/error."""
++    try:
++        proc = subprocess.run(
++            [sys.executable, path],
++            input=stdin_text, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++            text=True, timeout=timeout, check=False,
++        )
++    except subprocess.TimeoutExpired:
++        return "timeout", "", ""
++    if proc.returncode != 0:
++        return "error", proc.stdout, proc.stderr
++    return "ok", proc.stdout, proc.stderr
++
++
++def _normalize(text):
++    return [line.rstrip() for line in (text or "").strip().splitlines()]
++
++
++def tool_function(reference_path, candidate_path, generator_path, n_cases, timeout):
++    try:
++        n_cases = int(n_cases)
++        timeout = float(timeout)
++    except (TypeError, ValueError):
++        return "Error: n_cases must be an integer and timeout a number."
++    for label, path in [("reference", reference_path), ("candidate", candidate_path), ("generator", generator_path)]:
++        if not os.path.isfile(path):
++            return f"Error: {label} file not found: {path}"
++    if n_cases <= 0:
++        return "Error: n_cases must be positive."
++
++    for case_idx in range(n_cases):
++        try:
++            gen = subprocess.run(
++                [sys.executable, generator_path, str(case_idx)],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                text=True, timeout=timeout, check=False,
++            )
++        except subprocess.TimeoutExpired:
++            return f"Error: generator timed out on case {case_idx}."
++        if gen.returncode != 0:
++            return f"Error: generator failed on case {case_idx}:\n{gen.stderr.strip()[-1500:]}"
++        test_input = gen.stdout
++
++        ref_status, ref_out, ref_err = _run(reference_path, test_input, timeout)
++        if ref_status != "ok":
++            return (f"Reference {ref_status} on case {case_idx}. Input:\n{test_input}"
++                    f"stderr:\n{ref_err.strip()[-1500:]}")
++
++        cand_status, cand_out, cand_err = _run(candidate_path, test_input, timeout)
++        if cand_status == "timeout":
++            return f"MISMATCH (candidate timeout after {timeout}s) on case {case_idx}. Input:\n{test_input}"
++        if cand_status == "error":
++            return (f"MISMATCH (candidate runtime error) on case {case_idx}. Input:\n{test_input}"
++                    f"stderr:\n{cand_err.strip()[-1500:]}")
++        if _normalize(ref_out) != _normalize(cand_out):
++            return (f"MISMATCH on case {case_idx}.\nInput:\n{test_input}"
++                    f"Reference output:\n{ref_out}\nCandidate output:\n{cand_out}")
++
++    return f"PASS: all {n_cases} cases matched."

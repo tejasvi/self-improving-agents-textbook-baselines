@@ -1,0 +1,281 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7930b83..f702ddd 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -115,6 +115,8 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        # Set by _run_scaling_check: True while the last scaling check reports failure (incomplete).
++        self._scaling_failed = False
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -328,12 +330,22 @@ IMPORTANT RULES:
+ - Modifying only test files does not solve the task; the primary source file must be changed.
+ """
+         target = self._target_file()
++        target_path = os.path.join(self.git_tempdir, target)
+         snapshot = self._snapshot_repo()
++        design_phase = f"""
++DESIGN-FIRST WORKFLOW (follow in this order):
++A. Design step (before any solution code). Write a short design note to /tmp/design/notes.md (create the directory with bash `mkdir -p /tmp/design`; this path is OUTSIDE the repository). It must contain:
++   - Constraints: the maximum values of every input size/value parameter from the problem statement.
++   - Required time complexity: the largest number of basic operations that fits in about 1e8 for those maxima (e.g. N*M = 1e12 is infeasible; N log N or N*sqrt(N) may be needed).
++   - Planned algorithm: the approach, the key observation, and why it runs within the required complexity. Do NOT plan a brute-force or O(N*M) approach when the maxima make it infeasible; find the algorithm the constraints call for.
++   - Verification plan: which samples, edge cases, brute force and max-size tests you will run.
++   Keep the note short (under about 60 lines). Reason through the derivation in visible text if needed.
++B. Implementation step. Only after the design note is written, implement the algorithm in {target_path} using the editor tool (command=create or command=edit). If the design note cannot be finished, still write a quick, correct-on-small-inputs stub into {target_path} so that the patch is never empty, and then refine it.
++"""
+         instruction = (
+-            f"{task}\n{workflow}\n"
++            f"{task}\n{workflow}\n{design_phase}\n"
+             f"Current repository contents:\n{snapshot}\n\n"
+-            f"Your first action must be an editor create/edit on {os.path.join(self.git_tempdir, target)} "
+-            f"(the primary source file) that implements the solution."
++            f"After the design note, implement the solution in {target_path} (the primary source file)."
+         )
+         msg_history = []
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+@@ -347,6 +359,7 @@ IMPORTANT RULES:
+             safe_log("No source patch after initial attempt; escalating with a compact prompt.")
+             msg_history = self._attempt_with_models(self._compact_prompt(), msg_history)
+ 
++        msg_history = self._run_scaling_check(msg_history)
+         self._run_verification(msg_history)
+ 
+         if not self._has_source_patch():
+@@ -431,6 +444,54 @@ IMPORTANT RULES:
+             return ""
+         return ""
+ 
++    def _scaling_check_prompt(self, round_idx, max_rounds):
++        """Prompt for one scaling-check round; round 0 builds inputs and tests, later rounds redesign."""
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        if round_idx == 0:
++            return f"""Scaling check (mandatory, before verification). Keep reasoning brief; measure first.
++
++1. Re-read the constraints in the problem statement. Write the maximum value of every size/value parameter. If the naive algorithm you implemented costs more than about 1e8 basic operations at those maxima, it is too slow.
++2. Create /tmp/stress/gen_scale.py that prints ONE max-constraint input and supports the mode argument: `max` (every size at its maximum), `skewed` (one dimension at its maximum and the others tiny), and `equal` (all values equal, maximum sizes). Use `sys.argv[-1]` for the mode.
++3. Use the `scale_test` tool with solution_cmd="python3 {target_path}", time_limit=2, and inputs = ["$ python3 /tmp/stress/gen_scale.py max", "$ python3 /tmp/stress/gen_scale.py skewed", "$ python3 /tmp/stress/gen_scale.py equal"] (add more if relevant).
++4. If every input finishes well within the time limit, reply with the sentence "SCALING CHECK PASSED" and a one-line summary of the wall times.
++5. If any input times out, reply with "SCALING CHECK FAILED" and state which input timed out and why its complexity is too high."""
++        return f"""Scaling redesign round {round_idx + 1} of {max_rounds}. The algorithm's complexity is too high for the constraints; keep the slow version at /tmp/stress/slow.py as an oracle, derive an asymptotically faster algorithm, implement it, and verify it against the oracle on small and medium inputs.
++
++1. Copy the current solution to /tmp/stress/slow.py if that file does not exist yet (`cp {target_path} /tmp/stress/slow.py`). Keep /tmp/stress/slow.py unchanged; it is the reference oracle.
++2. Write the new complexity target in /tmp/design/notes.md: the maxima, the required complexity, and the new algorithm class (for example from O(N*M) to O(N log N) with a data structure, or a monotone/convex-hull/binary-search technique).
++3. Implement the new algorithm in {target_path} with the editor tool (str_replace or create). Constant-factor tuning alone does not count as a redesign.
++4. Verify against /tmp/stress/slow.py on many small random inputs and on medium-size inputs using the `stress_test` tool (solution_cmd="python3 {target_path}", brute_cmd="python3 /tmp/stress/slow.py"). Stop only once it reports no mismatches.
++5. Re-run the `scale_test` tool on the max-size and skewed inputs. If everything now passes, reply with "SCALING CHECK PASSED" and the wall times. If any input still times out, reply with "SCALING CHECK FAILED"."""
++
++    def _run_scaling_check(self, msg_history, max_rounds=3):
++        """
++        Bounded scaling check: build max/skewed inputs and time the solution (round 0). If any input
++        times out, run up to max_rounds redesign rounds. Stops as soon as a round reports
++        "SCALING CHECK PASSED"; otherwise the patch is marked incomplete via the failure marker.
++        """
++        if not self._has_source_patch():
++            safe_log("Scaling check skipped: no source patch present.")
++            return msg_history
++        self._scaling_failed = False
++        prompt = self._scaling_check_prompt(0, max_rounds)
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        for round_idx in range(max_rounds):
++            text = self._last_message_text(msg_history)
++            if "SCALING CHECK PASSED" in text:
++                safe_log("Scaling check passed.")
++                self._scaling_failed = False
++                return msg_history
++            self._scaling_failed = True
++            safe_log(f"Scaling check failed; redesign round {round_idx + 1}/{max_rounds}.")
++            prompt = self._scaling_check_prompt(round_idx + 1, max_rounds)
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        if "SCALING CHECK PASSED" in self._last_message_text(msg_history):
++            self._scaling_failed = False
++        else:
++            self._scaling_failed = True
++            safe_log("Scaling check failed after all redesign rounds; scaling check failed.")
++        return msg_history
++
+     def _verification_prompt(self, round_idx, max_rounds):
+         """Build the mandatory stress-test verification prompt for one round."""
+         target = self._target_file()
+@@ -441,11 +502,17 @@ IMPORTANT RULES:
+                 f"This is verification round {round_idx + 1} of {max_rounds}: the previous round did not finish "
+                 f"with a clean stress test. Re-check the solution from scratch against the brute force.\n\n"
+             )
+-        return f"""{retry_note}Verification phase (mandatory). Do not finish until this is done.
++        scaling_note = ""
++        if self._scaling_failed:
++            scaling_note = (
++                "WARNING: the scaling check FAILED: the current solution times out on max-size or skewed inputs. "
++                "The task is NOT complete until the algorithm is redesigned to meet the constraints.\n\n"
++            )
++        return f"""{retry_note}{scaling_note}Verification phase (mandatory). Do not finish until this is done.
+ 
+ The solution at {target_path} passing the sample tests is NOT enough; subtle modelling errors are common. Small random tests alone also miss bugs that only appear at larger sizes, so verify at several size regimes.
+ 
+-Keep your reasoning brief; run code first and reason only about concrete failures.
++Order of work: timing and max-size checks come FIRST, then the stress test. If the solution times out on a max-size or skewed input, the algorithm must be redesigned (asymptotically faster), not just have its constants tuned. Do not finish with a solution known to be too slow.
+ 
+ 1. Create scratch files ONLY under /tmp/stress/ (never inside {self.git_tempdir}):
+    - /tmp/stress/brute.py: an EXHAUSTIVE search that follows the literal rules of the problem statement directly (e.g. enumerate all choices / all permutations / all subsets / BFS over states). Do NOT re-implement the same idea or formula as the solution; it must be an independent, obviously-correct method. Keep it fast enough for small inputs.
+@@ -479,6 +546,8 @@ When everything is done, end your reply with a short report that includes the st
+         if not self._has_source_patch():
+             safe_log("Verification skipped: no source patch present.")
+             return msg_history
++        if self._scaling_failed:
++            safe_log("Scaling check failed: patch counts as incomplete; verification still runs.")
+         for round_idx in range(max_rounds):
+             safe_log(f"Verification round {round_idx + 1}/{max_rounds} starting.")
+             prompt = self._verification_prompt(round_idx, max_rounds)
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 164fb53..d3b07b4 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -367,7 +367,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+                 base_history = new_msg_history[:-2]
+             # get_response_from_llm returns plain text, so stop_reason is not visible here. An empty
+             # text reply from the manual-tool path is most often a max_tokens cut-off, so use the
+-            # concise token-exhaustion nudge.
++            # visible-derivation nudge.
+             nudge = TOKEN_EXHAUSTED_NUDGE if not (response or '').strip() else EMPTY_NUDGES[attempt]
+             resend = f"{base_user_msg}\n\n{nudge}"
+             response, new_msg_history = get_response_from_llm(
+@@ -385,9 +385,14 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+ 
+     return new_msg_history
+ 
++# Sent when a turn ended with no visible text and no tool call (typically max_tokens spent on
++# reasoning). It asks for the derivation in visible text first, so the design step is preserved,
++# and does NOT ask for a naive or first-guess solution.
+ TOKEN_EXHAUSTED_NUDGE = (
+-    "Be concise: skip lengthy reasoning. Write a first straightforward solution with the editor tool "
+-    "right away (command=create or command=edit on the target source file), then test it afterwards."
++    "Your previous turn ended without any visible output (the token budget was used up before "
++    "you wrote anything). Write your key derivation briefly in visible text (the constraints, the "
++    "required complexity, and the algorithm that meets it), then continue with the next tool call "
++    "(for example the editor tool on the target source file)."
+ )
+ 
+ EMPTY_NUDGES = [
+@@ -556,7 +561,8 @@ def chat_with_agent_claude(
+                 gave_up = True
+                 break
+             if getattr(response, 'stop_reason', None) == 'max_tokens':
+-                # The model spent its whole budget on reasoning: ask for brevity and a direct edit.
++                # The model spent its whole budget on reasoning: ask for the derivation as visible text
++                # (no thinking parameter is sent on this path, so extended thinking is already off).
+                 nudge = TOKEN_EXHAUSTED_NUDGE
+             else:
+                 nudge = EMPTY_NUDGES[attempt]
+diff --git a/tools/scale_test.py b/tools/scale_test.py
+new file mode 100644
+index 0000000..0a0e515
+--- /dev/null
++++ b/tools/scale_test.py
+@@ -0,0 +1,104 @@
++import subprocess
++import time
++
++HEAD_CHARS = 500
++GENERATOR_PREFIX = "$ "
++
++
++def tool_info():
++    return {
++        "name": "scale_test",
++        "description": """Run a solution on several large or skewed inputs and report raw measurements.\n
++* `solution_cmd` is a shell command that reads the input on stdin and writes the answer to stdout (e.g. `python3 /tmp/stress/slow.py` or `python3 /dgm/solution.py`).\n
++* `inputs` is a list of entries. An entry starting with "$ " is a shell command whose stdout is used as the input (a generator, e.g. "$ python3 /tmp/stress/gen_max.py skewed"). Any other entry is used as the literal input text.\n
++* Each input is run with a wall-clock timeout of `time_limit` seconds.\n
++* For every input it reports the wall time in seconds, whether it timed out, the exit code, and the first characters of stdout and stderr. No pass/fail judgement is made; compare the wall times with the time limit yourself.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command that runs the solution; reads the test input on stdin and writes the answer to stdout."
++                },
++                "inputs": {
++                    "type": "array",
++                    "items": {
++                        "type": "string",
++                        "description": "Literal input text, or a shell command prefixed with '$ ' whose stdout is the input."
++                    },
++                    "description": "List of inputs to run the solution on (e.g. max-size, skewed, all-equal inputs)."
++                },
++                "time_limit": {
++                    "type": "number",
++                    "description": "Per-input wall-clock timeout in seconds for the solution run (e.g. 2)."
++                }
++            },
++            "required": ["solution_cmd", "inputs", "time_limit"]
++        }
++    }
++
++
++def _head(text):
++    text = text or ""
++    return text[:HEAD_CHARS] + ("...[truncated]" if len(text) > HEAD_CHARS else "")
++
++
++def _decode(data):
++    if data is None:
++        return ""
++    if isinstance(data, bytes):
++        return data.decode(errors="replace")
++    return data
++
++
++def tool_function(solution_cmd, inputs, time_limit):
++    try:
++        limit = float(time_limit)
++    except (TypeError, ValueError):
++        return f"Error: time_limit must be a number, got {time_limit!r}"
++    if not isinstance(inputs, list):
++        return "Error: inputs must be a list of strings"
++
++    lines = []
++    for idx, entry in enumerate(inputs):
++        entry = str(entry)
++        label = f"Input {idx + 1}"
++        # Generate the input text.
++        if entry.startswith(GENERATOR_PREFIX):
++            gen_cmd = entry[len(GENERATOR_PREFIX):]
++            try:
++                gen = subprocess.run(gen_cmd, shell=True, capture_output=True, timeout=max(limit, 10.0))
++            except subprocess.TimeoutExpired:
++                lines.append(f"{label}: generator timed out ({gen_cmd})")
++                continue
++            if gen.returncode != 0:
++                lines.append(f"{label}: generator exit={gen.returncode} stderr={_head(_decode(gen.stderr))!r}")
++                continue
++            input_text = _decode(gen.stdout)
++            label = f"{label} (generated by `{gen_cmd}`, {len(input_text)} chars)"
++        else:
++            input_text = entry
++
++        # Run the solution.
++        start = time.monotonic()
++        try:
++            proc = subprocess.run(
++                solution_cmd, shell=True, input=input_text.encode(),
++                capture_output=True, timeout=limit,
++            )
++            elapsed = time.monotonic() - start
++            lines.append(
++                f"{label}: wall_time={elapsed:.3f}s timed_out=False exit_code={proc.returncode}\n"
++                f"  stdout_head={_head(_decode(proc.stdout))!r}\n"
++                f"  stderr_head={_head(_decode(proc.stderr))!r}"
++            )
++        except subprocess.TimeoutExpired as e:
++            elapsed = time.monotonic() - start
++            lines.append(
++                f"{label}: wall_time={elapsed:.3f}s timed_out=True exit_code=None\n"
++                f"  stdout_head={_head(_decode(e.stdout))!r}\n"
++                f"  stderr_head={_head(_decode(e.stderr))!r}"
++            )
++    if not lines:
++        return "No inputs given."
++    return "\n".join(lines)

@@ -1,0 +1,195 @@
+diff --git a/llm.py b/llm.py
+index d6b4da1..9624f74 100644
+--- a/llm.py
++++ b/llm.py
+@@ -7,6 +7,13 @@ import anthropic
+ import backoff
+ import openai
+ 
++from utils.api_retry import (
++    DEFAULT_MAX_BACKOFF,
++    DEFAULT_MAX_TIME,
++    DEFAULT_MAX_TRIES,
++    give_up_on_permanent_error,
++)
++
+ MAX_OUTPUT_TOKENS = 4096
+ AVAILABLE_LLMS = [
+     # Anthropic models
+@@ -85,7 +92,14 @@ def create_client(model: str):
+         raise ValueError(f"Model {model} not supported.")
+ 
+ # Get N responses from a single message, used for ensembling.
+-@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
++@backoff.on_exception(
++    backoff.expo,
++    Exception,
++    giveup=give_up_on_permanent_error,
++    max_tries=DEFAULT_MAX_TRIES,
++    max_time=DEFAULT_MAX_TIME,
++    max_value=DEFAULT_MAX_BACKOFF,
++)
+ def get_batch_responses_from_llm(
+         msg,
+         client,
+@@ -166,8 +180,11 @@ def get_batch_responses_from_llm(
+ 
+ @backoff.on_exception(
+     backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=120,
++    Exception,
++    giveup=give_up_on_permanent_error,
++    max_tries=DEFAULT_MAX_TRIES,
++    max_time=DEFAULT_MAX_TIME,
++    max_value=DEFAULT_MAX_BACKOFF,
+ )
+ def get_response_from_llm(
+         msg,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 61f09a0..b55ed56 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -9,6 +9,12 @@ import copy
+ from llm import create_client, get_response_from_llm
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
++from utils.api_retry import (
++    DEFAULT_MAX_BACKOFF,
++    DEFAULT_MAX_TIME,
++    DEFAULT_MAX_TRIES,
++    give_up_on_permanent_error,
++)
+ from utils.common_utils import truncate_text
+ 
+ # Max characters of a single tool result kept in the context
+@@ -67,47 +73,44 @@ def truncate_old_tool_results(messages, keep_recent=KEEP_RECENT_TOOL_RESULTS, ma
+         new_messages.append(msg_copy)
+     return new_messages
+ 
++def _log_retry(details, logging=None):
++    if logging is not None:
++        exc = details.get('exception')
++        logging(f"Transient API error (retry {details.get('tries')}, waiting {details.get('wait', 0):.1f}s): {exc}")
++
+ @backoff.on_exception(
+     backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=600,
+-    max_value=60,
++    Exception,
++    giveup=give_up_on_permanent_error,
++    max_tries=DEFAULT_MAX_TRIES,
++    max_time=DEFAULT_MAX_TIME,
++    max_value=DEFAULT_MAX_BACKOFF,
++    on_backoff=_log_retry,
+ )
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=None, max_retry=None,
+ ):
+-    try:
+-        if 'claude' in model:
+-            response = client.messages.create(
+-                model=model,
+-                messages=messages,
+-                max_tokens=4096,
+-                tool_choice=tool_choice,
+-                tools=tools,
+-            )
+-        elif model.startswith('o3-'):
+-            response = client.responses.create(
+-                model=model,
+-                input=messages,
+-                tool_choice=tool_choice,
+-                tools=tools,
+-                parallel_tool_calls=False
+-            )
+-            response = response
+-        else:
+-            raise ValueError(f"Unsupported model: {model}")
+-        return response
+-    except Exception as e:
+-        logging(f"Error in get_response_withtools: {str(e)}")
+-        if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+-
+-        # Hitting the context window limit
+-        if 'Input is too long for requested model' in str(e):
+-            pass
+-
+-        raise  # Re-raise the exception after logging
++    # Transient failures are retried by the backoff decorator above; other errors propagate.
++    if 'claude' in model:
++        response = client.messages.create(
++            model=model,
++            messages=messages,
++            max_tokens=4096,
++            tool_choice=tool_choice,
++            tools=tools,
++        )
++    elif model.startswith('o3-'):
++        response = client.responses.create(
++            model=model,
++            input=messages,
++            tool_choice=tool_choice,
++            tools=tools,
++            parallel_tool_calls=False
++        )
++    else:
++        raise ValueError(f"Unsupported model: {model}")
++    return response
+ 
+ def check_for_tool_use(response, model=''):
+     """
+diff --git a/utils/api_retry.py b/utils/api_retry.py
+new file mode 100644
+index 0000000..35905a0
+--- /dev/null
++++ b/utils/api_retry.py
+@@ -0,0 +1,44 @@
++"""
++Shared helpers for retrying LLM API calls on transient failures.
++
++Only transient errors (rate limits, timeouts, connection problems, 408/409/429 and 5xx
++responses) are retried. Permanent errors (e.g. 400 invalid request, 401 auth) are raised
++immediately so the caller sees them without waiting.
++"""
++import anthropic
++import openai
++
++# Exception classes from the SDKs that are always considered transient
++_TRANSIENT_EXC_TYPES = (
++    openai.RateLimitError,
++    openai.APITimeoutError,
++    openai.APIConnectionError,
++    openai.InternalServerError,
++    anthropic.RateLimitError,
++    anthropic.APITimeoutError,
++    anthropic.APIConnectionError,
++    anthropic.InternalServerError,
++)
++
++# HTTP status codes that are worth retrying
++TRANSIENT_STATUS_CODES = {408, 409, 429}
++
++# Defaults used by the decorators in llm.py / llm_withtools.py
++DEFAULT_MAX_TRIES = 6
++DEFAULT_MAX_TIME = 600  # seconds
++DEFAULT_MAX_BACKOFF = 60  # seconds between two attempts
++
++
++def is_transient_error(exc):
++    """Return True if the exception is a transient API failure that should be retried."""
++    if isinstance(exc, _TRANSIENT_EXC_TYPES):
++        return True
++    status = getattr(exc, 'status_code', None)
++    if isinstance(status, int):
++        return status in TRANSIENT_STATUS_CODES or status >= 500
++    return False
++
++
++def give_up_on_permanent_error(exc):
++    """`giveup` predicate for backoff: stop retrying when the error is not transient."""
++    return not is_transient_error(exc)

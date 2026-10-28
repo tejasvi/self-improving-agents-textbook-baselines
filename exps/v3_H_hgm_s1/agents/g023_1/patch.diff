@@ -1,0 +1,298 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2f12636..6378e22 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -11,6 +11,7 @@ import traceback
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from llm import create_client, get_response_from_llm
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.stress_test import tool_function as run_stress_test
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -311,7 +312,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 
+ Follow this workflow step by step:
+ 1. Explore the repository: list the files and directories under {self.git_tempdir}. Locate the target file named in the problem statement. If it does not exist, create it.
+-2. DRAFT FIRST: Your very first or second tool call must write a complete draft solution to the target file with the editor tool. Reasoning in prose without a tool call counts as failure; refine afterwards. Do not spend long on derivations before the draft is on disk.
++2. DRAFT FIRST: Your very first or second tool call must write a complete draft solution to the target file with the editor tool. This draft is PROVISIONAL: derive the algorithm with a brief justification of correctness, and do not submit a heuristic without a stress test. Reasoning in prose without a tool call counts as failure; refine afterwards.
+ 3. Plan and refine: analyze the problem statement, identify the input/output format, and decide on an algorithm. Consider whether the task expects a complete program that reads standard input and writes standard output, or a method of a given `Solution` class. Update the draft with the editor tool as you refine it.
+ 4. Test on the samples EXACTLY: Extract every sample input/output from the problem statement into files (e.g. /tmp/samples/N.in and N.out). Write a script that runs solution.py on each and diffs stdout against the expected output after whitespace normalization (or use the sample_runner tool). A semantic match is not enough: if the problem says multiple answers are accepted but your output differs from the sample, assume the grader may do an exact compare. Study how the sample answer was likely produced (e.g. which basis vector or bit position, ordering, smallest/largest choice) and adjust your deterministic construction until all samples match exactly, while still verifying validity with your own checker. Only if you cannot reproduce them after a few attempts, keep the valid answer and state why.
+ 5. Check edge cases and performance: consider minimum/maximum constraints and degenerate inputs, and make sure the solution is efficient on large inputs (avoid unnecessary quadratic work).
+@@ -393,16 +394,53 @@ IMPORTANT: Responding with text only, without editing files, counts as failure.
+             safe_log("[forward] Finished without detecting source edits.")
+             return
+ 
+-        # Verification turn: test the draft on the samples and fix it.
++        # Structured verification: brute force + generator + stress test.
+         verify_msg = (
+-            "A draft solution now exists in the repository. Test it on the sample inputs from the problem statement "
+-            "using bash or the sample_runner tool. If it fails or crashes, fix it with the editor tool and re-test. "
+-            "Report the result."
++            "A draft solution now exists in the repository. Verify it with a randomized stress test:\n"
++            "1. Write a trusted, simple brute-force reference to /tmp/stress/brute.py (a complete program reading stdin "
++            "and writing stdout, or a `brute(*args)` function for class-based tasks). Use the editor tool with `create` "
++            "(or `edit` if it exists), not bash heredocs.\n"
++            "2. Write a random small-input generator to /tmp/stress/gen.py defining gen(seed) that returns the input string "
++            "(stdio mode) or the args tuple (class mode). Keep inputs small so brute is fast.\n"
++            "3. Call the stress_test tool with solution_path, brute_path=/tmp/stress/brute.py, generator_path=/tmp/stress/gen.py.\n"
++            "4. If it reports a mismatch, study the minimal counterexample, fix the solution with the editor tool, and call "
++            "stress_test again. Repeat until it prints 'ALL N TESTS PASSED'.\n"
++            "Report the final stress_test result."
+         )
+         safe_log("[forward] Verification turn after draft.")
+-        result = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        if isinstance(result, list):
+-            msg_history = result
++        msg_history, status = self._call_agent_safely(verify_msg, self.code_model, msg_history)
++        if status != 'ok':
++            safe_log(f"[forward] Verification turn status={status}; re-prompting once.")
++            msg_history, status = self._call_agent_safely(verify_msg, self.code_model, msg_history)
++
++        # Harness-side stress test, bounded to 3 fix rounds.
++        stress_dir = '/tmp/stress'
++        brute_path = os.path.join(stress_dir, 'brute.py')
++        gen_path = os.path.join(stress_dir, 'gen.py')
++        full_target = os.path.join(self.git_tempdir, target) if target else None
++        for fix_round in range(3):
++            if not (os.path.isfile(brute_path) and os.path.isfile(gen_path) and full_target and os.path.isfile(full_target)):
++                report = ("Stress test files are missing: expected /tmp/stress/brute.py and /tmp/stress/gen.py "
++                          "(and the solution file).")
++            else:
++                try:
++                    report = run_stress_test(full_target, brute_path, gen_path, mode='stdio')
++                except Exception:
++                    report = f"Stress test harness error:\n{traceback.format_exc()}"
++            safe_log(f"[forward] Harness stress test round {fix_round + 1}: {report[:300]}")
++            if report.startswith('ALL ') and 'PASSED' in report:
++                break
++            fix_msg = (
++                "The stress test did not pass:\n" + report + "\n\n"
++                "If brute.py or gen.py are missing, write them to /tmp/stress/ with the editor tool. "
++                "Otherwise analyze the counterexample, fix the solution with the editor tool, and re-run stress_test. "
++                "Report the final result."
++            )
++            msg_history, status = self._call_agent_safely(fix_msg, self.code_model, msg_history)
++            if status != 'ok':
++                msg_history, status = self._call_agent_safely(fix_msg, self.code_model, msg_history)
++        else:
++            safe_log("[forward] Stress test still failing after 3 fix rounds.")
+ 
+         # Post-processing check: ask the agent to confirm exact sample matching.
+         confirm_msg = (
+diff --git a/tools/edit.py b/tools/edit.py
+index 244d440..2cca8db 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -60,7 +60,10 @@ def validate_path(path: str, command: str) -> Path:
+     elif command == "create":
+         # Path must not exist
+         if path_obj.exists():
+-            raise ValueError(f"Cannot create new file; {path} already exists.")
++            if path_obj.is_dir():
++                raise ValueError(f"{path} is a directory; cannot create a file there.")
++            # Overwrite existing file instead of wasting a turn on an error.
++            return path_obj
+     elif command == "edit":
+         # Path must exist and must be a file
+         if not path_obj.exists():
+@@ -135,7 +138,10 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
+         elif command == "create":
+             if file_text is None:
+                 raise ValueError("Missing required `file_text` for 'create' command.")
++            existed = path_obj.exists()
+             write_file(path_obj, file_text)
++            if existed:
++                return f"File at {path} already existed and has been overwritten (use 'edit' next time)."
+             return f"File created successfully at: {path}"
+ 
+         elif command == "edit":
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..513db85
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,183 @@
++import copy
++import importlib.util
++import os
++import subprocess
++import sys
++import traceback
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Randomized stress test comparing a solution against a trusted brute-force reference on many generated small inputs.\n
++* mode='class': solution_path defines class `Solution` with the method `method_name`; brute_path defines a function `brute(*args)` with the same arguments; generator_path defines `gen(seed)` returning a tuple of args.\n
++* mode='stdio': solution_path and brute_path are complete programs reading stdin and writing stdout; generator_path defines `gen(seed)` returning the input string.\n
++* Runs num_tests cases (seeds 0..num_tests-1), each with a timeout. Returns the smallest failing input (with brute output, solution output, or traceback) on mismatch, otherwise 'ALL N TESTS PASSED'.\n
++* Use this after writing a brute-force reference and a random input generator; fix the solution until it passes.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution file under test."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the trusted brute-force reference file."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to the generator file defining gen(seed)."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of random test cases to run (default 300)."
++                },
++                "mode": {
++                    "type": "string",
++                    "enum": ["class", "stdio"],
++                    "description": "'class' to test a Solution class method, 'stdio' to test a stdin/stdout program (default 'class')."
++                },
++                "method_name": {
++                    "type": "string",
++                    "description": "Name of the Solution method to test (class mode only)."
++                },
++                "timeout": {
++                    "type": "number",
++                    "description": "Per-case timeout in seconds (default 10)."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++MAX_FAILURES_COLLECTED = 50
++
++
++def _load_module(path, name):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _normalize(text):
++    return "\n".join(line.rstrip() for line in (text or "").strip().splitlines())
++
++
++def _run_stdio(path, stdin_text, timeout):
++    proc = subprocess.run(
++        [sys.executable, path],
++        input=stdin_text,
++        capture_output=True,
++        text=True,
++        timeout=timeout,
++    )
++    if proc.returncode != 0:
++        raise RuntimeError(f"exit code {proc.returncode}\nstderr:\n{proc.stderr.strip()}")
++    return proc.stdout
++
++
++def tool_function(solution_path, brute_path, generator_path, num_tests=300, mode='class',
++                  method_name=None, timeout=10):
++    try:
++        num_tests = int(num_tests) if num_tests is not None else 300
++        timeout = float(timeout) if timeout is not None else 10.0
++    except (TypeError, ValueError) as e:
++        return f"ERROR: invalid numeric argument: {e}"
++    mode = mode or 'class'
++    if mode not in ('class', 'stdio'):
++        return f"ERROR: unknown mode {mode!r}; use 'class' or 'stdio'."
++    for label, p in (("solution", solution_path), ("brute", brute_path), ("generator", generator_path)):
++        if not os.path.isfile(p):
++            return f"ERROR: {label} file not found: {p}"
++
++    try:
++        gen_mod = _load_module(generator_path, "_stress_gen")
++    except Exception:
++        return f"ERROR: failed to load generator:\n{traceback.format_exc()}"
++    if not hasattr(gen_mod, 'gen'):
++        return "ERROR: generator file must define gen(seed)."
++
++    sol_obj = None
++    brute_fn = None
++    if mode == 'class':
++        if not method_name:
++            return "ERROR: method_name is required in class mode."
++        try:
++            sol_mod = _load_module(solution_path, "_stress_solution")
++            sol_obj = sol_mod.Solution()
++            sol_method = getattr(sol_obj, method_name)
++        except Exception:
++            return f"ERROR: failed to load Solution.{method_name}:\n{traceback.format_exc()}"
++        try:
++            brute_mod = _load_module(brute_path, "_stress_brute")
++            brute_fn = brute_mod.brute
++        except Exception:
++            return f"ERROR: failed to load brute():\n{traceback.format_exc()}"
++
++    failures = []
++    for seed in range(num_tests):
++        if len(failures) >= MAX_FAILURES_COLLECTED:
++            break
++        try:
++            case = gen_mod.gen(seed)
++        except Exception:
++            return f"ERROR: generator raised on seed {seed}:\n{traceback.format_exc()}"
++
++        if mode == 'class':
++            args = case if isinstance(case, tuple) else (case,)
++            label = repr(args)
++            try:
++                expected = brute_fn(*copy.deepcopy(args))
++            except Exception:
++                return f"ERROR: brute raised on input {label}:\n{traceback.format_exc()}"
++            try:
++                actual = sol_method(*copy.deepcopy(args))
++                ok = (actual == expected)
++                actual_s, expected_s = repr(actual), repr(expected)
++                err = None
++            except Exception:
++                ok = False
++                actual_s, expected_s = "<exception>", repr(expected)
++                err = traceback.format_exc()
++            if not ok:
++                failures.append({"input": label, "expected": expected_s,
++                                 "actual": actual_s, "traceback": err})
++        else:
++            stdin_text = case if isinstance(case, str) else str(case)
++            label = stdin_text
++            try:
++                expected = _run_stdio(brute_path, stdin_text, timeout)
++            except subprocess.TimeoutExpired:
++                return f"ERROR: brute timed out on input:\n{label}"
++            except Exception:
++                return f"ERROR: brute failed on input:\n{label}\n{traceback.format_exc()}"
++            try:
++                actual = _run_stdio(solution_path, stdin_text, timeout)
++                err = None
++                ok = _normalize(actual) == _normalize(expected)
++            except subprocess.TimeoutExpired:
++                actual, err, ok = "", f"timed out after {timeout}s", False
++            except Exception as e:
++                actual, err, ok = "", str(e), False
++            if not ok:
++                failures.append({"input": label, "expected": expected,
++                                 "actual": actual, "traceback": err})
++
++    if not failures:
++        return f"ALL {num_tests} TESTS PASSED"
++
++    # Prefer the smallest failing input.
++    failures.sort(key=lambda f: len(repr(f["input"])))
++    f = failures[0]
++    out = [
++        f"MISMATCH (shortest of {len(failures)} failing cases checked)",
++        f"input:\n{f['input']}",
++        f"expected (brute):\n{f['expected']}",
++        f"actual (solution):\n{f['actual']}",
++    ]
++    if f["traceback"]:
++        out.append(f"traceback:\n{f['traceback']}")
++    return "\n\n".join(out)

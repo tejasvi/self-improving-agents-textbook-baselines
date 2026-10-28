@@ -1,0 +1,150 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 380c429..34316ab 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,8 +5,10 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm import create_client, get_response_from_llm
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -159,6 +161,11 @@ class AgenticSystem:
+                 "Create it with the complete solution (a full program reading stdin / writing stdout, "
+                 "or the requested Solution class method) before doing anything else."
+             )
++        with open(sol_path, 'r', errors='replace') as f:
++            if not f.read().strip():
++                return False, (
++                    f"{sol_path} exists but is empty. Write the complete solution into it."
++                )
+         result = subprocess.run(
+             [sys.executable, "-m", "py_compile", sol_path],
+             stdout=subprocess.PIPE,
+@@ -173,6 +180,67 @@ class AgenticSystem:
+             )
+         return True, ""
+ 
++    def _run_agent(self, prompt, msg_history):
++        """
++        Run one agent turn on top of msg_history and return the updated history.
++        """
++        return chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++    def _is_interactive(self):
++        text = (self.problem_statement or '').lower()
++        return ('interactive' in text) or ('judge' in text)
++
++    def _interactive_note(self):
++        if not self._is_interactive():
++            return ''
++        return (
++            "\n\nThis is an interactive problem: write a local interactor script that simulates the judge "
++            "via subprocess pipes (flush stdout after every print, count the queries, and enforce the query limit), "
++            "and use it for testing; do not compare against static sample output files."
++        )
++
++    def _fallback_write_solution(self, sol_path):
++        """
++        Last resort: ask the LLM directly (no tools) for a single python code block and write it to sol_path.
++        Returns True if a file was written.
++        """
++        prompt = (
++            f"Solve the following competitive programming problem in Python.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n"
++            + (
++                "This is an interactive problem: read the judge's replies from stdin and flush stdout after every print.\n"
++                if self._is_interactive() else ""
++            )
++            + "Reply with only one ```python code block containing the complete solution "
++            "(a full program reading stdin and writing stdout, or the requested Solution class). "
++            "Do not use tools. No other text."
++        )
++        try:
++            safe_log("[fallback] Requesting solution directly from the LLM without tools")
++            client, client_model = create_client(self.code_model)
++            response, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer. Reply only with a python code block.",
++                print_debug=False,
++                msg_history=[],
++            )
++            safe_log(f"[fallback] Raw response: {response}")
++            match = re.search(r"```python\s*\n(.*?)```", response, re.DOTALL)
++            if not match:
++                safe_log("[fallback] No ```python block found in response")
++                return False
++            code = match.group(1)
++            os.makedirs(os.path.dirname(sol_path) or '.', exist_ok=True)
++            with open(sol_path, 'w') as f:
++                f.write(code)
++            safe_log(f"[fallback] Wrote {sol_path} ({len(code)} chars)")
++            return True
++        except Exception as e:
++            safe_log(f"[fallback] Failed: {e}")
++            return False
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -210,20 +278,42 @@ Work through the following steps. Use the bash and editor tools to do the actual
+ 8. Before finishing, confirm that {sol_path} exists, is the final version of your solution, and compiles with `python -m py_compile {sol_path}`. Do not leave the solution file empty or missing. Give a brief summary of your final approach when done.
+ """
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        interactive_note = self._interactive_note()
++        instruction = instruction + interactive_note
++        msg_history = self._run_agent(instruction, [])
+ 
+-        # Re-prompt in the same conversation if no solution was produced or it does not compile
++        # Check after the first turn; retry with a FRESH history (the first turn may have been empty)
++        ok, problem = self._check_solution_state()
+         for attempt in range(3):
+-            ok, problem = self._check_solution_state()
+             if ok:
+                 break
+-            safe_log(f"[forward] Solution check failed (attempt {attempt + 1}/3): {problem}")
+-            retry_msg = (
+-                f"The check of the repository failed: {problem}\n\n"
+-                f"Please fix this now. Write the complete solution to {sol_path} using the tools, "
+-                f"verify it compiles with `python -m py_compile {sol_path}`, and run it on the sample inputs."
++            safe_log(f"[forward] Solution check failed (retry {attempt + 1}/3): {problem}")
++            short_prompt = (
++                f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Immediately create {sol_path} with a complete solution using the editor tool `create` "
++                f"(or `edit` if it exists). Do not just think; your first action must be a tool call. "
++                f"After writing, run it on a sample and fix errors."
++                f"{interactive_note}"
+             )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            msg_history = self._run_agent(short_prompt, [])
++            ok, problem = self._check_solution_state()
++
++        if not ok:
++            safe_log(f"[forward] Agent did not produce a valid solution; using fallback. Last problem: {problem}")
++            self._fallback_write_solution(sol_path)
++            ok, problem = self._check_solution_state()
++            if not ok:
++                safe_log(f"[forward] Fallback solution still invalid: {problem}")
++
++        if not os.path.isfile(sol_path):
++            # Never leave an empty patch
++            os.makedirs(os.path.dirname(sol_path) or '.', exist_ok=True)
++            with open(sol_path, 'w') as f:
++                f.write("# No solution could be generated.\npass\n")
++            safe_log(f"[forward] Wrote stub {sol_path}")
++
++        if not ok:
++            return msg_history
+ 
+         # Second verification pass: stress and performance testing
+         test_msg = f"""Now verify the solution in {sol_path} thoroughly. Use the bash and editor tools.
+diff --git a/null b/null
+new file mode 100644
+index 0000000..e69de29

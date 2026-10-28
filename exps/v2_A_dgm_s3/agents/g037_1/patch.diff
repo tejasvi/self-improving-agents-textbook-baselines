@@ -1,0 +1,723 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index aec7c13..baf1c4b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,6 +1,8 @@
+ import argparse
++import json
+ import subprocess
+ import logging
++import time
+ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+@@ -9,6 +11,7 @@ import threading
+ from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from utils.suite import score_suite, format_score
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -101,6 +104,11 @@ TOO_SLOW_PHRASES = [
+     'will time out', 'would time out', 'exceeds the time limit', 'exceed the time limit',
+ ]
+ MAX_PERF_ROUNDS = 3
++NUM_ATTEMPTS = 3            # K: candidate attempts per task
++TIME_BUDGET_S = 3 * 3600    # wall-clock budget; later attempts are skipped when exceeded
++SUITE_ITERATIONS = 150      # random seeds for the stress phase
++SUITE_TIMEOUT = 10.0        # per-run timeout for the suite
++SCORE_BUDGET_S = 600.0      # max wall time for scoring one candidate; incomplete scores never pass
+ 
+ 
+ def _message_text(msg):
+@@ -280,11 +288,8 @@ class AgenticSystem:
+ 
+         return f"Repository files (git ls-files):\n{listing_text}\n\n" + "\n\n".join(contents)
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    def _build_task(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -292,7 +297,9 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        workflow = """
++
++    def _workflow_text(self):
++        return """
+ Follow this workflow step by step:
+ 1. Explore the repository: list the files and read the relevant code, tests, and any README or specification. Then read the problem statement carefully.
+ 1b. Complexity budget (do this BEFORE writing any code): state N and the other limits from the constraints (e.g. n <= 2*10^5, values <= 10^9). Derive the allowed complexity (e.g. O(n log n) for n = 2*10^5 in Python; O(n^2) is usually too slow beyond n ~ 3000). Write down the algorithm you intend to use and its estimated complexity. If your first idea is too slow for the constraints, do not write it as the final solution; find a faster algorithm first (e.g. binary search on the answer with a feasibility check, sorting plus sweep, prefix sums, DP optimization, heaps, or data structures).
+@@ -315,9 +322,12 @@ IMPORTANT RULES:
+ - Responding with text only and no file edits counts as failure.
+ - Modifying only test files does not solve the task; the primary source file must be changed.
+ """
+-        instruction = f"{task}\n{workflow}"
+-        msg_history = []
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
++    def _run_single_attempt(self, instruction):
++        """
++        One agent trajectory on the current repo state: initial turn, bounded performance
++        follow-ups, source-patch retries, fresh-history retry and the tool-free last resort.
++        """
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+         safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
+ 
+         # Bounded performance follow-up: at most MAX_PERF_ROUNDS rounds, never an unbounded loop.
+@@ -361,7 +371,7 @@ IMPORTANT RULES:
+             target = self._target_file()
+             snapshot = self._snapshot_repo()
+             fresh_prompt = (
+-                f"{task}\n{snapshot}\n\n"
++                f"{self._build_task()}\n{snapshot}\n\n"
+                 f"The repository currently has no source patch. Your very first action must be an editor "
+                 f"create/edit call on {os.path.join(self.git_tempdir, target)} (the primary source file) "
+                 f"that implements the solution. Then run it via bash on the sample inputs, and finish with a summary."
+@@ -377,6 +387,310 @@ IMPORTANT RULES:
+             safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
+                      f"source patch: {self._has_source_patch()}")
+ 
++    # ------------------------------------------------------------------
++    # Multi-attempt orchestration: shared test suite, scored candidates,
++    # cross-attempt reflection, selection and independent review.
++    # ------------------------------------------------------------------
++
++    def _scratch_dir(self):
++        scratch = os.path.join(os.path.dirname(os.path.abspath(self.chat_history_file)), 'scratch_suite')
++        os.makedirs(scratch, exist_ok=True)
++        return scratch
++
++    def _snapshot_state(self):
++        """Return the current candidate patch (tracked + untracked changes vs base_commit)."""
++        return str(diff_versus_commit(self.git_tempdir, self.base_commit))
++
++    def _restore_state(self, patch=None):
++        """Reset the repo to base_commit, then optionally re-apply a stored patch."""
++        reset_to_commit(self.git_tempdir, self.base_commit)
++        if patch and patch.strip():
++            apply_patch(self.git_tempdir, patch)
++
++    def _build_test_suite(self):
++        """
++        Initial agent session: create brute.py, gen.py, gen_big.py and suite.json in the scratch
++        directory (outside the repo). Returns the parsed suite spec dict, or None.
++        """
++        scratch = self._scratch_dir()
++        spec_path = os.path.join(scratch, 'suite.json')
++        if os.path.exists(spec_path):
++            os.remove(spec_path)
++        prompt = f"""You are building a shared test suite for the programming problem below. The suite will be used to score several candidate solutions, so it must be deterministic and derived only from the problem statement.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Do NOT modify any file in {self.git_tempdir}. Work only in the scratch directory {scratch}. Create these files there:
++1. {scratch}/brute.py: an obviously-correct brute-force reference that reads stdin and prints the answer in exactly the required output format. Validate it on the sample inputs from the statement; it must reproduce every sample output exactly. Fix it until it does.
++2. {scratch}/gen.py: a random generator taking one integer seed argument (`python3 gen.py <seed>`) that prints ONE valid input for the problem (respect all constraints). Cover several regimes chosen by seed % 4: tiny inputs; medium inputs with many duplicates and ties; boundary values (minimum/maximum allowed values, n=1, all-equal elements); and random moderate sizes. Keep brute-force-feasible sizes so brute.py runs fast.
++3. {scratch}/gen_big.py: a generator taking one argument (`python3 gen_big.py <kind>`) printing a MAX-SIZE valid input for the worst case, where kind is one of: max_random, max_all_equal, max_sorted, max_reverse_sorted, max_alternating. Use the largest n and values allowed by the constraints.
++4. {scratch}/suite.json: a JSON object with exactly these keys: "solution_cmd" (the string "python3 {{SOLUTION}}", with the literal placeholder {{SOLUTION}}), "brute_cmd" ("python3 {scratch}/brute.py"), "gen_cmd" ("python3 {scratch}/gen.py"), "big_gen_cmd" ("python3 {scratch}/gen_big.py"), "big_args" (["max_random", "max_all_equal", "max_sorted", "max_reverse_sorted", "max_alternating"]), "samples" (a list of objects {{"input": ..., "output": ...}} with every sample input and expected output copied exactly from the statement), "iterations" (200), and "time_limit" (the problem's time limit in seconds, or 2.0 if not stated).
++
++Check each generator by running it, check brute.py against the samples with bash, and confirm suite.json is valid JSON (for example with python3 -m json.tool). Do not write any solution to the repository. When everything works, finish with a one-paragraph summary."""
++        safe_log("Building shared test suite (scratch dir: " + scratch + ")")
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        spec = self._load_suite_spec(spec_path)
++        if spec is None:
++            safe_log("Test suite build failed: no valid suite.json; scoring will use samples only.")
++        else:
++            safe_log(f"Test suite ready: {spec_path} (samples={len(spec.get('samples', []))}, "
++                     f"iterations={spec.get('iterations')})")
++        return spec
++
++    def _load_suite_spec(self, spec_path):
++        if not os.path.isfile(spec_path):
++            return None
++        try:
++            with open(spec_path) as fh:
++                spec = json.load(fh)
++        except Exception as e:
++            safe_log(f"Suite spec unreadable: {e}")
++            return None
++        if not isinstance(spec, dict) or 'brute_cmd' not in spec or 'gen_cmd' not in spec:
++            return None
++        spec.setdefault('samples', [])
++        spec.setdefault('iterations', SUITE_ITERATIONS)
++        spec.setdefault('timeout', SUITE_TIMEOUT)
++        spec.setdefault('time_limit', 2.0)
++        spec.setdefault('big_args', ['max_random'])
++        spec.setdefault('extra_inputs', [])
++        return spec
++
++    def _score_candidate(self, patch, spec, extra_inputs=None):
++        """Restore `patch`, run the shared suite directly from Python, and return the score dict."""
++        self._restore_state(patch)
++        solution_path = os.path.join(self.git_tempdir, self._target_file())
++        if not os.path.isfile(solution_path):
++            return {'score': -1e9, 'passed': False, 'samples_passed': 0, 'samples_total': 0,
++                    'stress_failures': 0, 'stress_total': 0, 'extra_failures': 0, 'extra_total': 0,
++                    'timeouts': 0, 'big_results': [], 'diff_size': 0, 'first_failure': {
++                        'input': '', 'expected': '', 'actual': '',
++                        'reason': f'target file {self._target_file()} does not exist', 'stderr': ''}}
++        if spec is None:
++            # No shared suite could be built: nothing was verified, so never report a pass.
++            return {'score': -1e6 - min(len(patch or ''), 1000000) * 1e-9, 'passed': False,
++                    'samples_passed': 0, 'samples_total': 0, 'stress_failures': 0, 'stress_total': 0,
++                    'extra_failures': 0, 'extra_total': 0, 'timeouts': 0, 'big_results': [],
++                    'diff_size': len(patch or ''), 'first_failure': None}
++        template = spec.get('solution_cmd') or 'python3 {SOLUTION}'
++        solution_cmd = template.replace('{SOLUTION}', solution_path)
++        result = score_suite(
++            solution_cmd=solution_cmd,
++            brute_cmd=spec.get('brute_cmd') or 'false',
++            gen_cmd=spec.get('gen_cmd'),
++            big_gen_cmd=spec.get('big_gen_cmd'),
++            big_args=spec.get('big_args'),
++            samples=spec.get('samples'),
++            extra_inputs=(spec.get('extra_inputs') or []) + list(extra_inputs or []),
++            iterations=spec.get('iterations', SUITE_ITERATIONS),
++            timeout=spec.get('timeout', SUITE_TIMEOUT),
++            time_limit=spec.get('time_limit', 2.0),
++            deadline=time.time() + SCORE_BUDGET_S,
++        )
++        # Smaller diff breaks ties between otherwise equal candidates.
++        result['diff_size'] = len(patch or '')
++        result['score'] = result['score'] - min(result['diff_size'], 1000000) * 1e-9
++        return result
++
++    def _diff_excerpt(self, patch, max_chars=1500):
++        patch = patch or ''
++        return patch if len(patch) <= max_chars else patch[:max_chars] + "\n... (truncated)"
++
++    def _describe_failure(self, score):
++        ff = score.get('first_failure')
++        if not ff:
++            return "No failing case recorded."
++        return (
++            f"Reason: {ff.get('reason')}\n"
++            f"Failing input (truncated):\n{str(ff.get('input', ''))[:1500]}\n"
++            f"Expected output:\n{str(ff.get('expected', ''))[:800]}\n"
++            f"Actual output:\n{str(ff.get('actual', ''))[:800]}\n"
++            f"stderr tail:\n{str(ff.get('stderr', ''))[-600:]}"
++        )
++
++    def _summarize_previous_attempts(self, attempts):
++        parts = []
++        for i, a in enumerate(attempts, 1):
++            sc = a['score']
++            parts.append(
++                f"## Attempt {i}\n"
++                f"Score: samples {sc.get('samples_passed')}/{sc.get('samples_total')}, "
++                f"stress failures {sc.get('stress_failures')}/{sc.get('stress_total')}, "
++                f"timeouts {sc.get('timeouts')}, passed={sc.get('passed')}\n"
++                f"First failing case:\n{self._describe_failure(sc)}\n"
++                f"Diff excerpt:\n{self._diff_excerpt(a['patch'])}\n"
++            )
++        return "\n".join(parts)
++
++    def _attempt_prompt(self, attempts, scratch):
++        base = f"{self._build_task()}\n{self._workflow_text()}"
++        if not attempts:
++            return base
++        summary = self._summarize_previous_attempts(attempts)
++        return (
++            f"{base}\n\nPrevious attempts at this problem FAILED the shared test suite. Their results:\n{summary}\n"
++            f"Do not repeat the same approach blindly. Identify the cause of the failing case above (wrong answer, "
++            f"crash, or timeout), then either fix that specific failure or change the algorithm. A reference "
++            f"brute-force oracle (brute.py), a random generator (gen.py) and a max-size generator (gen_big.py) are in "
++            f"{scratch}; use them with stress_test and perf_test before finishing."
++        )
++
++    def _reflection_prompt(self, patch, score):
++        scratch = self._scratch_dir()
++        return (
++            f"The current candidate still FAILS the shared test suite.\n"
++            f"Score: samples {score.get('samples_passed')}/{score.get('samples_total')}, "
++            f"stress failures {score.get('stress_failures')}, timeouts {score.get('timeouts')}.\n"
++            f"Failing case:\n{self._describe_failure(score)}\n"
++            f"Current candidate diff excerpt:\n{self._diff_excerpt(patch, 3000)}\n\n"
++            f"Fix the specific failure above in the existing solution file in {self.git_tempdir}. Reproduce it with bash, "
++            f"find the cause, fix it, and re-check against the brute-force oracle {os.path.join(scratch, 'brute.py')}. "
++            f"Keep the source file as the primary change and finish with a short summary."
++        )
++
++    def _review_pass(self, patch):
++        """
++        Independent review: one tool-free LLM call (thinking disabled, enough output tokens) that
++        reads the statement and the solution and returns adversarial inputs as JSON.
++        Returns a list of input strings (possibly empty). Never raises.
++        """
++        self._restore_state(patch)
++        solution_path = os.path.join(self.git_tempdir, self._target_file())
++        code = ''
++        if os.path.isfile(solution_path):
++            with open(solution_path, 'r', errors='replace') as fh:
++                code = fh.read()[:12000]
++        prompt = (
++            f"Review this solution to a competitive programming problem. Find inputs where it is likely wrong or too slow.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Solution ({self._target_file()}):\n```python\n{code}\n```\n\n"
++            f"Reply with ONLY a JSON object of the form {{\"inputs\": [\"<raw input 1>\", \"<raw input 2>\"]}} "
++            f"containing up to 8 small, valid, adversarial inputs (edge cases such as n=1, all-equal values, extremes, ties). "
++            f"Each string must be a complete valid input exactly as it would be given on stdin. No other text."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are a meticulous competitive programming reviewer. Output only JSON.",
++                msg_history=[],
++                max_tokens=16000,
++                thinking={'type': 'disabled'},
++            )
++        except Exception as e:
++            safe_log(f"Review call failed: {e}")
++            return []
++        match = re.search(r'\{.*\}', content or '', re.DOTALL)
++        if not match:
++            safe_log("Review: no JSON object in response.")
++            return []
++        try:
++            data = json.loads(match.group(0))
++        except Exception as e:
++            safe_log(f"Review: invalid JSON: {e}")
++            return []
++        inputs = data.get('inputs', []) if isinstance(data, dict) else []
++        inputs = [x for x in inputs if isinstance(x, str) and x.strip()][:8]
++        safe_log(f"Review produced {len(inputs)} adversarial inputs.")
++        return inputs
++
++    def _log_score(self, label, score):
++        safe_log(f"[{label}] score={score.get('score', 0):.3f} passed={score.get('passed')} "
++                 f"samples={score.get('samples_passed')}/{score.get('samples_total')} "
++                 f"stress_failures={score.get('stress_failures')}/{score.get('stress_total')} "
++                 f"extra_failures={score.get('extra_failures', 0)} timeouts={score.get('timeouts')} "
++                 f"diff_size={score.get('diff_size', 0)}")
++
++    def forward(self):
++        """
++        Test-gated multi-attempt solving:
++        1. build a shared suite once (outside the repo);
++        2. run up to NUM_ATTEMPTS attempts from base_commit, each scored by the same suite;
++        3. apply the best patch, run one reflection round if it still fails;
++        4. run an independent review, add its inputs to the suite and re-score the final patch.
++        """
++        start = time.time()
++        spec = None
++        try:
++            spec = self._build_test_suite()
++        except Exception as e:
++            safe_log(f"Suite build error: {e}")
++        scratch = self._scratch_dir()
++
++        attempts = []
++        self._restore_state('')
++        for k in range(NUM_ATTEMPTS):
++            if time.time() - start > TIME_BUDGET_S:
++                safe_log(f"Time budget exceeded; skipping attempt {k + 1}.")
++                break
++            self._restore_state('')
++            prompt = self._attempt_prompt(attempts, scratch)
++            safe_log(f"=== Attempt {k + 1}/{NUM_ATTEMPTS} (elapsed {time.time() - start:.0f}s) ===")
++            self._run_single_attempt(prompt)
++            patch = self._snapshot_state()
++            score = self._score_candidate(patch, spec)
++            self._log_score(f"attempt {k + 1}", score)
++            attempts.append({'patch': patch, 'score': score})
++            if score.get('passed'):
++                safe_log(f"Attempt {k + 1} is a perfect score; stopping early.")
++                break
++
++        if not attempts:
++            # Safety net: still produce one attempt so a patch exists.
++            self._restore_state('')
++            self._run_single_attempt(self._attempt_prompt([], scratch))
++            patch = self._snapshot_state()
++            attempts.append({'patch': patch, 'score': self._score_candidate(patch, spec)})
++
++        best = max(attempts, key=lambda a: (a['score'].get('score', -1e9), -len(a['patch'] or '')))
++        best_index = attempts.index(best) + 1
++        safe_log(f"Selected attempt {best_index} of {len(attempts)} "
++                 f"(score={best['score'].get('score', 0):.3f}, passed={best['score'].get('passed')}).")
++        best_patch, best_score = best['patch'], best['score']
++
++        # One reflection round on the best candidate if it still fails and time remains.
++        if not best_score.get('passed') and time.time() - start <= TIME_BUDGET_S and spec is not None:
++            safe_log("Reflection round on the best candidate.")
++            self._restore_state(best_patch)
++            self._run_single_attempt(self._reflection_prompt(best_patch, best_score))
++            refl_patch = self._snapshot_state()
++            refl_score = self._score_candidate(refl_patch, spec)
++            self._log_score("reflection", refl_score)
++            if refl_score.get('score', -1e9) > best_score.get('score', -1e9):
++                safe_log("Reflection candidate selected.")
++                best_patch, best_score = refl_patch, refl_score
++            else:
++                safe_log("Reflection candidate not better; keeping previous best.")
++
++        # Independent review: adversarial inputs added to the suite, then re-score.
++        if spec is not None and time.time() - start <= TIME_BUDGET_S:
++            extra = self._review_pass(best_patch)
++            if extra:
++                best_score = self._score_candidate(best_patch, spec, extra_inputs=extra)
++                self._log_score("review re-score", best_score)
++                if not best_score.get('passed') and time.time() - start <= TIME_BUDGET_S:
++                    safe_log("Review found a failure; running one fix round.")
++                    self._restore_state(best_patch)
++                    self._run_single_attempt(self._reflection_prompt(best_patch, best_score))
++                    fixed_patch = self._snapshot_state()
++                    fixed_score = self._score_candidate(fixed_patch, spec, extra_inputs=extra)
++                    self._log_score("review fix", fixed_score)
++                    if fixed_score.get('score', -1e9) > best_score.get('score', -1e9):
++                        best_patch, best_score = fixed_patch, fixed_score
++
++        # Apply the selected patch and make sure it contains source changes.
++        self._restore_state(best_patch)
++        safe_log(f"Final selection: passed={best_score.get('passed')} score={best_score.get('score', 0):.3f}")
++        if not self._has_source_patch():
++            safe_log("Selected patch has no source changes; running the fallback sequence.")
++            self._run_single_attempt(self._attempt_prompt([], scratch))
++            if not self._has_source_patch():
++                self._last_resort_write()
++
+     def _last_resort_write(self):
+         """
+         Tool-free fallback: ask the LLM for the complete target file in a fenced code block,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 44ebd41..a6c88c6 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -450,7 +450,8 @@ def chat_with_agent_claude(
+         # Budget escalation schedule: each entry is tried in order when a response is empty
+         # because the output budget was exhausted by hidden thinking (stop_reason == 'max_tokens').
+         budget_schedule = [
+-            {'max_tokens': 8192, 'thinking': None},
++            # First call: thinking disabled so hidden thinking cannot exhaust the output budget.
++            {'max_tokens': 8192, 'thinking': {'type': 'disabled'}},
+             {'max_tokens': 16384, 'thinking': {'type': 'disabled'}},
+             {'max_tokens': 32000, 'thinking': {'type': 'disabled'}},
+         ]
+diff --git a/tools/run_suite.py b/tools/run_suite.py
+new file mode 100644
+index 0000000..093f58f
+--- /dev/null
++++ b/tools/run_suite.py
+@@ -0,0 +1,107 @@
++import json
++
++
++def tool_info():
++    return {
++        "name": "run_suite",
++        "description": """Run the full test suite for a candidate solution with the same scoring the orchestrator uses.
++
++* samples: list of {"input": ..., "output": ...} from the problem statement; the solution's stdout must match `output` (whitespace-trimmed).
++* brute_cmd / gen_cmd: a brute-force oracle and a random generator (called as `<gen_cmd> <seed>` for seeds 1..iterations); outputs must match exactly.
++* big_gen_cmd / big_args: optional max-size generator (called as `<big_gen_cmd> <arg>`); only timing is checked against time_limit.
++* extra_inputs: optional list of additional raw inputs checked against brute_cmd.
++Returns a summary with pass/fail counts, the first failing input with expected vs actual output, and timing verdicts.
++Use it after every change to compare against the reference and to check performance.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command that runs the solution under test, e.g. 'python3 /path/solution.py'. Reads input from stdin."
++                },
++                "brute_cmd": {
++                    "type": "string",
++                    "description": "Shell command that runs the obviously-correct brute-force reference. Reads input from stdin."
++                },
++                "gen_cmd": {
++                    "type": "string",
++                    "description": "Shell command for the random generator, called as '<gen_cmd> <seed>' and printing one input to stdout."
++                },
++                "iterations": {
++                    "type": "integer",
++                    "description": "Number of random seeds (1..iterations) to check against brute force."
++                },
++                "samples": {
++                    "type": "array",
++                    "items": {
++                        "type": "object",
++                        "properties": {
++                            "input": {"type": "string", "description": "Sample input text."},
++                            "output": {"type": "string", "description": "Expected sample output text."}
++                        },
++                        "required": ["input", "output"]
++                    },
++                    "description": "Sample tests from the problem statement with their expected outputs."
++                },
++                "extra_inputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Additional raw inputs (e.g. adversarial edge cases) checked against brute_cmd."
++                },
++                "big_gen_cmd": {
++                    "type": "string",
++                    "description": "Optional max-size generator, called as '<big_gen_cmd> <arg>' for each big_args entry."
++                },
++                "big_args": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Arguments for big_gen_cmd, e.g. ['max_random', 'all_equal']."
++                },
++                "timeout": {
++                    "type": "number",
++                    "description": "Per-run timeout in seconds for the generators, brute force and solution (default 10)."
++                },
++                "time_limit": {
++                    "type": "number",
++                    "description": "The problem's real time limit in seconds, used for big-input timing verdicts."
++                }
++            },
++            "required": ["solution_cmd", "brute_cmd", "gen_cmd", "iterations"]
++        }
++    }
++
++
++def tool_function(solution_cmd, brute_cmd, gen_cmd, iterations, samples=None, extra_inputs=None,
++                  big_gen_cmd=None, big_args=None, timeout=10, time_limit=None):
++    from utils.suite import score_suite, format_score
++    try:
++        iterations = int(iterations)
++    except (TypeError, ValueError):
++        return f"Error: iterations must be an integer, got {iterations!r}"
++    if isinstance(samples, str):
++        try:
++            samples = json.loads(samples)
++        except Exception:
++            return "Error: samples must be a list of {input, output} objects."
++    if isinstance(extra_inputs, str):
++        extra_inputs = [extra_inputs]
++    if isinstance(big_args, str):
++        big_args = [big_args]
++    try:
++        result = score_suite(
++            solution_cmd=solution_cmd, brute_cmd=brute_cmd, gen_cmd=gen_cmd,
++            big_gen_cmd=big_gen_cmd, big_args=big_args, samples=samples,
++            extra_inputs=extra_inputs, iterations=iterations,
++            timeout=timeout, time_limit=time_limit,
++        )
++    except Exception as e:
++        return f"Error running suite: {e}"
++    text = format_score(result)
++    ff = result['first_failure']
++    if ff:
++        text += (
++            f"\n--- first failure: {ff['reason']} ---\n"
++            f"input:\n{ff['input']}\nexpected:\n{ff['expected']}\nactual:\n{ff['actual']}\n"
++            f"stderr tail:\n{ff['stderr']}"
++        )
++    return text
+diff --git a/utils/suite.py b/utils/suite.py
+new file mode 100644
+index 0000000..27675a6
+--- /dev/null
++++ b/utils/suite.py
+@@ -0,0 +1,196 @@
++"""
++Shared test-suite scoring used both by the agent's `run_suite` tool and by the
++orchestrator (coding_agent.py), so every candidate is scored by the same code.
++
++A suite is described by:
++  - solution_cmd: shell command running the candidate (reads stdin, writes stdout)
++  - brute_cmd:    shell command running the brute-force oracle
++  - gen_cmd:      random generator, invoked as `<gen_cmd> <seed>`
++  - big_gen_cmd:  optional max-size generator, invoked as `<big_gen_cmd> <arg>`
++  - big_args:     list of args for big_gen_cmd (default: ['max_1'])
++  - samples:      list of {"input": str, "output": str} from the problem statement
++  - extra_inputs: list of extra raw inputs (e.g. adversarial cases from a reviewer);
++                  their expected outputs come from brute_cmd
++  - iterations:   number of random seeds for the stress phase
++  - timeout:      per-run timeout (seconds) for solution/brute/generators
++  - time_limit:   the solution's time limit used for big-input timing verdicts
++"""
++import os
++import subprocess
++import tempfile
++import time
++
++
++def _normalize(text):
++    lines = [line.rstrip() for line in (text or '').strip().splitlines()]
++    return "\n".join(lines)
++
++
++def _run(cmd, stdin_text=None, timeout=10.0):
++    """Run a shell command. Returns (returncode, stdout, stderr, timed_out, elapsed)."""
++    start = time.perf_counter()
++    try:
++        proc = subprocess.run(
++            cmd, shell=True, input=stdin_text, capture_output=True,
++            text=True, timeout=timeout,
++        )
++        return proc.returncode, proc.stdout, proc.stderr, False, time.perf_counter() - start
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout.decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
++        err = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or '')
++        return None, out, err, True, time.perf_counter() - start
++
++
++def _tail(text, n=600):
++    text = (text or '').strip()
++    return text[-n:] if len(text) > n else text
++
++
++def score_suite(solution_cmd, brute_cmd, gen_cmd=None, big_gen_cmd=None, big_args=None,
++                samples=None, extra_inputs=None, iterations=200, timeout=10.0, time_limit=None,
++                deadline=None):
++    """
++    Run all suite phases and return a dict:
++      {
++        'samples_passed': int, 'samples_total': int,
++        'stress_failures': int, 'stress_total': int,
++        'first_failure': None or {'input', 'expected', 'actual', 'reason', 'stderr'},
++        'timeouts': int,           # number of big/perf cases that exceeded the time limit
++        'big_results': [str],
++        'passed': bool,            # all samples, stress, extra inputs and big cases OK
++        'score': float,            # monotone ranking key (higher is better)
++      }
++    The first failing case (any phase) is recorded in first_failure with its expected and
++    actual output, so that the agent can reason about it in the next attempt.
++    """
++    timeout = float(timeout or 10.0)
++    time_limit = float(time_limit) if time_limit else timeout
++    samples = samples or []
++    extra_inputs = extra_inputs or []
++    iterations = int(iterations or 0)
++    result = {
++        'samples_passed': 0, 'samples_total': len(samples),
++        'stress_failures': 0, 'stress_total': 0,
++        'extra_failures': 0, 'extra_total': len(extra_inputs),
++        'first_failure': None, 'timeouts': 0, 'big_results': [], 'passed': False, 'score': 0.0,
++        'incomplete': False,
++    }
++    def out_of_time():
++        return deadline is not None and time.time() > deadline
++
++    def record_failure(test_input, expected, actual, reason, stderr=''):
++        if result['first_failure'] is None:
++            result['first_failure'] = {
++                'input': test_input, 'expected': expected, 'actual': actual,
++                'reason': reason, 'stderr': _tail(stderr),
++            }
++
++    # Phase 1: samples (expected output given by the statement).
++    for s in samples:
++        rc, out, err, to, _ = _run(solution_cmd, s.get('input', ''), timeout=timeout)
++        if to:
++            record_failure(s.get('input', ''), s.get('output', ''), out, f'sample timed out ({timeout}s)', err)
++            result['timeouts'] += 1
++            continue
++        if rc != 0:
++            record_failure(s.get('input', ''), s.get('output', ''), out, f'sample exited with code {rc}', err)
++            continue
++        if _normalize(out) == _normalize(s.get('output', '')):
++            result['samples_passed'] += 1
++        else:
++            record_failure(s.get('input', ''), s.get('output', ''), out, 'sample output mismatch', err)
++
++    # Phase 2: stress against brute force (exact match).
++    def check_against_brute(test_input, label):
++        brute_rc, brute_out, brute_err, brute_to, _ = _run(brute_cmd, test_input, timeout=timeout)
++        if brute_to or brute_rc != 0:
++            return None, f'brute force failed on {label} (rc={brute_rc}, timeout={brute_to})'
++        sol_rc, sol_out, sol_err, sol_to, _ = _run(solution_cmd, test_input, timeout=timeout)
++        if sol_to:
++            return False, (brute_out, sol_out, f'solution timed out on {label} ({timeout}s)', sol_err)
++        if sol_rc != 0:
++            return False, (brute_out, sol_out, f'solution exited with code {sol_rc} on {label}', sol_err)
++        if _normalize(sol_out) != _normalize(brute_out):
++            return False, (brute_out, sol_out, f'output differs from brute force on {label}', sol_err)
++        return True, None
++
++    if gen_cmd and iterations > 0:
++        for seed in range(1, iterations + 1):
++            if out_of_time():
++                result['incomplete'] = True
++                break
++            gen_rc, gen_out, gen_err, gen_to, _ = _run(f"{gen_cmd} {seed}", timeout=timeout)
++            if gen_to or gen_rc != 0:
++                continue  # a broken generator is not a candidate failure
++            result['stress_total'] += 1
++            ok, detail = check_against_brute(gen_out, f'seed {seed}')
++            if ok is None:
++                continue
++            if ok:
++                continue
++            result['stress_failures'] += 1
++            if detail and isinstance(detail, tuple):
++                exp, act, reason, err = detail
++                record_failure(gen_out, exp, act, reason, err)
++                if reason.startswith('solution timed out'):
++                    result['timeouts'] += 1
++
++    # Phase 3: extra inputs (e.g. adversarial cases proposed by a reviewer).
++    for idx, extra in enumerate(extra_inputs):
++        ok, detail = check_against_brute(extra, f'extra case {idx + 1}')
++        if ok is None or ok:
++            continue
++        result['extra_failures'] += 1
++        exp, act, reason, err = detail
++        record_failure(extra, exp, act, reason, err)
++
++    # Phase 4: big inputs - correctness is not checked (no oracle at that size), only time.
++    if big_gen_cmd:
++        for arg in (big_args or ['max_1']):
++            if out_of_time():
++                result['incomplete'] = True
++                break
++            g_rc, g_out, g_err, g_to, _ = _run(f"{big_gen_cmd} {arg}", timeout=max(timeout, 60.0))
++            if g_to or g_rc != 0:
++                result['big_results'].append(f"[{arg}] GEN_ERROR")
++                continue
++            s_rc, s_out, s_err, s_to, elapsed = _run(solution_cmd, g_out, timeout=time_limit)
++            if s_to:
++                result['timeouts'] += 1
++                result['big_results'].append(f"[{arg}] TIMEOUT >{time_limit}s")
++            elif s_rc != 0:
++                result['big_results'].append(f"[{arg}] ERROR rc={s_rc}: {_tail(s_err, 200)}")
++            else:
++                result['big_results'].append(f"[{arg}] OK {elapsed:.3f}s")
++
++    total_fail = result['stress_failures'] + result['extra_failures']
++    samples_ok = result['samples_passed'] == result['samples_total']
++    result['passed'] = (
++        samples_ok and total_fail == 0 and not result['incomplete'] and result['timeouts'] == 0
++        and not any('ERROR' in r or 'TIMEOUT' in r for r in result['big_results'])
++    )
++    # Monotone ranking key: samples dominate, then fewer failures, then no timeouts.
++    result['score'] = (
++        result['samples_passed'] * 1000.0
++        - total_fail * 10.0
++        - result['timeouts'] * 100.0
++        + (1000000.0 if result['passed'] else 0.0)
++    )
++    return result
++
++
++def format_score(result):
++    """Human-readable one-block summary of a score_suite() result."""
++    lines = [
++        f"samples: {result['samples_passed']}/{result['samples_total']} passed",
++        f"stress: {result['stress_failures']} failures out of {result['stress_total']}",
++        f"extra inputs: {result['extra_failures']} failures out of {result['extra_total']}",
++        f"timeouts: {result['timeouts']}",
++    ]
++    lines += [f"big: {r}" for r in result['big_results']]
++    lines.append(f"passed: {result['passed']}")
++    return "\n".join(lines)
++
++
++def workspace_dir(prefix='suite_'):
++    return tempfile.mkdtemp(prefix=prefix)

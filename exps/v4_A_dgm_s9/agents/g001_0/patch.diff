@@ -1,0 +1,209 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 78c68fe..65aadfb 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,7 @@ import os
+ import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -94,6 +95,69 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++
++DEFAULT_SOLUTION_FILES = {
++    "python": "solution.py",
++    "cpp": "solution.cpp",
++    "java": "Solution.java",
++    "go": "solution.go",
++    "rust": "solution.rs",
++    "javascript": "solution.js",
++}
++
++def _block_text(block):
++    """Return the text of a content block (dict or object), or ''."""
++    if isinstance(block, dict):
++        return block.get("text") or ""
++    return getattr(block, "text", None) or ""
++
++def _block_type(block):
++    if isinstance(block, dict):
++        return block.get("type")
++    return getattr(block, "type", None)
++
++def _history_has_tool_use(msg_history):
++    """
++    True if the history contains any tool use: Claude-style 'tool_use' content blocks,
++    OpenAI-style 'tool_calls' on messages or 'tool' role messages, or the manual
++    '<tool_use>' text format.
++    """
++    for msg in msg_history or []:
++        if isinstance(msg, dict):
++            role = msg.get("role")
++            if role == "tool" or msg.get("tool_calls"):
++                return True
++            content = msg.get("content")
++        else:
++            if getattr(msg, "tool_calls", None):
++                return True
++            role = getattr(msg, "role", None)
++            content = getattr(msg, "content", None)
++        if isinstance(content, str):
++            if "<tool_use>" in content:
++                return True
++            continue
++        for block in content or []:
++            if _block_type(block) in ("tool_use", "tool_result"):
++                return True
++            if "<tool_use>" in _block_text(block):
++                return True
++    return False
++
++def _last_assistant_text(msg_history):
++    """Return the text of the final assistant message in the history ('' if none)."""
++    for msg in reversed(msg_history or []):
++        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
++        if role != "assistant":
++            continue
++        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
++        if isinstance(content, str):
++            text = content
++        else:
++            text = "".join(_block_text(b) for b in (content or []))
++        return text.strip()
++    return ""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -240,30 +304,113 @@ IMPORTANT RULES:
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         max_retries = 3
++        failure_class = None
++        retries_used = 0
+         for attempt in range(max_retries):
+             has_edit = self._has_source_edit()
+             changed = self._changed_files()
+             safe_log(f"[verify] attempt={attempt} has_source_edit={has_edit} changed_files={changed}")
+             if has_edit:
++                failure_class = None
+                 break
+ 
++            failure_class = self._classify_failure(msg_history)
++            safe_log(f"[verify] attempt={attempt} failure_class={failure_class}")
+             is_last = attempt == max_retries - 1
+-            file_hint = f"`{solution_file}`" if solution_file else "the required solution file"
+-            corrective = f"""No non-test source changes were detected in the repository.
+-Currently changed files: {changed if changed else "(none)"}
+-
+-You MUST immediately create or edit {file_hint} using the editor tool (`create` if it is missing, `edit` otherwise).
+-Then verify it by running the sample inputs from the problem statement with bash, and fix any mismatch.
+-Editing only test files does not count; the main solution source must be changed.
+-"""
++            file_hint = solution_file or DEFAULT_SOLUTION_FILES.get(self.language, "solution.py")
++            nudge = (
++                f"Call the editor tool now: command=create, path={self.git_tempdir}/{file_hint}, "
++                f"file_text=<complete solution>. Then run the samples with bash."
++            )
++            if attempt == 0:
++                corrective = (
++                    f"Your previous reply was {'empty' if failure_class == 'empty_reply' else 'incomplete'} "
++                    f"and made no source edits. " + nudge
++                )
++            else:
++                corrective = (
++                    f"Still no non-test source change. Currently changed files: "
++                    f"{changed if changed else '(none)'}.\n" + nudge
++                )
+             if is_last:
+-                corrective += "\nThis is the final attempt: write your best-effort solution now even if you are unsure. An imperfect patch is better than none."
+-
+-            safe_log(f"[retry] attempt={attempt} sending corrective message")
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                corrective += (
++                    "\nFinal attempt: write your best effort now, even if unsure. "
++                    "An imperfect patch is better than none."
++                )
++
++            retries_used += 1
++            safe_log(f"[retry] attempt={attempt} class={failure_class} retry={retries_used}")
++            if failure_class == "empty_reply":
++                # Broken history: start fresh with the task text plus the nudge.
++                msg_history = chat_with_agent(
++                    f"{task}\n{corrective}", model=self.code_model, msg_history=[], logging=safe_log
++                )
++            else:
++                msg_history = chat_with_agent(
++                    corrective, model=self.code_model, msg_history=msg_history, logging=safe_log
++                )
++
++        fallback_used = False
++        if not self._has_source_edit():
++            fallback_used = True
++            safe_log(f"[fallback] no source edit after {retries_used} retries; class={failure_class}")
++            self._write_fallback_solution(solution_file)
+ 
+         final_has_edit = self._has_source_edit()
+-        safe_log(f"[verify] final has_source_edit={final_has_edit} changed_files={self._changed_files()}")
++        safe_log(
++            f"[verify] final has_source_edit={final_has_edit} fallback_used={fallback_used} "
++            f"retries={retries_used} failure_class={failure_class} changed_files={self._changed_files()}"
++        )
++
++    def _classify_failure(self, msg_history):
++        """
++        Classify why the last turn produced no source edit:
++          'tests_only'    - files changed, but all are test files
++          'empty_reply'   - no tool use and the last assistant text is empty
++          'no_tool_calls' - no tool use, but some text was produced
++        """
++        changed = self._changed_files()
++        if changed and all(self._is_test_path(f) for f in changed):
++            return "tests_only"
++        if not _history_has_tool_use(msg_history) and not _last_assistant_text(msg_history):
++            return "empty_reply"
++        return "no_tool_calls"
++
++    def _write_fallback_solution(self, solution_file):
++        """
++        Last resort: ask for the complete solution as a single fenced code block (no tools)
++        and write it to the target file.
++        """
++        target_name = solution_file or DEFAULT_SOLUTION_FILES.get(self.language, "solution.py")
++        target_path = os.path.join(self.git_tempdir, target_name)
++        prompt = (
++            f"Output ONLY the complete contents of the solution file `{target_name}` "
++            f"in a single ```{self.language} code block, no tools, no explanation.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            response, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are a competitive programming expert. Reply with code only.",
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"[fallback] LLM call failed: {e}", level=logging.WARNING)
++            return False
++
++        match = re.search(r"```(?:python|cpp|java|go|rust|javascript)?\n(.*?)```", response or "", re.DOTALL)
++        if not match or not match.group(1).strip():
++            safe_log("[fallback] no code block found in reply", level=logging.WARNING)
++            return False
++
++        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
++        with open(target_path, "w") as f:
++            f.write(match.group(1))
++        safe_log(f"[fallback] wrote {target_path} ({len(match.group(1))} chars)")
++        return True
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

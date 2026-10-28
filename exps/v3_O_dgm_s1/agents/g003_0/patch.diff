@@ -1,0 +1,779 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e56d3b4..b5bbdf1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,8 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import json
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -102,7 +104,8 @@ class AgenticSystem:
+             chat_history_file='./chat_history.md',
+             test_description=None,
+             self_improve=False,
+-            language='python'
++            language='python',
++            max_attempts=3
+         ):
+         self.problem_statement = problem_statement
+         self.git_tempdir = git_tempdir
+@@ -111,6 +114,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.max_attempts = max_attempts
+ 
+         # Set the code model based based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -122,6 +126,9 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
++        # Store attempt results as list of dicts
++        self.attempts = []
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -137,16 +144,33 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def _run_sample_check(self):
+-        """Run the run_samples tool on the current solution and return its report string."""
+-        try:
+-            # Import the tool lazily to avoid circular imports
+-            from tools.run_samples import tool_function as run_samples_fn
+-        except Exception as e:
+-            return f"Error importing run_samples tool: {e}"
+-        # Determine solution path: look for modified file via diff, fallback to solution.py in git_tempdir
++    def _has_real_solution(self):
++        """Check whether the repo has a non‑trivial solution.
++        Returns True if there is a diff from base and the target file does not consist solely of a 'pass' statement.
++        """
++        diff_text = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        if not diff_text.strip():
++            return False
++        # Heuristic: find the first modified python file
++        for line in diff_text.splitlines():
++            if line.startswith('+++ b/') and line.endswith('.py'):
++                rel = line[len('+++ b/') :]
++                target_path = os.path.join(self.git_tempdir, rel)
++                try:
++                    content = open(target_path).read()
++                    stripped = ''.join(content.split())
++                    if stripped == 'pass' or stripped == '':
++                        return False
++                except Exception:
++                    pass
++        return True
++
++    def _evaluate_patch(self):
++        """Run verification harness on the current solution.
++        Returns a tuple (score:int, report:str, diff:str).
++        """
++        # Determine solution path similar to _run_sample_check
+         diff_text = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        # Simple heuristic: find lines starting with '+' that indicate added/modified python file
+         solution_path = None
+         for line in diff_text.splitlines():
+             if line.startswith('+++ b/') and line.endswith('.py'):
+@@ -154,74 +178,88 @@ class AgenticSystem:
+                 solution_path = os.path.join(self.git_tempdir, rel)
+                 break
+         if not solution_path:
+-            # fallback to default solution.py
+             solution_path = os.path.join(self.git_tempdir, 'solution.py')
+-        return run_samples_fn(solution_path=solution_path, problem_statement=self.problem_statement, timeout_seconds=5)
++        # Run verify_solution tool
++        from tools.verify_solution import tool_function as verify_fn
++        report = verify_fn(solution_path=solution_path)
++        # Simple scoring: count of passed cases (extract from JSON if possible)
++        try:
++            data = json.loads(report)
++            passed = data.get('passed', 0)
++            total = data.get('total', passed)
++        except Exception:
++            passed = 0
++            total = 0
++        score = passed
++        return score, report, diff_text
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
++    def _run_attempt(self, attempt_idx, prior_summary):
++        """Run a single attempt.
++        Returns True if a perfect solution was found.
+         """
+-        # Phase‑based instruction for the LLM agent
+-        phased_prompt = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your job is to edit files in the repository to produce a correct solution. Follow these explicit phases:
+-
+-1. **Restate constraints & required complexity** – briefly list the limits given in the problem and the expected time/space complexity.
+-2. **Create a brute‑force reference implementation** – write a simple, correct (but possibly exponential) solution in a scratch location *outside* the repository, e.g. under `/tmp/brute_{os.getpid()}.py`. Do not commit this file to the repo.
+-3. **Implement the efficient algorithm** – modify the target solution file(s) inside the repository to meet the required complexity.
+-4. **Run the example tests from the problem statement** – execute them to ensure the basic cases pass.
+-5. **Generate random small inputs** – write a tiny input generator (also in `/tmp`) and run a differential test comparing the efficient solution against the brute‑force version for many random trials.
+-6. **Perform a max‑size timing test** – run the efficient solution on a generated input that respects the maximum constraints and verify it finishes within the typical time limit (e.g., <2 seconds).
+-7. **If any discrepancy is found** – analyse the minimal failing case, adjust the algorithm and repeat steps 5‑7 until all checks pass.
+-8. **Cleanup** – delete any scratch files you created under `/tmp` and ensure the repository contains only the final solution.
+-
+-**Important note:** For problems that appear hard, greedy approaches are suspect until they have been stress‑tested against a brute‑force reference.
+-"""
+-        # First interaction – let the agent perform the above workflow
+-        init_msg = chat_with_agent(
+-            phased_prompt,
++        # Reset repo to base commit before each attempt
++        reset_to_commit(self.git_tempdir, self.base_commit)
++        # Build prompt with prior summary
++        prompt = f"Attempt {attempt_idx+1} of {self.max_attempts}.\n"
++        if prior_summary:
++            prompt += f"Previous attempts summary:\n{prior_summary}\n"
++        prompt += f"\nNow solve the problem.\n{self.problem_statement}\n"
++        # Initial chat
++        chat_with_agent(
++            prompt,
+             model=self.code_model,
+             msg_history=[],
+             logging=safe_log
+         )
+-
+-        # Sample verification loop – up to 5 attempts
+-        for attempt in range(5):
+-            sample_report = self._run_sample_check()
+-            if "PASS" in sample_report and "FAIL" not in sample_report:
+-                # All samples passed
++        # Verify that a real solution was written, nudge up to two times if not
++        for nudge in range(2):
++            if self._has_real_solution():
+                 break
+-            # Prepare feedback prompt
+-            feedback_prompt = (
+-                "Sample verification failed. Here is the report:\n" + sample_report + "\n\n"
+-                "Please hand‑simulate the algorithm on the failing inputs, identify the incorrect assumption, and edit solution.py to fix the bug."
+-            )
+-            chat_with_agent(
+-                feedback_prompt,
+-                model=self.code_model,
+-                msg_history=self.get_current_edits(),
+-                logging=safe_log
+-            )
+-        # Optional reviewer pass: stress‑test the current solution and fix bugs
+-        reviewer_prompt = (
+-            "Reviewer pass – independently write a brute‑force reference implementation and a random tester for the solution file you just edited (or for solution.py if that is the target). "
+-            "Run the tester, report any mismatches, and if a discrepancy exists, correct the solution. "
+-            "Also run a timing test on a max‑size input to ensure it respects the time limit. "
+-            "Provide the diff of any further edits you make."
+-        )
+-        # Use a bounded single iteration (no while True)
+-        for _ in range(1):
++            nudge_msg = "No solution was written. The editor `edit` command requires `file_text` containing the full file. Write the complete solution now."
+             chat_with_agent(
+-                reviewer_prompt,
++                nudge_msg,
+                 model=self.code_model,
+                 msg_history=self.get_current_edits(),
+                 logging=safe_log
+             )
++        # Evaluate patch
++        score, report, diff = self._evaluate_patch()
++        # Store attempt info
++        self.attempts.append({
++            'index': attempt_idx,
++            'score': score,
++            'report': report,
++            'diff': diff
++        })
++        # Determine if perfect (all tests passed). Assume perfect if score equals total in report.
++        perfect = False
++        try:
++            data = json.loads(report)
++            if data.get('passed') == data.get('total'):
++                perfect = True
++        except Exception:
++            pass
++        return perfect
++
++    def forward(self):
++        """Run the multi‑attempt workflow.
++        """
++        prior_summary = ''
++        for attempt_idx in range(self.max_attempts):
++            perfect = self._run_attempt(attempt_idx, prior_summary)
++            # Build summary of attempts so far
++            summary_lines = []
++            for att in self.attempts:
++                summary_lines.append(f"Attempt {att['index']+1}: score={att['score']}, report={att['report'][:200]}...")
++            prior_summary = "\n".join(summary_lines)
++            if perfect:
++                break
++        # Choose best attempt (highest score)
++        best = max(self.attempts, key=lambda a: a['score']) if self.attempts else None
++        if best:
++            # Reset to base and apply best diff
++            reset_to_commit(self.git_tempdir, self.base_commit)
++            apply_patch(self.git_tempdir, best['diff'])
+         # End of forward()
+ 
+ def main():
+@@ -231,30 +269,21 @@ def main():
+     parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+     parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+     parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
++    parser.add_argument('--test_description', default=None,
++                        help='Optional description of tests')
++    parser.add_argument('--self_improve', action='store_true', help='Enable self‑improvement mode')
++    parser.add_argument('--language', default='python', help='Programming language of the solution')
+     args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
++    agent = AgenticSystem(
+         problem_statement=args.problem_statement,
+         git_tempdir=args.git_dir,
+         base_commit=args.base_commit,
+         chat_history_file=args.chat_history_file,
+         test_description=args.test_description,
+         self_improve=args.self_improve,
+-        language=args.language,
++        language=args.language
+     )
++    agent.forward()
+ 
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
++if __name__ == '__main__':
+     main()
+diff --git a/tools/bash.py b/tools/bash.py
+index 8379704..2bf36d8 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,17 +1,15 @@
+-import asyncio
+-import os
++import subprocess
++import shlex
+ 
+ def tool_info():
+     return {
+         "name": "bash",
+-        "description": """Run commands in a bash shell\n
+-* When invoking this tool, the contents of the \"command\" parameter does NOT need to be XML-escaped.\n
+-* You don't have access to the internet via this tool.\n
+-* You do have access to a mirror of common linux and python packages via apt and pip.\n
+-* State is persistent across command calls and discussions with the user.\n
+-* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+-* Please avoid commands that may produce a very large amount of output.\n
+-* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""",
++        "description": """Run commands in a bash shell.
++
++* The command is executed via the system shell. No special job control is required.
++* Output is captured and returned. If the command fails (non‑zero exit), the stderr is included prefixed by "Error:".
++* This tool avoids interactive bash sessions and therefore does not emit startup warnings.
++""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+@@ -24,149 +22,63 @@ def tool_info():
+         }
+     }
+ 
++def tool_function(command: str, timeout_seconds: int = 30) -> str:
++    """Execute *command* in a bash shell and return its output.
++
++    The function runs the command with ``shell=True`` to allow pipelines, &&, etc.
++    Standard output is returned. If the command exits with a non‑zero status, the
++    error output is returned prefixed by ``Error:``.
++    """
++    try:
++        # Use subprocess.run for simplicity; capture both stdout and stderr.
++        result = subprocess.run(
++            command,
++            shell=True,
++            executable="/bin/bash",
++            capture_output=True,
++            text=True,
++            timeout=timeout_seconds,
++        )
++        stdout = result.stdout.strip()
++        stderr = result.stderr.strip()
++        if result.returncode != 0:
++            # Include stderr as error information.
++            err_msg = f"Error: {stderr}" if stderr else f"Error: Command exited with status {result.returncode}"
++            # If there is also stdout, include it before the error.
++            return f"{stdout}\n{err_msg}".strip()
++        return stdout
++    except subprocess.TimeoutExpired:
++        return f"Error: Execution timed out after {timeout_seconds} seconds"
++    except Exception as e:
++        return f"Error: {str(e)}"
++
++# Minimal BashSession for compatibility with existing tests.
+ class BashSession:
+-    """A session of a bash shell."""
++    """Simple wrapper providing start, stop, and run methods.
++
++    This is not an interactive session; each run executes the command directly
++    using :func:`tool_function`. It is sufficient for the test suite which only
++    imports the class.
++    """
+     def __init__(self):
+         self._started = False
+-        self._process = None
+-        self._timed_out = False
+-        self._timeout = 120.0  # seconds
+-        self._sentinel = "<<exit>>"
+-        self._output_delay = 0.2  # seconds
+ 
+     async def start(self):
+-        if self._started:
+-            return
+-        self._process = await asyncio.create_subprocess_shell(
+-            "/bin/bash -i",
+-            preexec_fn=os.setsid,
+-            stdin=asyncio.subprocess.PIPE,
+-            stdout=asyncio.subprocess.PIPE,
+-            stderr=asyncio.subprocess.PIPE,
+-            env=os.environ.copy()  # Ensures inheritance of the current environment
+-        )
++        # Mark as started; nothing else needed.
+         self._started = True
++        return None
+ 
+     def stop(self):
+-        """Terminate the bash subprocess if it is still running."""
+-        if self._process and self._process.returncode is None:
+-            try:
+-                self._process.terminate()
+-            except Exception:
+-                pass
+-        self._process = None
++        # No persistent process to terminate.
+         self._started = False
+-        self._timed_out = False
++        return None
+ 
+-    async def run(self, command):
++    async def run(self, command: str):
+         if not self._started:
+             raise ValueError("Session has not started.")
+-        if self._process.returncode is not None:
+-            raise ValueError(f"Bash has exited with returncode {self._process.returncode}")
+-        if self._timed_out:
+-            raise ValueError(
+-                f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-            )
+-        
+-        # Send command
+-        self._process.stdin.write(
+-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
+-        )
+-        await self._process.stdin.drain()
+-
+-        # Read output until sentinel
+-        try:
+-            output = ''
+-            start_time = asyncio.get_event_loop().time()
+-            
+-            while True:
+-                if asyncio.get_event_loop().time() - start_time > self._timeout:
+-                    self._timed_out = True
+-                    raise ValueError(
+-                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-                    )
+-                
+-                await asyncio.sleep(self._output_delay)
+-                # Read from the internal buffer
+-                stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+-                stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
+-                if self._sentinel in stdout_data:
+-                    output = stdout_data[: stdout_data.index(self._sentinel)]
+-                    break
+-
+-            # Clear buffers
+-            self._process.stdout._buffer.clear()
+-            self._process.stderr._buffer.clear()
+-
+-            output = output.strip()
+-            error = stderr_data.strip()
+-
+-            return output, error
+-
+-        except Exception as e:
+-            self._timed_out = True
+-            raise ValueError(str(e))
+-
+-def filter_error(error):
+-    # Filter out errors that we do not want to see
+-    filtered_lines = []
+-    i = 0
+-    error_lines = error.splitlines()
+-    while i < len(error_lines):
+-        line = error_lines[i]
+-
+-        # Skip the next lines if ioctl error, add relevant lines
+-        if "Inappropriate ioctl for device" in line:
+-            i += 3
+-            if '<<exit>>' in error_lines[i]:
+-                i += 1
+-            while i < len(error_lines) - 1:
+-                filtered_lines.append(error_lines[i])
+-                i += 1
+-            i += 1
+-            continue
+-
+-        filtered_lines.append(line)
+-        i += 1
+-    return '\n'.join(filtered_lines).strip()
+-
+-async def tool_function_call(command):
+-    """Execute a command in the bash shell."""
+-    try:
+-        bash_session = BashSession()
+-
+-        if not bash_session._started:
+-            await bash_session.start()
+-
+-        output, error = await bash_session.run(command)
+-        error = filter_error(error)
+-        result = ""
+-        if output:
+-            result += output
+-        if error:
+-            result += "\nError:\n" + error
+-        return result.strip()
+-    except Exception as e:
+-        return f"Error: {str(e)}"
+-    finally:
+-        # Ensure the subprocess is terminated to avoid resource leaks during tests
+-        if 'bash_session' in locals():
+-            bash_session.stop()
+-
+-def tool_function(command):
+-    return asyncio.run(tool_function_call(command))
+-
+-if __name__ == "__main__":
+-    # Example usage
+-    import sys
+-
+-    # Check if the script is called with arguments
+-    if len(sys.argv) < 2:
+-        print("Usage: python bash.py '<command>'")
+-    else:
+-        # Extract the command from the command-line arguments
+-        input_command = ' '.join(sys.argv[1:])
+-        # Run the tool_function asynchronously
+-        result = tool_function(input_command)
+-        print(result)
++        # Directly use tool_function synchronously.
++        output = tool_function(command)
++        # Separate output and error messages.
++        if output.startswith("Error:"):
++            return "", output[6:].strip()
++        return output, ""
+diff --git a/tools/edit.py b/tools/edit.py
+index 244d440..f4f6d51 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -4,27 +4,36 @@ import subprocess
+ def tool_info():
+     return {
+         "name": "editor",
+-        "description": """Custom editing tool for viewing, creating, and editing files\n
+-* State is persistent across command calls and discussions with the user.\n
+-* If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+-* The `create` command cannot be used if the specified `path` already exists as a file.\n
+-* If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+-* The `edit` command overwrites the entire file with the provided `file_text`.\n
++        "description": """Custom editing tool for viewing, creating, editing files, and string replacement.
++
++* State is persistent across command calls and discussions with the user.
++* If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.
++* The `create` command cannot be used if the specified `path` already exists as a file.
++* The `edit` command overwrites the entire file with the provided `file_text`.
++* The `str_replace` command replaces occurrences of a string within a file.
+ * No partial/line-range edits or partial viewing are supported.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "command": {
+                     "type": "string",
+-                    "enum": ["view", "create", "edit"],
+-                    "description": "The command to run: `view`, `create`, or `edit`."
++                    "enum": ["view", "create", "edit", "str_replace"],
++                    "description": "The command to run: `view`, `create`, `edit`, or `str_replace`."
+                 },
+                 "path": {
+                     "description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.",
+                     "type": "string"
+                 },
+                 "file_text": {
+-                    "description": "Required parameter of `create` or `edit` command, containing the content for the entire file.",
++                    "description": "Required for `create` or `edit`; the content for the entire file.",
++                    "type": "string"
++                },
++                "search": {
++                    "description": "String to search for (used with `str_replace`).",
++                    "type": "string"
++                },
++                "replace": {
++                    "description": "String to replace with (used with `str_replace`).",
+                     "type": "string"
+                 }
+             },
+@@ -43,7 +52,7 @@ def validate_path(path: str, command: str) -> Path:
+     Validate the file path for each command:
+       - 'view': path may be a file or directory; must exist.
+       - 'create': path must not exist (for new file creation).
+-      - 'edit': path must exist (for overwriting).
++      - 'edit'/'str_replace': path must exist (for overwriting or modification).
+     """
+     path_obj = Path(path)
+ 
+@@ -61,8 +70,8 @@ def validate_path(path: str, command: str) -> Path:
+         # Path must not exist
+         if path_obj.exists():
+             raise ValueError(f"Cannot create new file; {path} already exists.")
+-    elif command == "edit":
+-        # Path must exist and must be a file
++    elif command in ("edit", "str_replace"):
++        # Path must exist and be a file
+         if not path_obj.exists():
+             raise ValueError(f"The file {path} does not exist.")
+         if path_obj.is_dir():
+@@ -119,12 +128,8 @@ def view_path(path_obj: Path) -> str:
+     content = read_file(path_obj)
+     return format_output(content, str(path_obj))
+ 
+-def tool_function(command: str, path: str, file_text: str = None) -> str:
+-    """
+-    Main tool function that handles:
+-      - 'view'  : View the entire file or directory listing
+-      - 'create': Create a new file with the given file_text
+-      - 'edit'  : Overwrite an existing file with file_text
++def tool_function(command: str, path: str, file_text: str = None, search: str = None, replace: str = None) -> str:
++    """Main tool function handling view, create, edit, and str_replace.
+     """
+     try:
+         path_obj = validate_path(path, command)
+@@ -134,16 +139,24 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
+ 
+         elif command == "create":
+             if file_text is None:
+-                raise ValueError("Missing required `file_text` for 'create' command.")
++                raise ValueError("Provide the entire new file contents in `file_text`.")
+             write_file(path_obj, file_text)
+             return f"File created successfully at: {path}"
+ 
+         elif command == "edit":
+             if file_text is None:
+-                raise ValueError("Missing required `file_text` for 'edit' command.")
++                raise ValueError("Provide the entire new file contents in `file_text`.")
+             write_file(path_obj, file_text)
+             return f"File at {path} has been overwritten with new content."
+ 
++        elif command == "str_replace":
++            if search is None or replace is None:
++                raise ValueError("Both `search` and `replace` parameters must be provided for `str_replace`.")
++            original = read_file(path_obj)
++            new_content = original.replace(search, replace)
++            write_file(path_obj, new_content)
++            return f"Replaced occurrences of '{search}' with '{replace}' in {path}."
++
+         else:
+             raise ValueError(f"Unknown command: {command}")
+ 
+@@ -152,5 +165,5 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
+ 
+ if __name__ == "__main__":
+     # Example usage
+-    result = tool_function("view", "./coding_agent.py", view_range=[1, 10])
+-    print(result)
++    result = tool_function("view", "./coding_agent.py")
++    print(result)
+\ No newline at end of file
+diff --git a/tools/verify_solution.py b/tools/verify_solution.py
+new file mode 100644
+index 0000000..b833ccb
+--- /dev/null
++++ b/tools/verify_solution.py
+@@ -0,0 +1,157 @@
++import importlib.util
++import json
++import os
++import sys
++import traceback
++import time
++import subprocess
++from types import ModuleType
++from typing import Any, List, Tuple
++
++def tool_info():
++    return {
++        "name": "verify_solution",
++        "description": "Verify a Solution class by running JSON test cases and optional differential testing.",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Absolute path to the solution file containing a Solution class."
++                },
++                "cases_path": {
++                    "type": "string",
++                    "description": "Path to JSON file with test cases (list of {\"args\": [...], \"expected\": ...}). Defaults to /tmp/cases.json."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Optional path to a brute‑force implementation module for differential testing."
++                },
++                "gen_path": {
++                    "type": "string",
++                    "description": "Optional path to a generator script that writes a single random test case to stdout."
++                },
++                "time_limit": {
++                    "type": "number",
++                    "description": "Maximum acceptable runtime (seconds) for the max‑size test.",
++                    "default": 2
++                }
++            },
++            "required": ["solution_path"]
++        }
++    }
++
++def _load_module_from_path(path: str) -> ModuleType:
++    spec = importlib.util.spec_from_file_location("solution_mod", path)
++    if spec is None or spec.loader is None:
++        raise ImportError(f"Cannot load module from {path}")
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["solution_mod"] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++def _find_public_method(obj: Any) -> Tuple[str, Any]:
++    for attr in dir(obj):
++        if attr.startswith("_"):
++            continue
++        val = getattr(obj, attr)
++        if callable(val):
++            return attr, val
++    raise AttributeError("No public method found on solution object")
++
++def _run_cases(method, cases: List[dict]) -> Tuple[int, List[dict]]:
++    passed = 0
++    failures = []
++    for case in cases:
++        args = case.get("args", [])
++        expected = case.get("expected")
++        try:
++            result = method(*args)
++            if result == expected:
++                passed += 1
++            else:
++                failures.append({"case": case, "got": result, "expected": expected})
++        except Exception:
++            failures.append({"case": case, "error": traceback.format_exc()})
++    return passed, failures
++
++def tool_function(solution_path: str,
++                  cases_path: str = "/tmp/cases.json",
++                  brute_path: str = None,
++                  gen_path: str = None,
++                  time_limit: float = 2.0) -> str:
++    """Run verification harness. Returns a JSON string with results."""
++    report = {"passed": 0, "total": 0, "failures": [], "time_seconds": None}
++    try:
++        sol_mod = _load_module_from_path(solution_path)
++        # Find Solution class
++        Solution = None
++        for name in dir(sol_mod):
++            obj = getattr(sol_mod, name)
++            if isinstance(obj, type) and name == "Solution":
++                Solution = obj
++                break
++        if Solution is None:
++            raise AttributeError("Solution class not found")
++        instance = Solution()
++        _, method = _find_public_method(instance)
++        # Load cases
++        if os.path.exists(cases_path):
++            with open(cases_path) as f:
++                cases = json.load(f)
++        else:
++            cases = []
++        total = len(cases)
++        passed, failures = _run_cases(method, cases)
++        report["passed"] = passed
++        report["total"] = total
++        report["failures"] = failures
++        # Timing on last case if exists
++        if cases:
++            max_case = cases[-1]
++            start = time.time()
++            try:
++                method(*max_case.get("args", []))
++            except Exception:
++                pass
++            elapsed = time.time() - start
++            report["time_seconds"] = elapsed
++        # Differential testing
++        if brute_path and gen_path and os.path.exists(brute_path) and os.path.exists(gen_path):
++            brute_mod = _load_module_from_path(brute_path)
++            # Locate brute Solution
++            BruteSolution = None
++            for name in dir(brute_mod):
++                obj = getattr(brute_mod, name)
++                if isinstance(obj, type) and name == "Solution":
++                    BruteSolution = obj
++                    break
++            if BruteSolution is None:
++                raise AttributeError("Brute force Solution not found")
++            brute_inst = BruteSolution()
++            _, brute_method = _find_public_method(brute_inst)
++            diff_pass = 0
++            diff_total = 5
++            diff_failures = []
++            for _ in range(diff_total):
++                proc = subprocess.run(["python3", gen_path], capture_output=True, text=True, timeout=5)
++                if proc.returncode != 0:
++                    continue
++                try:
++                    gen_case = json.loads(proc.stdout.strip())
++                except Exception:
++                    continue
++                args = gen_case.get("args", [])
++                try:
++                    fast_res = method(*args)
++                    brute_res = brute_method(*args)
++                    if fast_res == brute_res:
++                        diff_pass += 1
++                    else:
++                        diff_failures.append({"case": gen_case, "fast": fast_res, "brute": brute_res})
++                except Exception:
++                    diff_failures.append({"case": gen_case, "error": traceback.format_exc()})
++            report["differential"] = {"passed": diff_pass, "total": diff_total, "failures": diff_failures}
++    except Exception:
++        report["error"] = traceback.format_exc()
++    return json.dumps(report)

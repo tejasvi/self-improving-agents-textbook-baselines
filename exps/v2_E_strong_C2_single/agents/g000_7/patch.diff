@@ -1,0 +1,172 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..47dee33 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -155,7 +155,12 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+ 5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++6. I/O robustness (do this for every problem, and especially for interactive or unusual I/O):
++   (a) Unless the problem is truly interactive, read ALL of stdin with a token reader (e.g. `data = sys.stdin.read().split()` with an index, or an iterator over tokens) instead of assuming one value per line. Never assume the input layout beyond what the statement says.
++   (b) For interactive problems: (i) test against a pipe-based interactive judge that you write (run solution.py with subprocess pipes, answer each query line, flush after every print, and never rely on line boundaries of the judge's output being stable); AND (ii) test a static run `python3 solution.py < transcript.txt` where transcript.txt is a flattened transcript containing the header followed by plausible extra lines (e.g. the hidden array and recorded answers, with the answers possibly on the same line or on separate lines). Make sure the program neither crashes nor misparses in either mode.
++   (c) Handle a response token that is outside the valid range, and input that is exhausted (EOF), gracefully: the program must fall back to a sensible default or stop cleanly instead of raising an exception (e.g. check the token count before indexing, and wrap response parsing so a missing or invalid token does not produce a traceback).
++   (d) In your final report, explicitly list which I/O assumptions were NOT verified (for example: the exact judge response format for an interactive problem, whether input may contain extra whitespace or trailing lines, the behavior on EOF, or the exact grader for a static transcript). Do not claim that everything passed without listing these.
++7. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+diff --git a/tools/interactive_judge.py b/tools/interactive_judge.py
+new file mode 100644
+index 0000000..e709756
+--- /dev/null
++++ b/tools/interactive_judge.py
+@@ -0,0 +1,148 @@
++import importlib.util
++import os
++import subprocess
++import sys
++import threading
++
++MAX_QUERIES_CAP = 100000
++MAX_TIMEOUT_CAP = 120
++
++
++def tool_info():
++    return {
++        "name": "interactive_judge",
++        "description": """Run a solution program against a judge written by you, to test interactive or unusual-I/O problems.\n
++* mode='pipe': starts the solution with stdin/stdout pipes. First writes `header` (one line) to the solution. Then, for each line the solution prints, calls the judge file's `respond(line, state)` function, which must return the next string to write to the solution's stdin (a newline is appended), or None to stop the interaction (stdin is closed). `state` is a dict that persists across calls; the judge may also set state['init'] lines via the `initial(state)` function (optional, returns a string written right after the header).
++* mode='static': runs the solution once with `static_input` (the full text) as stdin and returns its output. Use this to check that the program handles a flattened transcript (header plus extra data lines) without crashing.
++* Returns the full transcript (what was sent and what was received), the exit code, stderr, and any error (query limit exceeded, timeout, or a crash).
++* The judge file must be a Python file defining `respond(line, state)` (and optionally `initial(state)`).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the solution program to run (e.g. solution.py)."},
++                "mode": {"type": "string", "description": "Either 'pipe' (interactive judge) or 'static' (replay static stdin). Default 'pipe'."},
++                "header": {"type": "string", "description": "First line written to the solution in pipe mode (e.g. 'N L R')."},
++                "judge_path": {"type": "string", "description": "Path to a Python judge file defining respond(line, state) for pipe mode."},
++                "static_input": {"type": "string", "description": "Full stdin text for static mode."},
++                "query_limit": {"type": "integer", "description": "Maximum number of solution output lines allowed in pipe mode. Default 1000."},
++                "timeout": {"type": "integer", "description": "Overall time limit in seconds. Default 10."}
++            },
++            "required": ["solution_path"]
++        }
++    }
++
++
++def _load_judge(judge_path):
++    spec = importlib.util.spec_from_file_location("judge_module", judge_path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    if not hasattr(mod, "respond"):
++        raise ValueError("judge file must define respond(line, state)")
++    return mod
++
++
++def _clip(s, n=12000):
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++
++def _run_static(solution_path, static_input, timeout):
++    try:
++        p = subprocess.run([sys.executable, solution_path], input=static_input, capture_output=True,
++                           text=True, timeout=timeout, errors="replace")
++    except subprocess.TimeoutExpired:
++        return f"Error: static run timed out after {timeout} seconds."
++    out = f"Exit code: {p.returncode}\nSTDOUT:\n{p.stdout}"
++    if p.stderr.strip():
++        out += f"\nSTDERR:\n{p.stderr}"
++    if p.returncode != 0:
++        out += "\nError: solution exited with a non-zero code (possible crash on this input)."
++    return _clip(out)
++
++
++def _run_pipe(solution_path, header, judge_path, query_limit, timeout):
++    if not judge_path:
++        return "Error: judge_path is required in pipe mode."
++    judge = _load_judge(judge_path)
++    state = {}
++    transcript = []
++    proc = subprocess.Popen([sys.executable, solution_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE, text=True, bufsize=1, errors="replace")
++    err_chunks = []
++    threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()), daemon=True).start()
++
++    def send(text):
++        transcript.append("> " + text.rstrip("\n"))
++        proc.stdin.write(text + "\n")
++        proc.stdin.flush()
++
++    error = None
++    try:
++        send(header)
++        if hasattr(judge, "initial"):
++            init = judge.initial(state)
++            if init is not None:
++                send(init)
++        # Read solution output with a per-line timeout enforced via a helper thread.
++        for _ in range(query_limit):
++            result = {}
++
++            def read_line():
++                result["line"] = proc.stdout.readline()
++
++            t = threading.Thread(target=read_line, daemon=True)
++            t.start()
++            t.join(timeout)
++            if t.is_alive():
++                error = f"Error: no output from solution within {timeout} seconds (timeout)."
++                break
++            line = result.get("line", "")
++            if line == "":
++                break  # solution closed stdout (finished or crashed)
++            transcript.append("< " + line.rstrip("\n"))
++            reply = judge.respond(line.rstrip("\n"), state)
++            if reply is None:
++                break
++            send(str(reply))
++        else:
++            error = f"Error: query limit of {query_limit} exceeded."
++    except (BrokenPipeError, OSError) as e:
++        error = f"Error: solution closed its stdin early ({e})."
++    finally:
++        try:
++            proc.stdin.close()
++        except Exception:
++            pass
++        try:
++            proc.wait(timeout=2)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            proc.wait()
++    stderr_text = "".join(err_chunks) if err_chunks else ""
++    out = "TRANSCRIPT:\n" + "\n".join(transcript)
++    out += f"\nExit code: {proc.returncode}"
++    if stderr_text.strip():
++        out += f"\nSTDERR:\n{stderr_text}"
++    if error:
++        out += "\n" + error
++    elif proc.returncode != 0:
++        out += "\nError: solution exited with a non-zero code (possible crash)."
++    return _clip(out)
++
++
++def tool_function(solution_path, mode="pipe", header="", judge_path=None, static_input="",
++                  query_limit=1000, timeout=10):
++    try:
++        mode = (mode or "pipe").strip().lower()
++        query_limit = max(1, min(int(query_limit or 1000), MAX_QUERIES_CAP))
++        timeout = max(1, min(int(timeout or 10), MAX_TIMEOUT_CAP))
++        if not os.path.exists(solution_path):
++            return f"Error: solution file not found: {solution_path}"
++        if mode == "static":
++            return _run_static(solution_path, static_input or "", timeout)
++        if mode == "pipe":
++            return _run_pipe(solution_path, header or "", judge_path, query_limit, timeout)
++        return f"Error: unknown mode {mode!r}; use 'pipe' or 'static'."
++    except Exception as e:
++        return f"Error: interactive_judge failed: {type(e).__name__}: {e}"

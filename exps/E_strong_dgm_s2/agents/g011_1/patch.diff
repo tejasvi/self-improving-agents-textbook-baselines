@@ -1,0 +1,254 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 9d4cd27..e6a1e73 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,6 +8,8 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
++import resource
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -19,6 +21,7 @@ NUM_DIFF_TESTS = 200
+ FAST_LIMIT_SECONDS = 2.0
+ RUN_TIMEOUT = 10
+ MAX_NOTES_CHARS = 4000
++MEMORY_LIMIT_BYTES = 1024 * 1024 * 1024  # 1 GB address space per candidate run
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -218,6 +221,54 @@ class AgenticSystem:
+     # ---------------------------------------------------------------
+     # Harness-run evaluation (no LLM involved)
+     # ---------------------------------------------------------------
++    _SAMPLE_HEADER_RE = re.compile(r'^\s*Sample\s+(Input|Output)\s*(\d+)\s*:?\s*(.*)$', re.IGNORECASE)
++    _SAMPLE_STOP_RE = re.compile(
++        r'^\s*(Sample\b|Explanation|Example|Note\b|Constraints|Input\b|Output\b|#|Notes?\b|Time limit|Memory limit)',
++        re.IGNORECASE)
++
++    def _extract_samples(self):
++        """Parse 'Sample Input N' / 'Sample Output N' blocks from the statement into dev/samples/N.in and N.out.
++        Returns the number of sample pairs written."""
++        blocks = {}  # (kind, n) -> list of lines
++        current = None
++        for line in self.problem_statement.splitlines():
++            m = self._SAMPLE_HEADER_RE.match(line)
++            if m:
++                kind, n, rest = m.group(1).lower(), int(m.group(2)), m.group(3)
++                current = (kind, n)
++                blocks.setdefault(current, [])
++                if rest.strip():
++                    blocks[current].append(rest.strip())
++                continue
++            if current is None:
++                continue
++            stripped = line.strip()
++            if stripped.startswith('```'):
++                if blocks[current]:
++                    current = None  # closing fence ends the block
++                continue
++            if self._SAMPLE_STOP_RE.match(line):
++                current = None
++                continue
++            if stripped == '':
++                if blocks[current]:
++                    current = None  # blank line after content ends the block
++                continue
++            blocks[current].append(line.rstrip())
++        samples_dir = self._dev_path('samples')
++        os.makedirs(samples_dir, exist_ok=True)
++        written = 0
++        for (kind, n), lines in sorted(blocks.items(), key=lambda kv: (kv[0][1], kv[0][0])):
++            if kind != 'input' or not lines or ('output', n) not in blocks or not blocks[('output', n)]:
++                continue
++            out_lines = blocks[('output', n)]
++            with open(os.path.join(samples_dir, f"{n}.in"), 'w') as f:
++                f.write("\n".join(lines) + "\n")
++            with open(os.path.join(samples_dir, f"{n}.out"), 'w') as f:
++                f.write("\n".join(out_lines) + "\n")
++            written += 1
++        return written
++
+     def _dev_path(self, *parts):
+         return os.path.join(self.git_tempdir, 'dev', *parts)
+ 
+@@ -226,6 +277,10 @@ class AgenticSystem:
+         """Exact comparison, ignoring only trailing whitespace on each line and at the end."""
+         return "\n".join(line.rstrip() for line in text.strip().splitlines())
+ 
++    @staticmethod
++    def _limit_memory():
++        resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT_BYTES, MEMORY_LIMIT_BYTES))
++
+     @staticmethod
+     def _run_candidate(path, data, timeout):
+         """Run a python candidate on stdin data. Returns (stdout, stderr, returncode, timed_out, elapsed)."""
+@@ -234,6 +289,7 @@ class AgenticSystem:
+             p = subprocess.run(
+                 [sys.executable, "-I", path], input=data, capture_output=True, text=True,
+                 timeout=timeout, env={"PATH": os.environ.get("PATH", "")},
++                preexec_fn=AgenticSystem._limit_memory,
+             )
+             return p.stdout, p.stderr, p.returncode, False, time.time() - start
+         except subprocess.TimeoutExpired as e:
+@@ -257,6 +313,7 @@ class AgenticSystem:
+         # (a) samples
+         in_files = sorted(glob.glob(self._dev_path('samples', '*.in')))
+         sample_max_time = 0.0
++        sample_failure_reported = False
+         for in_file in in_files:
+             out_file = in_file[:-3] + '.out'
+             if not os.path.isfile(out_file):
+@@ -270,15 +327,18 @@ class AgenticSystem:
+             sample_max_time = max(sample_max_time, elapsed)
+             if not to and rc == 0 and self._canon(out) == self._canon(expected):
+                 result["n_pass"] += 1
+-            else:
+-                reason = "timed out" if to else (f"runtime error (exit code {rc})" if rc != 0 else "wrong answer")
++            elif not sample_failure_reported:
++                sample_failure_reported = True
++                reason = ("timed out after %d seconds" % RUN_TIMEOUT) if to else (
++                    f"runtime error (exit code {rc})" if rc != 0 else "wrong answer")
++                stderr_tail = "\n".join(err.strip().splitlines()[-15:]) if err.strip() else ""
+                 failures.append(
+                     f"SAMPLE {os.path.basename(in_file)} failed: {reason}.\n"
+                     f"INPUT:\n{_clip_lines(data, 40)}\n"
+                     f"EXPECTED:\n{_clip_lines(expected, 40)}\n"
+                     f"ACTUAL:\n{_clip_lines(out, 40)}\n"
+-                    + (f"STDERR:\n{_clip_lines(err, 40)}\n" if err.strip() else ""))
+-                break  # one concrete failing sample is enough to guide the next attempt
++                    + (f"STDERR (tail; MemoryError means the 1 GB memory limit was exceeded):\n{stderr_tail}\n"
++                       if stderr_tail else ""))
+         result["max_time"] = sample_max_time
+ 
+         # (b) differential test
+@@ -310,7 +370,8 @@ class AgenticSystem:
+                 failures.append(f"SPEED: slowest run took {result['max_time']:.2f}s; limit is {FAST_LIMIT_SECONDS}s.")
+ 
+         if result["n_total"] == 0:
+-            failures.append("No dev/samples/*.in and *.out files found; the harness could not test anything.")
++            failures.append("The harness found no usable samples (dev/samples/N.in + N.out pairs were not found), "
++                            "so this candidate was NOT tested and counts as a failure.")
+         if failures:
+             result["failure_text"] = "\n".join(failures)
+         return result
+@@ -319,6 +380,12 @@ class AgenticSystem:
+     def _is_passing(ev):
+         return ev["n_total"] > 0 and ev["n_pass"] == ev["n_total"] and ev["failure_text"] is None
+ 
++    @staticmethod
++    def _rank_key(ev):
++        """Higher is better: all samples passed, then pass count, then speed."""
++        all_ok = ev["n_total"] > 0 and ev["n_pass"] == ev["n_total"] and ev["n_total"] > 0
++        return (all_ok, ev["n_pass"], -ev["max_time"])
++
+     def _read_notes(self):
+         path = self._dev_path('NOTES.md')
+         if not os.path.isfile(path):
+@@ -333,18 +400,25 @@ class AgenticSystem:
+         """Short, self-contained prompt for attempts 2..N. Replaces the full previous message history."""
+         brute_exists = os.path.isfile(self._dev_path('brute.py'))
+         notes = self._read_notes()
++        sample_failed = "SAMPLE " in (eval_report or "") and " failed:" in (eval_report or "")
++        slow = "SPEED:" in (eval_report or "") or "TIMING:" in (eval_report or "")
+         if not has_solution:
+             if brute_exists:
+                 directive = ("solution.py still has no implementation. Immediately write a solution into solution.py "
+                              "based on dev/brute.py (read it first; it already contains the reference logic). "
+-                             "Make it correct first, then check it against dev/brute.py. Do not explore further.")
++                             "Make it correct first, then check it against dev/brute.py.")
+             else:
+                 directive = ("solution.py still has no implementation and dev/brute.py does not exist. Immediately write "
+                              "dev/brute.py (a simple correct brute force), then write a correct but possibly slow "
+-                             "solution.py based on it. Do not explore further.")
++                             "solution.py based on it.")
++        elif sample_failed or slow:
++            directive = ("The brute force in dev/brute.py is correct but too slow for the constraints; use it as an "
++                         "oracle to derive an efficient algorithm: tabulate brute-force answers for small parameters, "
++                         "look for formulas or patterns, then verify with diff_test against the oracle and run the "
++                         "large sample. The failing sample below is the concrete evidence; make it pass.")
+         else:
+-            directive = ("continue from the existing dev/ files; do not redo exploration; fix the failures or try a "
+-                         "different approach. Reuse dev/ files (brute.py, gen.py, samples/, max.in, NOTES.md).")
++            directive = ("continue from the existing dev/ files; fix the failures or try a different approach. "
++                         "Reuse dev/ files (brute.py, gen.py, samples/, max.in, NOTES.md).")
+         return f"""{task}
+ 
+ Previous attempt summary (earlier conversation is not available; this is all you get):
+@@ -360,6 +434,7 @@ Previous attempt summary (earlier conversation is not available; this is all you
+ {directive}
+ 
+ Working rules: never print more than 40 lines from any command; summarize tables instead of printing them.
++Keep each reply under about 400 words; make tool calls with all required arguments; write large files in a single editor `create` call rather than printing them.
+ Keep reasoning brief, and after each fix re-run the samples and dev/gen.py-based differential test."""
+ 
+     def forward(self):
+@@ -377,6 +452,8 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         method = """FIRST ACTION: view solution.py and immediately write a complete first-draft implementation using the editor tool; refine afterwards.
+ Keep each reply short; do not write long analyses before making a tool call.
++Keep each reply under about 400 words; make tool calls with all required arguments; write large files in a single editor `create` call rather than printing them.
++Dev sample files already exist: dev/samples/N.in and dev/samples/N.out were extracted from the statement automatically. Do not recreate them; use them as they are.
+ 
+ Dev workspace (persistent across attempts, keep helper artifacts here, under <repo>/dev/):
+ - Within your first 5 tool calls, write a brute force at dev/brute.py and a working (even if slow) solution.py. Save the samples from the statement to dev/samples/N.in and dev/samples/N.out (exact text).
+@@ -403,7 +480,12 @@ The final solution.py is what gets graded; helper files are ignored."""
+         os.makedirs(candidate_dir, exist_ok=True)
+         solution_path = os.path.join(self.git_tempdir, 'solution.py')
+ 
+-        best = None  # (key, path, attempt)
++        best = None  # (key, path, attempt, ev)
++        try:
++            n_samples = self._extract_samples()
++            safe_log(f"[setup] extracted {n_samples} sample pair(s) into dev/samples/")
++        except Exception as e:  # never let parsing break the run
++            safe_log(f"[setup] sample extraction failed: {e!r}")
+         eval_report = ""
+         for attempt in range(MAX_ATTEMPTS):
+             num = attempt + 1
+@@ -425,18 +507,24 @@ The final solution.py is what gets graded; helper files are ignored."""
+             shutil.copyfile(solution_path, cand_path)
+             ev = self._evaluate_candidate(cand_path)
+             safe_log(f"[attempt {num}] harness: pass {ev['n_pass']}/{ev['n_total']}, max_time {ev['max_time']:.3f}s")
+-            key = (ev["n_pass"], -ev["max_time"])
++            key = self._rank_key(ev)
+             if best is None or key > best[0]:
+-                best = (key, cand_path, num)
++                best = (key, cand_path, num, ev)
+             if self._is_passing(ev) and ev["max_time"] <= FAST_LIMIT_SECONDS:
+                 safe_log(f"[attempt {num}] passing and fast; stopping")
+                 break
+             eval_report = (f"Harness pass count: {ev['n_pass']}/{ev['n_total']}, slowest run {ev['max_time']:.2f}s.\n"
+                            + (ev["failure_text"] or "All checks passed, but the run was too slow."))
+ 
+-        if best is not None:
++        if best is not None and best[3]["n_total"] > 0:
+             shutil.copyfile(best[1], solution_path)
+-            safe_log(f"[final] solution.py set to attempt {best[2]} (pass count {best[0][0]}, max_time {-best[0][1]:.3f}s)")
++            ok = self._is_passing(best[3])
++            safe_log(f"[final] solution.py set to attempt {best[2]} (pass {best[3]['n_pass']}/{best[3]['n_total']}, "
++                     f"all_passed={ok}, max_time {best[3]['max_time']:.3f}s)")
++            if not ok:
++                safe_log("[final] WARNING: no candidate passed every sample; kept the best-scoring one.")
++        elif best is not None:
++            safe_log(f"[final] best candidate (attempt {best[2]}) had no usable samples; solution.py left unchanged")
+         else:
+             safe_log("[final] no candidate was produced; solution.py left unchanged")
+ 
+diff --git a/tools/bash.py b/tools/bash.py
+index 11b245e..33bfe4e 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -26,7 +26,9 @@ def _clip(s, n=4000):
+         return s
+     return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
+ 
+-def tool_function(command, timeout=60):
++def tool_function(command=None, timeout=60):
++    if not command or not str(command).strip():
++        return "Error: bash requires a `command` argument (a non-empty string). Re-issue the call with `command` set."
+     cwd = _STATE['cwd'] or os.getcwd()
+     timeout = max(1, min(int(timeout or 60), 300))
+     marker = '__CWD_MARKER__'

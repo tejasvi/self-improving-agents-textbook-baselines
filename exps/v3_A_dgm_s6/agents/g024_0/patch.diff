@@ -1,0 +1,456 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index aac4f1b..6a71b4d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -9,6 +9,10 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.run_tests import evaluate as run_tests_evaluate, format_result as run_tests_format
++
++TESTS_DIR = '/tmp/dgm_tests'
++NUM_ATTEMPTS = 3
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -165,6 +169,100 @@ class AgenticSystem:
+                     return True
+         return False
+ 
++    # ---- helpers -------------------------------------------------------
++    def _run_attempt(self, prompt, history=None):
++        """Run one agent turn and return the updated message history."""
++        if history is None:
++            history = []
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=list(history), logging=safe_log)
++        if not isinstance(msg_history, list):
++            safe_log("[forward] chat_with_agent did not return a history list; using empty history.")
++            msg_history = []
++        return msg_history
++
++    def _snapshot_patch(self):
++        return diff_versus_commit(self.git_tempdir, self.base_commit)
++
++    def _reset(self):
++        reset_to_commit(self.git_tempdir, self.base_commit)
++
++    @staticmethod
++    def _last_assistant_empty(history):
++        """True if the last assistant message has no text and no tool_use blocks."""
++        if not isinstance(history, list):
++            return True
++        for msg in reversed(history):
++            if msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            if isinstance(content, str):
++                return content.strip() == ""
++            if not isinstance(content, list):
++                return True
++            has_tool = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
++            if has_tool:
++                return False
++            text = " ".join(
++                b.get("text", "") for b in content
++                if isinstance(b, dict) and isinstance(b.get("text"), str)
++            )
++            return text.strip() == ""
++        return True
++
++    def _build_tests(self):
++        """Once per run: have a fresh agent session create sample files, brute.py and gen.py outside the repo."""
++        os.makedirs(TESTS_DIR, exist_ok=True)
++        prompt = f"""Build a local test kit for the competitive programming problem below. Work only in the directory {TESTS_DIR} (do not touch {self.git_tempdir}).
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Create these files in {TESTS_DIR}:
++1. Sample files: for every example input in the problem statement, create N.in and N.out (N = 1, 2, ...) with the exact example input and expected output. Copy them exactly.
++2. brute.py: a simple, obviously correct Python solution that reads stdin and writes stdout. Efficiency does not matter. It must pass all samples; run it on each N.in and compare with N.out to verify.
++3. gen.py: a generator that takes one integer seed as sys.argv[1], uses random.Random(seed), and prints one small valid input for the problem (small sizes so brute.py is fast). Respect all constraints from the statement.
++
++Use the editor tool to write the files and the bash tool to run and verify them. Finish only after brute.py passes all samples and gen.py runs for seeds 0..5."""
++        history = self._run_attempt(prompt)
++        if not self._tests_ready():
++            safe_log("[forward] Test kit incomplete; retrying once with a fresh history.")
++            history = self._run_attempt(prompt + "\nThe files were missing. Create them now with the editor tool.", history=[])
++        ready = self._tests_ready()
++        safe_log(f"[forward] Test kit ready: {ready}")
++        return ready
++
++    @staticmethod
++    def _tests_ready():
++        has_samples = os.path.isfile(os.path.join(TESTS_DIR, '1.in')) and os.path.isfile(os.path.join(TESTS_DIR, '1.out'))
++        return has_samples and os.path.isfile(os.path.join(TESTS_DIR, 'brute.py')) and os.path.isfile(os.path.join(TESTS_DIR, 'gen.py'))
++
++    def _score_current(self):
++        """Deterministic harness run on the solution file in the repo."""
++        solution = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(solution):
++            candidates = [f for f in self._solution_candidates()]
++            if not candidates:
++                return None, None
++            solution = candidates[0]
++        res = run_tests_evaluate(solution, TESTS_DIR, num_random=200, timeout=10)
++        return res["score"], run_tests_format(res)
++
++    def _solution_candidates(self):
++        found = []
++        for root, dirs, files in os.walk(self.git_tempdir):
++            dirs[:] = [d for d in dirs if not d.startswith('.')]
++            for f in files:
++                if f.endswith('.py') and not self._is_test_file(os.path.relpath(os.path.join(root, f), self.git_tempdir)):
++                    found.append(os.path.join(root, f))
++        return sorted(found)
++
++    @staticmethod
++    def _first_failure_summary(report):
++        if not report:
++            return "no harness report"
++        return report[-1500:]
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -177,94 +275,78 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"""{task}
+-
++        tests_note = f"""
++A test kit has been prepared outside the repository in {TESTS_DIR}:
++- N.in / N.out: sample inputs and expected outputs.
++- brute.py: a slow but correct reference solution.
++- gen.py: a generator; `python3 gen.py SEED` prints a small random valid input.
++To check your solution, use the run_tests tool with solution_path set to your solution file and tests_dir set to {TESTS_DIR}. Do not modify files in {TESTS_DIR}.
++"""
++        workflow = """
+ Please analyze the problem description carefully. Then make edits to the code files to complete the instruction.
+ 
+ Follow this workflow:
+-1. Explore the repository to find the primary solution file (e.g. a placeholder solution.py or the file the problem expects) and any existing tests.
+-2. Write the solution to the target source file using the editor tool.
+-3. Run the program on the sample inputs from the problem statement using the bash tool, and compare with the expected outputs.
+-4. Write a brute-force solution and compare against your solution on small random inputs. Also test on large inputs to check efficiency.
+-5. Fix any issues you find and re-run the checks until they pass.
+-6. After the solution is valid, compare its stdout to each sample's expected output exactly (use diff, or the sample_diff tool if available). If the problem says multiple answers are accepted but your output differs from the sample, do NOT assume the grader is a special checker; hidden tests may compare exact output. Reverse-engineer the construction behind the sample outputs (try different orderings of basis vectors, bit positions from the highest bit down, choosing the lexicographically largest/smallest or the canonical construction, scaling) and change your deterministic choices until all samples match exactly.
++1. Write the primary solution file first (e.g. solution.py in the repository) using the editor tool. Do not wait for more analysis after you have a working plan.
++2. Run the program on the sample inputs with bash and compare with the expected outputs byte for byte (diff).
++3. Run the run_tests tool on your solution file to check it against brute.py on random inputs and to check timeouts.
++4. If anything fails, read the counterexample, fix the solution with the editor tool, and re-run the checks.
++5. Keep iterating until all samples and random checks pass and the solution is efficient for the largest constraints.
++6. If the samples match only under an 'any answer accepted' clause, still make your output match the expected sample output exactly when feasible.
+ 
+ HARD RULE: You MUST use the editor/bash tools to write your code to disk. Do not finish your turn with only a plan or explanation. Your work is only counted if files in the repo are changed. The primary solution file must be modified (not only test files)."""
+ 
+-        msg_history = []
+-        safe_log("[forward] Starting initial attempt.")
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not isinstance(msg_history, list):
+-            safe_log("[forward] chat_with_agent did not return a history list; falling back to empty history.")
+-            msg_history = []
+-
+-        for attempt in range(3):
+-            diff = self._get_diff()
+-            if self._has_source_edits(diff):
+-                safe_log(f"[forward] Source edits detected after {attempt} retries.")
++        has_tests = self._build_tests()
++        if not has_tests:
++            safe_log("[forward] Proceeding without a complete test kit.")
++
++        best = None  # (score, patch)
++        history_notes = []
++        for attempt in range(NUM_ATTEMPTS):
++            self._reset()
++            prompt = task + (tests_note if has_tests else "") + workflow
++            if history_notes:
++                prompt += "\n\nPrevious attempts did not fully succeed. Summary:\n" + "\n".join(history_notes)
++                prompt += "\nTry a different approach from the earlier attempts where they failed."
++            safe_log(f"[forward] Attempt {attempt + 1}/{NUM_ATTEMPTS}.")
++            history = self._run_attempt(prompt, history=[])
++
++            patch = self._snapshot_patch()
++            if not patch.strip() or self._last_assistant_empty(history):
++                safe_log("[forward] Empty diff or empty reply; retrying once with a fresh history.")
++                short = ("Write solution.py now using the editor tool. "
++                         "Then run it on the samples and report the result.")
++                if has_tests:
++                    short = ("Use the editor tool now to write the solution file, then run the tests with the run_tests tool "
++                             f"(tests_dir={TESTS_DIR}).")
++                history = self._run_attempt(short, history=[])
++                patch = self._snapshot_patch()
++
++            if not has_tests or not self._solution_candidates():
++                score, report = (None, None)
++            else:
++                score, report = self._score_current()
++            if score is None:
++                score = (0, -1, 0) if patch.strip() else (-1, -1, -1)
++                report = "no test kit or solution file found"
++            safe_log(f"[forward] Attempt {attempt + 1} score={score} patch_bytes={len(patch)}")
++            history_notes.append(f"- Attempt {attempt + 1}: score (samples_passed, -mismatches, -timeouts) = {score}. "
++                                 f"Harness report: {self._first_failure_summary(report)}")
++
++            if best is None or score > best[0]:
++                best = (score, patch)
++            if score is not None and has_tests and score[0] == self._sample_total() and score[1] == 0 and score[2] == 0:
++                safe_log("[forward] Perfect score; stopping early.")
+                 break
+-            state = "the diff only changed test files" if (diff and str(diff).strip()) else "the diff is empty"
+-            safe_log(f"[forward] No source edits found ({state}); retry {attempt + 1}/3.")
+-            reminder = (
+-                f"Your previous response did not modify any source files ({state}). "
+-                "Do not describe a plan. Use the editor tool right now to create or edit the primary solution file "
+-                "that solves the problem, then run it with bash on the sample inputs."
+-            )
+-            msg_history = chat_with_agent(reminder, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            if not isinstance(msg_history, list):
+-                safe_log("[forward] chat_with_agent did not return a history list; falling back to empty history.")
+-                msg_history = []
+-
+-        has_source = self._has_source_edits(self._get_diff())
+-
+-        if has_source:
+-            safe_log("[forward] Running final verification pass.")
+-            verify_msg = (
+-                "Run all samples and diff against expected output byte for byte. "
+-                "If any differ, even if your output is valid under a 'any answer accepted' clause, "
+-                "modify the solution so that it reproduces the expected sample outputs exactly, while remaining valid. "
+-                "Do not dismiss a mismatch by appealing to 'any answer accepted' unless matching is shown to be infeasible after a few attempts. "
+-                "Report the diff result."
+-            )
+-            msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-
+-            # Bounded extra rounds: if the agent still reports mismatches, ask it to keep fixing.
+-            for extra_round in range(2):
+-                if not self._reports_mismatch(msg_history):
+-                    break
+-                safe_log(f"[forward] Sample mismatch reported; extra verification round {extra_round + 1}/2.")
+-                retry_msg = (
+-                    "Your report indicates at least one sample output still differs from the expected output. "
+-                    "Reverse-engineer the construction behind the expected sample output, change the deterministic choices "
+-                    "in the solution with the editor tool, re-run all samples with diff, and report the exact diff result."
+-                )
+-                msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        self._reset()
++        if best is not None and best[1].strip():
++            safe_log(f"[forward] Applying best patch with score {best[0]}.")
++            apply_patch(self.git_tempdir, best[1])
+         else:
+-            safe_log("[forward] No source edits after retries; giving up.")
++            safe_log("[forward] No attempt produced a patch.")
+ 
+-    @staticmethod
+-    def _reports_mismatch(msg_history):
+-        """
+-        Returns True if the most recent assistant text reports a sample mismatch.
+-        """
+-        if not isinstance(msg_history, list):
+-            return False
+-        for msg in reversed(msg_history):
+-            if msg.get("role") != "assistant":
+-                continue
+-            content = msg.get("content")
+-            if isinstance(content, str):
+-                text = content
+-            elif isinstance(content, list):
+-                text = " ".join(
+-                    block.get("text", "") for block in content
+-                    if isinstance(block, dict) and isinstance(block.get("text"), str)
+-                )
+-            else:
+-                text = ""
+-            lowered = text.lower()
+-            return any(k in lowered for k in ("mismatch", "differs", "does not match", "doesn't match"))
+-        return False
++    def _sample_total(self):
++        return len([f for f in os.listdir(TESTS_DIR) if f.endswith('.in')]) if os.path.isdir(TESTS_DIR) else 0
+ 
+ 
+ def main():
+diff --git a/tools/run_tests.py b/tools/run_tests.py
+new file mode 100644
+index 0000000..5b22e97
+--- /dev/null
++++ b/tools/run_tests.py
+@@ -0,0 +1,176 @@
++import glob
++import os
++import subprocess
++import sys
++
++MAX_SHOW = 600
++
++
++def tool_info():
++    return {
++        "name": "run_tests",
++        "description": """Run a Python solution against the test directory built for the problem.\n
++* Runs the solution on every *.in file in tests_dir and compares its stdout with the matching *.out file (whitespace-tolerant).\n
++* If brute.py and gen.py exist in tests_dir, it also runs gen.py with seeds 0..num_random-1, then compares the solution's output with brute.py's output on each generated input.\n
++* Reports sample pass counts, mismatch counts, timeouts, and the first counterexample (input, expected output, actual output).\n
++* Use it after writing or changing the solution file to check correctness.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python solution file to test, e.g. /repo/solution.py."
++                },
++                "tests_dir": {
++                    "type": "string",
++                    "description": "Absolute path to the directory containing *.in, *.out, brute.py and gen.py."
++                },
++                "num_random": {
++                    "type": "integer",
++                    "description": "Number of random seeds to run through gen.py and brute.py. Defaults to 200."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-run timeout in seconds. Defaults to 10."
++                }
++            },
++            "required": ["solution_path", "tests_dir"]
++        }
++    }
++
++
++def _run_py(script, stdin_text, timeout, args=None):
++    """Run a Python script with stdin. Returns (status, stdout) where status is 'ok', 'timeout', or 'error'."""
++    cmd = [sys.executable, script] + (args or [])
++    try:
++        proc = subprocess.run(
++            cmd,
++            input=stdin_text,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return "timeout", ""
++    if proc.returncode != 0:
++        return "error", proc.stderr
++    return "ok", proc.stdout
++
++
++def _same_output(a, b):
++    return a.split() == b.split()
++
++
++def _clip(text):
++    text = text or ""
++    if len(text) > MAX_SHOW:
++        return text[:MAX_SHOW] + "...(truncated)"
++    return text
++
++
++def evaluate(solution_path, tests_dir, num_random=200, timeout=10):
++    """
++    Deterministic scoring. Returns a dict with:
++      samples_total, samples_passed, random_total, mismatches, timeouts,
++      first_failure (dict or None), score (tuple: higher is better).
++    """
++    result = {
++        "samples_total": 0,
++        "samples_passed": 0,
++        "random_total": 0,
++        "mismatches": 0,
++        "timeouts": 0,
++        "first_failure": None,
++        "errors": [],
++    }
++
++    if not os.path.isfile(solution_path):
++        result["errors"].append(f"solution file not found: {solution_path}")
++        result["score"] = (0, -1, 0)
++        return result
++
++    # 1. Samples
++    in_files = sorted(glob.glob(os.path.join(tests_dir, "*.in")))
++    for in_path in in_files:
++        out_path = in_path[:-3] + ".out"
++        if not os.path.isfile(out_path):
++            continue
++        result["samples_total"] += 1
++        with open(in_path) as f:
++            sample_in = f.read()
++        with open(out_path) as f:
++            expected = f.read()
++        status, actual = _run_py(solution_path, sample_in, timeout)
++        if status == "timeout":
++            result["timeouts"] += 1
++            if result["first_failure"] is None:
++                result["first_failure"] = {"source": os.path.basename(in_path), "input": sample_in,
++                                           "expected": expected, "actual": "TIMEOUT"}
++        elif status == "error":
++            if result["first_failure"] is None:
++                result["first_failure"] = {"source": os.path.basename(in_path), "input": sample_in,
++                                           "expected": expected, "actual": "RUNTIME ERROR: " + _clip(actual)}
++        elif _same_output(actual, expected):
++            result["samples_passed"] += 1
++        elif result["first_failure"] is None:
++            result["first_failure"] = {"source": os.path.basename(in_path), "input": sample_in,
++                                       "expected": expected, "actual": actual}
++
++    # 2. Random stress against brute.py and gen.py
++    brute_path = os.path.join(tests_dir, "brute.py")
++    gen_path = os.path.join(tests_dir, "gen.py")
++    if os.path.isfile(brute_path) and os.path.isfile(gen_path):
++        for seed in range(max(0, int(num_random))):
++            gen_status, gen_input = _run_py(gen_path, "", timeout, args=[str(seed)])
++            if gen_status != "ok":
++                result["errors"].append(f"gen.py failed for seed {seed} ({gen_status})")
++                break
++            brute_status, expected = _run_py(brute_path, gen_input, timeout)
++            if brute_status != "ok":
++                result["errors"].append(f"brute.py failed on seed {seed} ({brute_status})")
++                continue
++            result["random_total"] += 1
++            status, actual = _run_py(solution_path, gen_input, timeout)
++            if status == "timeout":
++                result["timeouts"] += 1
++                actual_text = "TIMEOUT"
++            elif status == "error":
++                result["mismatches"] += 1
++                actual_text = "RUNTIME ERROR: " + _clip(actual)
++            elif _same_output(actual, expected):
++                continue
++            else:
++                result["mismatches"] += 1
++                actual_text = actual
++            if result["first_failure"] is None:
++                result["first_failure"] = {"source": f"gen.py seed {seed}", "input": gen_input,
++                                           "expected": expected, "actual": actual_text}
++
++    result["score"] = (result["samples_passed"], -result["mismatches"], -result["timeouts"])
++    return result
++
++
++def format_result(res):
++    lines = []
++    lines.append(f"Samples: {res['samples_passed']}/{res['samples_total']} passed.")
++    if res["random_total"]:
++        lines.append(f"Random: {res['random_total'] - res['mismatches'] - res['timeouts']}/{res['random_total']} matched brute.py "
++                     f"({res['mismatches']} mismatches, {res['timeouts']} timeouts).")
++    elif res["timeouts"]:
++        lines.append(f"Timeouts: {res['timeouts']}.")
++    for err in res["errors"][:3]:
++        lines.append(f"Harness note: {err}")
++    ff = res["first_failure"]
++    if ff is None:
++        lines.append("All checks passed.")
++    else:
++        lines.append(f"First failure ({ff['source']}):")
++        lines.append(f"Input:\n{_clip(ff['input'])}")
++        lines.append(f"Expected:\n{_clip(ff['expected'])}")
++        lines.append(f"Actual:\n{_clip(ff['actual'])}")
++    return "\n".join(lines)
++
++
++def tool_function(solution_path, tests_dir, num_random=200, timeout=10):
++    res = evaluate(solution_path, tests_dir, num_random=num_random, timeout=timeout)
++    return format_result(res)

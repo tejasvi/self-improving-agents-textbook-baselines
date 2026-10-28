@@ -1,0 +1,229 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 437e9a8..1d9b309 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -94,6 +94,53 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _message_role(msg):
++    if isinstance(msg, dict):
++        return msg.get('role', '')
++    return getattr(msg, 'role', '')
++
++def _message_text(msg):
++    """
++    Extract plain text from a message in any supported format
++    (dict with string or block-list content, or an SDK object).
++    """
++    content = msg.get('content', '') if isinstance(msg, dict) else getattr(msg, 'content', '')
++    if content is None:
++        return ''
++    if isinstance(content, str):
++        return content
++    parts = []
++    for block in content:
++        if isinstance(block, dict):
++            text = block.get('text')
++        else:
++            text = getattr(block, 'text', None)
++        if isinstance(text, str):
++            parts.append(text)
++    return '\n'.join(parts)
++
++def _is_empty_last_assistant(msg_history):
++    """
++    True if the last assistant message in the history has empty / whitespace-only text.
++    """
++    for msg in reversed(msg_history or []):
++        if _message_role(msg) == 'assistant':
++            return not _message_text(msg).strip()
++    return True
++
++def _sanitize_history(msg_history):
++    """
++    Drop trailing assistant messages with empty / whitespace-only text so the
++    history ends with a user message. Returns [] if nothing remains.
++    """
++    history = list(msg_history or [])
++    for _ in range(len(history)):
++        if history and _message_role(history[-1]) == 'assistant' and not _message_text(history[-1]).strip():
++            history.pop()
++        else:
++            break
++    return history
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -185,6 +232,51 @@ class AgenticSystem:
+         match = re.search(r'`([\w./-]+\.(?:py|js|go|rs|cpp|java))`', self.problem_statement or '')
+         return match.group(1) if match else None
+ 
++    def _tracked_source_files(self):
++        """
++        Return git-tracked (plus untracked) non-test files in git_tempdir, in listing order.
++        """
++        try:
++            out = subprocess.run(
++                ['git', 'ls-files', '--cached', '--others', '--exclude-standard'],
++                cwd=self.git_tempdir, capture_output=True, text=True, timeout=30,
++            ).stdout
++        except Exception:
++            return []
++        files = [f.strip() for f in out.splitlines() if f.strip()]
++        return [f for f in files if not self._is_test_file(f) and not f.startswith('.')]
++
++    def _target_file_path(self):
++        """
++        Relative path of the file the solution should be written to.
++        Order: backticked hint in the problem statement, then solution.py if present,
++        then the first non-test tracked/changed source file, then solution.py as a default.
++        """
++        hint = self._find_target_file_hint()
++        if hint:
++            return hint
++        if os.path.exists(os.path.join(self.git_tempdir, 'solution.py')):
++            return 'solution.py'
++        candidates = self._tracked_source_files()
++        if candidates:
++            return candidates[0]
++        return 'solution.py'
++
++    def _read_target_file(self, max_chars=6000):
++        """
++        Return the current content of the target file (truncated), for inclusion in prompts.
++        """
++        rel = self._target_file_path()
++        full = os.path.join(self.git_tempdir, rel)
++        try:
++            with open(full, 'r', encoding='utf-8', errors='replace') as f:
++                content = f.read()
++        except OSError:
++            return f"(file {rel} does not exist yet)"
++        if len(content) > max_chars:
++            content = content[:max_chars] + "\n... [truncated]"
++        return f"# {rel}\n{content}"
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -200,10 +292,11 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         instruction = f"""{task}
+ 
+ Please follow these steps:
+-1. Inspect the repository (list files, read the relevant existing code and any tests or examples) to understand what is required.
+-2. Create or edit the solution file (the file named in the problem statement, e.g. `solution.py`, or the existing source file that needs to change) using the editor tool. The solution MUST be written to disk with the editor tool (or a bash command), not only described in your reply.
+-3. Run and test your solution (write small tests or run example inputs with bash) and fix any problems you find.
+-4. Finally, confirm that the file(s) have been written and contain the final solution.
++1. Read the existing stub/target file first (e.g. `solution.py`), plus any relevant code, tests or examples in the repository.
++2. Write a first working version of the solution to disk early, using the editor tool, before doing any long experiments. The solution MUST be saved to the repository file, not only described in your reply.
++3. Run and test the solution (write small tests or run the sample inputs with bash) and fix any problems you find. Refine the file as needed.
++4. Never end a turn with an empty message. Always finish with a short summary of what you changed.
++5. At the end, re-read the target file to confirm it contains the final solution.
+ 
+ A text-only reply with no file changes is a failure. The solution must be saved to disk in the repository.
+ """
+@@ -211,39 +304,82 @@ A text-only reply with no file changes is a failure. The solution must be saved
+         if not isinstance(msg_history, list):
+             msg_history = []
+ 
+-        target_hint = self._find_target_file_hint()
+         max_retries = 3
+         for attempt in range(max_retries):
+-            if self._has_source_edits():
++            last_empty = _is_empty_last_assistant(msg_history)
++            if self._has_source_edits() and not last_empty:
+                 safe_log(f"Patch check passed after {attempt} retries: source edits detected.")
+-                break
++                return msg_history
+ 
+             changed = self._get_changed_files()
+-            safe_log(f"Retry {attempt + 1}/{max_retries}: no non-test source edits detected. Changed files: {changed}")
+-
+-            retry_msg = (
+-                "No changes to non-test source files were detected. You must now actually implement the solution "
+-                "by creating or editing the file with the editor tool. Do not answer with text only.\n"
+-                f"Changed files so far: {changed if changed else 'none'}\n"
++            safe_log(
++                f"Retry {attempt + 1}/{max_retries}: no non-test source edits detected "
++                f"(last reply empty: {last_empty}). Changed files: {changed}"
+             )
+-            if target_hint:
+-                retry_msg += (
+-                    f"The problem statement names the target file `{target_hint}`. If it is missing, create it; "
+-                    f"otherwise edit it so it contains the solution.\n"
++            stub = self._read_target_file()
++            target = self._target_file_path()
++
++            if attempt == 0:
++                history = _sanitize_history(msg_history)
++                retry_msg = (
++                    "Your previous reply was empty and no non-test source file was changed. "
++                    "Do not reply with text only.\n"
++                    f"Current content of the target file:\n{stub}\n\n"
++                    f"Your very next action must be an editor tool call that writes the complete solution to {target}. "
++                    "Then run the sample tests with bash and fix any issues.\n"
++                    f"Repository directory: {self.git_tempdir}\n"
++                    f"Problem: {self.problem_statement}\n"
+                 )
+-            retry_msg += (
+-                f"Repository directory: {self.git_tempdir}\n"
+-                f"Problem: {self.problem_statement}\n"
+-            )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            else:
++                history = []
++                retry_msg = (
++                    f"Problem: {self.problem_statement}\n\n"
++                    f"Stub content of {target}:\n{stub}\n\n"
++                    f"Repository directory: {self.git_tempdir}\n"
++                    f"Write the solution file immediately using the editor tool, then run the sample tests, then fix any issues. "
++                    f"The solution must be saved to {target}."
++                )
++            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=history, logging=safe_log)
+             if not isinstance(msg_history, list):
+                 msg_history = []
++
++        if self._has_source_edits() and not _is_empty_last_assistant(msg_history):
++            return msg_history
++
++        # Final fallback: ask for the full file in one code block and write it directly.
++        target = self._target_file_path()
++        safe_log(f"Fallback: asking for the complete contents of {target} in a single python block.")
++        fallback_msg = (
++            f"Problem: {self.problem_statement}\n\n"
++            f"Stub content of {target}:\n{self._read_target_file()}\n\n"
++            f"Reply with the complete final contents of {target} in exactly one ```python code block "
++            "and nothing else."
++        )
++        fallback_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
++        if not isinstance(fallback_history, list):
++            fallback_history = []
++        text = ''
++        for msg in reversed(fallback_history):
++            if _message_role(msg) == 'assistant':
++                text = _message_text(msg)
++                break
++        match = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
++        if match:
++            full = os.path.join(self.git_tempdir, target)
++            os.makedirs(os.path.dirname(full) or '.', exist_ok=True)
++            with open(full, 'w', encoding='utf-8') as f:
++                f.write(match.group(1))
++            safe_log(f"Fallback wrote {target}.")
++            msg_history = msg_history + fallback_history
+         else:
+-            if not self._has_source_edits():
+-                safe_log(f"Warning: no non-test source edits after {max_retries} retries.")
++            safe_log("Warning: fallback reply contained no ```python block.")
++
++        if not self._has_source_edits():
++            safe_log(f"Warning: no non-test source edits after {max_retries} retries and fallback.")
+ 
+         return msg_history
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

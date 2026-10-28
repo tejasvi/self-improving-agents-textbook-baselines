@@ -1,0 +1,235 @@
+diff --git a/llm.py b/llm.py
+index d6b4da1..388d5fb 100644
+--- a/llm.py
++++ b/llm.py
+@@ -1,10 +1,11 @@
+ # Code adapted from https://github.com/SakanaAI/AI-Scientist/blob/main/ai_scientist/llm.py.
+ import json
+ import os
++import random
+ import re
++import time
+ 
+ import anthropic
+-import backoff
+ import openai
+ 
+ MAX_OUTPUT_TOKENS = 4096
+@@ -41,6 +42,61 @@ AVAILABLE_LLMS = [
+     "deepseek-reasoner",
+ ]
+ 
++# Status codes that indicate a transient server-side or rate-limit failure.
++TRANSIENT_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
++
++TRANSIENT_ERROR_TYPES = (
++    anthropic.RateLimitError,
++    anthropic.APITimeoutError,
++    anthropic.APIConnectionError,
++    anthropic.InternalServerError,
++    openai.RateLimitError,
++    openai.APITimeoutError,
++    openai.APIConnectionError,
++    openai.InternalServerError,
++)
++
++def is_transient_error(e):
++    """
++    Return True if the exception is a transient API failure worth retrying
++    (rate limits, timeouts, connection problems, 5xx/overload responses).
++    Non-transient errors (e.g. 400 Bad Request, auth errors) return False.
++    """
++    if isinstance(e, TRANSIENT_ERROR_TYPES):
++        return True
++    status = getattr(e, "status_code", None)
++    return isinstance(status, int) and status in TRANSIENT_STATUS_CODES
++
++def call_with_retries(
++        fn,
++        max_retries=5,
++        base_delay=1.0,
++        max_delay=60.0,
++        logging=print,
++        sleep=None,
++):
++    """
++    Call fn() and retry transient API failures with exponential backoff and jitter.
++    Makes at most max_retries + 1 attempts. Non-transient errors are raised immediately.
++    """
++    if sleep is None:
++        sleep = time.sleep
++    for attempt in range(max_retries + 1):
++        try:
++            return fn()
++        except Exception as e:
++            if attempt >= max_retries or not is_transient_error(e):
++                raise
++            delay = min(max_delay, base_delay * (2 ** attempt))
++            delay = delay * random.uniform(0.5, 1.0)
++            if logging is not None:
++                logging(
++                    f"Transient API error ({type(e).__name__}: {e}); "
++                    f"retry {attempt + 1}/{max_retries} in {delay:.1f}s"
++                )
++            sleep(delay)
++
++
+ def create_client(model: str):
+     """
+     Create and return an LLM client based on the specified model.
+@@ -85,7 +141,6 @@ def create_client(model: str):
+         raise ValueError(f"Model {model} not supported.")
+ 
+ # Get N responses from a single message, used for ensembling.
+-@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
+ def get_batch_responses_from_llm(
+         msg,
+         client,
+@@ -95,6 +150,31 @@ def get_batch_responses_from_llm(
+         msg_history=None,
+         temperature=0.75,
+         n_responses=1,
++        max_retries=5,
++):
++    """
++    Get n_responses from the LLM, retrying transient API failures with exponential backoff.
++    """
++    return call_with_retries(
++        lambda: _get_batch_responses_from_llm_once(
++            msg, client, model, system_message,
++            print_debug=print_debug,
++            msg_history=msg_history,
++            temperature=temperature,
++            n_responses=n_responses,
++        ),
++        max_retries=max_retries,
++    )
++
++def _get_batch_responses_from_llm_once(
++        msg,
++        client,
++        model,
++        system_message,
++        print_debug=False,
++        msg_history=None,
++        temperature=0.75,
++        n_responses=1,
+ ):
+     if msg_history is None:
+         msg_history = []
+@@ -164,11 +244,6 @@ def get_batch_responses_from_llm(
+ 
+     return content, new_msg_history
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=120,
+-)
+ def get_response_from_llm(
+         msg,
+         client,
+@@ -177,6 +252,29 @@ def get_response_from_llm(
+         print_debug=False,
+         msg_history=None,
+         temperature=0.7,
++        max_retries=5,
++):
++    """
++    Query the LLM, retrying transient API failures with exponential backoff.
++    """
++    return call_with_retries(
++        lambda: _get_response_from_llm_once(
++            msg, client, model, system_message,
++            print_debug=print_debug,
++            msg_history=msg_history,
++            temperature=temperature,
++        ),
++        max_retries=max_retries,
++    )
++
++def _get_response_from_llm_once(
++        msg,
++        client,
++        model,
++        system_message,
++        print_debug=False,
++        msg_history=None,
++        temperature=0.7,
+ ):
+     if msg_history is None:
+         msg_history = []
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..6adf8f9 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -2,11 +2,10 @@ import ast
+ import json
+ import re
+ import anthropic
+-import backoff
+ import openai
+ import copy
+ 
+-from llm import create_client, get_response_from_llm
++from llm import call_with_retries, create_client, get_response_from_llm
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+@@ -22,19 +21,17 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=600,
+-    max_value=60,
+-)
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=print, max_retry=3
+ ):
+-    try:
++    """
++    Call the model with tools, retrying transient API failures with exponential backoff.
++    Non-transient errors (e.g. bad requests) are raised immediately.
++    """
++    def _call():
+         if 'claude' in model:
+-            response = client.messages.create(
++            return client.messages.create(
+                 model=model,
+                 messages=messages,
+                 max_tokens=4096,
+@@ -42,27 +39,17 @@ def get_response_withtools(
+                 tools=tools,
+             )
+         elif model.startswith('o3-'):
+-            response = client.responses.create(
++            return client.responses.create(
+                 model=model,
+                 input=messages,
+                 tool_choice=tool_choice,
+                 tools=tools,
+                 parallel_tool_calls=False
+             )
+-            response = response
+         else:
+             raise ValueError(f"Unsupported model: {model}")
+-        return response
+-    except Exception as e:
+-        logging(f"Error in get_response_withtools: {str(e)}")
+-        if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+-
+-        # Hitting the context window limit
+-        if 'Input is too long for requested model' in str(e):
+-            pass
+ 
+-        raise  # Re-raise the exception after logging
++    return call_with_retries(_call, max_retries=max_retry, logging=logging)
+ 
+ def check_for_tool_use(response, model=''):
+     """

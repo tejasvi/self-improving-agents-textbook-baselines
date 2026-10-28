@@ -1,0 +1,225 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f27534b..1b1183d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,8 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
++import sys
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -93,6 +95,121 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _sanitize_history(msg_history):
++    """
++    Remove assistant messages whose content is empty (or only empty text blocks),
++    and drop empty text blocks from the remaining messages.
++    """
++    cleaned = []
++    for msg in msg_history or []:
++        content = msg.get("content")
++        if isinstance(content, str):
++            if msg.get("role") == "assistant" and not content.strip():
++                continue
++            cleaned.append(msg)
++            continue
++        if not isinstance(content, list):
++            if msg.get("role") == "assistant":
++                continue
++            cleaned.append(msg)
++            continue
++        new_blocks = []
++        for block in content:
++            if isinstance(block, dict) and block.get("type") == "text" and not str(block.get("text", "")).strip():
++                continue
++            new_blocks.append(block)
++        if msg.get("role") == "assistant" and not new_blocks:
++            continue
++        new_msg = dict(msg)
++        new_msg["content"] = new_blocks
++        cleaned.append(new_msg)
++    return cleaned
++
++
++def _last_assistant_text(msg_history):
++    """Return the text of the last assistant message in msg_history ('' if none)."""
++    for msg in reversed(msg_history or []):
++        if msg.get("role") != "assistant":
++            continue
++        content = msg.get("content")
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            return "\n".join(
++                str(b.get("text", "")) for b in content
++                if isinstance(b, dict) and b.get("type") == "text"
++            )
++        return ""
++    return ""
++
++
++def _extract_python_block(text):
++    """Extract the first ```python fenced block from text, or None."""
++    match = re.search(r"```python[ \t]*\n(.*?)```", text or "", re.DOTALL)
++    if match:
++        return match.group(1)
++    return None
++
++
++def _extract_samples(problem_statement):
++    """
++    Extract (input, expected_output) pairs from 'Sample Input N' / 'Sample Output N' sections.
++    Each section body is its first paragraph (up to the next blank line), so trailing
++    notes after a sample are not included.
++    """
++    text = problem_statement or ""
++    header = re.compile(r"(Sample Input|Sample Output)\s*(\d+)\s*:?[ \t]*\n", re.IGNORECASE)
++    headers = list(header.finditer(text))
++
++    def first_paragraph(start_pos, idx):
++        end_pos = headers[idx + 1].start() if idx + 1 < len(headers) else len(text)
++        body = text[start_pos:end_pos].lstrip("\n")
++        para = re.split(r"\n[ \t]*\n", body, maxsplit=1)[0]
++        return para.strip("\n")
++
++    inputs, outputs = {}, {}
++    for i, m in enumerate(headers):
++        kind = m.group(1).lower()
++        num = int(m.group(2))
++        body = first_paragraph(m.end(), i)
++        if kind == "sample input":
++            inputs[num] = body
++        else:
++            outputs[num] = body
++
++    samples = []
++    for num in sorted(inputs):
++        if num in outputs:
++            samples.append((inputs[num] + "\n", outputs[num].strip()))
++    return samples
++
++
++def _run_samples(target_path, samples, cwd, timeout=10):
++    """
++    Run the Python program at target_path on each sample input.
++    Returns a list of mismatch descriptions (empty if all pass).
++    """
++    mismatches = []
++    for idx, (inp, expected) in enumerate(samples, start=1):
++        try:
++            result = subprocess.run(
++                [sys.executable, target_path],
++                input=inp, capture_output=True, text=True, timeout=timeout, cwd=cwd,
++            )
++            actual = result.stdout.strip()
++            err = result.stderr.strip()
++        except subprocess.TimeoutExpired:
++            actual, err = "", f"Timed out after {timeout}s"
++        except Exception as e:
++            actual, err = "", f"Failed to run: {e}"
++        if actual.split() != expected.split():
++            mismatches.append(
++                f"Sample {idx}:\nInput:\n{inp}\nExpected output:\n{expected}\n"
++                f"Actual output:\n{actual}\nStderr:\n{err}"
++            )
++    return mismatches
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -163,22 +280,68 @@ The task is a competitive programming problem in Python: either a complete progr
+ Never end your turn with only a plan; the task is only complete when the files are edited. Ending a turn after describing an algorithm in prose without writing code into the file is a failure.
+ """
+         instruction = f"{task}\n\nPlease analyze the problem description carefully, then follow the workflow above and make edits to the code files to complete the instruction."
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        def safe_chat(msg, history):
++            try:
++                return chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
++            except Exception as e:
++                safe_log(f"chat_with_agent failed: {e}")
++                return history
++
++        def has_diff():
++            return bool(diff_versus_commit(self.git_tempdir, self.base_commit).strip())
++
++        msg_history = _sanitize_history(safe_chat(instruction, []))
+ 
+-        # Ensure that the agent actually wrote something to the repository
++        # Retry with fresh histories until the repository has a diff (bounded)
++        terse_instruction = (
++            f"{task}\n\nUse the editor tool right now to write solution.py. "
++            "Your first action must be a tool call."
++        )
+         for attempt in range(3):
+-            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if diff.strip():
++            if has_diff():
+                 break
+-            safe_log(f"No changes detected after attempt {attempt + 1}; re-prompting agent.")
+-            retry_msg = (
+-                f"No changes were made to the repository in {self.git_tempdir}. "
+-                "A plan or description is not a solution. You must implement the solution NOW: "
+-                "use the editor tool to write the complete, working code into the target file immediately, "
+-                "then test it with a brute-force comparison and the problem examples. "
+-                "Do not reply with only a plan; the task is only complete when the files are edited."
++            safe_log(f"No changes detected after attempt {attempt + 1}; retrying with a fresh history.")
++            msg_history = _sanitize_history(safe_chat(terse_instruction, []))
++
++        # Determine target file: first .py filename mentioned in the statement, else solution.py
++        target_name = "solution.py"
++        mentioned = re.findall(r"`?([\w\-/]+\.py)`?", self.problem_statement or "")
++        if mentioned:
++            target_name = mentioned[0]
++        target_path = os.path.join(self.git_tempdir, target_name)
++
++        # No-tool fallback: ask for only the code in a python block and write it
++        if not has_diff():
++            safe_log("Still no changes; using no-tool fallback to obtain the program text.")
++            fallback_msg = (
++                f"{self.problem_statement}\n\n"
++                "Write the complete Python program that solves the problem above. "
++                "Reply with only the full program inside a single ```python fenced block. "
++                "Do not use any tools."
+             )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            fallback_history = _sanitize_history(safe_chat(fallback_msg, []))
++            code = _extract_python_block(_last_assistant_text(fallback_history))
++            if code is not None:
++                os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
++                with open(target_path, 'w') as f:
++                    f.write(code)
++                safe_log(f"Wrote fallback program to {target_path}")
++            else:
++                safe_log("Fallback did not return a python code block.")
++
++        # Run the samples from the problem statement; one fix pass on mismatches
++        if os.path.exists(target_path) and target_name.endswith(".py"):
++            samples = _extract_samples(self.problem_statement)
++            if samples:
++                mismatches = _run_samples(target_path, samples, cwd=self.git_tempdir)
++                if mismatches:
++                    safe_log(f"{len(mismatches)} sample(s) mismatched; requesting one fix pass.")
++                    fix_msg = (
++                        f"Running {target_name} on the sample inputs from the problem statement produced wrong output:\n\n"
++                        + "\n\n".join(mismatches)
++                        + f"\n\nFix {target_name} with the editor tool so that it matches the expected outputs exactly."
++                    )
++                    msg_history = _sanitize_history(safe_chat(fix_msg, msg_history))
+ 
+         # Verification pass once a diff exists
+         diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+@@ -193,7 +356,7 @@ Never end your turn with only a plan; the task is only complete when the files a
+                 "Make sure the final solution is saved in the target file and required imports are present.\n\n"
+                 f"For context, here is the current diff of the repository:\n{current_edits}"
+             )
+-            chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            safe_chat(verify_msg, _sanitize_history(msg_history))
+ 
+ 
+ def main():

@@ -1,0 +1,280 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e6a1e73..eb253dd 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -369,6 +369,20 @@ class AgenticSystem:
+             if result["max_time"] > FAST_LIMIT_SECONDS:
+                 failures.append(f"SPEED: slowest run took {result['max_time']:.2f}s; limit is {FAST_LIMIT_SECONDS}s.")
+ 
++        # (d) brute-force copy detection: a timed-out candidate identical to the brute force
++        if any("timed out" in f for f in failures) and os.path.isfile(self._dev_path('brute.py')):
++            try:
++                with open(path) as f:
++                    cand_src = f.read()
++                with open(self._dev_path('brute.py')) as f:
++                    brute_src = f.read()
++                if self._canon(cand_src) == self._canon(brute_src) or (
++                        brute_src.strip() and self._canon(cand_src).startswith(self._canon(brute_src))):
++                    failures.insert(0, "candidate is a brute force copy (identical to dev/brute.py) and timed out; "
++                                       "derive an efficient algorithm using feature_fit instead of copying the brute force.")
++            except OSError:
++                pass
++
+         if result["n_total"] == 0:
+             failures.append("The harness found no usable samples (dev/samples/N.in + N.out pairs were not found), "
+                             "so this candidate was NOT tested and counts as a failure.")
+@@ -412,10 +426,13 @@ class AgenticSystem:
+                              "dev/brute.py (a simple correct brute force), then write a correct but possibly slow "
+                              "solution.py based on it.")
+         elif sample_failed or slow:
+-            directive = ("The brute force in dev/brute.py is correct but too slow for the constraints; use it as an "
+-                         "oracle to derive an efficient algorithm: tabulate brute-force answers for small parameters, "
+-                         "look for formulas or patterns, then verify with diff_test against the oracle and run the "
+-                         "large sample. The failing sample below is the concrete evidence; make it pass.")
++            directive = ("The brute force in dev/brute.py is correct but too slow for the constraints, and solution.py "
++                         "must NOT remain a brute force. Use it as an oracle: run the feature_fit tool with oracle_path "
++                         "dev/brute.py, a baseline_expr that is an obvious lower bound (e.g. the Manhattan or block distance), "
++                         "and features such as local offsets, parities, signs and comparisons, to find which small feature "
++                         "set determines the residual. Write a formula-based solution from that table, then verify it with "
++                         "diff_test against dev/brute.py on a grid larger than the fitted one, and run the large sample. "
++                         "Update dev/NOTES.md with the current hypothesis. The failing sample below is the concrete evidence; make it pass.")
+         else:
+             directive = ("continue from the existing dev/ files; fix the failures or try a different approach. "
+                          "Reuse dev/ files (brute.py, gen.py, samples/, max.in, NOTES.md).")
+@@ -433,7 +450,7 @@ Previous attempt summary (earlier conversation is not available; this is all you
+ 
+ {directive}
+ 
+-Working rules: never print more than 40 lines from any command; summarize tables instead of printing them.
++Working rules: never print more than 40 lines from any command; summarize tables instead of printing them. Update dev/NOTES.md with the best current hypothesis after each experiment. solution.py must not be a brute force copy if dev/brute.py cannot finish dev/max.in in time.
+ Keep each reply under about 400 words; make tool calls with all required arguments; write large files in a single editor `create` call rather than printing them.
+ Keep reasoning brief, and after each fix re-run the samples and dev/gen.py-based differential test."""
+ 
+@@ -461,6 +478,9 @@ Dev workspace (persistent across attempts, keep helper artifacts here, under <re
+ - Keep running findings, hypotheses and what failed in dev/NOTES.md, updated as you go.
+ - Never print more than 40 lines from any command. Summarize tables instead of printing them.
+ - Stop exploring after a bounded budget (about 15 tool calls of investigation) and write code.
++- Keep each command's output under 40 lines (use head, tail, wc, or summaries) so replies are not truncated.
++- After each experiment, write the best current hypothesis into dev/NOTES.md.
++- BRUTE-FORCE RULE: if dev/brute.py cannot finish dev/max.in within the time limit, solution.py must NOT be the brute force (a byte-copy of dev/brute.py is rejected). Derive a formula or efficient algorithm instead.
+ 
+ Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+diff --git a/tools/feature_fit.py b/tools/feature_fit.py
+new file mode 100644
+index 0000000..b223c47
+--- /dev/null
++++ b/tools/feature_fit.py
+@@ -0,0 +1,212 @@
++import importlib.util
++import itertools
++import traceback
++
++
++_MAX_TABLE_LINES = 60
++_MAX_DETERMINING = 5
++_MAX_WITNESSES = 3
++
++
++def tool_info():
++    return {
++        "name": "feature_fit",
++        "description": """Fit the answer of a slow oracle as a function of a few simple features (structure finder).
++* `oracle_path` is a Python file defining `oracle_func`, a function that takes the grid parameters (keyword arguments named as in `params`) and returns a number (e.g. a brute-force answer).
++* `params` maps each parameter name to a list of integers; the tool evaluates the oracle on the full cartesian product (up to `max_instances`).
++* `baseline_expr` is a Python expression over the parameter names giving an obvious lower bound / base value; residual = oracle - baseline.
++* `features` maps feature names to Python expressions over the parameter names (helpers available: abs, min, max, sign(x), fdiv(a,b)=a//b, fmod(a,b)=a%b). Example: {"dx_parity": "(x1-x2) % 2", "sign_x": "sign(x1-x2)"}.
++* The tool searches feature subsets of size 0..max_subset_size in increasing size for one where the residual is a deterministic function of the feature tuple. It reports the smallest determining subsets, a lookup table for the best one, features unused by any minimal determining subset, and (if nothing determines) conflict counts plus witness instances so you can add features.
++* Set `emit_code` to true to also print a Python function skeleton implementing the lookup.
++Use it to find the formula structure of an answer, then write an efficient solution and verify it with diff_test against the oracle on a larger grid.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "oracle_path": {
++                    "type": "string",
++                    "description": "Path to the Python file containing the oracle function."
++                },
++                "oracle_func": {
++                    "type": "string",
++                    "description": "Name of the oracle function; it is called with keyword arguments named as the params keys and must return a number."
++                },
++                "params": {
++                    "type": "object",
++                    "description": "Object mapping each parameter name (string) to a JSON list of integer values; the grid is their cartesian product. Example: {\"x\": [0, 1, 2], \"y\": [0, 1]}."
++                },
++                "baseline_expr": {
++                    "type": "string",
++                    "description": "Python expression over the parameter names giving the baseline (default '0')."
++                },
++                "features": {
++                    "type": "object",
++                    "description": "Object mapping feature name (string) to a Python expression string over the parameter names. Example: {\"par\": \"(x+y)%2\"}."
++                },
++                "max_subset_size": {
++                    "type": "integer",
++                    "description": "Largest feature subset size to search (default 4)."
++                },
++                "max_instances": {
++                    "type": "integer",
++                    "description": "Maximum number of grid instances to evaluate (default 200000)."
++                },
++                "emit_code": {
++                    "type": "boolean",
++                    "description": "If true, also print a Python lookup function skeleton for the best subset (default false)."
++                }
++            },
++            "required": ["oracle_path", "oracle_func", "params"]
++        }
++    }
++
++
++def _sign(x):
++    return (x > 0) - (x < 0)
++
++
++def _helpers():
++    return {
++        "abs": abs, "min": min, "max": max, "sign": _sign,
++        "fdiv": lambda a, b: a // b, "fmod": lambda a, b: a % b,
++    }
++
++
++def _load_oracle(oracle_path, oracle_func):
++    spec = importlib.util.spec_from_file_location("_feature_fit_oracle", oracle_path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return getattr(mod, oracle_func)
++
++
++def _fmt(v):
++    return repr(v)
++
++
++def tool_function(oracle_path, oracle_func, params, baseline_expr="0", features=None,
++                  max_subset_size=4, max_instances=200000, emit_code=False):
++    features = features or {}
++    names = list(params.keys())
++    grids = [list(params[k]) for k in names]
++    total = 1
++    for g in grids:
++        total *= len(g)
++    lines = [f"grid: {len(names)} params {names}, {total} combinations, evaluating up to {max_instances}"]
++
++    try:
++        oracle = _load_oracle(oracle_path, oracle_func)
++    except Exception:
++        return "\n".join(lines + ["ORACLE IMPORT FAILED:", traceback.format_exc()])
++
++    base_code = compile(baseline_expr, "<baseline>", "eval")
++    feat_names = list(features.keys())
++    feat_codes = [compile(features[f], f"<feature {f}>", "eval") for f in feat_names]
++    helpers = _helpers()
++
++    rows = []  # (param_tuple, residual, feature_tuple)
++    try:
++        for count, combo in enumerate(itertools.product(*grids)):
++            if count >= max_instances:
++                lines.append(f"stopped at max_instances={max_instances}")
++                break
++            ns = dict(helpers)
++            ns.update(zip(names, combo))
++            kwargs = dict(zip(names, combo))
++            value = oracle(**kwargs)
++            base = eval(base_code, {"__builtins__": {}}, ns)
++            resid = value - base
++            fvals = tuple(eval(c, {"__builtins__": {}}, ns) for c in feat_codes)
++            rows.append((combo, resid, fvals, value))
++    except Exception:
++        lines.append(f"EVALUATION FAILED after {len(rows)} instances:")
++        lines.append(traceback.format_exc())
++        if not rows:
++            return "\n".join(lines)
++
++    lines.append(f"evaluated {len(rows)} instances; features: {feat_names}")
++    if not rows:
++        return "\n".join(lines)
++    lines.append(f"oracle value range: min {_fmt(min(r[3] for r in rows))}, max {_fmt(max(r[3] for r in rows))}")
++    res_vals = sorted(set(r[1] for r in rows))
++    lines.append(f"residual distinct values: {len(res_vals)} (first few: {[_fmt(v) for v in res_vals[:8]]})")
++
++    if not feat_names:
++        lines.append("no features given; residual is constant" if len(res_vals) == 1
++                     else "no features given and residual varies: add features")
++        return "\n".join(lines)
++
++    max_k = min(max_subset_size, len(feat_names))
++    determining = []  # list of (size, subset_indices)
++    scored = []  # (conflicts, subset_indices)
++    for k in range(0, max_k + 1):
++        for subset in itertools.combinations(range(len(feat_names)), k):
++            table = {}
++            conflicts = 0
++            witnesses = []
++            for combo, resid, fvals, _ in rows:
++                key = tuple(fvals[i] for i in subset)
++                if key in table:
++                    if table[key][0] != resid:
++                        conflicts += 1
++                        if len(witnesses) < _MAX_WITNESSES:
++                            witnesses.append((combo, resid, table[key][0], key))
++                else:
++                    table[key] = (resid, combo)
++            if conflicts == 0:
++                determining.append((k, subset, table))
++            else:
++                scored.append((conflicts, k, subset, witnesses))
++        if len(determining) >= _MAX_DETERMINING:
++            break
++
++    def sub_names(subset):
++        return [feat_names[i] for i in subset] or ["(none)"]
++
++    if determining:
++        best_k = determining[0][0]
++        lines.append(f"DETERMINING subsets found (smallest first, showing up to {_MAX_DETERMINING}):")
++        for k, subset, table in determining[:_MAX_DETERMINING]:
++            lines.append(f"  size {k}: {sub_names(subset)} -> {len(table)} distinct keys")
++        minimal = [s for k, s, _ in determining if k == best_k]
++        used = set(i for s in minimal for i in s)
++        unused = [feat_names[i] for i in range(len(feat_names)) if i not in used]
++        lines.append(f"features not used by any minimal determining subset: {unused}")
++        best_subset, best_table = determining[0][1], determining[0][2]
++        lines.append(f"LOOKUP TABLE for {sub_names(best_subset)} (key -> residual, baseline excluded):")
++        table_lines = [f"  {tuple(_fmt(x) for x in key)} -> {_fmt(v[0])}"
++                       for key, v in sorted(best_table.items(), key=lambda kv: kv[0])]
++        lines.extend(table_lines[:_MAX_TABLE_LINES])
++        if len(table_lines) > _MAX_TABLE_LINES:
++            lines.append(f"  ... ({len(table_lines) - _MAX_TABLE_LINES} more keys clipped)")
++        if emit_code:
++            lines.append("SKELETON:")
++            lines.extend(_skeleton(names, baseline_expr, feat_names, best_subset, features, best_table))
++    else:
++        lines.append(f"NO determining subset of size <= {max_k}. Conflict counts of the best subsets:")
++        scored.sort(key=lambda x: (x[0], x[1]))
++        for conflicts, k, subset, witnesses in scored[:_MAX_DETERMINING]:
++            lines.append(f"  {sub_names(subset)}: {conflicts} conflicting instances")
++        if scored:
++            _, _, subset, witnesses = scored[0]
++            lines.append("witness conflicts for the best subset (params, residual, conflicting residual, key):")
++            for combo, resid, other, key in witnesses:
++                lines.append(f"  {dict(zip(names, combo))} residual={_fmt(resid)} vs {_fmt(other)} key={key}")
++        lines.append("Add features that separate these witnesses (e.g. parities, signs, local offsets) and rerun.")
++    return "\n".join(lines)
++
++
++def _skeleton(names, baseline_expr, feat_names, subset, features, table):
++    out = [f"def lookup({', '.join(names)}):"]
++    out.append(f"    base = {baseline_expr}")
++    for i in subset:
++        out.append(f"    f_{feat_names[i]} = {features[feat_names[i]]}")
++    if subset:
++        key = ", ".join(f"f_{feat_names[i]}" for i in subset)
++        out.append(f"    key = ({key},)")
++    else:
++        out.append("    key = ()")
++    out.append("    table = {")
++    for k, v in sorted(table.items(), key=lambda kv: kv[0])[:_MAX_TABLE_LINES]:
++        out.append(f"        {k!r}: {v[0]!r},")
++    out.append("    }")
++    out.append("    return base + table[key]  # raises KeyError if an unseen key appears")
++    return out

@@ -1,0 +1,317 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d4d4f1d..6d635fc 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -337,6 +337,56 @@ class AgenticSystem:
+         return ('benchmark' in lowered or 'runtime' in lowered or 'wall time' in lowered or 'seconds' in lowered) \
+             and not self._has_risk_phrase(text)
+ 
++    _SAMPLE_FILE_RE = re.compile(r'(^|/)(samples?|examples?)[^/]*\.(in|txt|inp)$|(^|/)[^/]*\.(in|inp)$', re.IGNORECASE)
++
++    def _find_sample_inputs(self, max_files=10):
++        """
++        Find sample input files tracked or present in git_tempdir (generic name heuristics).
++        """
++        try:
++            result = subprocess.run(
++                ['git', 'ls-files', '--others', '--cached', '--exclude-standard'],
++                cwd=self.git_tempdir, capture_output=True, text=True, check=False,
++            )
++        except Exception as e:
++            safe_log(f"Failed to list sample files: {e}")
++            return []
++        if result.returncode != 0:
++            return []
++        found = []
++        for path in result.stdout.splitlines():
++            path = path.strip()
++            if path and self._SAMPLE_FILE_RE.search(path.replace('\\', '/')):
++                found.append(path)
++        return found[:max_files]
++
++    def _check_samples_post_run(self):
++        """
++        Re-run the solution on sample input files (if any) and log whether it ran cleanly.
++        Only logs; it does not edit files. Each run is a single bounded subprocess call.
++        """
++        samples = self._find_sample_inputs()
++        if not samples:
++            safe_log("Post-run check: no sample input files found in repo.")
++            return
++        py_files = [p for p in self._find_candidate_source_files() if p.endswith('.py')]
++        if not py_files:
++            safe_log("Post-run check: no python solution file found.")
++            return
++        sol = py_files[0]
++        for sample in samples:
++            try:
++                with open(os.path.join(self.git_tempdir, sample), 'rb') as fin:
++                    proc = subprocess.run(
++                        ['python3', sol], cwd=self.git_tempdir, stdin=fin,
++                        capture_output=True, timeout=10,
++                    )
++                status = 'OK' if proc.returncode == 0 and proc.stdout.strip() else 'FAILED'
++                safe_log(f"Post-run check {sample} with {sol}: {status} (rc={proc.returncode}) "
++                         f"stdout={proc.stdout.decode(errors='replace').strip()[:200]!r}")
++            except Exception as e:
++                safe_log(f"Post-run check {sample}: ERROR {e}")
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -358,6 +408,8 @@ Follow these steps in order:
+ 4. After the implementation, write a brute-force comparison on tiny random inputs and check that your solution matches it. Then write a stress script that generates worst-case inputs at the MAXIMUM constraints from the problem statement, run it with `timeout 20` (or the `benchmark` tool with a timeout), and print the elapsed time.
+ 5. If the measured time is over about 2 seconds, or the algorithm's complexity is above the budget from step 2, optimize the algorithm and re-run both the brute-force comparison and the max-size benchmark.
+ 6. Never finish with a statement like "may be too slow", "probably too slow", "never timed", or "unverified". If you have a performance concern, fix it by changing the algorithm and measuring again.
++7. Numeric fidelity (only if the output is floating-point): write a high-precision reference in a file (using fractions.Fraction, decimal, or a brute force with math.fsum) and compare the solution against it with the `compare_outputs` tool, on the samples and on many random small cases (use `inputs_dir` for a directory of generated inputs). Check the reported max_rel_err. If max_rel_err is above ~1e-12, make the numerics more accurate: use closed-form formulas instead of accumulated float additions, math.fsum, direct powers (pow / ** on the exact exponent) instead of repeated multiplication, and print at least 15 significant digits (e.g. repr or '%.17g'). Then re-run compare_outputs until the error is within threshold. Do not finish with a float answer that has not been checked this way.
++8. Test harnesses: always write test/brute-force/stress scripts to files with the editor tool, and check subprocess return codes so a crash (e.g. a missing import or an exception) is never mistaken for a passing test. Empty output or a non-zero exit code is a failure. Before using any third-party library such as numpy, verify it is importable with `python3 -c 'import numpy'`; if it is not, use pure Python (preferred anyway, via the standard library).
+ 
+ Never end a turn with an empty message. Read the starter file with one command, then write the implementation in your very next tool call. End with a tool call or a short summary after the files are edited.
+ 
+@@ -411,6 +463,9 @@ WARNING: Responding with only a plan, or describing the solution without editing
+                 safe_log("Fallback did not produce source edits.")
+ 
+         if self._has_source_edits():
++            # Post-run check: confirm the solution still reproduces sample outputs exactly
++            self._check_samples_post_run()
++
+             # Performance-focused final verification pass
+             verify_msg = (
+                 "Re-state the worst-case time complexity of your solution against the problem constraints, "
+diff --git a/tools/compare_outputs.py b/tools/compare_outputs.py
+new file mode 100644
+index 0000000..5b57c85
+--- /dev/null
++++ b/tools/compare_outputs.py
+@@ -0,0 +1,231 @@
++import math
++import os
++import subprocess
++
++MAX_OUTPUT_CHARS = 4000
++MAX_REPORTED_MISMATCHES = 3
++
++
++def tool_info():
++    return {
++        "name": "compare_outputs",
++        "description": """Run a solution and a reference command on test input(s) and compare their outputs token by token, with precision-aware reporting.\n
++* Each command is run via a shell with stdin redirected from the input file, under a timeout.\n
++* If either command exits non-zero, times out, or prints empty stdout, the tool reports a hard ERROR including stderr. Never ignore such an ERROR.\n
++* For numeric tokens it reports the absolute error, relative error and the number of agreeing significant digits.\n
++* It reports whether the raw output strings are exactly equal, the max relative error, and the first mismatching inputs.\n
++* Use a high-precision reference (fractions.Fraction, decimal, or brute force with math.fsum) for floating-point outputs. If max_rel_err is above ~1e-12, make the numerics more accurate and print at least 15 significant digits.\n
++* Pass either input_file (a single input) or inputs_dir (every regular file in the directory is used as an input).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command for the solution under test, e.g. 'python3 /path/sol.py'. It reads the input from stdin."
++                },
++                "reference_cmd": {
++                    "type": "string",
++                    "description": "Shell command for the trusted reference (brute force or high-precision), e.g. 'python3 /path/ref.py'. It reads the input from stdin."
++                },
++                "input_file": {
++                    "type": "string",
++                    "description": "Path to a single input file, fed to both commands via stdin."
++                },
++                "inputs_dir": {
++                    "type": "string",
++                    "description": "Path to a directory; every regular file in it is used as a separate input. Use instead of input_file."
++                },
++                "timeout_seconds": {
++                    "type": "integer",
++                    "description": "Hard time limit in seconds for each command run on each input. Defaults to 10."
++                }
++            },
++            "required": ["solution_cmd", "reference_cmd", "input_file"]
++        }
++    }
++
++
++def _run(cmd, input_path, timeout):
++    """Run cmd with stdin from input_path. Returns (returncode, stdout, stderr, error_str)."""
++    try:
++        with open(input_path, 'rb') as fin:
++            proc = subprocess.run(
++                cmd,
++                shell=True,
++                stdin=fin,
++                capture_output=True,
++                timeout=timeout,
++            )
++    except subprocess.TimeoutExpired:
++        return None, '', '', f"TIMEOUT after {timeout}s"
++    except Exception as e:
++        return None, '', '', f"EXCEPTION: {e}"
++    out = proc.stdout.decode('utf-8', errors='replace')
++    err = proc.stderr.decode('utf-8', errors='replace')
++    return proc.returncode, out, err, None
++
++
++def _to_float(tok):
++    try:
++        v = float(tok)
++    except ValueError:
++        return None
++    if math.isnan(v) or math.isinf(v):
++        return None
++    return v
++
++
++def _is_numeric_token(tok):
++    return _to_float(tok) is not None
++
++
++def _sig_digits(a_tok, b_tok, abs_err, rel_err):
++    """Number of agreeing significant digits between two numeric tokens."""
++    if abs_err == 0:
++        return 17.0
++    if rel_err == 0 or math.isinf(rel_err):
++        return 0.0
++    return max(0.0, -math.log10(rel_err))
++
++
++def _compare_one(name, sol_out, ref_out):
++    """Compare two outputs. Returns (ok, lines, max_rel_err, exact_match, numeric_stats)."""
++    lines = []
++    exact = sol_out == ref_out
++    sol_tokens = sol_out.split()
++    ref_tokens = ref_out.split()
++    max_rel = 0.0
++    max_abs = 0.0
++    token_mismatch = False
++    worst = None
++    if len(sol_tokens) != len(ref_tokens):
++        token_mismatch = True
++        lines.append(f"token count differs: solution={len(sol_tokens)} reference={len(ref_tokens)}")
++    for i, (s, r) in enumerate(zip(sol_tokens, ref_tokens)):
++        if s == r:
++            continue
++        sv, rv = _to_float(s), _to_float(r)
++        if sv is not None and rv is not None:
++            abs_err = abs(sv - rv)
++            denom = max(abs(rv), 1e-300)
++            rel_err = abs_err / denom
++            if abs_err > 0 and rel_err > max_rel:
++                max_rel = rel_err
++                worst = (i, s, r, abs_err, rel_err)
++            max_abs = max(max_abs, abs_err)
++        else:
++            token_mismatch = True
++            if len(lines) < 10:
++                lines.append(f"token {i}: solution={s!r} reference={r!r}")
++    if worst is not None:
++        i, s, r, abs_err, rel_err = worst
++        lines.append(
++            f"worst numeric token {i}: solution={s} reference={r} "
++            f"abs_err={abs_err:.3e} rel_err={rel_err:.3e} "
++            f"agreeing_sig_digits={_sig_digits(s, r, abs_err, rel_err):.1f}"
++        )
++    ok = (not token_mismatch) and max_rel <= 1e-12
++    return ok, lines, max_rel, max_abs, exact, token_mismatch
++
++
++def _collect_inputs(input_file, inputs_dir):
++    if inputs_dir:
++        if not os.path.isdir(inputs_dir):
++            return None, f"ERROR: inputs_dir not found: {inputs_dir}"
++        files = sorted(
++            os.path.join(inputs_dir, f) for f in os.listdir(inputs_dir)
++            if os.path.isfile(os.path.join(inputs_dir, f))
++        )
++        if not files:
++            return None, f"ERROR: no files in inputs_dir: {inputs_dir}"
++        return files, None
++    if not input_file:
++        return None, "ERROR: provide input_file or inputs_dir"
++    if not os.path.isfile(input_file):
++        return None, f"ERROR: input_file not found: {input_file}"
++    return [input_file], None
++
++
++def tool_function(solution_cmd, reference_cmd, input_file=None, inputs_dir=None, timeout_seconds=10):
++    try:
++        timeout = int(timeout_seconds) if timeout_seconds is not None else 10
++    except (TypeError, ValueError):
++        timeout = 10
++    timeout = max(1, timeout)
++
++    inputs, err = _collect_inputs(input_file, inputs_dir)
++    if err:
++        return err
++
++    report = []
++    max_rel_overall = 0.0
++    max_abs_overall = 0.0
++    all_exact = True
++    failures = []  # list of (input_path, reason)
++    hard_errors = []
++
++    for path in inputs:
++        name = os.path.basename(path)
++        s_rc, s_out, s_err, s_exc = _run(solution_cmd, path, timeout)
++        r_rc, r_out, r_err, r_exc = _run(reference_cmd, path, timeout)
++
++        problems = []
++        if s_exc:
++            problems.append(f"solution: {s_exc}")
++        elif s_rc != 0:
++            problems.append(f"solution exited with return code {s_rc}")
++        if r_exc:
++            problems.append(f"reference: {r_exc}")
++        elif r_rc != 0:
++            problems.append(f"reference exited with return code {r_rc}")
++        if not s_exc and not s_out.strip():
++            problems.append("solution printed empty stdout")
++        if not r_exc and not r_out.strip():
++            problems.append("reference printed empty stdout")
++
++        if problems:
++            msg = f"ERROR on input {name}: " + "; ".join(problems)
++            if s_err.strip():
++                msg += f"\n  solution stderr: {s_err.strip()[-1500:]}"
++            if r_err.strip():
++                msg += f"\n  reference stderr: {r_err.strip()[-1500:]}"
++            hard_errors.append(msg)
++            failures.append((name, "ERROR"))
++            continue
++
++        ok, lines, max_rel, max_abs, exact, _ = _compare_one(name, s_out, r_out)
++        max_rel_overall = max(max_rel_overall, max_rel)
++        max_abs_overall = max(max_abs_overall, max_abs)
++        all_exact = all_exact and exact
++        if not ok:
++            failures.append((name, f"max_rel_err={max_rel:.3e}"))
++        if not exact:
++            diff_lines = [
++                f"--- input {name}",
++                f"solution: {s_out.strip()[:300]!r}",
++                f"reference: {r_out.strip()[:300]!r}",
++            ] + lines
++            report.append("\n".join(diff_lines))
++
++    summary = (
++        f"SUMMARY: inputs={len(inputs)} errors={len(hard_errors)} "
++        f"max_abs_err={max_abs_overall:.3e}, max_rel_err={max_rel_overall:.3e}, "
++        f"exact_string_match={all_exact}"
++    )
++    if hard_errors:
++        out_lines = hard_errors[:MAX_REPORTED_MISMATCHES] + [summary]
++    else:
++        out_lines = []
++        if report:
++            out_lines.append("\n\n".join(report[:MAX_REPORTED_MISMATCHES]))
++        out_lines.append(summary)
++        if failures:
++            bad = [f"{n} ({why})" for n, why in failures[:MAX_REPORTED_MISMATCHES]]
++            out_lines.append("first mismatching inputs (rel_err > 1e-12 or token mismatch): " + ", ".join(bad))
++        else:
++            out_lines.append("all inputs agree within 1e-12 relative error")
++
++    text = "\n".join(out_lines)
++    if len(text) > MAX_OUTPUT_CHARS:
++        text = text[:MAX_OUTPUT_CHARS] + "\n... <truncated>"
++    return text

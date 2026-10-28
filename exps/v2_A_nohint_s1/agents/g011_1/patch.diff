@@ -1,0 +1,162 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5583586..1f936c7 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,8 +3,10 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -137,6 +139,71 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _has_changes(self):
++        """Return True if the repository differs from the base commit (non-empty diff)."""
++        try:
++            return str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip() != ''
++        except Exception as e:
++            safe_log(f"[forward] Exception while computing diff: {e}", level=logging.ERROR)
++            return False
++
++    def _clean_history(self, msg_history):
++        """Remove messages whose content is only empty text blocks (or an empty string)."""
++        cleaned = []
++        for msg in msg_history or []:
++            content = msg.get('content') if isinstance(msg, dict) else None
++            if isinstance(content, str):
++                if content.strip() == '':
++                    continue
++            elif isinstance(content, list):
++                blocks = [b for b in content if not (
++                    isinstance(b, dict) and b.get('type') == 'text' and str(b.get('text', '')).strip() == ''
++                )]
++                if len(blocks) == 0:
++                    continue
++                msg = {**msg, 'content': blocks}
++            cleaned.append(msg)
++        return cleaned
++
++    def _deliverable_name(self):
++        """Detect the deliverable filename from the problem statement (default solution.py)."""
++        match = re.search(r'`([\w./-]+\.py)`', self.problem_statement or '')
++        if match:
++            return match.group(1)
++        return 'solution.py'
++
++    def _fallback_write_solution(self):
++        """Ask the LLM for the full program in one python block and write it to the deliverable."""
++        client, client_model = create_client(self.code_model)
++        prompt = (
++            "Output only the complete Python 3 program in a single ```python code block. "
++            "No explanation.\n\n<problem_description>\n"
++            f"{self.problem_statement}\n</problem_description>"
++        )
++        _, new_history = get_response_from_llm(
++            prompt, client=client, model=client_model,
++            system_message="You are an expert competitive programmer.",
++            msg_history=[], temperature=0.0,
++        )
++        content = ''
++        for msg in reversed(new_history):
++            if msg.get('role') == 'assistant':
++                c = msg.get('content')
++                if isinstance(c, list):
++                    c = ''.join(b.get('text', '') for b in c if isinstance(b, dict))
++                content = c or ''
++                break
++        block = re.search(r'```(?:python|py)?\s*\n(.*?)```', content, re.DOTALL)
++        if not block:
++            safe_log("[forward] Fallback: no python code block found in model output.", level=logging.WARNING)
++            return
++        code = block.group(1)
++        out_path = os.path.join(self.git_tempdir, self._deliverable_name())
++        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
++        with open(out_path, 'w') as f:
++            f.write(code)
++        safe_log(f"[forward] Fallback wrote {out_path}.")
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -153,39 +220,52 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 
+ Please follow this workflow carefully:
+ 
+-1. Inspect the repository layout (e.g. `ls -la {self.git_tempdir}`) and identify the required deliverable file. If the task names a file (e.g. `solution.py`), use that; otherwise default to `solution.py` in the repository root. The task is either a complete program that reads standard input and writes standard output, or a method of a given `Solution` class; match whichever form the problem requires.
+-2. Write a first complete implementation to the deliverable file (solution.py or the file the task specifies) EARLY, before any further analysis. A working file on disk is more important than a perfect one. Do not leave the deliverable file empty or as a stub.
+-3. Extract the sample inputs and expected outputs from the problem statement. Save each sample input into its own file (e.g. `sample1.in`, `sample2.in`, ...) and the expected outputs into matching files (e.g. `sample1.out`). Run the solution on every sample via bash, e.g. `python solution.py < sample1.in`, and compare with the expected output. Fix any failures and repeat until all samples pass.
+-4. Write a brute-force reference implementation in `brute.py` that is obviously correct but slow. Then write a random-test comparison script (e.g. `stress.py`) that generates many small random inputs that respect the problem constraints, runs both `solution.py` and `brute.py` on each input, and reports any mismatch. Run it, and if there is any mismatch, determine whether the solution or the brute force is wrong, fix the bug, and re-run until there are no mismatches. Include edge cases (minimum sizes, equal values, duplicates, etc.) in the random generator.
+-5. Benchmark the solution on a maximum-constraint input (generate it with a script and time it with `time python solution.py < big.in`). Verify that it runs well within the time limit: use fast input reading (e.g. `sys.stdin.buffer.read` / `sys.stdin.readline`), avoid deep recursion (use iteration or raise the recursion limit with care), and use an appropriate algorithmic complexity. Optimize if it is too slow.
+-6. Finish only when all checks pass: the samples produce the expected output, the stress test shows no mismatches against the brute force, and the maximum-size input runs in time. Make sure the final solution is saved in the deliverable file. Helper files (brute.py, stress.py, sample files, big input) may remain in the repository, but the deliverable file must contain the final, complete solution.
++1. Create the deliverable file (solution.py, or the file the task names; the task is either a complete stdin/stdout program or a method of a given `Solution` class) IMMEDIATELY with a complete implementation using the editor tool. A working file on disk matters more than a perfect one. Do not leave it empty or as a stub.
++2. Extract the sample inputs/outputs from the problem statement, save them to files, and run the solution on each via bash (e.g. `python solution.py < sample1.in`). Fix any failures until all samples pass.
++3. Make sure the file runs correctly on the sample inputs from the problem statement before finishing.
+ """
+         instruction = f"{task}{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Ensure the agent actually made file changes; retry a bounded number of times if not.
+-        for attempt in range(3):
+-            if str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip() != '':
++        # Initial turn.
++        try:
++            msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"[forward] Exception in initial turn: {e}", level=logging.ERROR)
++            msg_history = []
++
++        # Escalation when the diff is still empty.
++        # Attempt 0: fresh history with a minimal prompt. Attempt 1: direct LLM fallback writing the file.
++        for attempt in range(2):
++            if self._has_changes():
+                 break
+-            safe_log(f"[forward] Attempt {attempt + 1}: no file changes detected, re-prompting agent.")
+-            retry_msg = (
+-                "Your previous attempt made no file changes. You must now create the solution file with a "
+-                "complete implementation, run it on the samples, and fix any failures. "
+-                f"The repository is at {self.git_tempdir}. Write the deliverable file (solution.py or the file "
+-                "the task specifies) now, then test it on the sample inputs with bash, write brute.py and a "
+-                "random comparison script, and benchmark a maximum-size input."
+-            )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            safe_log(f"[forward] Escalation stage {attempt}: no file changes detected.")
++            try:
++                if attempt == 0:
++                    retry_msg = (
++                        f"Create {self._deliverable_name()} now with a complete solution using the editor tool. "
++                        f"The repository is at {self.git_tempdir}.\n\n"
++                        f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++                    )
++                    msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++                    msg_history = self._clean_history(msg_history)
++                else:
++                    self._fallback_write_solution()
++            except Exception as e:
++                safe_log(f"[forward] Exception in escalation stage {attempt}: {e}", level=logging.ERROR)
+ 
+-        # Bounded verification round (single pass).
+-        if str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip() != '':
++        # Verification turn once a non-empty patch exists.
++        if self._has_changes():
+             verify_msg = (
+                 "Verification pass: re-run the solution on all sample inputs and compare with the expected outputs. "
+                 "Then re-run the random stress test against brute.py (create them if they do not exist) and the "
+                 "maximum-size timing test. If you find any discrepancy, wrong output, or timeout, fix the solution "
+                 "and re-verify. Make sure the final solution is saved in the deliverable file."
+             )
+-            msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            try:
++                msg_history = self._clean_history(msg_history)
++                chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            except Exception as e:
++                safe_log(f"[forward] Exception in verification turn: {e}", level=logging.ERROR)
+ 
+ 
+ def main():

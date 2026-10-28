@@ -1,0 +1,189 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e3f1230..8ac7362 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,9 +3,10 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, simple_chat
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -187,6 +188,70 @@ class AgenticSystem:
+         """
+         return any(not _is_test_file(f) for f in self._changed_files())
+ 
++    def _direct_write_fallback(self, task):
++        """
++        Last-resort, tool-less write: ask the model for the complete target file
++        and write the extracted code block to disk. Returns the written path or None.
++        """
++        # 1) Determine the target file
++        tracked = subprocess.run(
++            ["git", "-C", self.git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        ).stdout.decode(errors='replace').splitlines()
++        tracked_src = [
++            f for f in tracked
++            if f.strip() and not _is_test_file(f)
++            and not os.path.basename(f).upper().startswith('README')
++        ]
++        target = None
++        for name in re.findall(r'`([\w\-./]+\.\w+)`', self.problem_statement or ''):
++            if _is_test_file(name) or os.path.basename(name).upper().startswith('README'):
++                continue
++            if name in tracked_src:
++                target = name
++                break
++            if target is None and name.endswith('.py'):
++                target = name
++        if target is None and len(tracked_src) == 1:
++            target = tracked_src[0]
++        if target is None:
++            safe_log("[fallback] could not determine target file; skipping direct write.")
++            return None
++        safe_log(f"[fallback] target file: {target}")
++
++        # 2) Read current contents
++        path = os.path.join(self.git_tempdir, target)
++        current = ""
++        if os.path.isfile(path):
++            with open(path, 'r', errors='replace') as f:
++                current = f.read()
++        safe_log(f"[fallback] read {len(current)} chars from {target}")
++
++        # 3) Ask the model (tool-less) for the complete file
++        prompt = f"""{task}
++
++Current contents of `{target}`:
++```python
++{current}
++```
++
++Think briefly. Then output ONLY the complete file for `{target}` in one ```python fenced block, with no other code blocks.
++"""
++        response = simple_chat(prompt, model=self.code_model, max_tokens=32000, logging=safe_log)
++        safe_log(f"[fallback] model response length: {len(response or '')}")
++
++        # 4) Extract the last fenced block and write it
++        blocks = re.findall(r"```(?:python|py)?[ \t]*\n(.*?)```", response or '', re.DOTALL)
++        code = blocks[-1] if blocks else ""
++        if not code.strip():
++            safe_log("[fallback] no non-empty code block in response; file not written.")
++            return None
++        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++        with open(path, 'w') as f:
++            f.write(code if code.endswith('\n') else code + '\n')
++        safe_log(f"[fallback] wrote {len(code)} chars to {target}")
++        return target
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -225,6 +290,12 @@ Follow this step-by-step workflow:
+             current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+             changed = self._changed_files()
+             safe_log(f"[retry {attempt + 1}] no non-test source change. changed files: {changed}")
++            if attempt == 0:
++                retry_style = ("Write the code IMMEDIATELY. Start with a plan of at most 3 lines written as code comments "
++                               "at the top of the file, then write the solution. Do not write long reasoning.")
++            else:
++                retry_style = ("Keep your plan to at most 3 lines and do not write long reasoning. "
++                               "Prioritize writing a correct file to disk over analysis.")
+             retry_msg = f"""{task}
+ 
+ The current state of the repository has NO source change: the diff is empty or only touches test files.
+@@ -234,11 +305,26 @@ Changed files so far: {changed if changed else '(none)'}
+ Current diff:
+ {current_diff if current_diff.strip() else '(empty)'}
+ 
+-This is a strict instruction: immediately use the editor tool (`create` or `edit`) to write the solution file for the problem to disk, then verify it by running it with bash on all sample inputs. Do not reply with text only. Do not only edit test files.
++This is a strict instruction: immediately use the editor tool (`create` or `edit`) to write the solution file for the problem to disk, then verify it by running it with bash on all sample inputs. {retry_style} Do not reply with text only. Do not only edit test files.
+ """
+             retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[retry {attempt + 1}] chat finished; source patch present: {self._has_source_patch()}")
+ 
++        if not self._has_source_patch():
++            safe_log("[fallback] no source patch after retries; trying direct write.")
++            written = self._direct_write_fallback(task)
++            safe_log(f"[fallback] direct write result: {written}; source patch present: {self._has_source_patch()}")
++            if written and self._has_source_patch():
++                verify_msg = f"""{task}
++
++A solution file `{written}` has been written to disk. Verify it briefly:
++1. Run the program on every sample input in the problem statement with bash and compare with the expected output.
++2. If any sample mismatches, fix the file using the editor tool and re-run.
++Keep your reasoning short. Do not rewrite the whole approach unless necessary.
++"""
++                chat_with_agent(verify_msg, model=self.code_model, msg_history=[], logging=safe_log)
++                safe_log(f"[verify] verification pass finished; source patch present: {self._has_source_patch()}")
++
+         if self._has_source_patch():
+             current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+             perf_msg = f"""{task}
+diff --git a/llm_withtools.py b/llm_withtools.py
+index e5ecdd7..ee5be62 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -336,26 +336,31 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+     return new_msg_history
+ 
+ EMPTY_MAX_TOKENS_NUDGE = (
+-    "Your previous response was cut off. Do not think at length; "
+-    "call the editor tool now to write the file."
++    "Your previous response was cut off before any output. Do not reason at length. "
++    "Write the code immediately, with at most a 3-line plan in code comments, "
++    "then call the editor tool now to write the file."
+ )
+ EMPTY_MAX_TOKENS_RETRY_LIMIT = 2
+ FIRST_CALL_MAX_TOKENS = 8192
+-EMPTY_MAX_TOKENS_RETRY_BUDGET = 8192
++# Budgets escalate on each retry (one entry per retry)
++EMPTY_MAX_TOKENS_RETRY_BUDGETS = [16000, 32000]
++FORCED_EDITOR_CHOICE = {'type': 'tool', 'name': 'editor'}
+ 
+ def _is_empty_max_tokens(response):
+     return getattr(response, 'stop_reason', None) == 'max_tokens' and not response.content
+ 
+-def get_response_handling_empty(client, model, base_messages, tools, logging):
++def get_response_handling_empty(client, model, base_messages, tools, logging, tool_choice={'type': 'auto'}):
+     """
+     Call the model. If it stops at max_tokens with no content, append a nudge
+-    to the conversation and retry a bounded number of times with a larger
+-    max_tokens budget. Returns (response, messages_used_for_last_call).
++    to the conversation and retry a bounded number of times with an escalating
++    max_tokens budget. On the final retry, force a call to the editor tool
++    (Claude only; no extended thinking is enabled, so forced tool_choice is valid).
++    Returns (response, messages_used_for_last_call).
+     """
+     messages = base_messages
+     response = get_response_withtools(
+         client=client, model=model, messages=messages,
+-        tool_choice={"type": "auto"}, tools=tools, logging=logging,
++        tool_choice=tool_choice, tools=tools, logging=logging,
+         max_tokens=FIRST_CALL_MAX_TOKENS,
+     )
+     for attempt in range(EMPTY_MAX_TOKENS_RETRY_LIMIT):
+@@ -366,10 +371,15 @@ def get_response_handling_empty(client, model, base_messages, tools, logging):
+             "role": "user",
+             "content": [{"type": "text", "text": EMPTY_MAX_TOKENS_NUDGE}],
+         }]
++        is_last = attempt == EMPTY_MAX_TOKENS_RETRY_LIMIT - 1
++        retry_choice = tool_choice
++        if is_last and 'claude' in model:
++            retry_choice = FORCED_EDITOR_CHOICE
++        budget = EMPTY_MAX_TOKENS_RETRY_BUDGETS[min(attempt, len(EMPTY_MAX_TOKENS_RETRY_BUDGETS) - 1)]
+         response = get_response_withtools(
+             client=client, model=model, messages=messages,
+-            tool_choice={"type": "auto"}, tools=tools, logging=logging,
+-            max_tokens=EMPTY_MAX_TOKENS_RETRY_BUDGET,
++            tool_choice=retry_choice, tools=tools, logging=logging,
++            max_tokens=budget,
+         )
+     return response, messages
+ 

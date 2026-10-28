@@ -1,0 +1,284 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 8ead127..44e5c59 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -123,6 +123,32 @@ def _extract_python_code(text):
+     matches = [m for m in matches if m.strip()]
+     return max(matches, key=len).rstrip() + "\n" if matches else ''
+ 
++STUB_SOLUTION = "import sys\n\n\ndef main():\n    data = sys.stdin.read()\n\n\nif __name__ == '__main__':\n    main()\n"
++
++def _extract_code_tolerant(text):
++    """Extract code from any fenced block (any/no language tag), or the raw text if it looks like code."""
++    text = text or ''
++    matches = re.findall(r"```[A-Za-z0-9_+-]*[ \t]*\n(.*?)```", text, re.DOTALL)
++    matches = [m for m in matches if m.strip()]
++    if matches:
++        return max(matches, key=len).rstrip() + "\n"
++    stripped = text.strip()
++    if stripped and ('import' in stripped or 'def ' in stripped or 'input(' in stripped):
++        return stripped + "\n"
++    return ''
++
++def _has_action(msg_history):
++    """True if the final assistant message contains non-whitespace text or a tool_use block."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') == 'assistant':
++            for b in _message_blocks(msg):
++                if b.get('type') == 'tool_use':
++                    return True
++                if b.get('type') == 'text' and b.get('text', '').strip():
++                    return True
++            return False
++    return False
++
+ 
+ class AgenticSystem:
+     def __init__(
+@@ -173,8 +199,23 @@ class AgenticSystem:
+         path = os.path.join(self.git_tempdir, 'solution.py')
+         if not (os.path.exists(path) and os.path.getsize(path) > 0):
+             return False
++        with open(path, 'r') as f:
++            if f.read() == STUB_SOLUTION:
++                return False
+         return str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip() != ''
+ 
++    def _call_with_recovery(self, prompt, history, model=None):
++        """Call chat_with_agent; return (history, ok). ok is True if the last assistant turn has
++        text or tool_use, or if the repo diff is non-empty. Model exceptions are logged, not raised."""
++        model = model or self.code_model
++        try:
++            new_history = chat_with_agent(prompt, model=model, msg_history=history, logging=safe_log)
++        except Exception as e:
++            safe_log(f"[recovery] chat_with_agent failed with model={model}: {e}", level=logging.WARNING)
++            return history, False
++        ok = _has_action(new_history) or str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip() != ''
++        return new_history, ok
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -199,41 +240,65 @@ Please follow this workflow carefully:
+ 6. Finish only when all checks pass: the samples produce the expected output, the stress test shows no mismatches against the brute force, and the maximum-size input runs in time. Make sure the final solution is saved in the deliverable file. Helper files (brute.py, stress.py, sample files, big input) may remain in the repository, but the deliverable file must contain the final, complete solution.
+ """
+         instruction = f"{task}{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        # Write a stub so the diff is never empty; _deliverable_exists treats the unchanged stub as missing.
++        stub_path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.exists(stub_path):
++            os.makedirs(self.git_tempdir, exist_ok=True)
++            with open(stub_path, 'w') as f:
++                f.write(STUB_SOLUTION)
++
++        msg_history, ok = self._call_with_recovery(instruction, [], model=self.code_model)
++        safe_log(f"[forward] Initial call: ok={ok}, deliverable_exists={self._deliverable_exists()}")
++
++        alt_model = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++        minimal_msg = (
++            f"The repository is at {self.git_tempdir}. Solve the following problem.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            "Create solution.py with the editor tool (a complete program reading stdin and writing stdout, "
++            "or the required Solution class if the task specifies one), then test it on the sample inputs."
++        )
++        nocode_msg = (
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            "Output ONLY the complete Python 3 solution in one ```python block. No explanations."
++        )
++        strategies = [
++            ('continue', msg_history,
++             f"Continue: create solution.py in {self.git_tempdir} now with the editor tool, then test it on the samples.",
++             self.code_model),
++            ('minimal_alt_model', [], minimal_msg, alt_model),
++            ('nocode_alt_model', [], nocode_msg, alt_model),
++        ]
+ 
+-        # Robustness: ensure a deliverable exists. Retry up to 3 times with a FRESH history
+-        # and a directive prompt if the deliverable is missing or the last turn was empty.
+-        for attempt in range(3):
++        for name, hist, prompt, model in strategies:
+             if self._deliverable_exists():
+                 break
+-            safe_log(f"[forward] Attempt {attempt + 1}: deliverable missing or empty, re-prompting agent with fresh history.")
+-            retry_msg = (
+-                f"The repository is at {self.git_tempdir}. Solve the following problem.\n\n"
+-                f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                "Think briefly about the algorithm, then immediately create solution.py with the editor tool "
+-                "(a complete program reading stdin and writing stdout, or the required Solution class if the task "
+-                "specifies one). Then test it on the sample inputs with bash and fix any failures."
+-            )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[forward] Attempt {attempt + 1} finished: deliverable_exists={self._deliverable_exists()}, "
+-                     f"last_assistant_empty={_last_assistant_empty(msg_history)}")
++            safe_log(f"[forward] Recovery strategy '{name}' starting (model={model}).")
++            if name == 'nocode_alt_model':
++                try:
++                    fb_history = chat_with_agent(prompt, model=model, msg_history=[], logging=safe_log)
++                except Exception as e:
++                    safe_log(f"[forward] Strategy '{name}' alt model failed ({e}); falling back to {self.code_model}.")
++                    try:
++                        fb_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++                    except Exception as e2:
++                        safe_log(f"[forward] Strategy '{name}' primary fallback failed: {e2}", level=logging.WARNING)
++                        fb_history = []
++                code = _extract_code_tolerant(_last_assistant_text(fb_history))
++                if code:
++                    os.makedirs(self.git_tempdir, exist_ok=True)
++                    with open(stub_path, 'w') as f:
++                        f.write(code)
++                    safe_log(f"[forward] Strategy '{name}' wrote extracted code to solution.py.")
++                else:
++                    safe_log(f"[forward] Strategy '{name}' produced no extractable code.")
++            else:
++                msg_history, ok = self._call_with_recovery(prompt, hist, model=model)
++                safe_log(f"[forward] Strategy '{name}' outcome: ok={ok}, "
++                         f"deliverable_exists={self._deliverable_exists()}")
++            safe_log(f"[forward] Strategy '{name}' finished: deliverable_exists={self._deliverable_exists()}")
+ 
+-        # Final fallback: ask for only the code and write it to solution.py from the harness.
+         if not self._deliverable_exists():
+-            safe_log("[forward] Deliverable still missing after retries, running no-tools code fallback.")
+-            fallback_msg = (
+-                f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                "Output ONLY the complete Python 3 solution in one ```python block. No explanations."
+-            )
+-            fb_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            code = _extract_python_code(_last_assistant_text(fb_history))
+-            if code:
+-                os.makedirs(self.git_tempdir, exist_ok=True)
+-                with open(os.path.join(self.git_tempdir, 'solution.py'), 'w') as f:
+-                    f.write(code)
+-                safe_log("[forward] Fallback solution.py written.")
+-            else:
+-                safe_log("[forward] Fallback produced no parsable python code block.")
++            safe_log("[forward] All recovery strategies exhausted; no deliverable produced.", level=logging.WARNING)
+ 
+         # Bounded verification round (single pass), only if the deliverable exists.
+         if self._deliverable_exists():
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..46a506e
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,121 @@
++import argparse
++import subprocess
++import logging
++from logging.handlers import RotatingFileHandler
++import os
++import re
++import threading
++
++from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++
++# reset_to_commit(git_dname, commit)
++# apply_patch(git_dname, patch_str)
++
++# TEST COMMANDS for different languages
++# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
++NPM_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
++    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
++    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
++    ["npm", "run", "test"]
++]
++
++CPP_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
++    ["sh", "-c", "cd build"],
++    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
++    ["make"],
++    ["sh", "-c", "cd ../"]
++]
++
++TEST_COMMANDS = {
++    "python": [["pytest", "-rA", "--tb=long"]],
++    "rust": [["cargo", "test", "--", "--include-ignored"]],
++    "go": [["go", "test", "./..."]],
++    "javascript": NPM_TEST_COMMANDS,
++    "cpp": CPP_TEST_COMMANDS,
++    "java": [["./gradlew", "test"]],
++}
++
++# Thread-local storage for logger instances
++thread_local = threading.local()
++
++def get_thread_logger():
++    """
++    Get the logger instance specific to the current thread.
++    Returns None if no logger has been set for this thread.
++    """
++    return getattr(thread_local, 'logger', None)
++
++def set_thread_logger(logger):
++    """
++    Set the logger instance for the current thread.
++    """
++    thread_local.logger = logger
++
++def setup_logger(log_file='./chat_history.md', level=logging.INFO):
++    """
++    Set up a logger with both file and console handlers.
++    """
++    # Create logger with a unique name based on thread ID
++    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
++    logger.setLevel(level)
++    
++    # Remove existing handlers to avoid duplicates
++    logger.handlers = []
++    
++    # Create formatters
++    file_formatter = logging.Formatter('%(message)s')
++    
++    # Create and set up file handler
++    os.makedirs(os.path.dirname(log_file), exist_ok=True)
++    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
++    file_handler.setLevel(level)
++    file_handler.setFormatter(file_formatter)
++    
++    # Add handlers to logger
++    logger.addHandler(file_handler)
++    
++    # Store logger in thread-local storage
++    set_thread_logger(logger)
++    
++    return logger
++
++def safe_log(message, level=logging.INFO):
++    """
++    Thread-safe logging function that ensures messages go to the correct logger.
++    """
++    logger = get_thread_logger()
++    if logger:
++        logger.log(level, message)
++    else:
++        print(f"Warning: No logger found for thread {threading.get_ident()}")
++
++def _message_blocks(msg):
++    content = msg.get('content', [])
++    if isinstance(content, str):
++        return [{'type': 'text', 'text': content}]
++    return [b if isinstance(b, dict) else {'type': 'text', 'text': str(b)} for b in content]
++
++def _last_assistant_text(msg_history):
++    """Return the concatenated text of the final assistant message ('' if none)."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') == 'assistant':
++            return "\n".join(b.get('text', '') for b in _message_blocks(msg) if b.get('type') == 'text')
++    return ''
++
++def _last_assistant_empty(msg_history):
++    """True if the final assistant message has only empty text and no tool_use blocks."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') == 'assistant':
++            blocks = _message_blocks(msg)
++            if any(b.get('type') == 'tool_use' for b in blocks):
++                return False
++            return all(not b.get('text', '').strip() for b in blocks if b.get('type') == 'text')
++    return True
++
++def _extract_python_code(text):
++    """Extract the longest

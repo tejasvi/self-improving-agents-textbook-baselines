@@ -1,0 +1,170 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 87e129e..6175ef3 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -94,6 +95,25 @@ def safe_log(message, level=logging.INFO):
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
+ class AgenticSystem:
++    EDIT_NOTE = (
++        "IMPORTANT: Before anything else, you must write an initial working solution file with the editor tool "
++        "(a naive version is fine), and you must never end your turn without having created or modified the solution file."
++    )
++
++    CORRECTIVE_MESSAGES = [
++        "No source file has been modified (current diff: {state}). Use the editor tool to create/edit the solution file now "
++        "with a complete implementation. Do not respond with text only.",
++        "Still no source file has been modified (current diff: {state}). You MUST use the editor tool right now to write the "
++        "solution file with a complete best-effort implementation. A text-only reply is not acceptable.",
++        "FINAL WARNING: no source file has been modified (current diff: {state}). Stop analyzing. Call the editor tool immediately "
++        "to write the solution file. Do not respond with text only.",
++    ]
++
++    FINAL_FORCE_MESSAGE = (
++        "Write the solution file immediately using the editor tool, with a best-effort complete implementation. "
++        "Do not do any analysis first."
++    )
++
+     def __init__(
+             self,
+             problem_statement,
+@@ -112,6 +132,7 @@ class AgenticSystem:
+         self.self_improve = self_improve
+         self.language = language
+         self.max_fix_iterations = 2
++        self.max_patch_retries = 3
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -123,6 +144,62 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
++    # ----- patch guard helpers -----
++    TEST_LIKE_KEYWORDS = ('test', 'tests', 'brute', 'gen', 'sample', 'stress')
++
++    def _current_diff(self):
++        return str(diff_versus_commit(self.git_tempdir, self.base_commit))
++
++    def _get_changed_files(self, diff=None):
++        """Parse the file paths from `diff --git a/X b/X` header lines."""
++        if diff is None:
++            diff = self._current_diff()
++        files = []
++        for line in diff.splitlines():
++            m = re.match(r'^diff --git a/(\S+) b/(\S+)', line)
++            if m:
++                files.append(m.group(2))
++        return files
++
++    def _is_test_like(self, path):
++        lowered = path.lower()
++        return any(kw in lowered for kw in self.TEST_LIKE_KEYWORDS)
++
++    def _has_source_edit(self):
++        """True if the diff is non-empty and touches at least one non-test-like file."""
++        diff = self._current_diff()
++        if not diff.strip():
++            return False
++        changed = self._get_changed_files(diff)
++        return any(not self._is_test_like(f) for f in changed)
++
++    @staticmethod
++    def _is_empty_assistant_message(msg):
++        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++            return False
++        content = msg.get('content')
++        if content is None:
++            return True
++        if isinstance(content, str):
++            return not content.strip()
++        if isinstance(content, list):
++            for block in content:
++                if isinstance(block, dict):
++                    btype = block.get('type')
++                    if btype == 'text' and str(block.get('text', '')).strip():
++                        return False
++                    if btype not in (None, 'text'):
++                        return False  # tool_use etc. counts as content
++                elif block is not None:
++                    return False
++            return True
++        return False
++
++    def _history_is_unusable(self, msg_history):
++        if not msg_history:
++            return True
++        return self._is_empty_assistant_message(msg_history[-1])
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -156,6 +233,8 @@ Please analyze the problem description carefully, then follow these steps in ord
+ 
+ (a) Restate the constraints (N, value ranges, time/memory limits, output format, precision requirements). Derive the algorithm and estimate its time and memory complexity. Check that it fits the constraints.
+ 
++Step 0 (mandatory, do this first): inspect the repo with the editor view command, then immediately write an initial working solution file with the editor tool (even a simple/naive one) before optimizing. You must never end your turn without having created or modified the solution file.
++
+ (b) Implement the solution in the repository (the solution file for this task). If the problem asks for a `Solution` class method, implement that method; otherwise make the program read standard input and write standard output.
+ 
+ (c) Run all provided sample inputs and compare the outputs with the expected outputs (diff them).
+@@ -172,11 +251,49 @@ Please analyze the problem description carefully, then follow these steps in ord
+ """
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Bounded verification/fix loop: feed back stress-test results and ask for fixes.
++        # Guard: if the first turn returned an unusable history, restart with the instruction plus a corrective note.
++        if self._history_is_unusable(init_edit):
++            safe_log("PATCH GUARD: initial history empty or ends in empty assistant message; restarting fresh.")
++            init_edit = chat_with_agent(
++                instruction + "\n\n" + self.EDIT_NOTE,
++                model=self.code_model, msg_history=[], logging=safe_log,
++            )
+         msg_history = init_edit
++
++        # Patch guard: force a real (non-test) source edit with escalating corrective messages.
++        for attempt in range(self.max_patch_retries):
++            if self._has_source_edit():
++                safe_log(f"PATCH GUARD: real source edit present before retry {attempt}; no retry needed.")
++                break
++            diff = self._current_diff().strip()
++            state = "empty" if not diff else "only test/scratch files: " + ", ".join(self._get_changed_files(diff))
++            safe_log(f"PATCH GUARD: no real source edit (current diff: {state}); corrective retry {attempt + 1}/{self.max_patch_retries}.")
++            corrective = self.CORRECTIVE_MESSAGES[min(attempt, len(self.CORRECTIVE_MESSAGES) - 1)]
++            msg = corrective.format(state=state)
++            new_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            if self._history_is_unusable(new_history):
++                safe_log("PATCH GUARD: retry returned unusable history; restarting fresh with corrective note.")
++                new_history = chat_with_agent(
++                    instruction + "\n\n" + self.EDIT_NOTE + "\n\n" + msg,
++                    model=self.code_model, msg_history=[], logging=safe_log,
++                )
++            msg_history = new_history
++
++        if not self._has_source_edit():
++            # Last resort: one bare request for the solution file, no analysis.
++            diff = self._current_diff().strip()
++            state = "empty" if not diff else "only test/scratch files"
++            safe_log(f"PATCH GUARD: patch still has no real source edit after retries (diff: {state}); final forced call.")
++            msg_history = chat_with_agent(self.FINAL_FORCE_MESSAGE, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            return
++
++        safe_log("PATCH GUARD: real source edit confirmed; running verification follow-up loop.")
++
++        # Bounded verification/fix loop: feed back stress-test results and ask for fixes.
+         for _ in range(self.max_fix_iterations):
++            diff_state = "the diff is currently non-empty" if self._current_diff().strip() else "the diff is currently EMPTY, which should not happen"
+             followup = (
+-                "Please re-verify your solution: rerun the samples and the stress_test tool "
++                f"Please re-verify your solution ({diff_state}): rerun the samples and the stress_test tool "
+                 "(brute.py / gen.py in your scratch directory outside the repository, at least 300 cases). "
+                 "If there is any mismatch, crash, timeout, or sample failure, debug it with the minimal failing input, "
+                 "fix the solution, and rerun. When everything passes, delete the scratch files outside the repository "

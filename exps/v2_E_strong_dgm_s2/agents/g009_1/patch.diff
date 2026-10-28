@@ -1,0 +1,745 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5b91139..1ea3c78 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -23,20 +23,35 @@ MAX_RECOVERY = 2
+ RECOVERY_CODE_CLIP = 4000
+ MAX_TURNS_PER_CALL = 30   # tool-call rounds allowed per chat_with_agent call (per attempt)
+ MAX_EMPTY_STEPS = 2       # extra non-counted attempt steps allowed when replies stay empty
++CORPUS_PATH = os.path.join('tests', 'corpus.txt')   # failing inputs persisted across attempts
++CORPUS_SEP = "\n#=====\n"
++CORPUS_MAX = 60           # cap on stored failing inputs
++MULTI_ANSWER_RE = re.compile(r"any of them|multiple solutions|print any|any valid", re.I)
++# Runs checker.py in a subprocess: reads {"inp","sol","brute"} JSON on stdin, prints [ok, msg].
++_CHECKER_DRIVER = (
++    "import sys, json\n"
++    "sys.path.insert(0, '.')\n"
++    "import checker\n"
++    "d = json.load(sys.stdin)\n"
++    "r = checker.check(d['inp'], d['sol'], d['brute'])\n"
++    "print(json.dumps([bool(r[0]), str(r[1] if len(r) > 1 else '')]))\n"
++)
+ 
+ METHOD_PROMPT = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool. The final solution.py must be a stdin/stdout program (read input with sys.stdin, print the answer), unless the statement asks for a Solution class method.
++1. Read the statement and constraints. Decide whether the output is unique. If several valid answers may exist ("print any", "any of them", "multiple solutions"), write checker.py defining check(inp, out, brute_out) -> (ok: bool, msg: str) that validates ANY correct answer by recomputing the constraints from inp; the harness and stress_test use it instead of token comparison. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++2. Write the solution in solution.py with the editor tool. The final solution.py must be a stdin/stdout program (read input with sys.stdin, print the answer), unless the statement asks for a Solution class method. Put the logic in a solve(text) -> str function that takes the whole input text and returns the output text, and guard the entry point with `if __name__ == '__main__':` (reading sys.stdin and printing solve(...)), so the file works both as a program and as an importable module.
+ 3. Write the I/O contract: input format, output format, and whether the task is interactive. For interactive tasks, read all input through a token iterator over sys.stdin (never sys.stdin.read() before the interaction is over, and never assume one value per line), flush after each print, write an interactor and use the interactive_judge tool, and also run the program on a static transcript where all judge data is pre-supplied on stdin.
+-3b. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write brute.py: a verified-correct brute force written directly from the statement (plain simulation or full enumeration, NOT your fast idea), as a stdin/stdout program. Write gen.py exposing gen(rng, size) that returns a small random input as a string, including degenerate cases (minimum size, all equal values, extreme values). Then run the `stress_test` tool comparing solution.py with brute.py using gen.py. Do not skip degenerate inputs. Fix every mismatch. Also enumerate all tiny inputs when feasible (enumerate_all() in gen.py).
++3b. Run it on every sample in the statement and compare with the expected outputs. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++4. Write brute.py with the editor tool: a verified-correct brute force written directly from the statement (plain simulation or full enumeration, NOT your fast idea), as a stdin/stdout program. Check that brute.py reproduces every sample output before trusting it. Write gen.py exposing gen(rng, size) that returns a small random input as a string, including degenerate cases (minimum size, all equal values, extreme values). Then run the `stress_test` tool (use mode='stdio' for stdin programs, and checker_path=checker.py if you wrote one) comparing solution.py with brute.py using gen.py. Do not skip degenerate inputs. Fix every mismatch. Also enumerate all tiny inputs when feasible (enumerate_all() in gen.py).
+ 5. Save a maximum-size input allowed by the constraints as max_input.txt in the repository directory, and check that `python3 solution.py < max_input.txt` finishes well under 2 seconds. The harness uses a 3 second limit on max_input.txt.
+ 6. Audit every early return and special-case branch in the final code against inputs where its condition is false but the branch is still reached.
+ 7. Limit exploration: after about 15 tool calls you must have a candidate fast solution in solution.py, and then test it. Do not do open-ended analysis or long experiments.
+ 8. Before finishing, run the stress_test tool once more on the final solution.py. The final answer must beat the time limit and must NOT be the brute force. Keep iterating until all checks pass.
+ 9. Timeout rule: if a sample with large values does not finish in a few seconds, the algorithm is wrong for this problem and its approach must change. Simulation/BFS is only a reference for tiny inputs (move it to brute.py); it is never the final solution. Derive the efficient formula from brute-force tables of small cases (print tables, look at the dependence on each parameter) before writing the final solution.py.
+ 10. Keep assistant turns short: think briefly, act with tools, and do not write long reasoning in the reply. Move long reasoning into files or short notes.
+-11. Write scripts to files with the editor tool instead of long inline python heredocs inside bash commands."""
++11. Write scripts to files with the editor tool instead of long inline python heredocs inside bash commands. Do NOT chain file creation with `&&`: a failing step silently skips the rest. Create each file (brute.py, gen.py, checker.py, solution.py) with the editor tool, then run `ls` to verify that all of them exist.
++12. Do not name files after standard-library modules (enum.py, random.py, json.py, string.py, test.py, etc.); they shadow imports and break the harness.
++"""
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -360,36 +375,157 @@ class AgenticSystem:
+             safe_log(f"_generate_cases failed for {gen_file}: {e}", level=logging.WARNING)
+             return []
+ 
++    def _checker_file(self):
++        p = os.path.join(self.git_tempdir, 'checker.py')
++        return p if os.path.isfile(p) else None
++
++    def _is_multi_answer(self):
++        return isinstance(self.problem_statement, str) and MULTI_ANSWER_RE.search(self.problem_statement) is not None
++
++    def _compare(self, inp, sol_out, brute_out):
++        """Compare a candidate output with a reference output.
++        Returns (ok, msg): ok True = accepted, False = rejected, None = inconclusive."""
++        if self._checker_file() is not None:
++            payload = json.dumps({"inp": inp, "sol": sol_out, "brute": brute_out})
++            try:
++                proc = subprocess.run(
++                    ["python3", "-c", _CHECKER_DRIVER], input=payload, capture_output=True, text=True,
++                    timeout=20, cwd=self.git_tempdir, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
++            except Exception as e:
++                return None, f"checker.py could not be run: {e}"
++            if proc.returncode != 0:
++                return None, "checker.py crashed: " + self._clip((proc.stderr or "")[-600:], 600)
++            try:
++                ok, msg = json.loads(proc.stdout.strip().splitlines()[-1])
++                return bool(ok), str(msg)
++            except Exception:
++                return None, "checker.py printed unparseable output (expected check() -> (ok, msg))"
++        if sol_out.split() == brute_out.split():
++            return True, "tokens equal"
++        if self._is_multi_answer():
++            return None, ("outputs differ, but the problem admits several valid answers and there is no checker.py. "
++                          "Write checker.py with check(inp, out, brute_out) -> (ok, msg) that validates ANY correct answer "
++                          "(recompute the constraints from inp), then re-run the tests.")
++        return False, "token mismatch"
++
++    def _load_corpus(self):
++        p = os.path.join(self.git_tempdir, CORPUS_PATH)
++        try:
++            with open(p) as f:
++                text = f.read()
++        except OSError:
++            return []
++        return [c for c in text.split(CORPUS_SEP) if c.strip()]
++
++    def _save_corpus(self, new_inputs):
++        if not new_inputs:
++            return
++        try:
++            existing = self._load_corpus()
++            merged = []
++            for c in existing + [x for x in new_inputs if len(x) <= 5000]:
++                c = c if c.endswith("\n") else c + "\n"
++                if c not in merged:
++                    merged.append(c)
++            merged = merged[-CORPUS_MAX:]
++            p = os.path.join(self.git_tempdir, CORPUS_PATH)
++            os.makedirs(os.path.dirname(p), exist_ok=True)
++            with open(p, "w") as f:
++                f.write(CORPUS_SEP.join(merged))
++        except Exception as e:
++            safe_log(f"_save_corpus failed: {e}", level=logging.WARNING)
++
++    def _artifact_paths_text(self):
++        lines = []
++        for name in ('brute.py', 'gen.py', 'checker.py'):
++            p = os.path.join(self.git_tempdir, name)
++            lines.append(f"  {name}: {p if os.path.isfile(p) else 'MISSING'}")
++        lines.append(f"  tests/corpus.txt (failing inputs from earlier attempts, re-run first): "
++                     f"{os.path.join(self.git_tempdir, CORPUS_PATH)}")
++        return "\n".join(lines)
++
++    @staticmethod
++    def _score(samples_ok, max_ok, brute_ok, brute_trusted, checker_present):
++        return (samples_ok, max_ok, brute_ok, int(brute_trusted), int(checker_present))
++
+     def _evaluate(self):
+         """
+         Objectively evaluate solution.py. Returns a dict with:
+-          score:  (samples_passed, max_input_ok, brute_agreement)  -- higher is better
++          score:  (samples_passed, max_input_ok, brute_agreement, brute_trusted, checker_present)
++                  -- higher is better; the last two are tie-breakers
+           report: short text describing failures
+-          passed: True when every available check passes
++          passed: True when every available check passes and nothing was inconclusive
+         """
++        checker_present = self._checker_file() is not None
+         path = os.path.join(self.git_tempdir, 'solution.py')
+         if not os.path.isfile(path) or os.path.getsize(path) == 0:
+-            return {"score": (-1, 0, 0), "report": "solution.py is missing or empty.", "passed": False, "has_solution": False}
++            return {"score": self._score(-1, 0, 0, False, checker_present),
++                    "report": "solution.py is missing or empty.", "passed": False, "has_solution": False}
+         try:
+             with open(path) as f:
+                 compile(f.read(), path, 'exec')
+         except Exception as e:
+-            return {"score": (-1, 0, 0), "report": f"solution.py does not compile:\n{self._clip(e, 600)}",
++            return {"score": self._score(-1, 0, 0, False, checker_present),
++                    "report": f"solution.py does not compile:\n{self._clip(e, 600)}",
+                     "passed": False, "has_solution": True}
+ 
+         report = []
+-
+-        # 1. Samples from the statement (token-wise comparison).
++        inconclusive = False
+         samples = self._extract_samples()
++        if not samples:
++            safe_log("_evaluate: no parseable samples in statement", level=logging.WARNING)
++
++        # 0. Validate brute.py on the statement samples before trusting it.
++        brute_path = os.path.join(self.git_tempdir, 'brute.py')
++        brute_trusted = False
++        if not os.path.isfile(brute_path):
++            report.append("[brute] brute.py is missing. Write a verified brute force so differential checks can run. "
++                          "The differential check is neutral (not a failure) until it exists.")
++        else:
++            brute_trusted = bool(samples)  # trusted only if it was actually checked against samples
++            for idx, (inp, exp) in enumerate(samples, 1):
++                bstat, bout, _ = self._run_program("brute.py", inp, SAMPLE_TIMEOUT)
++                if bstat != "ok":
++                    brute_trusted = False
++                    report.append(self._failure_text(f"[brute] brute.py on Sample {idx}", inp, exp, bstat, bout))
++                    break
++                ok, msg = self._compare(inp, bout, exp)
++                if ok is None:
++                    brute_trusted = False  # could not verify brute against the sample; do not trust it
++                    inconclusive = True    # multi-answer problem without checker.py: not a full pass
++                    report.append(f"[brute] could not verify brute.py on Sample {idx}: {msg}")
++                    break
++                if ok is False:
++                    brute_trusted = False
++                    report.append(f"[brute] brute.py does not reproduce Sample {idx}: {msg}\n"
++                                  f"expected:\n{self._clip(exp, 300)}\nbrute actual:\n{self._clip(bout, 300)}")
++                    break
++            if brute_trusted:
++                safe_log("_evaluate: brute.py reproduces the samples")
++            else:
++                report.append("[brute] brute.py is NOT trusted (it failed or could not be checked against the samples). "
++                              "The differential check is neutral (does not count against the solution). "
++                              "Fix brute.py so it reproduces the statement samples.")
++
++        # 1. Samples from the statement.
+         samples_ok = 0
++        new_failures = []  # failing inputs are persisted to tests/corpus.txt
+         for idx, (inp, exp) in enumerate(samples, 1):
+             status, out, _ = self._run_solution(inp, SAMPLE_TIMEOUT)
+-            if status == "ok" and out.split() == exp.split():
++            if status != "ok":
++                new_failures.append(inp)
++                report.append(self._failure_text(f"Sample {idx}", inp, exp, status, out))
++                continue
++            ok, msg = self._compare(inp, out, exp)
++            if ok:
+                 samples_ok += 1
++            elif ok is None:
++                samples_ok += 1  # inconclusive: never lowers the score, but blocks 'passed'
++                inconclusive = True
++                report.append(f"[Sample {idx}] inconclusive: {msg}")
+             else:
++                new_failures.append(inp)
+                 report.append(self._failure_text(f"Sample {idx}", inp, exp, status, out))
+-        if not samples:
+-            safe_log("_evaluate: no parseable samples in statement", level=logging.WARNING)
+ 
+         # 2. Max-size input saved by the agent.
+         max_ok = 1
+@@ -415,20 +551,21 @@ class AgenticSystem:
+                 else:
+                     safe_log(f"_evaluate: max_input ran in {elapsed:.2f}s")
+ 
+-        # 3. Optional differential check against brute.py using gen.py.
++        # 3. Differential check against brute.py: persisted corpus first, then gen.py cases.
+         brute_ok = 1
+         differential_ran = False
+-        brute_path = os.path.join(self.git_tempdir, 'brute.py')
+         gen_file = None
+         for cand in ('gen.py', 'generator.py'):
+             if os.path.isfile(os.path.join(self.git_tempdir, cand)):
+                 gen_file = cand
+                 break
+-        if os.path.isfile(brute_path) and gen_file is not None:
+-            cases = self._generate_cases(gen_file)
++        corpus = self._load_corpus()
++        gen_cases = self._generate_cases(gen_file)[:DIFF_CASES] if gen_file is not None else []
++        cases = corpus + gen_cases
++        if brute_trusted and cases:
+             total = agree = 0
+             deadline = time.time() + DIFF_BUDGET
+-            for inp in cases[:DIFF_CASES]:
++            for inp in cases:
+                 if time.time() > deadline:
+                     break
+                 bstat, bout, _ = self._run_program("brute.py", inp, DIFF_TIMEOUT)
+@@ -436,25 +573,40 @@ class AgenticSystem:
+                     continue  # brute itself failed on this input; not evidence against solution
+                 total += 1
+                 sstat, sout, _ = self._run_solution(inp, DIFF_TIMEOUT)
+-                if sstat == "ok" and sout.split() == bout.split():
+-                    agree += 1
++                if sstat == "ok":
++                    ok, msg = self._compare(inp, sout, bout)
+                 else:
+-                    report.append(self._failure_text("brute mismatch", inp, bout, sstat, sout))
+-                    break  # one counterexample is enough; avoids long repeated timeouts
++                    ok, msg = False, f"solution {sstat}"
++                if ok:
++                    agree += 1
++                    continue
++                if ok is None:
++                    agree += 1  # inconclusive: do not set brute_ok=0
++                    if not inconclusive:
++                        report.append(f"[differential] inconclusive: {msg}")
++                    inconclusive = True
++                    continue
++                new_failures.append(inp)
++                report.append(self._failure_text("brute mismatch", inp, bout, sstat, sout))
++                break  # one counterexample is enough; avoids long repeated timeouts
+             if total > 0:
+                 differential_ran = True
+             if total > 0 and agree < total:
+                 brute_ok = 0
+-            safe_log(f"_evaluate: differential {agree}/{total} agree")
++            safe_log(f"_evaluate: differential {agree}/{total} agree (corpus {len(corpus)} + gen {len(gen_cases)})")
++        self._save_corpus(new_failures)
+ 
+-        score = (samples_ok, max_ok, brute_ok)
+-        passed = (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1
++        score = self._score(samples_ok, max_ok, brute_ok, brute_trusted, checker_present)
++        passed = (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1 and not inconclusive
+         if not samples and not differential_ran:
+             # Nothing was actually verified: never report success.
+             passed = False
+-            score = (0, max_ok, 0)
++            score = self._score(0, max_ok, 0, brute_trusted, checker_present)
+             report.append("No verifiable checks ran; write your own tests (a brute force with stress_test, "
+                           "or an interactive_judge run for interactive problems, plus a static-transcript run).")
++        if inconclusive:
++            report.append("Some outputs could not be verified (see 'inconclusive'). If the problem admits several "
++                          "valid answers, write checker.py with check(inp, out, brute_out) -> (ok, msg).")
+         if not report:
+             report_text = "All available checks passed."
+         else:
+@@ -604,6 +756,9 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                     "A brute-force-only solution is NOT acceptable. Find the efficient algorithm: derive it, "
+                     "or find patterns in brute-force data and verify them against brute.py.\n"
+                     "Keep the verified-correct brute force as brute.py; do not overwrite it with a fast version.\n"
++                    f"Test artifacts (EXTEND these, do not rebuild them from scratch):\n{self._artifact_paths_text()}\n"
++                    "tests/corpus.txt holds inputs that failed earlier; they are re-run first on every evaluation.\n"
++                    "If the answer is not unique and checker.py is missing, write checker.py now.\n"
+                     "Avoid unbounded exploration: commit a candidate fast solution to solution.py early "
+                     "(within about 15 tool calls), then test it on the samples, on max_input.txt, and with stress_test.\n"
+                 )
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index bc26c91..e94cbb0 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -1,274 +1,197 @@
++import importlib.util
++import json
+ import os
++import random
+ import subprocess
+ import sys
+ import tempfile
+-import json
++import threading
++import warnings
++from concurrent.futures import ThreadPoolExecutor
+ 
+-# Driver executed in a subprocess. It loads the solution, the brute force and the
+-# generator, runs exhaustive enumeration (if the generator provides enumerate_all)
+-# and then random cases with growing sizes, and writes a JSON result to result_path.
+-_DRIVER = r'''
+-import sys, json, random, signal, importlib.util, os, io, copy, traceback, itertools, contextlib
++DEFAULT_TIMEOUT = 5
++MAX_WORKERS = 4
+ 
+-sol_path, brute_path, gen_path, num_cases, per_call, method, result_path = sys.argv[1:8]
+-num_cases = int(num_cases)
+-per_call = float(per_call)
+-ENUM_CAP = 20000
+-MAX_SIZE = 30
+-SHRINK_BUDGET = 400
+-REPR_CAP = 2000
+ 
+-def finish(d):
+-    with open(result_path, "w") as f:
+-        json.dump(d, f)
+-    sys.stdout.flush()
+-    sys.stderr.flush()
+-    os._exit(0)  # not catchable by the surrounding except BaseException blocks
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": (
++            "Stress-test a solution against a brute-force reference with random inputs from a generator. "
++            "mode='module': solution/brute files define solve(input_obj) and gen(rng,size) returns an object. "
++            "mode='stdio': solution/brute are stdin/stdout programs run with `python3 file < input`; "
++            "gen(rng,size) returns an input string. Outputs are compared with checker_path "
++            "(check(input_text, output_text, brute_output_text) -> (ok, message)) if given, else by tokens. "
++            "Reports the shrunk failing input, both outputs and the checker message."
++        ),
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to solution file."},
++                "brute_path": {"type": "string", "description": "Path to brute-force reference file."},
++                "generator_path": {"type": "string", "description": "Path to generator file exposing gen(rng, size)."},
++                "num_cases": {"type": "integer", "description": "Number of random cases (default 300)."},
++                "mode": {"type": "string", "description": "'module' (default) or 'stdio'."},
++                "checker_path": {"type": "string", "description": "Optional checker file exposing check(inp, out, brute_out)."},
++                "timeout": {"type": "integer", "description": "Per-call timeout in seconds (default 5)."},
++                "method": {"type": "string", "description": "Optional, module mode only: class Solution method name; inputs are tuples of args."},
++            },
++            "required": ["solution_path", "brute_path", "generator_path"],
++        },
++    }
+ 
+-def clip(s):
+-    s = str(s)
+-    return s if len(s) <= REPR_CAP else s[:REPR_CAP] + "...<clipped>"
+ 
+-def load(path, name):
+-    d = os.path.dirname(os.path.abspath(path))
+-    if d not in sys.path:
+-        sys.path.insert(0, d)
++def _load(path, name):
+     spec = importlib.util.spec_from_file_location(name, path)
+     mod = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(mod)
+     return mod
+ 
+-try:
+-    sol_mod = load(sol_path, "_stress_solution")
+-    brute_mod = load(brute_path, "_stress_brute")
+-    gen_mod = load(gen_path, "_stress_gen")
+-except BaseException:
+-    finish({"status": "error", "message": "Failed to import a file:\n" + traceback.format_exc(limit=5)})
+-
+-if not hasattr(gen_mod, "gen"):
+-    finish({"status": "error", "message": "generator file must define gen(rng, size)"})
+ 
+-def make_fn(mod, which):
+-    if method:
+-        if not hasattr(mod, "Solution"):
+-            raise AttributeError(f"{which} file has no class Solution (method={method!r})")
+-        inst = mod.Solution()
+-        m = getattr(inst, method)
+-        return lambda x: m(*x)
+-    if not hasattr(mod, "solve"):
+-        raise AttributeError(f"{which} file must define solve(input_obj)")
+-    return mod.solve
+-
+-try:
+-    sol_fn = make_fn(sol_mod, "solution")
+-    brute_fn = make_fn(brute_mod, "brute")
+-except BaseException:
+-    finish({"status": "error", "message": "Setup failed:\n" + traceback.format_exc(limit=5)})
+-
+-class _Timeout(BaseException):
+-    pass
+-
+-def _on_alarm(signum, frame):
+-    raise _Timeout()
+-
+-signal.signal(signal.SIGALRM, _on_alarm)
+-
+-def call(fn, x):
+-    """Returns (status, value); status in ok|timeout|exc. Input is deep-copied so mutation is harmless."""
+-    buf = io.StringIO()
+-    signal.setitimer(signal.ITIMER_REAL, per_call)
++def _has_main_guard(path):
+     try:
+-        with contextlib.redirect_stdout(buf):
+-            v = fn(copy.deepcopy(x))
+-        return ("ok", v)
+-    except _Timeout:
+-        return ("timeout", None)
+-    except Exception:
+-        return ("exc", traceback.format_exc(limit=4))
+-    finally:
+-        signal.setitimer(signal.ITIMER_REAL, 0)
++        with open(path, "r", encoding="utf-8") as f:
++            src = f.read()
++    except OSError:
++        return True
++    return "__name__" in src and "__main__" in src
+ 
+-def same(a, b):
+-    if isinstance(a, str) and isinstance(b, str):
+-        return a.strip() == b.strip()
+-    try:
+-        return a == b
+-    except Exception:
+-        return False
+ 
+-def check(x):
+-    """Returns None if solution agrees with brute, else (kind, expected, actual_text)."""
+-    bs, bv = call(brute_fn, x)
+-    if bs != "ok":
+-        return ("brute_" + bs, None, bv or "brute force failed")
+-    ss, sv = call(sol_fn, x)
+-    if ss == "timeout":
+-        return ("solution_timeout", bv, f"timed out after {per_call} seconds")
+-    if ss == "exc":
+-        return ("solution_exception", bv, sv)
+-    if not same(sv, bv):
+-        return ("mismatch", bv, sv)
+-    return None
++def _tokens_equal(a, b):
++    return a.split() == b.split()
+ 
+-def candidates(x, top_tuple=False):
+-    """Yield strictly smaller variants of x (lazily)."""
+-    if isinstance(x, bool):
+-        return
+-    if isinstance(x, int):
+-        out = []
+-        if x != 0:
+-            out.append(0)
+-            if x > 0:
+-                out += [x // 2, x - 1]
+-            else:
+-                out += [-((-x) // 2), x + 1]
+-        for c in dict.fromkeys(out):
+-            if c != x:
+-                yield c
+-        return
+-    if isinstance(x, str):
+-        for i in range(len(x)):
+-            yield x[:i] + x[i + 1:]
+-        return
+-    if isinstance(x, (list, tuple)):
+-        if not top_tuple:
+-            for i in range(len(x)):
+-                yield type(x)(list(x[:i]) + list(x[i + 1:]))
+-        for i in range(len(x)):
+-            for c in candidates(x[i]):
+-                lst = list(x)
+-                lst[i] = c
+-                yield type(x)(lst)
+-        return
+ 
+-def shrink(x, kind):
+-    cur = x
+-    budget = SHRINK_BUDGET
++def _run_stdio(path, inp, timeout):
++    try:
++        p = subprocess.run([sys.executable, path], input=inp, capture_output=True,
++                           text=True, timeout=timeout)
++    except subprocess.TimeoutExpired:
++        return None, "TIMEOUT after %ss" % timeout
++    if p.returncode != 0:
++        return p.stdout, "RUNTIME ERROR (exit %d): %s" % (p.returncode, p.stderr[-800:])
++    return p.stdout, None
++
++
++def _shrink(inp, fails):
++    """Greedy shrink: drop whole lines, then single tokens inside lines (line structure kept).
++    fails(s)->bool must hold for the original input and is only accepted for candidates that still fail."""
++    lines = inp.rstrip("\n").split("\n")
+     changed = True
+-    while changed and budget > 0:
++    while changed:
+         changed = False
+-        for cand in candidates(cur, top_tuple=bool(method) and isinstance(cur, tuple)):
+-            budget -= 1
+-            if budget <= 0:
+-                break
+-            f = check(cand)
+-            if f is not None and f[0] == kind:
+-                cur = cand
++        for i in range(len(lines)):
++            cand = lines[:i] + lines[i + 1:]
++            if cand and fails("\n".join(cand) + "\n"):
++                lines = cand
+                 changed = True
+                 break
+-    return cur
+-
+-def fail_result(x, f, count, phase):
+-    kind, expected, actual = f
+-    shrunk = shrink(x, kind)
+-    f2 = check(shrunk)
+-    if f2 is None or f2[0] != kind:
+-        shrunk, f2 = x, f
+-    kind, expected, actual = f2
+-    return {
+-        "status": "fail",
+-        "cases": count,
+-        "message": (
+-            f"FAILED ({kind}) during {phase} after {count} cases.\n"
+-            f"Input (shrunk): {clip(repr(shrunk))}\n"
+-            f"Expected: {clip(repr(expected))}\n"
+-            f"Actual: {clip(actual if isinstance(actual, str) and kind != 'mismatch' else repr(actual))}"
+-        ),
+-    }
+-
+-count = 0
+-# Phase 1: exhaustive enumeration of tiny inputs, if provided.
+-if hasattr(gen_mod, "enumerate_all"):
+-    try:
+-        it = gen_mod.enumerate_all()
+-        for x in itertools.islice(iter(it), ENUM_CAP):
+-            count += 1
+-            f = check(x)
+-            if f is not None:
+-                finish(fail_result(x, f, count, "exhaustive enumeration"))
+-    except BaseException:
+-        finish({"status": "error", "message": "enumerate_all() failed:\n" + traceback.format_exc(limit=5), "cases": count})
+-
+-# Phase 2: random cases with growing sizes.
+-for i in range(num_cases):
+-    size = 1 + (i * MAX_SIZE) // max(1, num_cases - 1) if num_cases > 1 else 1
+-    rng = random.Random(i * 7919 + 12345)
+-    try:
+-        x = gen_mod.gen(rng, size)
+-    except BaseException:
+-        finish({"status": "error", "message": "gen(rng, size) failed:\n" + traceback.format_exc(limit=5), "cases": count})
+-    count += 1
+-    f = check(x)
+-    if f is not None:
+-        finish(fail_result(x, f, count, f"random case {i} (size {size})"))
+-
+-finish({"status": "pass", "cases": count,
+-        "message": f"All {count} cases passed (exhaustive enumeration: {'yes' if hasattr(gen_mod, 'enumerate_all') else 'not provided'}; random cases: {num_cases})."})
+-'''
+-
+-
+-def tool_info():
+-    return {
+-        "name": "stress_test",
+-        "description": """Stress-test a solution against a brute-force reference using a random input generator.\n
+-* The solution, brute-force, and generator are Python files. Solution and brute files each expose `solve(input_obj)` returning the output (or, if `method` is given, a class `Solution` whose method of that name is called with the elements of a tuple input).
+-* The generator file exposes `gen(rng, size)` returning an input object, where `rng` is a `random.Random` instance and `size` grows from 1 upward. Optionally it exposes `enumerate_all()` yielding all tiny inputs; these are run first, exhaustively.
+-* Generated inputs must include degenerate cases (minimum size, all equal, extreme values, etc.); do not filter them out in the generator.
+-* Output is compared as a whole (strings compared after stripping whitespace). On failure, the tool returns the shrunk failing input with the expected (brute) and actual (solution) outputs, or the exception/timeout. On success it returns the number of cases run.
+-* Each solve call is limited by `timeout` seconds; the whole run is limited to about 280 seconds, so reduce `num_cases` if needed.""",
+-        "input_schema": {
+-            "type": "object",
+-            "properties": {
+-                "solution_path": {"type": "string", "description": "Path to the solution Python file (absolute or relative to the current directory)."},
+-                "brute_path": {"type": "string", "description": "Path to the brute-force reference Python file. Must be independent of the algorithm under test."},
+-                "generator_path": {"type": "string", "description": "Path to the generator Python file exposing gen(rng, size) and optionally enumerate_all()."},
+-                "num_cases": {"type": "integer", "description": "Number of random cases to run after enumeration (default 300)."},
+-                "timeout": {"type": "integer", "description": "Per-call timeout in seconds for each solve call (default 5)."},
+-                "method": {"type": "string", "description": "Optional. If given, solution and brute files define class Solution with this method name; generated inputs must be tuples of positional arguments."}
+-            },
+-            "required": ["solution_path", "brute_path", "generator_path"]
+-        }
+-    }
++    changed = True
++    while changed:
++        changed = False
++        for i in range(len(lines)):
++            toks = lines[i].split()
++            for j in range(len(toks)):
++                cand_toks = toks[:j] + toks[j + 1:]
++                cand_lines = lines[:i] + [" ".join(cand_toks)] + lines[i + 1:]
++                if cand_toks and fails("\n".join(cand_lines) + "\n"):
++                    lines = cand_lines
++                    changed = True
++                    break
++            if changed:
++                break
++    return "\n".join(lines) + "\n"
+ 
+ 
+-def tool_function(solution_path, brute_path, generator_path, num_cases=300, timeout=5, method=None):
+-    for label, p in (("solution_path", solution_path), ("brute_path", brute_path), ("generator_path", generator_path)):
+-        if not p or not os.path.isfile(os.path.abspath(p)):
+-            return f"Error: {label} does not exist: {p}"
+-    try:
+-        num_cases = max(0, min(int(num_cases if num_cases is not None else 300), 100000))
+-        timeout = max(1, min(int(timeout if timeout is not None else 5), 60))
+-    except (TypeError, ValueError):
+-        return "Error: num_cases and timeout must be integers."
+-    fd, result_path = tempfile.mkstemp(suffix=".json")
+-    os.close(fd)
+-    try:
+-        cmd = [sys.executable, "-c", _DRIVER,
+-               os.path.abspath(solution_path), os.path.abspath(brute_path), os.path.abspath(generator_path),
+-               str(num_cases), str(timeout), method or "", result_path]
++def _compare(checker, inp, sol_out, brute_out):
++    if checker is not None:
+         try:
+-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=280, stdin=subprocess.DEVNULL,
+-                               errors="replace")
+-        except subprocess.TimeoutExpired:
+-            return ("Error: stress test exceeded the 280 second overall limit. "
+-                    "Reduce num_cases, or make the solution/brute faster.")
++            res = checker.check(inp, sol_out, brute_out)
++            ok, msg = res[0], (res[1] if len(res) > 1 else "")
++            return bool(ok), str(msg)
++        except Exception as e:  # checker crash counts as failure with message
++            return False, "checker raised: %r" % (e,)
++    if _tokens_equal(sol_out, brute_out):
++        return True, "tokens equal"
++    return False, "token mismatch"
++
++
++def _stdio_ok(checker, inp, sol_out, brute_out):
++    return _compare(checker, inp, sol_out, brute_out)[0]
++
++
++def _stdio_case(solution_path, brute_path, checker, timeout, inp):
++    sol_out, err = _run_stdio(solution_path, inp, timeout)
++    if err is not None:
++        return False, err, sol_out, None
++    brute_out, berr = _run_stdio(brute_path, inp, timeout)
++    if berr is not None:
++        return False, "BRUTE " + berr, sol_out, brute_out
++    ok, msg = _compare(checker, inp, sol_out, brute_out)
++    return ok, msg, sol_out, brute_out
++
++
++def _run_stdio_mode(solution_path, brute_path, gen, checker, num_cases, timeout, rng):
++    inputs = [gen(rng, size) for size in range(1, num_cases + 1)]
++    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
++        results = list(ex.map(
++            lambda inp: (inp, _stdio_case(solution_path, brute_path, checker, timeout, inp)),
++            inputs))
++    for inp, (ok, msg, sol_out, brute_out) in results:
++        if not ok:
++            def fails(s):
++                # only mismatches count; runtime errors/timeouts on either side are not the bug being shrunk
++                _, m, so, bo = _stdio_case(solution_path, brute_path, checker, timeout, s)
++                return so is not None and bo is not None and not _stdio_ok(checker, s, so, bo)
++            shrunk = _shrink(inp, fails)
++            ok2, msg2, s2, b2 = _stdio_case(solution_path, brute_path, checker, timeout, shrunk)
++            return ("FAIL\nshrunk input:\n%s\nsolution output:\n%s\nbrute output:\n%s\nmessage: %s"
++                    % (shrunk, s2, b2, msg2))
++    return "PASS: %d cases" % num_cases
++
++
++def _call(mod, inp, method):
++    if method:
++        m = getattr(mod.Solution(), method)
++        return m(*inp)
++    return mod.solve(inp)
++
++
++def _run_module_mode(solution_path, brute_path, gen_path, num_cases, rng, method=None):
++    for p in (solution_path, brute_path):
++        if not _has_main_guard(p):
++            warnings.warn("%s has no __main__ guard; importing it may run main()" % p)
++    sol = _load(solution_path, "sol_mod")
++    brute = _load(brute_path, "brute_mod")
++    gen = _load(gen_path, "gen_mod")
++    for size in range(1, num_cases + 1):
++        inp = gen.gen(rng, size)
+         try:
+-            with open(result_path) as f:
+-                content = f.read()
+-        except OSError:
+-            content = ""
+-        if not content.strip():
+-            err = (p.stderr or "").strip()[-3000:]
+-            return "Error: stress test driver produced no result.\n" + (err or "(no stderr)")
+-        res = json.loads(content)
+-        msg = res.get("message", "")
+-        if res.get("status") == "pass":
+-            return f"PASS: {msg}"
+-        if res.get("status") == "fail":
+-            return msg
+-        return f"ERROR: {msg}"
+-    finally:
++            a = _call(sol, inp, method)
++        except Exception as e:
++            return "FAIL on input %r: solution raised %r" % (inp, e)
+         try:
+-            os.remove(result_path)
+-        except OSError:
+-            pass
++            b = _call(brute, inp, method)
++        except Exception as e:
++            return "FAIL on input %r: brute raised %r" % (inp, e)
++        if a != b:
++            return "FAIL\ninput: %r\nsolution output: %r\nbrute output: %r" % (inp, a, b)
++    return "PASS: %d cases" % num_cases
++
++
++def tool_function(solution_path, brute_path, generator_path, num_cases=300, mode="module",
++                  checker_path=None, timeout=DEFAULT_TIMEOUT, method=None):
++    num_cases = int(num_cases or 300)
++    timeout = int(timeout or DEFAULT_TIMEOUT)
++    mode = (mode or "module").lower()
++    rng = random.Random(12345)
++    try:
++        gen = _load(generator_path, "gen_src")
++        checker = _load(checker_path, "checker_mod") if checker_path else None
++        if mode == "stdio":
++            return _run_stdio_mode(solution_path, brute_path, gen.gen, checker,
++                                   num_cases, timeout, rng)
++        if mode != "module":
++            return "ERROR: unknown mode %r" % mode
++        return _run_module_mode(solution_path, brute_path, generator_path, num_cases, rng, method or None)
++    except Exception as e:
++        return "ERROR: %r" % (e,)

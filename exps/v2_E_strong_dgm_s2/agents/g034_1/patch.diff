@@ -1,0 +1,321 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 9e80ce3..a358a4c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -15,9 +15,13 @@ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ MAX_ATTEMPTS = 3
+ SAMPLE_TIMEOUT = 5
+ MAX_INPUT_TIMEOUT = 3
+-DIFF_CASES = 20
++DIFF_CASES = 40          # differential cases per size (sizes 1..DIFF_MAX_SIZE)
++DIFF_MAX_SIZE = 30
+ DIFF_TIMEOUT = 5
++DIFF_BRUTE_TIMEOUT = 2
+ DIFF_BUDGET = 60
++FAILING_CASES_FILE = 'failing_cases.jsonl'
++MAX_REPLAY_IN_PROMPT = 3
+ 
+ EMPTY_RETRY_LIMIT = 3
+ 
+@@ -26,6 +30,8 @@ CORE_PROMPT = """Work like a careful competitive programmer:
+ 2. Write the solution in solution.py with the editor tool. The final solution.py must be a stdin/stdout program (read input with sys.stdin, print the answer), unless the statement asks for a Solution class method.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 4. Write brute.py: a verified-correct brute force written directly from the statement (plain simulation or full enumeration, NOT your fast idea), as a stdin/stdout program. Write gen.py exposing gen(rng, size) that returns a small random input as a string, including degenerate cases (minimum size, all equal values, extreme values). Then run the `stress_test` tool comparing solution.py with brute.py using gen.py. Do not skip degenerate inputs. Fix every mismatch. Also enumerate all tiny inputs when feasible (enumerate_all() in gen.py).
++   - stress_test saves every counterexample (shrunk) in failing_cases.jsonl next to gen.py. The harness replays these saved cases on every later check, so the agent must make them pass; a solution that still fails a saved case will be rejected.
++   - If the brute force is exponential or BFS-based and cannot reach medium sizes (e.g. n around 30-200), write a polynomial-time but obviously correct 'middle oracle' (for example a straightforward O(n^3) or O(n^2) DP or memoized search that is easy to verify by reading), check it against brute.py on small inputs, and then compare the fast solution against this middle oracle on medium-size random inputs.
+ 5. Save a maximum-size input allowed by the constraints as max_input.txt in the repository directory, and check that `python3 solution.py < max_input.txt` finishes well under 2 seconds. The harness uses a 3 second limit on max_input.txt.
+ 6. Audit every early return and special-case branch in the final code against inputs where its condition is false but the branch is still reached.
+ 7. Limit exploration: after about 15 tool calls you must have a candidate fast solution in solution.py, and then test it. Do not do open-ended analysis or long experiments. If the final answer would still be a brute-force solution, keep working while tool-call budget remains. Never finish with a solution that still times out on max_input.txt while budget remains.
+@@ -353,24 +359,46 @@ class AgenticSystem:
+             lines.append(f"actual:\n{self._clip(output, 300)}")
+         return "\n".join(lines)
+ 
++    def _load_saved_cases(self):
++        """String inputs saved by stress_test (failing_cases.jsonl). Non-string records are skipped."""
++        path = os.path.join(self.git_tempdir, FAILING_CASES_FILE)
++        cases = []
++        if not os.path.isfile(path):
++            return cases
++        try:
++            with open(path) as f:
++                for line in f:
++                    line = line.strip()
++                    if not line:
++                        continue
++                    try:
++                        rec = json.loads(line)
++                    except Exception:
++                        continue
++                    if isinstance(rec, dict) and rec.get("is_str") and isinstance(rec.get("input"), str):
++                        cases.append(rec["input"])
++        except Exception as e:
++            safe_log(f"_load_saved_cases failed: {e}", level=logging.WARNING)
++        return cases
++
+     def _generate_cases(self, gen_file):
+-        """Use gen.py's gen(rng, size) (returning input text) to build a few small test inputs."""
++        """Use gen.py's gen(rng, size) to build test inputs: DIFF_CASES per size for sizes 1..DIFF_MAX_SIZE, round-robin over sizes so the time budget never drops large sizes."""
+         driver = (
+             "import random, json, sys\n"
+             "sys.path.insert(0, '.')\n"
+             "import gen\n"
+             "rng = random.Random(12345)\n"
+             "out = []\n"
+-            "for s in range(1, 6):\n"
+-            "    for _ in range(4):\n"
++            "for _ in range(%d):\n"
++            "    for s in range(1, %d + 1):\n"
+             "        out.append(str(gen.gen(rng, s)))\n"
+             "print(json.dumps(out))\n"
+-        )
++        ) % (DIFF_CASES, DIFF_MAX_SIZE)
+         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+         try:
+             proc = subprocess.run(
+                 ["python3", "-c", driver],
+-                capture_output=True, text=True, timeout=20,
++                capture_output=True, text=True, timeout=60,
+                 cwd=self.git_tempdir, env=env,
+             )
+             if proc.returncode != 0:
+@@ -435,6 +463,13 @@ class AgenticSystem:
+                         report.append("[max_input] FAILED: program printed nothing on max_input.txt "
+                                       "(it may have exited on EOF without answering).")
+ 
++        incomplete = False
++        if not os.path.isfile(max_path) and os.path.isfile(os.path.join(self.git_tempdir, 'brute.py')) \
++                and any(os.path.isfile(os.path.join(self.git_tempdir, c)) for c in ('gen.py', 'generator.py')):
++            incomplete = True
++            report.append("[incomplete] max_input.txt missing: timing unverified. Save a maximum-size input "
++                          "as max_input.txt and check that it runs within the time limit.")
++
+         # 2b. Empty stdout on max_input is suspicious (e.g. program exits on EOF with nothing printed).
+         if os.path.isfile(max_path):
+             try:
+@@ -452,7 +487,7 @@ class AgenticSystem:
+                                   "(ValueError/IndexError/EOF). Parse only the tokens you need.\n"
+                                   + self._failure_text("junk probe", junk, None, st_j, out_j))
+ 
+-        # 3. Optional differential check against brute.py using gen.py.
++        # 3. Optional differential check against brute.py using gen.py, plus saved counterexamples.
+         brute_ok = 1
+         brute_ran = False
+         brute_path = os.path.join(self.git_tempdir, 'brute.py')
+@@ -461,31 +496,56 @@ class AgenticSystem:
+             if os.path.isfile(os.path.join(self.git_tempdir, cand)):
+                 gen_file = cand
+                 break
+-        if os.path.isfile(brute_path) and gen_file is not None:
+-            cases = self._generate_cases(gen_file)
+-            total = agree = 0
++        if os.path.isfile(brute_path):
+             deadline = time.time() + DIFF_BUDGET
+-            for inp in cases[:DIFF_CASES]:
++            total = agree = 0
++            failed_case = None
++
++            # 3a. Saved failing cases (from stress_test) must still agree.
++            saved = self._load_saved_cases()
++            for inp in saved:
+                 if time.time() > deadline:
+                     break
+-                bstat, bout, _ = self._run_program("brute.py", inp, DIFF_TIMEOUT)
++                if not inp.endswith("\n"):
++                    inp += "\n"
++                bstat, bout, _ = self._run_program("brute.py", inp, DIFF_BRUTE_TIMEOUT)
+                 if bstat != "ok":
+-                    continue  # brute itself failed on this input; not evidence against solution
++                    continue
+                 total += 1
+                 sstat, sout, _ = self._run_solution(inp, DIFF_TIMEOUT)
+                 if sstat == "ok" and sout.split() == bout.split():
+                     agree += 1
+                 else:
+-                    report.append(self._failure_text("brute mismatch", inp, bout, sstat, sout))
+-                    break  # one counterexample is enough; avoids long repeated timeouts
++                    failed_case = (inp, bout, sstat, sout)
++                    report.append("[saved counterexample] solution.py disagrees with brute.py on a case "
++                                  f"saved in {FAILING_CASES_FILE} (reproduce it with brute.py, then fix):\n"
++                                  + self._failure_text("saved counterexample", inp, bout, sstat, sout))
++                    break
++
++            # 3b. Differential run over generated cases, sizes 1..DIFF_MAX_SIZE.
++            if failed_case is None and gen_file is not None:
++                cases = self._generate_cases(gen_file)
++                for inp in cases:
++                    if time.time() > deadline:
++                        break
++                    bstat, bout, _ = self._run_program("brute.py", inp, DIFF_BRUTE_TIMEOUT)
++                    if bstat != "ok":
++                        continue  # brute itself failed or timed out on this input; not evidence against solution
++                    total += 1
++                    sstat, sout, _ = self._run_solution(inp, DIFF_TIMEOUT)
++                    if sstat == "ok" and sout.split() == bout.split():
++                        agree += 1
++                    else:
++                        report.append(self._failure_text("brute mismatch", inp, bout, sstat, sout))
++                        break  # one counterexample is enough; avoids long repeated timeouts
+             brute_ran = total > 0
+             if total > 0 and agree < total:
+                 brute_ok = 0
+-            safe_log(f"_evaluate: differential {agree}/{total} agree")
++            safe_log(f"_evaluate: differential {agree}/{total} agree (saved cases: {len(saved)})")
+ 
+         score = (samples_ok, max_ok, brute_ok)
+         verified = len(samples) > 0 or brute_ran
+-        passed = verified and (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1
++        passed = verified and (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1 and not incomplete
+         if not verified:
+             msg = ("[unverified] No parseable samples in the statement and no brute-force agreement "
+                    "was checked, so correctness is UNVERIFIED. Build your own tests: write brute.py and "
+@@ -578,6 +638,18 @@ class AgenticSystem:
+                          f"rather than starting over), score={best_score}:\n```python\n{best_text}\n```")
+         parts.append(f"Verification score (samples_passed, max_input_ok, brute_agreement): {prev_score}\n"
+                      f"Harness report:\n{prev_report}\n")
++        if prev_report and ("counterexample" in prev_report or "brute mismatch" in prev_report
++                            or "FAILED" in prev_report):
++            saved = self._load_saved_cases()[-MAX_REPLAY_IN_PROMPT:]
++            if saved:
++                listed = "\n".join(f"--- case {i + 1} ---\n{self._clip(c, 400)}" for i, c in enumerate(saved))
++                parts.append("Known counterexamples (shrunk inputs saved in failing_cases.jsonl):\n"
++                             f"{listed}\n"
++                             "First reproduce these with brute.py to confirm the expected output, then fix "
++                             "solution.py so it matches. Do not patch blindly.\n")
++            else:
++                parts.append("First reproduce the failing case(s) above with brute.py to confirm the expected "
++                             "output, then fix solution.py. Do not patch blindly.\n")
+         parts.append("A brute-force-only solution is NOT acceptable. Find the efficient algorithm: derive it, "
+                      "or find patterns in brute-force data and verify them against brute.py.\n"
+                      "Keep the verified-correct brute force as brute.py; do not overwrite it with a fast version.\n"
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index bc26c91..1b1b7e9 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -8,9 +8,10 @@ import json
+ # generator, runs exhaustive enumeration (if the generator provides enumerate_all)
+ # and then random cases with growing sizes, and writes a JSON result to result_path.
+ _DRIVER = r'''
+-import sys, json, random, signal, importlib.util, os, io, copy, traceback, itertools, contextlib
++import sys, json, random, signal, importlib.util, os, io, copy, traceback, itertools, contextlib, ast
+ 
+-sol_path, brute_path, gen_path, num_cases, per_call, method, result_path = sys.argv[1:8]
++sol_path, brute_path, gen_path, num_cases, per_call, method, result_path, fail_path, replay_flag = sys.argv[1:10]
++REPLAY = replay_flag == '1'
+ num_cases = int(num_cases)
+ per_call = float(per_call)
+ ENUM_CAP = 20000
+@@ -158,6 +159,45 @@ def shrink(x, kind):
+                 break
+     return cur
+ 
++def _encode(x):
++    if isinstance(x, str):
++        return {"is_str": True, "input": x}
++    return {"is_str": False, "input": repr(x)}
++
++def load_saved():
++    """Previously saved failing inputs (string inputs raw, others via literal_eval). Unreadable entries are skipped."""
++    out = []
++    if not os.path.isfile(fail_path):
++        return out
++    try:
++        with open(fail_path) as fh:
++            lines = fh.read().splitlines()
++    except OSError:
++        return out
++    for line in lines:
++        try:
++            rec = json.loads(line)
++            if rec.get("is_str"):
++                out.append(rec["input"])
++            else:
++                out.append(ast.literal_eval(rec["input"]))
++        except Exception:
++            continue
++    return out
++
++def save_case(x):
++    try:
++        key = json.dumps(_encode(x), sort_keys=True)
++        existing = set()
++        if os.path.isfile(fail_path):
++            with open(fail_path) as fh:
++                existing = set(l.strip() for l in fh if l.strip())
++        if key not in existing:
++            with open(fail_path, "a") as fh:
++                fh.write(key + "\n")
++    except Exception:
++        pass
++
+ def fail_result(x, f, count, phase):
+     kind, expected, actual = f
+     shrunk = shrink(x, kind)
+@@ -165,6 +205,7 @@ def fail_result(x, f, count, phase):
+     if f2 is None or f2[0] != kind:
+         shrunk, f2 = x, f
+     kind, expected, actual = f2
++    save_case(shrunk)
+     return {
+         "status": "fail",
+         "cases": count,
+@@ -177,6 +218,14 @@ def fail_result(x, f, count, phase):
+     }
+ 
+ count = 0
++# Phase 0: replay previously saved failing inputs (before anything else).
++if REPLAY:
++    for x in load_saved():
++        count += 1
++        f = check(x)
++        if f is not None and not f[0].startswith("brute_"):
++            finish(fail_result(x, f, count, "replay of saved failing case"))
++
+ # Phase 1: exhaustive enumeration of tiny inputs, if provided.
+ if hasattr(gen_mod, "enumerate_all"):
+     try:
+@@ -215,7 +264,8 @@ def tool_info():
+ * The generator file exposes `gen(rng, size)` returning an input object, where `rng` is a `random.Random` instance and `size` grows from 1 upward. Optionally it exposes `enumerate_all()` yielding all tiny inputs; these are run first, exhaustively.
+ * Generated inputs must include degenerate cases (minimum size, all equal, extreme values, etc.); do not filter them out in the generator.
+ * Output is compared as a whole (strings compared after stripping whitespace). On failure, the tool returns the shrunk failing input with the expected (brute) and actual (solution) outputs, or the exception/timeout. On success it returns the number of cases run.
+-* Each solve call is limited by `timeout` seconds; the whole run is limited to about 280 seconds, so reduce `num_cases` if needed.""",
++* Each solve call is limited by `timeout` seconds; the whole run is limited to about 280 seconds, so reduce `num_cases` if needed.
++* Every failing input (shrunk) is saved to failing_cases.jsonl next to the generator file. Saved cases are replayed first on every later call (disable with replay_failures=false). The harness replays these saved cases too, so they must pass before the solution is accepted.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+@@ -224,14 +274,18 @@ def tool_info():
+                 "generator_path": {"type": "string", "description": "Path to the generator Python file exposing gen(rng, size) and optionally enumerate_all()."},
+                 "num_cases": {"type": "integer", "description": "Number of random cases to run after enumeration (default 300)."},
+                 "timeout": {"type": "integer", "description": "Per-call timeout in seconds for each solve call (default 5)."},
+-                "method": {"type": "string", "description": "Optional. If given, solution and brute files define class Solution with this method name; generated inputs must be tuples of positional arguments."}
++                "method": {"type": "string", "description": "Optional. If given, solution and brute files define class Solution with this method name; generated inputs must be tuples of positional arguments."},
++                "replay_failures": {"type": "boolean", "description": "Optional, default true. Re-run all previously saved failing cases (failing_cases.jsonl) before enumeration and random cases."}
+             },
+             "required": ["solution_path", "brute_path", "generator_path"]
+         }
+     }
+ 
+ 
+-def tool_function(solution_path, brute_path, generator_path, num_cases=300, timeout=5, method=None):
++def tool_function(solution_path, brute_path, generator_path, num_cases=300, timeout=5, method=None, replay_failures=True):
++    if isinstance(replay_failures, str):
++        replay_failures = replay_failures.strip().lower() not in ("0", "false", "no", "")
++    replay = True if replay_failures is None else bool(replay_failures)
+     for label, p in (("solution_path", solution_path), ("brute_path", brute_path), ("generator_path", generator_path)):
+         if not p or not os.path.isfile(os.path.abspath(p)):
+             return f"Error: {label} does not exist: {p}"
+@@ -243,9 +297,10 @@ def tool_function(solution_path, brute_path, generator_path, num_cases=300, time
+     fd, result_path = tempfile.mkstemp(suffix=".json")
+     os.close(fd)
+     try:
++        fail_path = os.path.join(os.path.dirname(os.path.abspath(generator_path)), "failing_cases.jsonl")
+         cmd = [sys.executable, "-c", _DRIVER,
+                os.path.abspath(solution_path), os.path.abspath(brute_path), os.path.abspath(generator_path),
+-               str(num_cases), str(timeout), method or "", result_path]
++               str(num_cases), str(timeout), method or "", result_path, fail_path, "1" if replay else "0"]
+         try:
+             p = subprocess.run(cmd, capture_output=True, text=True, timeout=280, stdin=subprocess.DEVNULL,
+                                errors="replace")
+diff --git a/chat_history.md b/chat_history.md
+new file mode 100644
+index 0000000..e69de29

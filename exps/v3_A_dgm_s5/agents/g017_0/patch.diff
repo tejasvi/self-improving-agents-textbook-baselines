@@ -1,0 +1,222 @@
+diff --git a/utils/__init__.py b/utils/__init__.py
+index e69de29..8a7b06f 100644
+--- a/utils/__init__.py
++++ b/utils/__init__.py
+@@ -0,0 +1,217 @@
++"""General-purpose helpers for the coding agent.
++
++These helpers are task-agnostic and depend only on the standard library, so
++they can be imported by coding_agent.py without pulling in model clients.
++
++Contents:
++  - is_degenerate_history: detect empty / no-action assistant responses.
++  - score_candidate: sample tests + brute-force stress tests + runtime check.
++  - score_key / select_best_candidate: rank scored candidates.
++  - safe_fallback_copy: copy the first existing source file, never raising.
++  - summarize_failures: short text summary of failing cases.
++"""
++
++import os
++import random
++import shutil
++import subprocess
++import sys
++import time
++
++
++def _message_has_content(message):
++    """Return True if an assistant message has non-empty text or a tool call."""
++    if not isinstance(message, dict):
++        return False
++    content = message.get("content")
++    if isinstance(content, str):
++        return bool(content.strip())
++    if isinstance(content, list):
++        for block in content:
++            if not isinstance(block, dict):
++                continue
++            btype = block.get("type")
++            if btype in ("tool_use", "function_call", "tool_calls"):
++                return True
++            if btype == "text" and str(block.get("text", "")).strip():
++                return True
++        return False
++    if isinstance(content, dict):
++        return _message_has_content({"content": [content]})
++    # OpenAI-style tool_calls stored outside content
++    if message.get("tool_calls"):
++        return True
++    return False
++
++
++def is_degenerate_history(history):
++    """Return (is_bad, reason) for the last assistant message in history.
++
++    A response is degenerate when there is no assistant message, or when the
++    last assistant message has neither non-empty text nor a tool call.
++    """
++    if not history:
++        return True, "empty history"
++    last_assistant = None
++    for msg in reversed(history):
++        if isinstance(msg, dict) and msg.get("role") == "assistant":
++            last_assistant = msg
++            break
++    if last_assistant is None:
++        return True, "no assistant message in history"
++    if not _message_has_content(last_assistant):
++        return True, "assistant message has no text and no tool calls"
++    return False, ""
++
++
++def _run(cmd, stdin_text=None, timeout=5.0):
++    """Run a command with a timeout. Returns (ok, stdout, stderr, elapsed)."""
++    start = time.time()
++    try:
++        proc = subprocess.run(
++            cmd,
++            input=stdin_text,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++        elapsed = time.time() - start
++        return proc.returncode == 0, proc.stdout or "", proc.stderr or "", elapsed
++    except subprocess.TimeoutExpired:
++        return False, "", "TIMEOUT after %.1fs" % timeout, time.time() - start
++    except Exception as e:  # defensive: scoring must never crash the agent
++        return False, "", "EXEC ERROR: %r" % (e,), time.time() - start
++
++
++def _same_output(got, expected):
++    """Compare outputs token-wise (whitespace-insensitive)."""
++    return got.split() == (expected or "").split()
++
++
++def score_candidate(
++    candidate_path,
++    samples,
++    brute_path=None,
++    gen_path=None,
++    num_random=200,
++    timeout=5.0,
++    seed=0,
++    python=sys.executable,
++):
++    """Score a candidate solution.
++
++    Args:
++        candidate_path: path to the candidate Python program (reads stdin).
++        samples: list of (input_text, expected_output_text) pairs.
++        brute_path: optional brute-force reference program (reads stdin).
++        gen_path: optional generator; invoked as `gen.py <seed>` and prints
++            one random small input to stdout.
++        num_random: number of random stress cases to compare against brute.
++        timeout: per-run timeout in seconds.
++        seed: base seed for the generator.
++
++    Returns:
++        dict with keys: passed, total, max_runtime, failures (list of dicts
++        with 'input', 'expected', 'got'), ok (bool: every check passed).
++    """
++    passed = 0
++    total = 0
++    max_runtime = 0.0
++    failures = []
++
++    if not os.path.isfile(candidate_path):
++        return {
++            "passed": 0,
++            "total": 0,
++            "max_runtime": 0.0,
++            "failures": [{"input": "", "expected": "", "got": "missing candidate"}],
++            "ok": False,
++        }
++
++    for inp, expected in samples or []:
++        total += 1
++        ok, out, err, elapsed = _run([python, candidate_path], inp, timeout)
++        max_runtime = max(max_runtime, elapsed)
++        if ok and _same_output(out, expected):
++            passed += 1
++        else:
++            failures.append(
++                {"input": inp, "expected": expected, "got": out if ok else err}
++            )
++
++    use_stress = (
++        bool(brute_path) and bool(gen_path)
++        and os.path.isfile(brute_path) and os.path.isfile(gen_path)
++    )
++    if use_stress:
++        rng = random.Random(seed)
++        for _ in range(num_random):
++            case_seed = rng.randrange(1 << 30)
++            ok_g, inp, _, _ = _run([python, gen_path, str(case_seed)], None, timeout)
++            if not ok_g:
++                continue
++            ok_b, expected, _, _ = _run([python, brute_path], inp, timeout)
++            if not ok_b:
++                continue
++            total += 1
++            ok_c, out, err, elapsed = _run([python, candidate_path], inp, timeout)
++            max_runtime = max(max_runtime, elapsed)
++            if ok_c and _same_output(out, expected):
++                passed += 1
++            else:
++                failures.append(
++                    {"input": inp, "expected": expected, "got": out if ok_c else err}
++                )
++
++    return {
++        "passed": passed,
++        "total": total,
++        "max_runtime": max_runtime,
++        "failures": failures,
++        "ok": total > 0 and passed == total,
++    }
++
++
++def score_key(result):
++    """Sort key: higher pass fraction first, then lower runtime."""
++    total = result.get("total", 0) or 0
++    passed = result.get("passed", 0) or 0
++    frac = (passed / total) if total else 0.0
++    return (frac, -result.get("max_runtime", 0.0))
++
++
++def select_best_candidate(scored):
++    """scored: list of (path, result_dict). Returns (path, result) or (None, None)."""
++    best_path, best_result = None, None
++    for path, result in scored or []:
++        if best_result is None or score_key(result) > score_key(best_result):
++            best_path, best_result = path, result
++    return best_path, best_result
++
++
++def safe_fallback_copy(sources, target_path):
++    """Copy the first existing source file to target_path. Never raises.
++
++    Returns the source path used, or None if no source could be copied.
++    """
++    for src in sources or []:
++        try:
++            if src and os.path.isfile(src):
++                parent = os.path.dirname(os.path.abspath(target_path))
++                os.makedirs(parent, exist_ok=True)
++                shutil.copyfile(src, target_path)
++                return src
++        except Exception:
++            continue
++    return None
++
++
++def summarize_failures(failures, limit=3):
++    """Short human-readable summary of up to `limit` failure dicts."""
++    lines = []
++    for f in (failures or [])[:limit]:
++        inp = str(f.get("input", ""))[:200]
++        exp = str(f.get("expected", ""))[:100]
++        got = str(f.get("got", ""))[:100]
++        lines.append("input=%r expected=%r got=%r" % (inp, exp, got))
++    return "\n".join(lines)

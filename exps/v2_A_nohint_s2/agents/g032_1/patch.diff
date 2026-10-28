@@ -1,0 +1,279 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d65f283..412010b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -184,6 +184,60 @@ def _last_assistant_is_empty(history):
+         return True
+     return True
+ 
++FAILURE_KEYWORDS = ('timeout', 'timed out', 'exit 124', 'fail', 'tle', 'too slow', 'not complete', 'exit code')
++
++def _turn_ended_without_action(history):
++    """
++    Return True if the last assistant message contains no tool_use block.
++    """
++    for msg in reversed(history or []):
++        role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++        if role != 'assistant':
++            continue
++        content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++        if isinstance(content, list):
++            for block in content:
++                btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++                if btype == 'tool_use':
++                    return False
++        return True
++    return True
++
++def _last_output_has_failure(history):
++    """
++    Return True if the last non-empty message (tool output or assistant text) mentions a failure keyword.
++    """
++    for msg in reversed(history or []):
++        lowered = _message_text(msg).lower()
++        if not lowered.strip():
++            continue
++        return any(re.search(r'(?<![a-z])' + re.escape(k) + r'(?![a-z])', lowered) for k in FAILURE_KEYWORDS)
++    return False
++
++def _turn_text_signals_unfinished(history):
++    """
++    Return True if the last assistant turn has no tool call and its text says work is still pending.
++    """
++    if not _turn_ended_without_action(history):
++        return False
++    for msg in reversed(history or []):
++        role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++        if role == 'assistant':
++            lowered = _message_text(msg).lower()
++            return any(k in lowered for k in ("i'll", "i will", "will rewrite", "need to fix", "not complete", "timed out", "let me"))
++    return False
++
++def _last_test_passed(history):
++    """
++    Return True if the last message mentions a pass marker for both the examples and the timing test.
++    """
++    for msg in reversed(history or []):
++        lowered = _message_text(msg).lower()
++        if not lowered.strip():
++            continue
++        return ('pass' in lowered and 'ok elapsed' in lowered) or ('all examples pass' in lowered and 'stress' in lowered)
++    return False
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -253,10 +307,11 @@ Your first action must be a tool call (view the file or write the first draft).
+ Workflow:
+ 1. Inspect the starter code in {self.git_tempdir} and find the file to modify. If the task asks for a `Solution` class method, keep the class and method signature and add needed imports. If it asks for a complete program, read stdin and write stdout.
+ 2. Restate the constraints and required complexity, and identify edge cases.
++2b. Before writing code, compute the worst-case operation count (n, k, log factors) and state the target complexity; if it exceeds ~5e7 basic operations in Python, pick another algorithm (use sorting, bisect, two pointers, prefix sums, heaps, binary search instead of nested loops).
+ 3. Write an efficient algorithm that meets the constraints, and save a first draft to disk early.
+ 4. Write a brute-force reference and a randomized stress test, and run it. Fix any mismatches.
+ 5. Run the examples from the problem statement and check the outputs match exactly.
+-6. Test the worst-case input size to confirm the runtime. Optimize if needed.
++6. Test the worst-case input size to confirm the runtime with the time_solution tool (generate a max-size input, timeout ~10s). Optimize if needed.
+ 7. Re-run tests after each fix. Finish with a short summary of the changes and test results.
+ {interactive_hint}
+ Rules: never end a turn without a tool call or a final summary. numpy and other third-party packages may not be installed; prefer pure Python.
+@@ -286,7 +341,9 @@ Rules: never end a turn without a tool call or a final summary. numpy and other
+ 
+             code_prompt = (
+                 "Reply with only the complete Python source in a single ```python block, no tools, no other text. "
+-                "The source must solve the following problem and be a full, runnable file.\n\n"
++                "The source must solve the following problem and be a full, runnable file. It must be efficient: "
++                "first compute the worst-case operation count from the constraints and use an algorithm within roughly "
++                "5e7 basic Python operations (sorting, bisect, two pointers, prefix sums, heaps, binary search), not nested loops.\n\n"
+                 f"<problem_description>\n{self.problem_statement}\n</problem_description>\n"
+                 f"{interactive_note}"
+             )
+@@ -343,25 +400,27 @@ Rules: never end a turn without a tool call or a final summary. numpy and other
+                     with open(target_path, 'w', encoding='utf-8') as fh:
+                         fh.write(template)
+ 
+-        # Bounded verification rounds once a non-empty diff exists
+-        verification_prompts = [
+-            (
+-                "Now verify your solution. Run all the examples from the problem statement and check that the outputs "
+-                "match exactly. Write and run a brute-force reference plus a randomized stress test comparing your "
+-                "solution against it on many small inputs. Also run the worst-case input size from the constraints to "
+-                "check the runtime. If anything fails, fix the code and re-run the tests. When everything passes, "
+-                "confirm that the task is complete."
+-            ),
+-            (
+-                "Do one final check: re-run the examples from the problem statement and the stress test on the current "
+-                "code in the repository. Fix any remaining failures. Make sure all changes are saved to disk, then "
+-                "confirm completion with a short summary."
+-            ),
+-        ]
+-        for prompt in verification_prompts:
++        # Bounded verification rounds: keep fixing until correctness and worst-case timing pass
++        for round_idx in range(5):
+             if not _has_changes(self.git_tempdir, self.base_commit):
+                 break
++            prompt = (
++                "Run (1) the examples from the problem statement plus a brute-force randomized stress test comparing "
++                "your solution against a brute-force reference on many small inputs, and (2) a max-size timing test "
++                "using the time_solution tool with a timeout of about 10s. Paste the raw results. If anything fails or "
++                "is too slow, first estimate the operation count of your algorithm from the constraints, design a better "
++                "algorithm if needed (e.g. sort + bisect/two pointers/DP/binary search with greedy), edit the file, and "
++                "re-run. Do not end your turn until all checks pass or you have tried a fix."
++            )
+             history = chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
++            if _last_test_passed(history):
++                break
++            # The agent described a fix but did not apply it, or the last test still failed: push it to act
++            if _turn_text_signals_unfinished(history) or _last_output_has_failure(history):
++                history = chat_with_agent(
++                    "You described a fix but did not apply it; apply it now with the editor/bash tool and re-run the timing test.",
++                    model=self.code_model, msg_history=history, logging=safe_log,
++                )
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/time_solution.py b/tools/time_solution.py
+new file mode 100644
+index 0000000..a0d7f30
+--- /dev/null
++++ b/tools/time_solution.py
+@@ -0,0 +1,140 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import time
++
++DEFAULT_TIMEOUT = 10
++MAX_OUTPUT_CHARS = 1000
++
++# Harness executed in a child process for class-method entry points.
++# It runs the generator, imports the solution file, times one call and prints a JSON line.
++_METHOD_HARNESS = r'''
++import importlib.util, json, sys, time
++path, entry, gen_code = sys.argv[1], sys.argv[2], sys.argv[3]
++ns = {}
++exec(gen_code, ns)
++args = ns["gen"]()
++if not isinstance(args, tuple):
++    args = (args,)
++spec = importlib.util.spec_from_file_location("user_solution", path)
++mod = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(mod)
++cls_name, meth_name = entry.split(".", 1)
++obj = getattr(mod, cls_name)()
++fn = getattr(obj, meth_name)
++t0 = time.perf_counter()
++res = fn(*args)
++el = time.perf_counter() - t0
++print(json.dumps({"elapsed": el, "result": repr(res)[:500]}))
++'''
++
++
++def tool_info():
++    return {
++        "name": "time_solution",
++        "description": """Time a solution on a generated max-size input, in a subprocess with a hard timeout.\n
++* Use this to check the worst-case runtime of a solution against the constraints in the problem statement.\n
++* 'generator_code' is a Python snippet that defines a function gen() with no arguments.
++  - For entry='stdin': gen() must return the full stdin text (a string) for the program.
++  - For entry like 'Solution.methodName': gen() must return a tuple of the arguments to pass to the method (a single non-tuple value is also accepted as one argument).
++  - The generator runs before timing starts; only the solution's execution is timed.
++* 'entry' is 'stdin' to run the file as a complete program (input via stdin), or 'ClassName.method' to call a method of a class in the file.
++* Returns plain text: 'OK elapsed=<seconds>s' with the output/result preview, or 'TIMEOUT after <N>s' if the run exceeded the timeout, or the error traceback / exit code on failure.
++* The timing is only meaningful for the worst-case size; generate the largest input allowed by the constraints.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "file_path": {
++                    "type": "string",
++                    "description": "Path to the Python solution file to time."
++                },
++                "generator_code": {
++                    "type": "string",
++                    "description": "Python source defining gen() that returns the max-size input (stdin text, or a tuple of method arguments)."
++                },
++                "entry": {
++                    "type": "string",
++                    "description": "'stdin' to run the file as a program, or 'ClassName.method' (e.g. 'Solution.maxDistance') to call a method."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Timeout in seconds for the timed run. Defaults to 10."
++                }
++            },
++            "required": ["file_path", "generator_code", "entry"]
++        }
++    }
++
++
++def _truncate(text, limit=MAX_OUTPUT_CHARS):
++    text = text or ""
++    if len(text) > limit:
++        return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
++    return text
++
++
++def _run_stdin(file_path, generator_code, timeout):
++    ns = {}
++    try:
++        exec(generator_code, ns)
++        input_text = ns["gen"]()
++    except Exception as e:
++        return f"ERROR: generator_code failed: {type(e).__name__}: {e}"
++    if isinstance(input_text, bytes):
++        input_text = input_text.decode()
++    if not isinstance(input_text, str):
++        input_text = str(input_text)
++    t0 = time.perf_counter()
++    try:
++        proc = subprocess.run(
++            [sys.executable, file_path],
++            input=input_text, capture_output=True, text=True, timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return f"TIMEOUT after {timeout}s (program did not finish on the generated max-size input)"
++    elapsed = time.perf_counter() - t0
++    if proc.returncode != 0:
++        return (f"ERROR: exit code {proc.returncode} after {elapsed:.3f}s\n"
++                f"stdout:\n{_truncate(proc.stdout)}\nstderr:\n{_truncate(proc.stderr)}")
++    return (f"OK elapsed={elapsed:.3f}s\n"
++            f"stdout preview:\n{_truncate(proc.stdout)}\n"
++            f"stderr:\n{_truncate(proc.stderr)}")
++
++
++def _run_method(file_path, entry, generator_code, timeout):
++    try:
++        proc = subprocess.run(
++            [sys.executable, "-c", _METHOD_HARNESS, file_path, entry, generator_code],
++            capture_output=True, text=True, timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return f"TIMEOUT after {timeout}s (method {entry} did not return on the generated max-size input)"
++    if proc.returncode != 0:
++        return f"ERROR: exit code {proc.returncode}\nstdout:\n{_truncate(proc.stdout)}\nstderr:\n{_truncate(proc.stderr)}"
++    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
++    if not lines:
++        return f"ERROR: harness produced no output\nstderr:\n{_truncate(proc.stderr)}"
++    try:
++        data = json.loads(lines[-1])
++    except json.JSONDecodeError:
++        return f"ERROR: unexpected harness output\n{_truncate(proc.stdout)}"
++    return f"OK elapsed={data['elapsed']:.3f}s\nresult preview: {data['result']}"
++
++
++def tool_function(file_path, generator_code, entry, timeout=DEFAULT_TIMEOUT):
++    try:
++        timeout = int(timeout) if timeout is not None else DEFAULT_TIMEOUT
++    except (TypeError, ValueError):
++        timeout = DEFAULT_TIMEOUT
++    if timeout <= 0:
++        timeout = DEFAULT_TIMEOUT
++    if not os.path.isfile(file_path):
++        return f"ERROR: file not found: {file_path}"
++    entry = (entry or "").strip()
++    if entry == "stdin":
++        return _run_stdin(file_path, generator_code, timeout)
++    if "." not in entry:
++        return f"ERROR: entry must be 'stdin' or 'ClassName.method', got {entry!r}"
++    return _run_method(file_path, entry, generator_code, timeout)

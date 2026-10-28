@@ -1,0 +1,178 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2cf4db9..a7a5597 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -137,11 +137,23 @@ def _clean_history(msg_history):
+         cleaned.append(m)
+     return cleaned
+ 
++def _is_empty_reply(msg_history):
++    """True if msg_history is not a list, or its last assistant message has no text and no tool_use."""
++    if not isinstance(msg_history, list):
++        return True
++    for m in reversed(msg_history):
++        if isinstance(m, dict) and m.get('role') == 'assistant':
++            return not _message_text(m).strip() and not _has_tool_use(m)
++    return True
++
+ def _infer_target_file(problem_statement):
+     """Find a backticked source filename in the problem statement; default to solution.py."""
+     match = re.search(r'`([\w./-]+\.(?:py|js|rs|go|cpp|java))`', problem_statement or '')
+     return match.group(1) if match else 'solution.py'
+ 
++STUB_MARKERS = ('placeholder', 'todo', 'write your solution here', 'not been confirmed')
++MIN_CODE_LINES = 3
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -186,11 +198,44 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _is_stub_solution(self):
++        """
++        Return True if the target file is missing, unchanged from base_commit, has fewer than
++        MIN_CODE_LINES non-comment code lines, or contains a stub marker.
++        """
++        target = _infer_target_file(self.problem_statement)
++        path = os.path.join(self.git_tempdir, target)
++        try:
++            with open(path, 'r', errors='replace') as f:
++                content = f.read()
++        except OSError:
++            return True
++
++        base_result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:{target}"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        if base_result.returncode == 0 and base_result.stdout.decode('utf-8', errors='replace') == content:
++            return True
++
++        code_lines = [
++            line for line in content.splitlines()
++            if line.strip() and not line.strip().startswith(('#', '//', '/*', '*'))
++        ]
++        if len(code_lines) < MIN_CODE_LINES:
++            return True
++
++        lowered = content.lower()
++        if any(re.search(r'\b' + re.escape(marker) + r'\b', lowered) for marker in STUB_MARKERS):
++            return True
++        return False
++
+     def _classify_patch(self):
+         """
+         Classify the current repo diff versus base_commit.
+         Returns 'empty' (no changes), 'test_only' (only test/scratch files changed,
+-        or the target file was not changed/created), or 'ok'.
++        or the target file was not changed/created), 'stub' (target file is a placeholder
++        or unchanged from base), or 'ok'.
+         """
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         changed_files = []
+@@ -215,7 +260,7 @@ class AgenticSystem:
+             f == target or f.replace('\\', '/').endswith('/' + target) for f in changed_files
+         )
+         if target_changed:
+-            return 'ok'
++            return 'stub' if self._is_stub_solution() else 'ok'
+         # Target file missing: only tests, scratch files (brute.py, check.py, ...) or other
+         # side files were touched, which does not count as a solution.
+         return 'test_only'
+@@ -287,20 +332,43 @@ IMPORTANT: Finishing with only a text response and no file edits counts as FAILU
+ 
+         target = _infer_target_file(self.problem_statement)
+         retry_msg = (
+-            f"Your previous attempt made no usable changes to the target file `{target}`. "
+-            f"Your first action MUST be an editor create/edit call writing a full draft of the solution "
+-            f"to `{target}` in {self.git_tempdir}. Do not reply with text only. After writing it, "
+-            f"run it on the sample input to check it, fix any errors, and finish."
++            f"Your previous attempt did not produce a real solution in the target file `{target}` "
++            f"(it was missing, unchanged, a placeholder, or a stub). Do the following in order:\n"
++            f"1. Restate the problem in your own words: input format, output format, constraints.\n"
++            f"2. Derive the algorithm in text and state its time and memory complexity.\n"
++            f"3. Write the FULL implementation to `{target}` in {self.git_tempdir} with the editor tool. "
++            f"Use the `edit` command if the file already exists; the `create` command fails on existing files.\n"
++            f"4. Test it with a sample input or a mock judge, fix any errors, and finish.\n"
++            f"Placeholder, TODO, or echo code (code that just prints or returns its input) counts as failure. "
++            f"Do not reply with text only."
++        )
++        empty_reply_note = (
++            "\n\nYour reply was empty; call a tool now. Use the editor to write the complete "
++            f"implementation to `{target}`, then test it."
+         )
+ 
+         msg_history = []
+         msg = instruction
+         for attempt in range(3):
++            prev_history = msg_history
+             try:
+                 new_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+             except Exception:
+                 safe_log(f"Attempt {attempt + 1}: chat_with_agent failed:\n{traceback.format_exc()}", level=logging.ERROR)
+                 new_history = []
++
++            # An empty final assistant turn: re-prompt once with a stronger instruction.
++            if _is_empty_reply(new_history):
++                safe_log(f"Attempt {attempt + 1}: empty assistant reply; re-prompting once.")
++                try:
++                    new_history = chat_with_agent(
++                        msg + empty_reply_note, model=self.code_model,
++                        msg_history=_clean_history(prev_history), logging=safe_log,
++                    )
++                except Exception:
++                    safe_log(f"Attempt {attempt + 1}: re-prompt failed:\n{traceback.format_exc()}", level=logging.ERROR)
++                    new_history = []
++
+             safe_log(f"Attempt {attempt + 1}: returned history type={type(new_history).__name__}, "
+                      f"size={len(new_history) if isinstance(new_history, list) else 'n/a'}")
+             msg_history = _clean_history(new_history)
+@@ -310,16 +378,43 @@ IMPORTANT: Finishing with only a text response and no file edits counts as FAILU
+             if classification == 'ok':
+                 break
+ 
+-            # Retry from a fresh history on empty/test-only results; otherwise keep cleaned partial work.
+-            if classification in ('empty', 'test_only'):
++            # Retry from a fresh history on empty/test_only/stub results; otherwise keep cleaned partial work.
++            if classification in ('empty', 'test_only', 'stub'):
+                 msg_history = []
+             msg = retry_msg
+ 
+-        if self._classify_patch() != 'ok':
++        if self._classify_patch() == 'ok':
++            self._self_review()
++        else:
+             safe_log("All attempts failed to produce a patch; trying direct-write fallback.")
+             self._fallback_direct_write()
+             safe_log(f"After fallback: patch classification = {self._classify_patch()}")
+ 
++    def _self_review(self):
++        """
++        One-shot review of the final solution: re-check against the problem statement and a
++        handwritten sample, run it (with a mock interactor for interactive problems), and fix bugs.
++        """
++        target = _infer_target_file(self.problem_statement)
++        review_msg = f"""Review your final solution in `{target}` (repository: {self.git_tempdir}) once more.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Steps:
++1. Read the target file `{target}` with the editor tool.
++2. Re-read the problem statement and check the input/output format, edge cases, and the algorithm against the constraints.
++3. Work out a small sample by hand and check that the code produces the expected output on it.
++4. Run the code on that sample. For interactive problems, build a small mock interactor that feeds responses and checks the queries.
++5. If you find any discrepancy or bug, fix it in `{target}` with the editor tool (use `edit`, since the file exists). Do not replace it with a placeholder.
++Finish with a short summary of what you verified."""
++        try:
++            chat_with_agent(review_msg, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception:
++            safe_log(f"Self-review: chat_with_agent failed:\n{traceback.format_exc()}", level=logging.ERROR)
++        safe_log(f"After self-review: patch classification = {self._classify_patch()}")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

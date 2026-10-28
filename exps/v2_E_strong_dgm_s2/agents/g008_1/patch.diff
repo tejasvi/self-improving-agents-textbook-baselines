@@ -1,0 +1,294 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 848e0c3..5b91139 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -18,6 +18,11 @@ MAX_INPUT_TIMEOUT = 3
+ DIFF_CASES = 20
+ DIFF_TIMEOUT = 5
+ DIFF_BUDGET = 60
++QUICK_SAMPLE_TIMEOUT = 5
++MAX_RECOVERY = 2
++RECOVERY_CODE_CLIP = 4000
++MAX_TURNS_PER_CALL = 30   # tool-call rounds allowed per chat_with_agent call (per attempt)
++MAX_EMPTY_STEPS = 2       # extra non-counted attempt steps allowed when replies stay empty
+ 
+ METHOD_PROMPT = """Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+@@ -28,7 +33,10 @@ METHOD_PROMPT = """Work like a careful competitive programmer:
+ 5. Save a maximum-size input allowed by the constraints as max_input.txt in the repository directory, and check that `python3 solution.py < max_input.txt` finishes well under 2 seconds. The harness uses a 3 second limit on max_input.txt.
+ 6. Audit every early return and special-case branch in the final code against inputs where its condition is false but the branch is still reached.
+ 7. Limit exploration: after about 15 tool calls you must have a candidate fast solution in solution.py, and then test it. Do not do open-ended analysis or long experiments.
+-8. Before finishing, run the stress_test tool once more on the final solution.py. The final answer must beat the time limit and must NOT be the brute force. Keep iterating until all checks pass."""
++8. Before finishing, run the stress_test tool once more on the final solution.py. The final answer must beat the time limit and must NOT be the brute force. Keep iterating until all checks pass.
++9. Timeout rule: if a sample with large values does not finish in a few seconds, the algorithm is wrong for this problem and its approach must change. Simulation/BFS is only a reference for tiny inputs (move it to brute.py); it is never the final solution. Derive the efficient formula from brute-force tables of small cases (print tables, look at the dependence on each parameter) before writing the final solution.py.
++10. Keep assistant turns short: think briefly, act with tools, and do not write long reasoning in the reply. Move long reasoning into files or short notes.
++11. Write scripts to files with the editor tool instead of long inline python heredocs inside bash commands."""
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -484,11 +492,84 @@ class AgenticSystem:
+         with open(path, 'w') as f:
+             f.write(text)
+ 
++    def _run_samples_quick(self):
++        """
++        Harness check right after a draft: run statement samples with a short timeout.
++        Returns a list of (k, symptom, detail) for failing samples (symptom: tle | wa | error).
++        """
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(path):
++            return []
++        failures = []
++        for idx, (inp, exp) in enumerate(self._extract_samples(), 1):
++            status, out, _ = self._run_solution(inp, QUICK_SAMPLE_TIMEOUT)
++            if status == "tle":
++                failures.append((idx, "tle", self._failure_text(f"Sample {idx}", inp, exp, status, out)))
++            elif status == "error":
++                failures.append((idx, "error", self._failure_text(f"Sample {idx}", inp, exp, status, out)))
++            elif out.split() != exp.split():
++                failures.append((idx, "wa", self._failure_text(f"Sample {idx}", inp, exp, status, out)))
++        return failures
++
++    def _timeout_hint(self, failures):
++        """Message injected into the continued conversation when a sample times out."""
++        tle = [k for k, sym, _ in failures if sym == "tle"]
++        if not tle:
++            return None
++        k = tle[0]
++        return (f"Sample {k} timed out at {QUICK_SAMPLE_TIMEOUT}s: your algorithm is not scalable; "
++                "stop patching it. Move the current code to brute.py if it is a correct reference, "
++                "tabulate brute outputs for small parameters, derive a closed-form or near-linear "
++                "algorithm, write it to solution.py, and verify it with stress_test.")
++
++    def _repo_files(self):
++        try:
++            names = sorted(os.listdir(self.git_tempdir))
++        except Exception:
++            return []
++        return [n for n in names if not n.startswith('.') and n != '__pycache__']
++
++    def _git_status(self):
++        try:
++            proc = subprocess.run(["git", "status", "--short"], capture_output=True, text=True,
++                                  timeout=20, cwd=self.git_tempdir)
++            return (proc.stdout or "").strip()
++        except Exception as e:
++            return f"(git status failed: {e})"
++
++    def _recovery_prompt(self, reason, failure_text, sol_text):
++        """Compact prompt for a continuation turn: context, not a restart."""
++        files = ", ".join(self._repo_files()) or "(none)"
++        sol = self._clip(sol_text or "", RECOVERY_CODE_CLIP) if sol_text else "(solution.py missing)"
++        return (
++            f"Continue the task (repository: {self.git_tempdir}). Your last reply was empty or cut off.\n"
++            f"Reason: {reason}\n"
++            f"Repository files: {files}\n"
++            f"git status:\n{self._clip(self._git_status(), 400)}\n\n"
++            f"Current solution.py (clipped):\n```python\n{sol}\n```\n\n"
++            f"Last failing result:\n{self._clip(failure_text, 1500)}\n\n"
++            "Next step: fix the failing case. Keep your reply short, use tools, "
++            "and write scripts to files with the editor tool rather than long inline bash."
++        )
++
++    def _continue(self, msg, history):
++        """chat_with_agent continuation; returns new history (keeps old one on exception)."""
++        try:
++            new_hist = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log,
++                                       max_turns=MAX_TURNS_PER_CALL)
++            return new_hist or history
++        except Exception as e:
++            safe_log(f"Continuation raised an exception: {e}", level=logging.WARNING)
++            return history
++
+     def forward(self):
+         """
+-        Run up to MAX_ATTEMPTS agent attempts. Each attempt is verified by _evaluate();
+-        feedback from failed attempts is passed to the next one. The best-scoring
+-        solution.py snapshot is restored at the end.
++        Run up to MAX_ATTEMPTS counted attempts. Each attempt is verified by _evaluate();
++        feedback from failed attempts is passed to the next one. Empty or cut-off replies
++        are recovered inside the same conversation (MAX_RECOVERY continuations) and, if still
++        empty, the step is retried without consuming a counted attempt (MAX_EMPTY_STEPS).
++        A failed evaluation (not only a missing solution.py) always triggers the next attempt.
++        The best-scoring solution.py snapshot is restored at the end.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -507,8 +588,11 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         prev_score = None
+         prev_report = ""
+         init_msg_history = []
++        counted = 0      # attempts that actually ran to evaluation
++        empty_steps = 0  # steps lost to empty replies (not counted as attempts)
+ 
+-        for attempt in range(MAX_ATTEMPTS):
++        while counted < MAX_ATTEMPTS:
++            attempt = counted
+             if attempt == 0:
+                 instruction = f"{first_line}{task}\n\n{method}"
+             else:
+@@ -524,16 +608,51 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                     "(within about 15 tool calls), then test it on the samples, on max_input.txt, and with stress_test.\n"
+                 )
+                 instruction = f"{task}\n\n{method}{feedback}"
++            history = []
+             try:
+-                history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++                history = chat_with_agent(instruction, model=self.code_model, msg_history=[],
++                                          logging=safe_log, max_turns=MAX_TURNS_PER_CALL) or []
+             except Exception as e:
+                 safe_log(f"Attempt {attempt + 1} raised an exception: {e}", level=logging.WARNING)
+                 history = []
+-            if attempt == 0:
+-                init_msg_history = history or []
++
++            # Recovery: empty/cut-off last reply -> continue the same conversation (bounded).
++            for recoveries in range(1, MAX_RECOVERY + 1):
++                if self._last_message_text(history):
++                    break
++                safe_log(f"Attempt {attempt + 1}: empty/cut-off reply; recovery {recoveries}/{MAX_RECOVERY}",
++                         level=logging.WARNING)
++                sol_now = self._read_solution()
++                failures = self._run_samples_quick() if sol_now is not None else []
++                fail_text = "\n\n".join(f for _, _, f in failures) or prev_report or "(no failing result recorded)"
++                history = self._continue(self._recovery_prompt("empty or cut-off assistant reply",
++                                                               fail_text, sol_now), history)
++
+             if not self._last_message_text(history):
+-                safe_log(f"Attempt {attempt + 1}: final assistant message empty or cut off; evaluating anyway",
++                # Still empty: do not consume a counted attempt; retry the step from scratch.
++                empty_steps += 1
++                safe_log(f"Attempt {attempt + 1}: reply still empty after recovery; retrying step "
++                         f"without consuming an attempt ({empty_steps}/{MAX_EMPTY_STEPS})",
+                          level=logging.WARNING)
++                if empty_steps <= MAX_EMPTY_STEPS:
++                    continue
++                # Out of empty-step retries: evaluate whatever draft exists below.
++
++            counted += 1
++            if counted == 1:
++                init_msg_history = history
++
++            # Quick sample check on the draft (harness check, separate from full evaluation).
++            quick = self._run_samples_quick()
++            hint = self._timeout_hint(quick)
++            if hint and history:
++                safe_log(f"Attempt {attempt + 1}: quick check found TLE; injecting timeout hint")
++                history = self._continue(hint, history)
++                if not self._last_message_text(history):
++                    history = self._continue(self._recovery_prompt("timeout hint got empty reply",
++                                                                   hint, self._read_solution()), history)
++                if counted == 1:
++                    init_msg_history = history
+ 
+             result = self._evaluate()
+             safe_log(f"Attempt {attempt + 1} score={result['score']} passed={result['passed']}")
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 5404143..1f7e4ee 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -280,7 +280,7 @@ def convert_msg_history(msg_history, model=None):
+     else:
+         return msg_history
+ 
+-def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
++def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print, max_turns=MAX_TURNS):
+     # Construct message
+     if msg_history is None:
+         msg_history = []
+@@ -309,7 +309,9 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+ 
+         # Tool use
+         tool_use = check_for_tool_use(response, model=client_model)
+-        while tool_use:
++        turns = 0
++        while tool_use and turns < max_turns:
++            turns += 1
+             # Process tool call
+             tool_name = tool_use['tool_name']
+             tool_input = tool_use['tool_input']
+@@ -341,6 +343,7 @@ def chat_with_agent_claude(
+         model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+         msg_history=None,
+         logging=print,
++        max_turns=MAX_TURNS,
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -377,19 +380,20 @@ def chat_with_agent_claude(
+         )
+ 
+         # Tool loop: answer every tool_use block of a response; bounded number of turns.
++        # Budget: at most max_turns tool-call rounds (plus one nudge for truncated replies).
+         turns = 0
+         nudged = False
+-        while True:
++        for _ in range(max_turns + 2):
+             uses = [b for b in response.content if getattr(b, 'type', None) == 'tool_use']
+             if not uses:
+-                if response.stop_reason == 'max_tokens' and not nudged and turns < MAX_TURNS:
++                if response.stop_reason == 'max_tokens' and not nudged and turns < max_turns:
+                     nudged = True
+                     new_msg_history.append({"role": "assistant", "content": [b for b in response.content if getattr(b, 'type', None) == 'text'] or [{"type": "text", "text": "(no output)"}]})
+-                    new_msg_history.append({"role": "user", "content": [{"type": "text", "text": "Your last reply was cut off by the output limit. Continue the task and use the tools to write and test the files."}]})
++                    new_msg_history.append({"role": "user", "content": [{"type": "text", "text": "Your last reply was cut off by the output limit. Continue briefly and use the tools to write and test the files."}]})
+                 else:
+                     break
+             else:
+-                if turns >= MAX_TURNS:
++                if turns >= max_turns:
+                     break
+                 results = []
+                 for u in uses:
+@@ -429,6 +433,7 @@ def chat_with_agent_openai(
+         model='o3-mini-2025-01-31',
+         msg_history=None,
+         logging=print,
++        max_turns=MAX_TURNS,
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -469,7 +474,9 @@ def chat_with_agent_openai(
+         # Check for tool use
+         tool_use = check_for_tool_use(response, model=client_model)
+         logging(tool_use)
+-        while tool_use:
++        turns = 0
++        while tool_use and turns < max_turns:
++            turns += 1
+             # Process tool call
+             tool_name = tool_use['tool_name']
+             tool_input = tool_use['tool_input']
+@@ -517,13 +524,14 @@ def chat_with_agent(
+     msg_history=None,
+     logging=print,
+     convert=False,  # Convert the message history to a generic format, so that msg_history can be used across models
++    max_turns=MAX_TURNS,  # Per-call budget of tool-call rounds
+ ):
+     if msg_history is None:
+         msg_history = []
+ 
+     if 'claude' in model:
+         # Claude models
+-        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging, max_turns=max_turns)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         logging(conv_msg_history)
+         if convert:
+@@ -532,14 +540,14 @@ def chat_with_agent(
+ 
+     elif model.startswith('o3-'):
+         # OpenAI models
+-        new_msg_history = chat_with_agent_openai(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_openai(msg, model=model, msg_history=msg_history, logging=logging, max_turns=max_turns)
+         # Current version does not support cross-model conversion
+         # new_msg_history = convert_msg_history(new_msg_history, model=model)
+         new_msg_history = msg_history + new_msg_history
+ 
+     else:
+         # Models without in-built tool calling
+-        new_msg_history = chat_with_agent_manualtools(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_manualtools(msg, model=model, msg_history=msg_history, logging=logging, max_turns=max_turns)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         if convert:
+             new_msg_history = conv_msg_history

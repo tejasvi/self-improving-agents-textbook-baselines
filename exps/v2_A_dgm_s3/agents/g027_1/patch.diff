@@ -1,0 +1,168 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a7a5597..5a33090 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -151,8 +151,50 @@ def _infer_target_file(problem_statement):
+     match = re.search(r'`([\w./-]+\.(?:py|js|rs|go|cpp|java))`', problem_statement or '')
+     return match.group(1) if match else 'solution.py'
+ 
++def _ran_solution(msg_history, target):
++    """
++    True if msg_history contains a bash tool invocation that runs the target file with python.
++    Handles real tool_use blocks (dicts with 'name'/'input') and the logged text form
++    `<tool_use>{'tool_name': bash, 'tool_input': {...}}</tool_use>`.
++    """
++    if not isinstance(msg_history, list) or not target:
++        return False
++    base = os.path.basename(target)
++    targets = {target, base}
++
++    def command_runs_target(command):
++        if not isinstance(command, str):
++            return False
++        if 'python' not in command:
++            return False
++        return any(re.search(r'(?<![\w./-])' + re.escape(t) + r'(?![\w.-])', command) for t in targets)
++
++    for m in msg_history:
++        if not isinstance(m, dict):
++            continue
++        content = m.get('content')
++        if isinstance(content, list):
++            for block in content:
++                if isinstance(block, dict):
++                    btype, bname, binput = block.get('type'), block.get('name'), block.get('input')
++                else:
++                    btype = getattr(block, 'type', None)
++                    bname = getattr(block, 'name', None)
++                    binput = getattr(block, 'input', None)
++                if btype == 'tool_use' and bname == 'bash' and isinstance(binput, dict):
++                    if command_runs_target(binput.get('command')):
++                        return True
++        text = _message_text(m)
++        for seg in re.findall(r'<tool_use>(.*?)</tool_use>', text, re.DOTALL):
++            if not re.search(r"tool_name['\"]?\s*:\s*['\"]?bash", seg):
++                continue
++            if command_runs_target(seg):
++                return True
++    return False
++
+ STUB_MARKERS = ('placeholder', 'todo', 'write your solution here', 'not been confirmed')
+ MIN_CODE_LINES = 3
++SELF_REVIEW_ROUNDS = 3
+ 
+ class AgenticSystem:
+     def __init__(
+@@ -172,6 +214,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self._executed = False  # True once any bash run of the target file is seen
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -360,10 +403,13 @@ IMPORTANT: Finishing with only a text response and no file edits counts as FAILU
+             # An empty final assistant turn: re-prompt once with a stronger instruction.
+             if _is_empty_reply(new_history):
+                 safe_log(f"Attempt {attempt + 1}: empty assistant reply; re-prompting once.")
++                continue_history = _clean_history(new_history) if isinstance(new_history, list) else []
++                if not continue_history:
++                    continue_history = _clean_history(prev_history)
+                 try:
+                     new_history = chat_with_agent(
+-                        msg + empty_reply_note, model=self.code_model,
+-                        msg_history=_clean_history(prev_history), logging=safe_log,
++                        "continue" + empty_reply_note, model=self.code_model,
++                        msg_history=continue_history, logging=safe_log,
+                     )
+                 except Exception:
+                     safe_log(f"Attempt {attempt + 1}: re-prompt failed:\n{traceback.format_exc()}", level=logging.ERROR)
+@@ -372,11 +418,22 @@ IMPORTANT: Finishing with only a text response and no file edits counts as FAILU
+             safe_log(f"Attempt {attempt + 1}: returned history type={type(new_history).__name__}, "
+                      f"size={len(new_history) if isinstance(new_history, list) else 'n/a'}")
+             msg_history = _clean_history(new_history)
++            if _ran_solution(msg_history, _infer_target_file(self.problem_statement)):
++                self._executed = True
+ 
+             classification = self._classify_patch()
++            if classification == 'ok' and not self._executed:
++                classification = 'unverified'
+             safe_log(f"Attempt {attempt + 1}: patch classification = {classification}")
+             if classification == 'ok':
+                 break
++            if classification == 'unverified':
++                msg = (
++                    f"The solution in `{target}` was written but never executed. Run it now with the bash tool "
++                    f"(e.g. `cd {self.git_tempdir} && python {target} < sample_input.txt`), show the output, "
++                    f"fix any problems, and finish."
++                )
++                continue
+ 
+             # Retry from a fresh history on empty/test_only/stub results; otherwise keep cleaned partial work.
+             if classification in ('empty', 'test_only', 'stub'):
+@@ -392,8 +449,8 @@ IMPORTANT: Finishing with only a text response and no file edits counts as FAILU
+ 
+     def _self_review(self):
+         """
+-        One-shot review of the final solution: re-check against the problem statement and a
+-        handwritten sample, run it (with a mock interactor for interactive problems), and fix bugs.
++        Bounded (at most SELF_REVIEW_ROUNDS) review of the final solution. History is kept across
++        rounds. The solution must be executed via bash at least once; otherwise a follow-up is sent.
+         """
+         target = _infer_target_file(self.problem_statement)
+         review_msg = f"""Review your final solution in `{target}` (repository: {self.git_tempdir}) once more.
+@@ -402,18 +459,43 @@ IMPORTANT: Finishing with only a text response and no file edits counts as FAILU
+ {self.problem_statement}
+ </problem_description>
+ 
+-Steps:
++Steps (you MUST actually run the code with the bash tool; do not only read it):
+ 1. Read the target file `{target}` with the editor tool.
+-2. Re-read the problem statement and check the input/output format, edge cases, and the algorithm against the constraints.
+-3. Work out a small sample by hand and check that the code produces the expected output on it.
+-4. Run the code on that sample. For interactive problems, build a small mock interactor that feeds responses and checks the queries.
+-5. If you find any discrepancy or bug, fix it in `{target}` with the editor tool (use `edit`, since the file exists). Do not replace it with a placeholder.
+-Finish with a short summary of what you verified."""
+-        try:
+-            chat_with_agent(review_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-        except Exception:
+-            safe_log(f"Self-review: chat_with_agent failed:\n{traceback.format_exc()}", level=logging.ERROR)
+-        safe_log(f"After self-review: patch classification = {self._classify_patch()}")
++2. Extract sample input/output from the statement or README (if present in {self.git_tempdir}). If there are no explicit samples, write a small one by hand and compute the expected output.
++3. Run the program on each sample via bash, e.g. `cd {self.git_tempdir} && python {target} < sample_input.txt`, and compare with the expected output.
++4. If the problem is interactive, build a small mock interactor script that answers the solution's queries, and run the solution against it via bash, checking the queries are valid.
++5. Hidden tests may supply the input as a static stream (a plain file piped to stdin) rather than a live interactor. Make input parsing robust to this: read all tokens (e.g. via sys.stdin.read().split()), and do not crash on unexpected or extra tokens.
++6. If you find any discrepancy, crash, or bug, fix it in `{target}` with the editor tool (use `edit`, since the file exists). Re-run after each fix. Do not replace it with a placeholder.
++7. Finish with a short report that lists the observed outputs of each run and what you verified."""
++
++        msg_history = []
++        msg = review_msg
++        for round_idx in range(SELF_REVIEW_ROUNDS):
++            try:
++                new_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            except Exception:
++                safe_log(f"Self-review round {round_idx + 1}: chat_with_agent failed:\n{traceback.format_exc()}", level=logging.ERROR)
++                break
++            msg_history = _clean_history(new_history)
++            executed = _ran_solution(msg_history, target)
++            self._executed = self._executed or executed
++            empty = _is_empty_reply(msg_history)
++            safe_log(f"Self-review round {round_idx + 1}: executed={executed}, empty_reply={empty}")
++            if executed and not empty:
++                break
++            msg = (
++                "You have not executed the solution yet. Run it now with bash and show the output."
++                if not executed else
++                "Your last reply was empty. Continue: run the solution with bash on the sample input "
++                "and report the observed output."
++            )
++        final = self._classify_patch()
++        if final == 'ok' and not self._executed:
++            final = 'unverified'
++            safe_log("VERIFICATION GATE FAILED: patch is ok but the solution was never executed via bash.",
++                     level=logging.WARNING)
++        safe_log(f"After self-review: patch classification = {final}, executed={self._executed}")
++
+ 
+ 
+ def main():

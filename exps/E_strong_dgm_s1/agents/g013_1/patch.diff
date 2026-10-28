@@ -1,0 +1,333 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..7e36528 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,9 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
++import shutil
++import tempfile
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -111,6 +114,10 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self._samples = []
++        self._best_score = None
++        self._backup_path = None
++        self._pending_prompt = None
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -137,10 +144,245 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    # ------------------------------------------------------------------
++    # Harness helpers: sample extraction, sample running, placeholder and
++    # snapshot logic. All of these are generic (no task-specific paths).
++    # ------------------------------------------------------------------
++    SAMPLE_HEAD_RE = re.compile(
++        r'^[ \t#*_>`]*(sample|example)[ \t]*#?[ \t]*\d*[ \t]*(input|output)[ \t]*#?[ \t]*\d*[ \t]*[:.*_`]*[ \t]*$',
++        re.IGNORECASE | re.MULTILINE)
++    BARE_HEAD_RE = re.compile(
++        r'^[ \t#*_>`]*(input|output)[ \t]*#?[ \t]*\d*[ \t]*[:.*_`]*[ \t]*$',
++        re.IGNORECASE | re.MULTILINE)
++
++    @staticmethod
++    def _clean_sample_block(text):
++        """Strip code fences, keep the first non-blank run of lines."""
++        lines = [l.rstrip() for l in text.splitlines()]
++        lines = [l for l in lines if not l.strip().startswith('```')]
++        out = []
++        for l in lines:
++            if not l.strip():
++                if out:
++                    break
++                continue
++            out.append(l)
++        return '\n'.join(out) + ('\n' if out else '')
++
++    def _extract_samples(self):
++        """
++        Parse the problem statement for (input, expected_output) pairs.
++        Returns a list of tuples; [] when nothing reliable is found.
++        """
++        try:
++            text = self.problem_statement or ''
++            if not text.strip():
++                return []
++
++            def pair_up(regex, require_sanity):
++                matches = list(regex.finditer(text))
++                pairs = []
++                for i in range(len(matches) - 1):
++                    cur, nxt = matches[i], matches[i + 1]
++                    kinds = (cur.group(cur.lastindex).lower(), nxt.group(nxt.lastindex).lower())
++                    if kinds != ('input', 'output'):
++                        continue
++                    stop_out = matches[i + 2].start() if i + 2 < len(matches) else len(text)
++                    inp = self._clean_sample_block(text[cur.end():nxt.start()])
++                    out = self._clean_sample_block(text[nxt.end():stop_out])
++                    if not (inp.strip() and out.strip()):
++                        continue
++                    if require_sanity and re.search(r'[a-z]{2,}\s+[a-z]{2,}\s+[a-z]{2,}', inp + out):
++                        # Bare "Input"/"Output" headings often introduce prose
++                        # format descriptions; reject those.
++                        continue
++                    pairs.append((inp, out))
++                return pairs
++
++            pairs = pair_up(self.SAMPLE_HEAD_RE, require_sanity=False)
++            if not pairs:
++                pairs = pair_up(self.BARE_HEAD_RE, require_sanity=True)
++            return pairs
++        except Exception as e:
++            safe_log(f"_extract_samples failed: {e}")
++            return []
++
++    def _run_samples(self, samples=None):
++        """
++        Run `python3 solution.py` on each sample. Returns a list of failure dicts
++        with keys: input, expected, actual, stderr. Empty list means all passed.
++        """
++        if samples is None:
++            samples = self._samples
++        failures = []
++        for inp, expected in samples:
++            try:
++                proc = subprocess.run(
++                    ["python3", "solution.py"],
++                    cwd=self.git_tempdir,
++                    input=inp if inp.endswith('\n') else inp + '\n',
++                    capture_output=True, text=True, timeout=10)
++                actual, stderr = proc.stdout, proc.stderr
++            except subprocess.TimeoutExpired as e:
++                actual = e.stdout.decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
++                stderr = 'TimeoutError: solution.py did not finish within 10 seconds'
++            except Exception as e:
++                actual, stderr = '', f'{type(e).__name__}: {e}'
++            if actual.split() != expected.split():
++                failures.append({
++                    'input': inp,
++                    'expected': expected,
++                    'actual': actual,
++                    'stderr': stderr[-1500:],
++                })
++        return failures
++
++    def _solution_path(self):
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _meaningful_lines(self, text):
++        count = 0
++        for l in text.splitlines():
++            s = l.strip()
++            if not s or s.startswith('#') or s in ('pass', '...'):
++                continue
++            count += 1
++        return count
++
++    def _is_placeholder(self):
++        """
++        True if solution.py is missing, unchanged versus base_commit, or has
++        (almost) no meaningful code.
++        """
++        try:
++            path = self._solution_path()
++            if not os.path.exists(path):
++                return True
++            with open(path, 'r', errors='replace') as f:
++                content = f.read()
++            if self._meaningful_lines(content) < 1:
++                return True
++            diff = subprocess.run(
++                ["git", "-C", self.git_tempdir, "diff", self.base_commit, "--", "solution.py"],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False).stdout.decode(errors='replace')
++            if not diff.strip():
++                untracked = subprocess.run(
++                    ["git", "-C", self.git_tempdir, "ls-files", "--others", "--exclude-standard", "--", "solution.py"],
++                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False).stdout.decode(errors='replace')
++                # Untracked solution.py with real code counts as edited; tracked and
++                # unchanged is a placeholder.
++                return not untracked.strip()
++            changed = sum(1 for l in diff.splitlines()
++                          if (l.startswith('+') or l.startswith('-'))
++                          and not l.startswith('+++') and not l.startswith('---'))
++            return changed < 2
++        except Exception as e:
++            safe_log(f"_is_placeholder failed: {e}")
++            return True
++
++    def _score_current(self):
++        """Number of samples the current solution.py passes (0 if no samples known)."""
++        if not self._samples:
++            return 0
++        return len(self._samples) - len(self._run_samples(self._samples))
++
++    def _snapshot_if_better(self, score):
++        """Back up solution.py if it passes more samples than the best so far."""
++        try:
++            path = self._solution_path()
++            if not os.path.exists(path):
++                return
++            if self._best_score is None or score > self._best_score:
++                if self._backup_path is None:
++                    fd, self._backup_path = tempfile.mkstemp(prefix='solution_best_', suffix='.py')
++                    os.close(fd)
++                shutil.copyfile(path, self._backup_path)
++                self._best_score = score
++                safe_log(f"Snapshot saved: {score}/{len(self._samples)} samples passing")
++        except Exception as e:
++            safe_log(f"_snapshot_if_better failed: {e}")
++
++    def _restore_best(self):
++        """Restore the best snapshot of solution.py if the final version scores worse."""
++        try:
++            if self._backup_path is None or not os.path.exists(self._backup_path):
++                return
++            final_score = self._score_current()
++            if self._best_score is not None and final_score < self._best_score:
++                shutil.copyfile(self._backup_path, self._solution_path())
++                safe_log(f"Restored best snapshot ({self._best_score} passing) over final ({final_score})")
++            else:
++                safe_log(f"Final solution kept ({final_score} passing)")
++        except Exception as e:
++            safe_log(f"_restore_best failed: {e}")
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            parts = []
++            for block in content or []:
++                text = block.get('text') if isinstance(block, dict) else getattr(block, 'text', None)
++                if text:
++                    parts.append(text)
++            return '\n'.join(parts)
++        return ''
++
++    def _read_file(self, path, limit):
++        try:
++            with open(path, 'r', errors='replace') as f:
++                content = f.read()
++            if len(content) > limit:
++                content = content[:limit] + '\n...[truncated]'
++            return content
++        except Exception:
++            return '(missing)'
++
++    def _notes_path(self):
++        return os.path.join('/work/dev', 'NOTES.md')
++
++    def _build_feedback(self, failures, placeholder, reply_empty):
++        parts = []
++        if reply_empty:
++            parts.append("Your previous reply was cut off; the work so far is in files, continue; write solution.py now.")
++        if placeholder:
++            parts.append("WARNING: solution.py is still the placeholder (unchanged or nearly empty). Write a real solution.py now.")
++        if failures:
++            parts.append(f"{len(failures)} sample(s) FAILED. Details:")
++            for idx, fl in enumerate(failures[:3], 1):
++                parts.append(
++                    f"--- failing sample {idx} ---\nInput:\n{fl['input']}"
++                    f"Expected:\n{fl['expected']}"
++                    f"Actual:\n{fl['actual'] or '(no output)'}\n"
++                    f"Stderr:\n{fl['stderr'] or '(none)'}")
++        parts.append(f"# Current solution.py ({self._solution_path()})\n```python\n"
++                     f"{self._read_file(self._solution_path(), 8000)}\n```")
++        parts.append(f"# Notes ({self._notes_path()})\n{self._read_file(self._notes_path(), 3000)}")
++        parts.append("Continue from the existing work rather than starting over. Fix the problems above, "
++                     "re-run the samples, keep tool outputs small and messages short, and update NOTES.md.")
++        return "\n\n".join(parts)
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        The forward function for the AgenticSystem: a bounded multi-round loop
++        where the harness checks the result after each round and feeds back
++        failures.
+         """
++        MAX_ROUNDS = 4
++        self._samples = self._extract_samples()
++        self._best_score = None
++        self._backup_path = None
++        safe_log(f"Extracted {len(self._samples)} sample(s) from the problem statement")
++
++        try:
++            os.makedirs('/work/dev', exist_ok=True)
++        except Exception as e:
++            safe_log(f"Could not create /work/dev: {e}")
++
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -151,13 +393,56 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         method = """Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
++2. Write a simple first-draft solution.py within your first few steps, then improve it. Write the solution in solution.py with the editor tool.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+ 5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored.
++
++Output discipline: keep tool outputs small (print at most ~40 lines, never huge tables), keep each message short, and keep a notes file at /work/dev/NOTES.md with your findings (approach, samples status, open issues)."""
++        verify_prompt = """Verification round. Write brute.py straight from the statement (a simple, obviously-correct reference). Write a random generator with small parameters that covers edge cases: minimum parameter values, negatives (if allowed), equal endpoints, extreme-magnitude values. Run 300+ random cases comparing solution.py against brute.py, and run a max-size timing test on solution.py (must finish well under 2 seconds). Fix any mismatch in solution.py. Keep tool outputs small and update /work/dev/NOTES.md."""
++
++        verify_sent = False      # True once the dedicated verification round has been issued
++        history_summary = []
++        self._pending_prompt = None
++        for rnd in range(MAX_ROUNDS):
++            if rnd == 0:
++                prompt = f"{task}\n\n{method}"
++            else:
++                prompt = self._pending_prompt
++            try:
++                msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"Round {rnd}: chat_with_agent raised {type(e).__name__}: {e}")
++                msg_history = []
++            reply = self._last_assistant_text(msg_history).strip()
++            reply_empty = not reply
++
++            placeholder = self._is_placeholder()
++            failures = self._run_samples(self._samples) if self._samples else []
++            score = len(self._samples) - len(failures)
++            self._snapshot_if_better(score)
++            summary = (f"Round {rnd}: reply_chars={len(reply)} empty={reply_empty} "
++                       f"placeholder={placeholder} samples={score}/{len(self._samples)} "
++                       f"verify_round_done={verify_sent}")
++            safe_log(summary)
++            history_summary.append(summary)
++
++            healthy = not reply_empty and not placeholder and not failures
++            if healthy and verify_sent:
++                break  # samples pass and the verification round has run
++            if healthy:
++                # Samples pass (or none could be parsed): run the dedicated verification round.
++                verify_sent = True
++                self._pending_prompt = verify_prompt
++                continue
++
++            # Not done: repair round with harness feedback (fresh history, state lives in files).
++            self._pending_prompt = self._build_feedback(failures, placeholder, reply_empty)
++
++        self._restore_best()
++        for line in history_summary:
++            safe_log(line)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

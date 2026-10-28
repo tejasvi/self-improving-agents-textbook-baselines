@@ -1,0 +1,612 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index dfaf21c..8bba701 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,6 @@
+ import argparse
+ import subprocess
++import sys
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -104,10 +105,15 @@ def _last_assistant_text(msg_history):
+         if isinstance(content, str):
+             return content
+         if isinstance(content, list):
+-            parts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
++            parts = [b.get('text') or '' for b in content if isinstance(b, dict) and b.get('type') == 'text']
+             return '\n'.join(parts)
+     return ''
+ 
++def _is_incomplete_reply(msg_history):
++    """True when the last assistant message is empty, a '(no output)' placeholder, or otherwise missing text."""
++    text = _last_assistant_text(msg_history).strip()
++    return text in ('', '(no output)')
++
+ def _verify_solution(git_tempdir, num_tests=200):
+     """Run solution_check stress mode against repo brute.py/gen.py. Returns (passed, report)."""
+     from tools import solution_check
+@@ -119,6 +125,71 @@ def _verify_solution(git_tempdir, num_tests=200):
+     report = solution_check.tool_function(sol, brute_path=brute, gen_path=gen, num_tests=num_tests)
+     return 'RESULT: OK' in report, report
+ 
++PERF_TIMEOUT = 5            # seconds per run in the performance gate
++RECOVERY_SESSIONS = 2       # bounded efficiency-recovery sessions
++CONTINUE_MSG = ("continue, write files: your last reply was empty or cut off. Do not restate the analysis; "
++                "use the editor tool now to write or update {sol} with your best current solution, "
++                "then run it on the samples.")
++
++
++def _extract_samples(statement):
++    """Extract (input, output) pairs from 'Sample Input N' / 'Sample Output N' blocks.
++    Fence lines (```) are skipped; a block ends at a blank line, the next header, or an 'Explanation'/'Note' line."""
++    pairs = []
++    cur_in, cur_out = [], []
++    state = None  # None | 'input' | 'output'
++
++    def flush():
++        inp = '\n'.join(cur_in).strip('\n')
++        out = '\n'.join(cur_out).strip()
++        if inp.strip() and out:
++            pairs.append((inp + '\n', out + '\n'))
++
++    for raw in (statement or '').replace('\r\n', '\n').split('\n'):
++        s = raw.strip().strip('*_#: ').strip()
++        head = re.match(r'(?i)^sample\s+(input|output)\b', s)
++        if head:
++            if state == 'output':
++                flush()
++            if head.group(1).lower() == 'input':
++                cur_in, cur_out, state = [], [], 'input'
++            else:
++                cur_out, state = [], 'output'
++            continue
++        if state is None or s.startswith('```'):
++            continue
++        if re.match(r'(?i)^(explanation|note)\b', s):
++            if state == 'output':
++                flush()
++            state = None
++            continue
++        if not s:
++            if state == 'output' and cur_out:
++                flush()
++                state = None
++            elif state == 'input' and cur_in:
++                state = None
++            continue
++        if state == 'input':
++            cur_in.append(raw.rstrip())
++        else:
++            cur_out.append(raw.rstrip())
++    if state == 'output' and cur_out:
++        flush()
++    return pairs
++
++
++def _gate_verdict(report, n_inputs):
++    """True when solution_check's plain-mode summary reports every input passed."""
++    if not report or report.startswith('Error'):
++        return False
++    m = re.findall(r'(\d+)/(\d+) passed', report)
++    if not m:
++        return False
++    ok, total = m[-1]
++    return int(total) == n_inputs and int(ok) == n_inputs and '] FAIL' not in report
++
++
+ def _read_text(path):
+     if not os.path.isfile(path):
+         return None
+@@ -140,10 +211,11 @@ CANDIDATE_METHOD = """Work like a careful competitive programmer:
+    - seed % 4 == 3: cases biased toward nontrivial answers (e.g. re-sample until the brute answer is not 0/1/trivial, or construct inputs where the answer depends on many parts).
+    Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Read its `brute output stats` line: if distinct is small or top_frac is high (it reports TEST QUALITY: WEAK / RESULT: WEAK_TESTS), your generator is producing trivial answers; diversify gen.py and re-run. Fix every mismatch, crash or timeout it reports, then re-run until it reports RESULT: OK.
+ 5. Derivation audit: list every assumption your derivation relies on (e.g. monotonicity, independence of components, that a value can be reached, handling of duplicates, the modulus, off-by-one in indices). For EACH assumption, write at least one targeted test (a specific input in gen.py or a small check script) that would fail if the assumption were false, and run it. Then write an independent second solution (brute-force-free, using a DIFFERENT algorithm or formulation than solution.py, e.g. a DP or simulation instead of a closed form) saved as ref2.py, and run solution_check in differential mode: solution_path=solution.py, ref2_path=ref2.py, gen_path=gen.py, on medium-size inputs where the brute force is infeasible. Investigate and fix every DIFFERENTIAL MISMATCH (decide which of the two is wrong with a small brute-force case).
+-6. Generate a maximum-size input (gen-style, with the largest constraints) and check that solution.py finishes in well under 2 seconds. The max-size test must be built so its answer is nontrivial, or so the full code path is executed (not an early exit such as a zero-answer or trivially-sized shortcut). Keep iterating on the solution until all checks pass.
+-7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
+-8. An unrun stress test means the task is NOT finished. Do not end your turn until step 4 (stress mode) has reported RESULT: OK and step 5 (differential mode) has reported RESULT: OK on the final version of solution.py.
+-9. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
++6. If the brute force is too slow for the constraints, find the pattern from small-case data; do not stop at a brute force; write the best formula to solution.py early.
++7. Generate a maximum-size input (gen-style, with the largest constraints) and check that solution.py finishes in well under 2 seconds. The max-size test must be built so its answer is nontrivial, or so the full code path is executed (not an early exit such as a zero-answer or trivially-sized shortcut). Keep iterating on the solution until all checks pass.
++8. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
++9. An unrun stress test means the task is NOT finished. Do not end your turn until step 4 (stress mode) has reported RESULT: OK and step 5 (differential mode) has reported RESULT: OK on the final version of solution.py.
++10. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
+ The final solution.py is what gets graded; helper files are ignored."""
+ 
+ class AgenticSystem:
+@@ -259,7 +331,7 @@ Independent attempt '{label}': other solvers are working on the same problem in
+ Work only inside {work}/ for your draft, brute.py, gen.py and tests (do not edit {os.path.join(self.git_tempdir, 'solution.py')}). When your solution passes the samples and your own stress test, write the final code to {cand} with the editor tool (command=create). Your final message should state briefly which formulation you used.
+ """
+         safe_log(f"Attempt {label}: hint={hint[:80]}")
+-        return chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        return self._chat_continue(prompt, [])
+ 
+     def _write_oracle(self, task):
+         """Chat session that writes oracle.py (statement-literal), gen_small.py and gen_medium.py.
+@@ -401,6 +473,98 @@ Your job:
+                 safe_log("Round broke verification; restoring last passing solution.py")
+                 _write_text(sol_path, best_text)
+ 
++    # ------------------------------------------------------------------
++    # Empty-reply continuation, performance gate and efficiency recovery
++    # ------------------------------------------------------------------
++    def _chat_continue(self, msg, history, max_continues=2):
++        """Send msg, then continue the SAME history (not a restart) while the last reply is empty/truncated."""
++        hist = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        for _ in range(max_continues):
++            if not _is_incomplete_reply(hist):
++                break
++            safe_log("Empty or truncated reply; continuing the same message history")
++            hist = chat_with_agent(CONTINUE_MSG.format(sol=sol_path), model=self.code_model,
++                                   msg_history=hist, logging=safe_log)
++        return hist
++
++    def _write_gen_max(self):
++        """Session that writes gen_max.py (prints one max-size valid input). Returns its path or None."""
++        gen_max = os.path.join(self.git_tempdir, 'gen_max.py')
++        prompt = f"""Problem statement:
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Write {gen_max}: a Python program that takes no required arguments and prints ONE valid input for this problem at the MAXIMUM constraints
++(largest n / values allowed, with a nontrivial answer; use random.seed(0) for any randomness). Use the editor tool (command=create).
++Then run `python3 {gen_max}` once to confirm it prints a valid input. Do not solve the problem in this session; keep the reply short.
++"""
++        safe_log("Writing gen_max.py for the performance gate")
++        self._chat_continue(prompt, [], max_continues=1)
++        return gen_max if os.path.isfile(gen_max) else None
++
++    def _perf_gate(self):
++        """Performance gate: solution.py must pass the statement samples and finish a max-size input within
++        PERF_TIMEOUT seconds. A timeout, crash or wrong sample answer fails the gate. Returns (ok, report)."""
++        from tools import solution_check
++        sol = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(sol):
++            return False, 'Performance gate failed: solution.py is missing.'
++        samples = _extract_samples(self.problem_statement)
++        inputs = [s[0] for s in samples]
++        expected = [s[1] for s in samples]
++        gen_max = os.path.join(self.git_tempdir, 'gen_max.py')
++        if not os.path.isfile(gen_max):
++            gen_max = self._write_gen_max()
++        if not gen_max:
++            return False, 'Performance gate failed: gen_max.py could not be written.'
++        try:
++            proc = subprocess.run([sys.executable, '-I', gen_max], capture_output=True, text=True, timeout=30,
++                           cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return False, 'Performance gate failed: gen_max.py timed out.'
++        max_input = proc.stdout
++        if proc.returncode != 0 or not max_input.strip():
++            return False, f'Performance gate failed: gen_max.py rc={proc.returncode} stderr={proc.stderr[-500:]}'
++        inputs.append(max_input if max_input.endswith('\n') else max_input + '\n')
++        expected.append('')
++        report = solution_check.tool_function(sol, inputs=inputs, expected_outputs=expected, timeout=PERF_TIMEOUT)
++        ok = _gate_verdict(report, len(inputs))
++        report = f"[perf gate: {len(samples)} sample(s) + 1 max-size input, timeout {PERF_TIMEOUT}s]\n{report}"
++        safe_log(f"Performance gate ok={ok}")
++        return ok, report
++
++    def _recover_efficiency(self, task, sol_path, gate_report):
++        """One bounded efficiency-recovery session. Keeps the new solution.py only if it passes the gate."""
++        snapshot = _read_text(sol_path)
++        current = snapshot or '(solution.py is missing)'
++        prompt = f"""{task}
++
++PERFORMANCE GATE FAILED. The current solution.py is:
++```python
++{current}
++```
++
++Gate report (solution.py run on the samples and on a max-size input, timeout {PERF_TIMEOUT}s; a timeout, crash or wrong sample answer fails):
++{gate_report[-3000:]}
++
++It is probably a brute force (BFS, exponential search, or enumeration) that cannot handle the maximum constraints. Do the following:
++(a) Dump brute-force outputs over small parameter grids to files (write a script that runs the brute force on many small inputs and saves the results).
++(b) Vary one parameter at a time and hypothesise a closed form or an O(log) / polynomial algorithm.
++(c) Check each hypothesis against ALL the brute data with a script (you may use the formula_fit tool).
++(d) Write solution.py as soon as the samples pass; then refine it.
++(e) Never end a turn without editing solution.py with the editor tool. Keep replies short.
++The final solution.py must read stdin, write stdout, and run the max-size input well under {PERF_TIMEOUT} seconds.
++"""
++        safe_log("Efficiency-recovery session")
++        self._chat_continue(prompt, [], max_continues=2)
++        ok, report = self._perf_gate()
++        if not ok and snapshot is not None:
++            safe_log("Recovery did not pass the gate; restoring the snapshot")
++            _write_text(sol_path, snapshot)
++        return ok, report
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -419,8 +583,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         sol_path = os.path.join(self.git_tempdir, 'solution.py')
+ 
+         # (a) First attempt (cand_0), then K-1 fresh-context candidates.
+-        init_edit = chat_with_agent(f"{task}\n{CANDIDATE_METHOD}", model=self.code_model,
+-                                    msg_history=[], logging=safe_log)
++        init_edit = self._chat_continue(f"{task}\n{CANDIDATE_METHOD}", [])
+         for attempt in range(3):
+             if self._has_primary_edit():
+                 break
+@@ -463,6 +626,16 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                 _write_text(sol_path, _read_text(best))
+                 safe_log(f"Selected {best}")
+ 
++        # (f) performance gate: recover bounded times if solution.py is too slow or fails the samples.
++        if os.path.isfile(sol_path):
++            ok, gate_report = self._perf_gate()
++            for recovery in range(RECOVERY_SESSIONS):
++                if ok:
++                    break
++                safe_log(f"Performance gate failed; recovery session {recovery + 1}/{RECOVERY_SESSIONS}")
++                ok, gate_report = self._recover_efficiency(task, sol_path, gate_report)
++            safe_log(f"Performance gate final ok={ok}")
++
+         # Review rounds get the hard-test corpus and the oracle path; snapshot/restore fallback.
+         self._review_rounds(task, sol_path, summary)
+ 
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+index 07abf79..709ac18 100644
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -40,9 +40,12 @@ def test_pipeline_selects_correct_candidate(tmp_path, monkeypatch):
+     agent.code_model = 'm'
+     agent.logger = None
+     agent._has_primary_edit = lambda: True
++    monkeypatch.setattr(ca.AgenticSystem, '_perf_gate', lambda self: (True, 'stub'))
+     agent.forward()
+ 
+     assert open(tmp_path / 'solution.py').read() == GOOD
+     assert (tmp_path / 'cands' / 'cand_0.py').read_text() == WRONG
+     # no unbounded loop: at most 1 first attempt + oracle + (K-1) attempts + arbitration rounds + review rounds
+-    assert len(calls) <= 1 + 1 + (ca.NUM_CANDIDATES - 1) + ca.MAX_ARBITRATION + 2
++    # each session may add at most max_continues=2 continuation calls when its reply is empty
++    sessions = 1 + 1 + (ca.NUM_CANDIDATES - 1) + ca.MAX_ARBITRATION + 2
++    assert len(calls) <= sessions * 3
+diff --git a/null b/null
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_perf_gate.py b/tests/test_perf_gate.py
+new file mode 100644
+index 0000000..d8d5d01
+--- /dev/null
++++ b/tests/test_perf_gate.py
+@@ -0,0 +1,133 @@
++import os
++import shutil
++import coding_agent as ca
++from tools import formula_fit
++
++STMT = "Sum two numbers.\nSample Input 1\n1 2\nSample Output 1\n3\n"
++GEN_MAX = "print(10**16, 10**16)\n"
++
++
++def _agent(tmp_path):
++    a = ca.AgenticSystem.__new__(ca.AgenticSystem)
++    a.problem_statement = STMT
++    a.git_tempdir = str(tmp_path)
++    a.code_model = 'm'
++    return a
++
++
++def _gate(tmp_path, src):
++    (tmp_path / 'solution.py').write_text(src)
++    (tmp_path / 'gen_max.py').write_text(GEN_MAX)
++    return _agent(tmp_path)._perf_gate()
++
++
++def test_gate_accepts_fast_solution(tmp_path):
++    ok, rep = _gate(tmp_path, "a, b = map(int, input().split())\nprint(a + b)\n")
++    assert ok, rep
++
++
++def test_gate_rejects_exponential_solution(tmp_path):
++    src = ("n = int(input().split()[0])\n"
++           "def f(k):\n    return 1 if k == 0 else f(k - 1) + f(k - 1)\n"
++           "print(f(n) % 7)\n")
++    ok, rep = _gate(tmp_path, src)
++    assert not ok
++    assert 'TIMED OUT' in rep or 'rc' in rep or 'exit code' in rep
++
++
++def test_gate_rejects_sleeping_solution(tmp_path, monkeypatch):
++    monkeypatch.setattr(ca, 'PERF_TIMEOUT', 1)
++    src = "import time\na, b = map(int, input().split())\nprint(a + b)\ntime.sleep(10)\n"
++    ok, rep = _gate(tmp_path, src)
++    assert not ok
++    assert 'TIMED OUT' in rep
++
++
++def test_gate_rejects_wrong_sample(tmp_path):
++    ok, rep = _gate(tmp_path, "a, b = map(int, input().split())\nprint(a - b)\n")
++    assert not ok
++
++
++def test_gate_fails_without_solution(tmp_path):
++    ok, rep = _agent(tmp_path)._perf_gate()
++    assert not ok
++
++
++def test_extract_samples():
++    st = ("Blah\nSample Input 1\n```\n3\n1 2 3\n```\nSample Output 1\n```\n6\n```\n"
++          "Explanation: x\nSample Input 2\n5\nSample Output 2\n10\n")
++    assert ca._extract_samples(st) == [("3\n1 2 3\n", "6\n"), ("5\n", "10\n")]
++    assert ca._extract_samples("no samples") == []
++
++
++def test_formula_fit_identifies_correct_formula(tmp_path):
++    prog = tmp_path / 'brute.py'
++    prog.write_text("n = int(input())\nprint(n * (n + 1) // 2)\n")
++    grid = [f"{n}\n" for n in range(1, 8)]
++    out = formula_fit.tool_function(str(prog), grid, ["n*(n+1)//2", "n*n"], var_names=["n"])
++    assert "expression: n*(n+1)//2  matches: 7/7" in out
++    assert "expression: n*n  matches:" in out and "matches: 7/7" not in out.split("expression: n*n")[1]
++
++
++def test_formula_fit_reports_counterexamples(tmp_path):
++    prog = tmp_path / 'brute.py'
++    prog.write_text("n = int(input())\nprint(2 ** n)\n")
++    grid = [f"{n}\n" for n in range(0, 10)]
++    out = formula_fit.tool_function(str(prog), grid, ["2*n"], var_names=["n"])
++    # 2**n == 2*n only at n=1 (2==2) and n=2 (4==4)
++    assert "expression: 2*n  matches: 2/10" in out
++    assert "first counterexamples" in out
++    # the first counterexample is n=0 (output 1, expression value 0)
++    assert "input='0' output='1' expression_value=0" in out
++    assert out.count("input=") == 5
++
++
++def test_tool_schemas_are_valid():
++    from tools import load_all_tools
++    for tool in load_all_tools(logging=lambda *_: None):
++        info = tool['info']
++        schema = info['input_schema']
++        assert schema['type'] == 'object'
++        assert isinstance(schema['properties'], dict)
++        assert set(schema['required']) <= set(schema['properties'])
++        for name, prop in schema['properties'].items():
++            assert 'type' in prop and 'description' in prop, (tool['name'], name)
++            assert 'required' not in prop and 'properties' not in prop or prop.get('type') == 'object'
++        assert 'required' not in schema['properties']
++    names = [t['info']['name'] for t in load_all_tools(logging=lambda *_: None)]
++    assert 'formula_fit' in names
++
++
++def test_recovery_restores_snapshot_when_gate_still_fails(tmp_path, monkeypatch):
++    sol = tmp_path / 'solution.py'
++    sol.write_text("print('brute')\n")
++    a = _agent(tmp_path)
++
++    def writer(msg, hist, max_continues=2):
++        # the recovery session writes a new solution that still fails the gate
++        sol.write_text("print('new but slow')\n")
++        return []
++
++    monkeypatch.setattr(a, '_chat_continue', writer)
++    monkeypatch.setattr(a, '_perf_gate', lambda: (False, 'still slow'))
++    ok, _ = a._recover_efficiency('task', str(sol), 'gate failed')
++    assert not ok
++    assert sol.read_text() == "print('brute')\n"
++
++
++def test_chat_continue_continues_same_history(tmp_path, monkeypatch):
++    calls = []
++    empty = [{'role': 'user', 'content': 'x'}, {'role': 'assistant', 'content': [{'type': 'text', 'text': ''}]}]
++    full = empty[:1] + [{'role': 'assistant', 'content': [{'type': 'text', 'text': 'done'}]}]
++
++    def fake_chat(msg, model=None, msg_history=None, logging=print):
++        calls.append((msg, list(msg_history or [])))
++        return empty if len(calls) == 1 else full
++
++    monkeypatch.setattr(ca, 'chat_with_agent', fake_chat)
++    a = _agent(tmp_path)
++    out = a._chat_continue('write it', [])
++    assert len(calls) == 2
++    assert calls[1][0].startswith('continue, write files')
++    assert calls[1][1] == empty  # continued from the history returned by the first call
++    assert out == full
+diff --git a/tools/formula_fit.py b/tools/formula_fit.py
+new file mode 100644
+index 0000000..2ec0592
+--- /dev/null
++++ b/tools/formula_fit.py
+@@ -0,0 +1,195 @@
++import math
++import os
++import signal
++import subprocess
++import sys
++
++# Fit closed-form candidates against a program's outputs on a parameter grid.
++# Each grid entry is a stdin string for the program. var_names bind the whitespace-separated
++# tokens of that input (in order) to names; the program's output is available as `out`.
++# Expressions are evaluated in a restricted namespace (math helpers, integer helpers, no builtins).
++
++_MAX_ROWS = 300
++_SHOW_ROWS = 60
++_MAX_COUNTEREXAMPLES = 5
++_EVAL_SECONDS = 2
++
++
++def tool_info():
++    return {
++        "name": "formula_fit",
++        "description": """Fit closed-form formulas against a program's outputs over a parameter grid.\n
++* Runs the program (python3 -I) once per entry of `param_grid` (each entry is the full stdin text of one test).\n
++* Prints a compact table of inputs and outputs.\n
++* Binds `var_names` to the whitespace-separated tokens of each input (in order, integers when possible) and binds `out` to the program's output (an integer when possible).\n
++* Evaluates each expression in `expressions` on every row (math module functions, comb, perm, gcd, lcm, isqrt, factorial, abs, min, max, sum, pow, divmod, range, len, int, round; no other builtins). An expression matches a row when its value equals `out`.\n
++* Reports the match count per expression and the first 5 counterexamples (input, output, expression value).\n
++Use it to test a hypothesis such as '2**n - 1' or 'n*(n+1)//2' against brute-force data before writing solution.py.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "program_path": {
++                    "type": "string",
++                    "description": "Path to the Python program that reads stdin and writes the answer to stdout (for example the brute force)."
++                },
++                "param_grid": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of stdin strings, one per test (for example '3\\n' or '2 5\\n'). At most 300 entries."
++                },
++                "expressions": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Python expressions over the variable names (and `out`) that should equal the program's output, for example 'n*(n+1)//2'."
++                },
++                "var_names": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Names for the whitespace-separated tokens of each input, in order, for example ['n'] or ['n', 'k']."
++                }
++            },
++            "required": ["program_path", "param_grid", "expressions"]
++        }
++    }
++
++
++def _allowed_names():
++    ns = {}
++    for name in dir(math):
++        if not name.startswith('_'):
++            ns[name] = getattr(math, name)
++    for name in ('abs', 'min', 'max', 'sum', 'len', 'range', 'int', 'round', 'pow', 'divmod',
++                 'bool', 'sorted', 'all', 'any', 'float'):
++        ns[name] = __builtins__[name] if isinstance(__builtins__, dict) else getattr(__builtins__, name)
++    ns['comb'] = math.comb
++    ns['perm'] = math.perm
++    ns['isqrt'] = math.isqrt
++    ns['gcd'] = math.gcd
++    ns['lcm'] = math.lcm
++    return ns
++
++
++def _parse_value(text):
++    text = text.strip()
++    try:
++        return int(text)
++    except ValueError:
++        return text
++
++
++class _EvalTimeout(Exception):
++    pass
++
++
++def _on_alarm(signum, frame):
++    raise _EvalTimeout()
++
++
++def _eval_expr(code, env):
++    """Evaluate compiled code in env; returns (value, error_string_or_None)."""
++    use_alarm = hasattr(signal, 'SIGALRM') and hasattr(signal, 'setitimer')
++    old = None
++    try:
++        if use_alarm:
++            old = signal.signal(signal.SIGALRM, _on_alarm)
++            signal.setitimer(signal.ITIMER_REAL, _EVAL_SECONDS)
++        return eval(code, env), None
++    except _EvalTimeout:
++        return None, 'evaluation timed out'
++    except Exception as e:  # noqa: BLE001 - report any evaluation error as a mismatch
++        return None, f"{type(e).__name__}: {e}"
++    finally:
++        if use_alarm:
++            signal.setitimer(signal.ITIMER_REAL, 0)
++            if old is not None:
++                signal.signal(signal.SIGALRM, old)
++
++
++def _run_program(program_path, stdin_text, timeout):
++    try:
++        proc = subprocess.run([sys.executable, '-I', program_path], input=stdin_text,
++                              capture_output=True, text=True, timeout=timeout,
++                              cwd=os.path.dirname(os.path.abspath(program_path)) or None)
++    except subprocess.TimeoutExpired:
++        return None, 'TIMEOUT'
++    if proc.returncode != 0:
++        err = (proc.stderr or '').strip().splitlines()
++        return None, f"ERROR(rc={proc.returncode}): {err[-1] if err else ''}"
++    return proc.stdout.strip(), None
++
++
++def tool_function(program_path, param_grid, expressions, var_names=None, timeout=10):
++    if not program_path or not os.path.isfile(program_path):
++        return f"Error: program not found: {program_path}"
++    if not isinstance(param_grid, list) or not param_grid:
++        return "Error: param_grid must be a non-empty list of input strings."
++    if not isinstance(expressions, list) or not expressions:
++        return "Error: expressions must be a non-empty list of Python expressions."
++    var_names = list(var_names or [])
++    if len(param_grid) > _MAX_ROWS:
++        return f"Error: param_grid has {len(param_grid)} rows; the limit is {_MAX_ROWS}."
++    try:
++        timeout = max(1, int(timeout or 10))
++    except (TypeError, ValueError) as e:
++        return f"Error: invalid timeout: {e}"
++
++    compiled = []
++    for expr in expressions:
++        try:
++            compiled.append((expr, compile(str(expr), '<expr>', 'eval')))
++        except SyntaxError as e:
++            return f"Error: expression {expr!r} has a syntax error: {e.msg}"
++
++    # Run the program on every grid entry.
++    rows = []
++    for inp in param_grid:
++        inp_text = str(inp)
++        if inp_text and not inp_text.endswith('\n'):
++            inp_text += '\n'
++        out, err = _run_program(program_path, inp_text, timeout)
++        rows.append({'input': inp_text, 'out_text': out if err is None else err, 'error': err})
++
++    # Evaluate expressions per row.
++    base = _allowed_names()
++    stats = {expr: {'matches': 0, 'counter': []} for expr, _ in compiled}
++    evaluated = 0
++    for row in rows:
++        tokens = row['input'].split()
++        env = dict(base)
++        env['__builtins__'] = {}
++        for i, name in enumerate(var_names):
++            if i < len(tokens):
++                env[name] = _parse_value(tokens[i])
++        row_out = _parse_value(row['out_text']) if row['error'] is None else None
++        env['out'] = row_out
++        for expr, code in compiled:
++            if row['error'] is not None:
++                if len(stats[expr]['counter']) < _MAX_COUNTEREXAMPLES:
++                    stats[expr]['counter'].append((row['input'], row['out_text'], 'skipped (program failed)'))
++                continue
++            value, err = _eval_expr(code, env)
++            if err is None and value == row_out:
++                stats[expr]['matches'] += 1
++            elif len(stats[expr]['counter']) < _MAX_COUNTEREXAMPLES:
++                stats[expr]['counter'].append((row['input'], row['out_text'], err if err else repr(value)))
++        if row['error'] is None:
++            evaluated += 1
++
++    lines = [f"program: {program_path}  rows: {len(rows)}  program-ok rows: {evaluated}"]
++    lines.append("")
++    lines.append("table (input -> output):")
++    shown = rows[:_SHOW_ROWS]
++    for row in shown:
++        inp = row['input'].strip().replace('\n', ' | ') or '(empty)'
++        lines.append(f"  {inp:<30} -> {row['out_text'][:60]}")
++    if len(rows) > _SHOW_ROWS:
++        lines.append(f"  ... ({len(rows) - _SHOW_ROWS} more rows not shown)")
++    lines.append("")
++    for expr, _ in compiled:
++        st = stats[expr]
++        lines.append(f"expression: {expr}  matches: {st['matches']}/{len(rows)}")
++        if st['matches'] < len(rows):
++            lines.append(f"  first counterexamples (up to {_MAX_COUNTEREXAMPLES}):")
++            for inp, out_text, value in st['counter']:
++                lines.append(f"    input={inp.strip()!r} output={out_text!r} expression_value={value}")
++    return "\n".join(lines)

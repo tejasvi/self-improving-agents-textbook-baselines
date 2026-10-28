@@ -1,0 +1,438 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 6727f24..195a54b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import sys
+ import threading
+ import tempfile
+ 
+@@ -96,6 +97,66 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++MAX_STAGE_RETRIES = 3
++MIN_ANALYSIS_CHARS = 20
++
++
++def _append(path, text):
++    with open(path, 'a') as f:
++        f.write(text)
++
++
++def _reply_text(msg_history):
++    """Text of the last assistant message, or '' if the last message is not an assistant reply."""
++    if not msg_history or msg_history[-1].get('role') != 'assistant':
++        return ''
++    content = msg_history[-1].get('content')
++    if isinstance(content, str):
++        return content.strip()
++    parts = []
++    for block in content or []:
++        if isinstance(block, dict) and block.get('type') == 'text':
++            parts.append(block.get('text') or '')
++        elif isinstance(block, str):
++            parts.append(block)
++    return '\n'.join(parts).strip()
++
++
++def _nonempty_file(path):
++    return os.path.isfile(path) and os.path.getsize(path) > 0
++
++
++def _compiles(path):
++    """Smoke check: the file must at least byte-compile. Returns an error string or None."""
++    try:
++        p = subprocess.run([sys.executable, '-I', '-c',
++                            'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")', path],
++                           capture_output=True, text=True, timeout=30)
++    except subprocess.TimeoutExpired:
++        return f"{os.path.basename(path)} did not compile in time"
++    if p.returncode != 0:
++        return f"{os.path.basename(path)} has a syntax error: {p.stderr.strip()[-400:]}"
++    return None
++
++
++def _smoke_all(*names):
++    """Build a smoke check that byte-compiles each named file in helper_dir."""
++    def check(helper_dir):
++        for n in names:
++            err = _compiles(os.path.join(helper_dir, n))
++            if err:
++                return err
++        return None
++    return check
++
++
++def _smoke_modes(helper_dir):
++    path = os.path.join(helper_dir, 'modes.txt')
++    with open(path) as f:
++        n = len([line for line in f if line.strip()])
++    return None if n > 0 else "modes.txt has no mode names"
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -177,36 +238,20 @@ The final solution.py is what gets graded; helper files are ignored."""
+         phase_a = f"{task}\n\n{method}\n\nFor now do only steps 1-3 and 5 (write solution.py and pass all samples). Do not write any stress tests yet; that comes in the next step."
+         msg_history = chat_with_agent(phase_a, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        phase_b = f"""Phase B: build an independent self-testing harness. Put ALL helper files in the directory {helper_dir} (NOT inside {self.git_tempdir}, do not modify any other repo file). Write these files there:
+-
+-1. Before writing gen.py, state your explicit list of edge-case classes for THIS problem (e.g. minimal N, N=1, heavy duplicates, all-equal values, extreme values at the bounds, planted solution at the first/last position, no solution by construction, maximal answers, overflow-prone sums, etc.). Write that list in your reply.
+-
+-2. `brute.py`: a simple, obviously-correct brute force that reads stdin and prints the output in the exact format of the statement. It must work for small inputs. Verify it on the samples.
+-
+-3. `alt_solution.py`: a DIFFERENT, efficient algorithm (not a tweak of solution.py) that reads stdin and prints the same format. It must be fast enough for max-size inputs. Check that it agrees with brute.py on many small random inputs before trusting it.
+-
+-4. `gen.py`: usage `python3 gen.py MODE SEED`; it prints exactly ONE valid input to stdout, using random.Random(SEED) only (deterministic). Required modes (create one for each edge-case class of your list, using names of the form):
+-   - small-value random tiny inputs (e.g. `tiny_random`)
+-   - heavy duplicates (`duplicates`)
+-   - all values equal (`all_equal`)
+-   - boundary values (`boundary`)
+-   - planted answer: a valid YES instance built by construction (`planted`)
+-   - no answer by construction when the statement allows NO answers (`no_answer`)
+-   - a max-size variant of each of the above, named with the prefix `max_` (e.g. `max_duplicates`, `max_planted`). Max-size means the largest constraints in the statement, and the generator must still produce VALID inputs.
+-   Write the list of mode names, one per line, into {modes_file}. Do not put the max_ modes in any other place.
+-
+-5. `checker.py`: usage `python3 checker.py INPUT_FILE SOLUTION_OUTPUT_FILE REFERENCE_OUTPUT_FILE`. Exit 0 if the solution output is acceptable for the input according to the statement, otherwise exit non-zero and print the reason. If many outputs are valid (e.g. any valid construction), check validity against the statement rather than exact equality. If the answer is unique, compare exactly with the reference output. The checker must be independent of solution.py.
+-
+-Then check that gen.py produces valid inputs in every mode, that brute.py and alt_solution.py agree on tiny inputs, and that the checker accepts the reference output on them.
+-
+-Rules for the final tests: for every max-size YES instance, the expected answer must be verified by the checker (not only timed). Reject any max-size test whose expected answer you have not computed. Do not treat a max-size test as valid just because solution.py runs fast on it.
+-
+-Do not modify solution.py in this phase unless you find a real bug in it."""
+-        msg_history = chat_with_agent(phase_b, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        msg_history, kind = self._build_harness(helper_dir, msg_history, modes_file)
+ 
+         K = 3
+         for rnd in range(K):
+-            report, failed = self._run_stress_round(helper_dir, sol_path, modes_file)
++            report, failed = self._run_stress_round(helper_dir, sol_path, modes_file, kind)
++            if report.startswith('HARNESS MISSING'):
++                _append(attempts_file, f"\n## Round {rnd + 1}: {report}\n")
++                safe_log(f"[stress] round {rnd + 1}: {report}; running fallback stage")
++                msg_history = self._fallback_stage(helper_dir, msg_history, modes_file, kind, report)
++                report, failed = self._run_stress_round(helper_dir, sol_path, modes_file, kind)
++                if report.startswith('HARNESS MISSING'):
++                    _append(attempts_file, f"\n## Round {rnd + 1} (after fallback): {report}\n")
++                    safe_log(f"[stress] harness still missing after fallback: {report}")
++                    break
+             with open(attempts_file, 'a') as f:
+                 f.write(f"\n## Round {rnd + 1}\n")
+                 f.write((report or 'stress test could not run').strip()[:4000] + "\n")
+@@ -232,7 +277,7 @@ Summary of earlier rounds (full log in {attempts_file}):
+ Instructions:
+ - Read the failing inputs and both outputs. Decide whether solution.py, brute.py/alt_solution.py (reference) or the checker is wrong, and verify it by hand on the failing input (for small inputs run brute.py directly).
+ - Fix solution.py (the repo file) so that it is correct. Do not weaken checker.py or the reference to hide a real bug.
+-- Re-run the samples, and then re-run the stress_test tool on all modes (the modes are listed in {modes_file}; use ref_path=brute.py for small modes and ref_path=alt_solution.py for max_ modes, with checker_path=checker.py).
++- Re-run the samples, and then re-run the stress_test tool on all modes (the modes are listed in {modes_file}). Use the same harness as before: judge_path=judge.py for an interactive problem; otherwise ref_path=brute.py for small modes, ref_path=alt_solution.py for max_ modes, with checker_path=checker.py.
+ - Do not repeat an approach that already failed according to the summary above.
+ - Reply with a short summary of what you changed."""
+             msg_history = chat_with_agent(phase_c, model=self.code_model, msg_history=msg_history, logging=safe_log)
+@@ -245,29 +290,180 @@ Instructions:
+ Then give a short final summary."""
+         msg_history = chat_with_agent(final, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+-    def _run_stress_round(self, helper_dir, sol_path, modes_file):
+-        """Run the stress test tool on the current solution. Returns (raw_report, failed_flag)."""
++    def _run_stage(self, helper_dir, msg_history, name, prompt, required, smoke=None, min_reply=1):
++        """One staged chat turn with verification and bounded corrective retries.
++        Returns (msg_history, ok). Every outcome is logged to attempts.md."""
++        attempts_file = os.path.join(helper_dir, 'attempts.md')
++        for attempt in range(MAX_STAGE_RETRIES + 1):
++            if attempt == 0:
++                msg = prompt
++            else:
++                missing_now = [f for f in required if not _nonempty_file(os.path.join(helper_dir, f))]
++                if missing_now:
++                    msg = (f"The file {missing_now[0]} was not created. Write it now using the editor tool, "
++                           f"keeping the content under 150 lines. Files still missing: {', '.join(missing_now)}. Reply briefly.")
++                else:
++                    msg = ("Your last reply was empty or cut off. Continue now: finish the task for this step "
++                           "using the editor tool, keeping the content under 150 lines. Reply briefly.")
++            msg_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++            problems = []
++            missing = [f for f in required if not _nonempty_file(os.path.join(helper_dir, f))]
++            if missing:
++                problems.append(f"missing or empty: {', '.join(missing)}")
++            reply = _reply_text(msg_history)
++            if len(reply) < min_reply:
++                problems.append("last assistant reply is empty or too short")
++            if not missing and smoke is not None:
++                err = smoke(helper_dir)
++                if err:
++                    problems.append(f"smoke check failed: {err}")
++            if not problems:
++                safe_log(f"[harness] stage '{name}' ok (attempt {attempt + 1})")
++                _append(attempts_file, f"\n## Stage {name}: OK (attempt {attempt + 1})\n")
++                return msg_history, True
++            safe_log(f"[harness] stage '{name}' attempt {attempt + 1} failed: {'; '.join(problems)}")
++            _append(attempts_file, f"\n## Stage {name}: FAILED attempt {attempt + 1}: {'; '.join(problems)}\n")
++        return msg_history, False
++
++    def _build_harness(self, helper_dir, msg_history, modes_file):
++        """Build the self-test harness in short verified stages. Returns (msg_history, kind)."""
++        attempts_file = os.path.join(helper_dir, 'attempts.md')
++        reuse = ("If during the solving step you already wrote a brute force or a simulated judge outside the repo "
++                 f"(e.g. in /tmp), copy it into {helper_dir} with a shell `cp` and reuse it instead of rewriting it. ")
++        analyze_prompt = (
++            "Phase B, stage 'analyze'. Do NOT write any file in this step. Classify the problem as one of: "
++            "batch (one exact answer per input), interactive (the program exchanges queries with a judge), or "
++            "multi-answer (many valid outputs, a checker is needed). Then list the edge-case classes for THIS problem "
++            "in a few lines (e.g. minimal N, N=1, duplicates, all-equal, bound values, no-answer, maximal answers). "
++            "The first line of your reply must be exactly `TYPE: batch`, `TYPE: interactive` or `TYPE: multi-answer`. Reply briefly.")
++        msg_history, ok = self._run_stage(helper_dir, msg_history, 'analyze', analyze_prompt, [],
++                                          None, min_reply=MIN_ANALYSIS_CHARS)
++        kind = self._problem_kind(msg_history)
++        _append(attempts_file, f"\nProblem kind: {kind}\n")
++        for name, prompt, required, smoke in self._stage_list(helper_dir, modes_file, kind, reuse):
++            msg_history, ok = self._run_stage(helper_dir, msg_history, name, prompt, required, smoke)
++            if not ok:
++                safe_log(f"[harness] stage '{name}' failed after retries; continuing with what exists")
++        return msg_history, kind
++
++    def _problem_kind(self, msg_history):
++        """'interactive' if the analysis reply declares TYPE: interactive, else 'batch'."""
++        for line in _reply_text(msg_history).splitlines()[:5]:
++            low = line.lower()
++            if 'type' in low and 'interactive' in low:
++                return 'interactive'
++            if 'type' in low:
++                return 'batch'
++        return 'batch'
++
++    def _stage_list(self, helper_dir, modes_file, kind, reuse):
++        """Ordered (name, prompt, required_files, smoke_check) stages after the analysis."""
++        d = helper_dir
++        if kind == 'interactive':
++            checker_stage = ('judge', (
++                f"Phase B, stage 'judge'. Write only judge.py in {d}. {reuse}Usage: `python3 judge.py SOLUTION_PATH INPUT_FILE`. "
++                "The judge reads the generator input file (which seeds the hidden data), builds the hidden structure from "
++                "that seed, spawns SOLUTION_PATH with subprocess pipes (`python3 -I`), answers each query from the hidden data, "
++                "counts queries against the query limit stated in the problem, and exits non-zero with a short reason on "
++                "a protocol violation (malformed or missing reply), a query-limit violation, or a wrong final answer. "
++                "Exit 0 only when the solution answers correctly within the limit. Keep it under 150 lines. Reply briefly."),
++                ['judge.py'], _smoke_all('judge.py'))
++        else:
++            checker_stage = ('checker', (
++                f"Phase B, stage 'checker'. Write only checker.py in {d}. Usage: `python3 checker.py INPUT_FILE SOLUTION_OUTPUT_FILE REFERENCE_OUTPUT_FILE`. "
++                "Exit 0 if the solution output is acceptable for the input according to the statement, otherwise exit non-zero "
++                "and print the reason. If many outputs are valid, check validity against the statement; if the answer is unique, "
++                "compare with the reference output. It must not reuse solution.py. Keep it under 150 lines. Reply briefly."),
++                ['checker.py'], _smoke_all('checker.py'))
++        return [
++            ('brute', (
++                f"Phase B, stage 'brute'. Write only brute.py in {d}. {reuse}"
++                "brute.py is a simple, obviously-correct brute force that reads stdin and prints the output in the exact "
++                "format of the statement. Verify it on the samples. Reply briefly."),
++                ['brute.py'], _smoke_all('brute.py')),
++            ('gen_basic', (
++                f"Phase B, stage 'gen_basic'. Write only gen.py in {d}. Usage: `python3 gen.py MODE SEED`; it prints exactly ONE valid "
++                "input to stdout using random.Random(SEED) only (deterministic). Start with a few small modes: "
++                "tiny_random, duplicates, all_equal, boundary, and planted or no_answer when the statement allows them. "
++                "Keep it under 150 lines. Reply briefly."),
++                ['gen.py'], _smoke_all('gen.py')),
++            ('gen_max', (
++                f"Phase B, stage 'gen_max'. Edit only gen.py in {d}: add max_ variants (max_tiny_random, max_duplicates, "
++                "max_planted, ...) that produce the LARGEST valid inputs allowed by the statement. They must still be valid. "
++                "Keep gen.py under 150 lines. Reply briefly."),
++                ['gen.py'], _smoke_all('gen.py')),
++            checker_stage,
++            ('alt', (
++                f"Phase B, stage 'alt'. Write only alt_solution.py in {d}. It is a DIFFERENT efficient algorithm (not a tweak of "
++                "solution.py) that reads stdin and prints the same format, fast enough for max-size inputs. Check that it agrees "
++                "with brute.py on several small random inputs. Keep it under 150 lines. Reply briefly."),
++                ['alt_solution.py'], _smoke_all('alt_solution.py')),
++            ('modes', (
++                f"Phase B, stage 'modes'. Write only modes.txt in {d}: one generator mode name per line, listing every mode "
++                "gen.py supports (including the max_ modes). Reply briefly."),
++                ['modes.txt'], _smoke_modes),
++        ]
++
++    def _fallback_stage(self, helper_dir, msg_history, modes_file, kind, report):
++        """Minimal fallback when the harness is missing: brute/judge + random generator + modes.txt."""
++        if kind == 'interactive':
++            required = ['judge.py', 'gen.py', 'modes.txt']
++            what = "judge.py (usage `python3 judge.py SOLUTION_PATH INPUT_FILE`) and gen.py"
++        else:
++            required = ['brute.py', 'gen.py', 'modes.txt']
++            what = "brute.py (simple correct brute force) and gen.py (random small inputs)"
++        prompt = (
++            f"Minimal fallback stage. The self-test harness in {helper_dir} is incomplete:\n{report}\n"
++            f"Write ONLY the missing files now: {what}, plus modes.txt listing the generator modes (e.g. `random`). "
++            f"{'' if kind == 'interactive' else 'Compare outputs by tokens against brute.py; no checker is needed. '}"
++            "Keep each file under 150 lines and reply briefly.")
++        msg_history, ok = self._run_stage(helper_dir, msg_history, 'fallback', prompt, required, _smoke_modes)
++        return msg_history
++
++    def _run_stress_round(self, helper_dir, sol_path, modes_file, kind='batch'):
++        """Run the stress test tool on the current solution. Returns (raw_report, failed_flag).
++        A missing harness is reported as 'HARNESS MISSING: <files>' with failed_flag True."""
+         gen = os.path.join(helper_dir, 'gen.py')
+         brute = os.path.join(helper_dir, 'brute.py')
+         alt = os.path.join(helper_dir, 'alt_solution.py')
+         checker = os.path.join(helper_dir, 'checker.py')
+-        try:
+-            with open(modes_file) as f:
+-                modes = [line.strip() for line in f if line.strip()]
+-        except OSError:
+-            return "modes file missing", True
++        judge = os.path.join(helper_dir, 'judge.py')
++        if kind == 'interactive':
++            needed = {'gen.py': gen, 'judge.py': judge}
++        else:
++            needed = {'gen.py': gen, 'brute.py': brute}
++        needed['modes.txt'] = modes_file
++        missing = [name for name, path in needed.items() if not _nonempty_file(path)]
++        if missing:
++            return f"HARNESS MISSING: {', '.join(missing)}", True
++        with open(modes_file) as f:
++            modes = [line.strip() for line in f if line.strip()]
++        if not modes:
++            return "HARNESS MISSING: modes.txt (no mode names)", True
+         small = [m for m in modes if not m.startswith('max_')]
+         big = [m for m in modes if m.startswith('max_')]
+         parts = []
+         try:
+-            if small:
+-                parts.append("### small modes (reference: brute.py)\n" + stress_test(
+-                    solution_path=sol_path, gen_path=gen, ref_path=brute, checker_path=checker,
+-                    modes=small, seeds_per_mode=30, timeout=10))
+-            if big:
+-                parts.append("### max modes (reference: alt_solution.py)\n" + stress_test(
+-                    solution_path=sol_path, gen_path=gen, ref_path=alt, checker_path=checker,
+-                    modes=big, seeds_per_mode=1, timeout=60))
++            if kind == 'interactive':
++                if small:
++                    parts.append("### small modes (judge: judge.py)\n" + stress_test(
++                        solution_path=sol_path, gen_path=gen, ref_path=None, judge_path=judge,
++                        modes=small, seeds_per_mode=30, timeout=10))
++                if big:
++                    parts.append("### max modes (judge: judge.py)\n" + stress_test(
++                        solution_path=sol_path, gen_path=gen, ref_path=None, judge_path=judge,
++                        modes=big, seeds_per_mode=1, timeout=60))
++            else:
++                checker_path = checker if os.path.isfile(checker) else None
++                if small:
++                    parts.append("### small modes (reference: brute.py)\n" + stress_test(
++                        solution_path=sol_path, gen_path=gen, ref_path=brute, checker_path=checker_path,
++                        modes=small, seeds_per_mode=30, timeout=10))
++                if big:
++                    parts.append("### max modes (reference: alt_solution.py)\n" + stress_test(
++                        solution_path=sol_path, gen_path=gen, ref_path=alt if os.path.isfile(alt) else brute,
++                        checker_path=checker_path, modes=big, seeds_per_mode=1, timeout=60))
+         except Exception as e:
+             parts.append(f"stress test raised: {type(e).__name__}: {e}")
+             return "\n".join(parts), True
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index ed61658..ff3055c 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -17,6 +17,7 @@ def tool_info():
+ * `gen_path` is a script run as `python3 gen.py MODE SEED` (in a clean subprocess) that prints ONE test input to stdout.
+ * For every mode in `modes` and every seed in 0..seeds_per_mode-1, the input is generated, then solution_path and ref_path are run on it in clean subprocesses (`python3 -I`, scrubbed env).
+ * If `checker_path` is given it is run as `python3 checker.py input_file solution_output_file ref_output_file` and must exit 0 when the solution output is valid. Otherwise the whitespace-separated tokens of the solution output and the reference output must match exactly.
++* If `judge_path` is given (interactive problems), the judge is run instead: `python3 judge.py solution_path input_file` for every generated input. The judge spawns the solution itself and exits non-zero on a protocol/limit/answer violation. ref_path and checker_path are then not used. The judge's stdout, stderr and exit code are reported raw.
+ * Returns RAW text only: per-mode pass/fail counts, the max elapsed time per mode, the elapsed time and length of the largest input per mode, and the first few failing cases with the input, both outputs, the checker output and stderr (all clipped). Nothing is parsed or interpreted.""",
+         "input_schema": {
+             "type": "object",
+@@ -31,12 +32,16 @@ def tool_info():
+                 },
+                 "ref_path": {
+                     "type": "string",
+-                    "description": "Path to the reference (trusted, slow-but-correct) solution Python file reading stdin."
++                    "description": "Path to the reference (trusted, slow-but-correct) solution Python file reading stdin. Required unless judge_path is given."
+                 },
+                 "checker_path": {
+                     "type": "string",
+                     "description": "Optional path to a checker script called as `python3 checker_path input_file solution_output_file ref_output_file`; exit code 0 means the solution output is acceptable."
+                 },
++                "judge_path": {
++                    "type": "string",
++                    "description": "Optional path to an interactive judge script, called as `python3 judge_path solution_path input_file` for every generated input. Exit code 0 means the solution passed. When given, ref_path and checker_path are ignored and the judge's raw stdout/stderr/exit code are reported."
++                },
+                 "modes": {
+                     "type": "array",
+                     "items": {"type": "string"},
+@@ -51,7 +56,7 @@ def tool_info():
+                     "description": "Per-run time limit in seconds for generator, solution, reference and checker (default 10)."
+                 }
+             },
+-            "required": ["solution_path", "gen_path", "ref_path", "modes", "seeds_per_mode"]
++            "required": ["solution_path", "gen_path", "modes", "seeds_per_mode"]
+         }
+     }
+ 
+@@ -87,7 +92,7 @@ def _tokens_equal(a, b):
+ 
+ 
+ def tool_function(solution_path, gen_path, ref_path, modes, seeds_per_mode,
+-                  checker_path=None, timeout=10):
++                  checker_path=None, timeout=10, judge_path=None):
+     try:
+         timeout = max(1, min(int(timeout or 10), 120))
+     except (TypeError, ValueError):
+@@ -100,13 +105,20 @@ def tool_function(solution_path, gen_path, ref_path, modes, seeds_per_mode,
+         modes = [modes]
+     if not modes:
+         return "Error: modes is empty"
+-    for p in [solution_path, gen_path, ref_path] + ([checker_path] if checker_path else []):
++    if judge_path:
++        needed = [solution_path, gen_path, judge_path]
++    else:
++        if not ref_path:
++            return "Error: ref_path is required when judge_path is not given"
++        needed = [solution_path, gen_path, ref_path] + ([checker_path] if checker_path else [])
++    for p in needed:
+         if not os.path.isfile(p):
+             return f"Error: file not found: {p}"
+     solution_path = os.path.abspath(solution_path)
+     gen_path = os.path.abspath(gen_path)
+-    ref_path = os.path.abspath(ref_path)
++    ref_path = os.path.abspath(ref_path) if ref_path else None
+     checker_path = os.path.abspath(checker_path) if checker_path else None
++    judge_path = os.path.abspath(judge_path) if judge_path else None
+ 
+     stats = {}
+     fails = []  # (mode, seed, reason, input, sol_out, ref_out, stderr)
+@@ -126,6 +138,22 @@ def tool_function(solution_path, gen_path, ref_path, modes, seeds_per_mode,
+                 with open(in_file, 'w') as f:
+                     f.write(inp)
+ 
++                if judge_path:
++                    j = _run([sys.executable, '-I', judge_path, solution_path, in_file], tmp,
++                             timeout=max(timeout, 30))
++                    st['max_elapsed'] = max(st['max_elapsed'], j['elapsed'])
++                    if len(inp) > st['largest_len']:
++                        st['largest_len'] = len(inp)
++                        st['largest_elapsed'] = j['elapsed']
++                        st['largest_seed'] = seed
++                    if j['rc'] != 0:
++                        st['fail'] += 1
++                        fails.append((mode, seed, f"judge rejected (rc={j['rc']})", inp,
++                                      j['stdout'], '(judge mode: no reference output)', j['stderr']))
++                    else:
++                        st['pass'] += 1
++                    continue
++
+                 s = _run([sys.executable, '-I', solution_path], tmp, data=inp, timeout=timeout)
+                 r = _run([sys.executable, '-I', ref_path], tmp, data=inp, timeout=max(timeout, 30))
+                 st['max_elapsed'] = max(st['max_elapsed'], s['elapsed'])
+@@ -173,7 +201,10 @@ def tool_function(solution_path, gen_path, ref_path, modes, seeds_per_mode,
+     out = []
+     out.append("== Stress test summary ==")
+     out.append(f"solution: {solution_path}")
+-    out.append(f"generator: {gen_path}  reference: {ref_path}  checker: {checker_path or '(token comparison)'}")
++    if judge_path:
++        out.append(f"generator: {gen_path}  judge: {judge_path}  (interactive judge mode)")
++    else:
++        out.append(f"generator: {gen_path}  reference: {ref_path}  checker: {checker_path or '(token comparison)'}")
+     out.append(f"seeds per mode: {seeds_per_mode}, timeout: {timeout}s")
+     for mode, st in stats.items():
+         out.append(

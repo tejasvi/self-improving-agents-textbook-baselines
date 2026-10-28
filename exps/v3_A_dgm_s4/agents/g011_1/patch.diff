@@ -1,0 +1,214 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0cfe4d1..952b40b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,7 @@ import os
+ import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -227,11 +228,22 @@ class AgenticSystem:
+ 
+     def _infer_target_file(self):
+         """
+-        Infer the primary solution file from the problem statement (first *.py name), default solution.py.
++        Infer the primary solution file from the problem statement.
++        Prefers a backticked or bare *.py name that already exists in the repo,
++        then any mentioned *.py name, defaulting to solution.py.
+         Returns its absolute path under git_tempdir.
+         """
+-        match = re.search(r'(?<![\w/.-])([A-Za-z_][\w-]*\.py)\b', self.problem_statement or '')
+-        name = match.group(1) if match else 'solution.py'
++        text = self.problem_statement or ''
++        names = []
++        for m in re.finditer(r'`([A-Za-z_][\w/-]*\.py)`', text):
++            names.append(m.group(1))
++        for m in re.finditer(r'(?<![\w/.-])([A-Za-z_][\w-]*\.py)\b', text):
++            names.append(m.group(1))
++        for name in names:
++            candidate = os.path.abspath(os.path.join(self.git_tempdir, name))
++            if os.path.exists(candidate):
++                return candidate
++        name = names[0] if names else 'solution.py'
+         return os.path.abspath(os.path.join(self.git_tempdir, name))
+ 
+     def _has_source_edits(self):
+@@ -240,11 +252,8 @@ class AgenticSystem:
+         """
+         return any(not self._is_test_file(f) for f in self._get_changed_files())
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    def _task_text(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -252,7 +261,9 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        workflow = f"""
++
++    def _workflow_text(self):
++        return f"""
+ 
+ Follow these steps:
+ 1. Explore the repository in {self.git_tempdir} with the bash and editor tools (list files, read any existing solution stub, README, or tests).
+@@ -262,7 +273,75 @@ Follow these steps:
+ 5. Fix any failures or mismatches, then re-run the tests until the outputs are correct.
+ 6. Always finish with the solution file saved on disk. A text-only reply without file edits is a failure.
+ """
+-        instruction = f"{task}{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++
++    def _full_prompt(self, extra):
++        """Every prompt sent to the model includes the full problem statement."""
++        return f"{self._task_text()}{self._workflow_text()}\n{extra}"
++
++    def _log_empty_response(self, msg_history, label):
++        """Log raw history and stop_reason when the last assistant reply has no tool calls and no text."""
++        last = None
++        for m in (msg_history or []):
++            if isinstance(m, dict) and m.get('role') == 'assistant':
++                last = m
++        if last is None:
++            return
++        content = last.get('content')
++        blocks = content if isinstance(content, list) else [content]
++        has_tool = False
++        has_text = False
++        for b in blocks:
++            btype = b.get('type') if isinstance(b, dict) else getattr(b, 'type', None)
++            text = b.get('text') if isinstance(b, dict) else getattr(b, 'text', None)
++            if btype in ('tool_use', 'function_call', 'tool_call'):
++                has_tool = True
++            if isinstance(text, str) and text.strip():
++                has_text = True
++            if isinstance(b, str) and b.strip():
++                has_text = True
++        if not has_tool and not has_text:
++            stop_reason = last.get('stop_reason', None)
++            safe_log(f"[forward] {label}: empty assistant reply with no tool calls. stop_reason={stop_reason}. raw={msg_history!r}", logging.WARNING)
++
++    def _direct_generate_solution(self, target_path):
++        """
++        Fallback: ask the model once, without tools, for the full program and write it to target_path.
++        Returns True if a non-empty file was written.
++        """
++        prompt = (
++            f"{self._task_text()}\n"
++            "Reply with ONLY the complete Python 3 program inside a ```python fenced block. "
++            "It must read from standard input and write to standard output."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            resp, _ = get_response_from_llm(
++                prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer.",
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"[forward] Direct generation failed: {e}", logging.WARNING)
++            return False
++        resp = resp or ''
++        match = re.search(r'```(?:python|py)?\s*\n(.*?)```', resp, re.S)
++        code = match.group(1) if match else resp
++        if not code.strip():
++            safe_log("[forward] Direct generation returned empty code", logging.WARNING)
++            return False
++        os.makedirs(os.path.dirname(target_path), exist_ok=True)
++        with open(target_path, 'w') as f:
++            f.write(code)
++        safe_log(f"[forward] Direct generation wrote {target_path}")
++        return True
++
++    def forward(self):
++        """
++        The forward function for the AgenticSystem.
++        """
++        instruction = self._full_prompt("Please analyze the problem description carefully. Then make edits to the code files to complete the instruction.")
+         target_path = self._infer_target_file()
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+@@ -274,39 +353,49 @@ Follow these steps:
+             return has_src
+ 
+         _log_state("Initial call done")
+-        recovery = (
+-            f"{task}\n"
+-            "Your previous attempt produced no file edits. Do NOT explore first. "
+-            f"Immediately call the editor tool with command=create (or edit if the file exists) on {target_path} "
+-            "to write a full working program that reads stdin and writes stdout. "
+-            "After it is saved, run the sample tests with bash and fix any errors."
+-        )
+-        simple = f"Create the file {target_path} now with a complete working program that reads stdin and writes stdout using the editor tool."
++        self._log_empty_response(msg_history, "Initial call")
++
++        retry_prompts = [
++            self._full_prompt(
++                "Your previous attempt produced no file edits. Do NOT explore first. "
++                f"Your last reply was empty. Call the editor tool now with command=create (or command=edit if the file exists) on {target_path}. "
++                "Write a full working program that reads stdin and writes stdout, then run the sample tests with bash and fix any errors."
++            ),
++            self._full_prompt(
++                f"Your last reply was empty again. The problem statement is included above. Immediately call the editor tool on {target_path} "
++                "with a complete implementation. Do not reply with text only."
++            ),
++            self._full_prompt(
++                f"Last attempt failed again. Use the editor tool on {target_path} right now to write the complete solution, "
++                "then test it with the sample inputs using bash."
++            ),
++        ]
+ 
+-        for attempt in range(3):
++        for attempt, prompt in enumerate(retry_prompts):
+             if _log_state(f"Attempt {attempt + 1} check"):
+                 break
+-            cleaned = self._clean_history(msg_history)
+-            safe_log(f"[forward] Retry {attempt + 1}: no source edits; history cleaned from {len(msg_history)} to {len(cleaned)} messages; starting fresh context")
+-            prompt = recovery if attempt < 2 else simple
++            safe_log(f"[forward] Retry {attempt + 1}: no source edits; starting fresh context with full prompt")
+             # Fresh context: never reuse a history that ends with an empty assistant message
+             msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            self._log_empty_response(msg_history, f"Retry {attempt + 1}")
+ 
+         if not _log_state("Final check after retries"):
+-            if not os.path.exists(target_path):
+-                stub = "import sys\n\ndata = sys.stdin.read()\nprint(0)\n"
++            wrote = self._direct_generate_solution(target_path)
++            if wrote:
++                _log_state("After direct generation")
++                test_prompt = self._full_prompt(
++                    f"{target_path} now contains a draft. Test it against the sample inputs from the problem statement with bash "
++                    "and fix any bugs; edit the file with the editor tool."
++                )
++                msg_history = chat_with_agent(test_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++                self._log_empty_response(msg_history, "Test pass")
++                _log_state("After test/fix pass")
++            if not _log_state("After direct generation check") and not os.path.exists(target_path):
++                # Last resort only: direct generation failed, so write a minimal stub
+                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                 with open(target_path, 'w') as f:
+-                    f.write(stub)
+-                safe_log(f"[forward] Wrote stub to {target_path}")
+-            _log_state("After stub written")
+-            final_prompt = (
+-                f"A stub exists at {target_path}. It is only a placeholder and must be replaced with a real implementation "
+-                "that reads stdin and writes stdout. Use the editor tool to overwrite it with a full solution, "
+-                "then test it with the sample inputs using bash and fix any errors."
+-            )
+-            msg_history = chat_with_agent(final_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+-            _log_state("After final stub-replacement pass")
++                    f.write("import sys\n\ndata = sys.stdin.read()\nprint(0)\n")
++                safe_log(f"[forward] Direct generation failed; wrote last-resort stub to {target_path}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

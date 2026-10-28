@@ -1,0 +1,266 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index fa2f4f2..9f398e3 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -247,6 +247,12 @@ Step 2 - Implement the solution in the target file.
+ - Avoid depending on builtins that might be shadowed or restricted in the grader's environment. For hot-path primitives (modular exponentiation, gcd, etc.), consider writing small helper functions instead of relying on builtins whose behavior could differ. For example, write a manual square-and-multiply modular exponentiation instead of the 3-argument `pow` when the environment is uncertain.
+ - Include all imports you use explicitly (e.g. `from typing import List`), and do not shadow builtins with your own variable or function names (e.g. `list`, `sum`, `max`, `min`, `pow`, `input`, `len`, `str`).
+ - Keep the solution correct for the full constraints, not only for the examples: consider the time and memory complexity needed for the largest inputs.
++- If the answer is a real number (floating-point output), do precision-aware verification, because the hidden grader may compare more strictly than the problem's stated tolerance (e.g. 1e-6):
++  * Build an exact reference with fractions.Fraction or decimal.Decimal (brute force for small N) and run it against the solution on many random small inputs and on all samples. Target a max relative error <= 1e-11, not just the problem's tolerance.
++  * Use the compare_outputs tool to check the solution against the expected sample outputs (and against the exact reference on random small inputs). It reports max absolute/relative errors and the number of matching leading characters per case.
++  * Diff the printed sample output strings against the expected strings digit by digit and note the first differing digit position. If they differ only in the last few digits, that is a precision problem, not a formula problem.
++  * If the discrepancy is larger than ~1e-12 relative, reformulate for accuracy: use Horner-style recurrences, math.fsum for sums, exact Fraction arithmetic until the final division, Decimal with sufficient precision, and a consistent power computation (e.g. 0.9**k computed the same way everywhere, rather than mixing pow chains that accumulate error). Then re-verify.
++  * Print with enough digits (e.g. repr(x) or '%.12f' or as many significant digits as the problem's magnitude requires) rather than default short formatting.
+ 
+ Step 3 - Write a persistent test script OUTSIDE the repository, e.g. /tmp/test_solution.py.
+ - The script must import the solution module fresh (in a new process) from its file path, and must not rely on your interactive shell state.
+diff --git a/tests/test_compare_outputs_tool.py b/tests/test_compare_outputs_tool.py
+new file mode 100644
+index 0000000..fa40365
+--- /dev/null
++++ b/tests/test_compare_outputs_tool.py
+@@ -0,0 +1,34 @@
++import os
++import tempfile
++from tools.compare_outputs import tool_info, tool_function
++
++
++def _write(d, name, text):
++    p = os.path.join(d, name)
++    with open(p, "w") as f:
++        f.write(text)
++    return p
++
++
++def test_schema_nesting():
++    schema = tool_info()["input_schema"]
++    assert schema["type"] == "object"
++    assert set(schema["required"]) == {"solution_path", "inputs"}
++    for name, prop in schema["properties"].items():
++        assert "type" in prop and "description" in prop, name
++
++
++def test_exact_match_and_flag():
++    with tempfile.TemporaryDirectory() as d:
++        sol = _write(d, "sol.py", "import sys\nx=float(sys.stdin.read())\nprint(f'{x:.6f}')\n")
++        ok = tool_function(sol, ["1.5"], expected_outputs=["1.500000"])
++        assert "flagged cases" in ok and "none" in ok
++        bad = tool_function(sol, ["1.0000001234"], expected_outputs=["1.000000123400"], rel_tol=1e-12)
++        assert "FLAG: relative error" in bad
++
++
++def test_nonnumeric_exact():
++    with tempfile.TemporaryDirectory() as d:
++        sol = _write(d, "sol.py", "print('YES')\n")
++        out = tool_function(sol, ["x"], expected_outputs=["NO"])
++        assert "differs exactly" in out
+diff --git a/tools/compare_outputs.py b/tools/compare_outputs.py
+new file mode 100644
+index 0000000..5babe29
+--- /dev/null
++++ b/tools/compare_outputs.py
+@@ -0,0 +1,203 @@
++import math
++import subprocess
++import sys
++
++# Runs a solution script in a FRESH python process per test input, compares its stdout
++# against expected outputs (or a reference script's stdout), and reports per-case errors.
++# Numeric tokens are compared with absolute / relative error; other tokens exactly.
++
++
++def tool_info():
++    return {
++        "name": "compare_outputs",
++        "description": """Run a stdin/stdout Python solution on several inputs and compare its output precisely against expected outputs or a reference script.\n
++* Each entry of 'inputs' is the full stdin for one case; the solution is run in a fresh subprocess per case.\n
++* Provide either 'expected_outputs' (one string per input) or 'reference_path' (a Python script that produces the reference output on the same stdin). If both are given, expected_outputs is used.\n
++* Output is whitespace-tokenized. Numeric tokens get absolute and relative error; non-numeric tokens must match exactly.\n
++* Reports per case: actual output, expected output, max absolute error, max relative error, number of matching leading characters, and flags cases whose relative error exceeds rel_tol (default 1e-10). Also reports a summary of the maximum errors.\n
++* Use this to verify floating-point answers much more strictly than the problem's stated tolerance, and to see how many digits agree with the expected output.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python solution script (reads stdin, writes stdout)."
++                },
++                "inputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of stdin contents, one string per test case."
++                },
++                "expected_outputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Optional list of expected stdout strings, one per input, in the same order."
++                },
++                "reference_path": {
++                    "type": "string",
++                    "description": "Optional absolute path to a Python reference script that prints the correct output for the same stdin. Used when expected_outputs is not given."
++                },
++                "rel_tol": {
++                    "type": "number",
++                    "description": "Relative error threshold above which a case is flagged (default 1e-10)."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Timeout in seconds for each subprocess run (default 20)."
++                }
++            },
++            "required": ["solution_path", "inputs"]
++        }
++    }
++
++
++def _run_script(script_path, stdin_text, timeout):
++    """Run a python script with stdin_text. Returns (stdout, stderr, returncode) or raises TimeoutError."""
++    try:
++        proc = subprocess.run(
++            [sys.executable, script_path],
++            input=stdin_text,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        raise TimeoutError(f"timed out after {timeout} seconds")
++    return proc.stdout, proc.stderr, proc.returncode
++
++
++def _parse_number(token):
++    """Return float value of token if it is a finite numeric token, else None."""
++    try:
++        value = float(token)
++    except ValueError:
++        return None
++    if math.isnan(value) or math.isinf(value):
++        return None
++    return value
++
++
++def _common_prefix_len(a, b):
++    n = 0
++    for x, y in zip(a, b):
++        if x != y:
++            break
++        n += 1
++    return n
++
++
++def _compare_outputs(actual, expected):
++    """
++    Compare two output strings token by token.
++    Returns (max_abs_err, max_rel_err, prefix_len, problems) where problems is a list of strings.
++    max_abs_err / max_rel_err are None when no numeric comparison was possible.
++    """
++    problems = []
++    a_tokens = actual.split()
++    e_tokens = expected.split()
++    prefix = _common_prefix_len(actual.strip(), expected.strip())
++    max_abs = None
++    max_rel = None
++    if len(a_tokens) != len(e_tokens):
++        problems.append(f"token count differs: actual {len(a_tokens)} vs expected {len(e_tokens)}")
++    for idx, (a, e) in enumerate(zip(a_tokens, e_tokens)):
++        av = _parse_number(a)
++        ev = _parse_number(e)
++        if av is not None and ev is not None:
++            abs_err = abs(av - ev)
++            rel_err = abs_err / abs(ev) if ev != 0 else abs_err
++            max_abs = abs_err if max_abs is None else max(max_abs, abs_err)
++            max_rel = rel_err if max_rel is None else max(max_rel, rel_err)
++        elif a != e:
++            problems.append(f"token {idx} differs exactly: actual '{a}' vs expected '{e}'")
++    return max_abs, max_rel, prefix, problems
++
++
++def _fmt(x):
++    return "n/a" if x is None else f"{x:.3e}"
++
++
++def tool_function(solution_path, inputs, expected_outputs=None, reference_path=None, rel_tol=1e-10, timeout=20):
++    if not isinstance(inputs, list) or not inputs:
++        return "Error: 'inputs' must be a non-empty array of strings."
++    try:
++        rel_tol = float(rel_tol) if rel_tol is not None else 1e-10
++    except (TypeError, ValueError):
++        rel_tol = 1e-10
++    try:
++        timeout = int(timeout) if timeout else 20
++    except (TypeError, ValueError):
++        timeout = 20
++
++    use_expected = expected_outputs is not None
++    if use_expected:
++        if not isinstance(expected_outputs, list) or len(expected_outputs) != len(inputs):
++            return "Error: 'expected_outputs' must be an array with the same length as 'inputs'."
++    elif not reference_path:
++        return "Error: provide either 'expected_outputs' or 'reference_path'."
++
++    lines = []
++    worst_abs = None
++    worst_rel = None
++    flagged = []
++    min_prefix = None
++
++    for i, stdin_text in enumerate(inputs):
++        stdin_text = "" if stdin_text is None else str(stdin_text)
++        header = f"=== Case {i + 1}/{len(inputs)} ==="
++        try:
++            actual, a_err, a_code = _run_script(solution_path, stdin_text, timeout)
++        except TimeoutError as e:
++            lines.append(f"{header}\nFLAG: solution {e}")
++            flagged.append(i + 1)
++            continue
++        if a_code != 0:
++            lines.append(f"{header}\nFLAG: solution exited with code {a_code}\nSTDERR:\n{a_err.strip()}")
++            flagged.append(i + 1)
++            continue
++
++        if use_expected:
++            expected = str(expected_outputs[i])
++        else:
++            try:
++                expected, r_err, r_code = _run_script(reference_path, stdin_text, timeout)
++            except TimeoutError as e:
++                lines.append(f"{header}\nFLAG: reference {e}")
++                flagged.append(i + 1)
++                continue
++            if r_code != 0:
++                lines.append(f"{header}\nFLAG: reference exited with code {r_code}\nSTDERR:\n{r_err.strip()}")
++                flagged.append(i + 1)
++                continue
++
++        max_abs, max_rel, prefix, problems = _compare_outputs(actual, expected)
++        if max_abs is not None:
++            worst_abs = max_abs if worst_abs is None else max(worst_abs, max_abs)
++        if max_rel is not None:
++            worst_rel = max_rel if worst_rel is None else max(worst_rel, max_rel)
++        min_prefix = prefix if min_prefix is None else min(min_prefix, prefix)
++
++        is_flagged = bool(problems) or (max_rel is not None and max_rel > rel_tol)
++        if is_flagged:
++            flagged.append(i + 1)
++        lines.append(
++            f"{header}\n"
++            f"actual:   {actual.strip()!r}\n"
++            f"expected: {expected.strip()!r}\n"
++            f"max abs error: {_fmt(max_abs)}  max rel error: {_fmt(max_rel)}  "
++            f"matching leading chars: {prefix}\n"
++            + ("FLAG: " + "; ".join(problems) + "\n" if problems else "")
++            + (f"FLAG: relative error {max_rel:.3e} exceeds rel_tol {rel_tol:.1e}\n"
++               if max_rel is not None and max_rel > rel_tol else "")
++            + ("OK" if not is_flagged else "")
++        )
++
++    summary = [
++        "=== SUMMARY ===",
++        f"cases: {len(inputs)}",
++        f"flagged cases (rel_tol={rel_tol:.1e}): {flagged if flagged else 'none'}",
++        f"max absolute error: {_fmt(worst_abs)}",
++        f"max relative error: {_fmt(worst_rel)}",
++        f"min matching leading chars: {min_prefix if min_prefix is not None else 'n/a'}",
++    ]
++    return "\n\n".join(lines) + "\n\n" + "\n".join(summary)

@@ -1,0 +1,553 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5dabc1e..c245c1b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -385,31 +385,88 @@ class AgenticSystem:
+             safe_log(f"[sanitize] dropped {dropped} degenerate assistant message(s)")
+         return cleaned
+ 
+-    def _safe_chat(self, msg, history):
++    def _attempt_configs(self):
+         """
+-        Call chat_with_agent, never raising. On failure, log and return the sanitized input history.
++        Ordered, bounded list (5 entries) of attempt configurations for _safe_chat.
++        Each dict has: model (str), prompt_style ('full' | 'short' | 'minimal'), use_tools (bool).
++        The first entry is the normal call; later entries are progressively simpler retries.
+         """
+-        try:
+-            new_history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+-            if new_history is None:
+-                raise ValueError("chat_with_agent returned None")
+-            if new_history and self._is_degenerate_assistant(new_history[-1]):
+-                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent; retrying once with a shortened prompt",
+-                         level=logging.WARNING)
+-                short_prompt = self._shortened_prompt(msg)
+-                retry_history = chat_with_agent(short_prompt, model=self.code_model,
+-                                                msg_history=self._sanitize_history(history),
+-                                                logging=safe_log)
+-                if retry_history and not self._is_degenerate_assistant(retry_history[-1]):
+-                    return retry_history
+-                safe_log("[safe_chat] shortened retry still degenerate", level=logging.WARNING)
+-                return retry_history or new_history
+-            elif len(new_history) <= len(history):
+-                safe_log("[safe_chat] chat_with_agent added no messages", level=logging.WARNING)
+-            return new_history
+-        except Exception as e:
+-            safe_log(f"[safe_chat] exception from chat_with_agent: {type(e).__name__}: {e}", level=logging.ERROR)
+-            return self._sanitize_history(history)
++        primary = self.code_model
++        alternate = CLAUDE_MODEL if 'claude' not in primary else OPENAI_MODEL
++        configs = [
++            {'model': primary, 'prompt_style': 'full', 'use_tools': True},
++            {'model': primary, 'prompt_style': 'short', 'use_tools': True},
++            {'model': primary, 'prompt_style': 'minimal', 'use_tools': True},
++            {'model': alternate, 'prompt_style': 'short', 'use_tools': True},
++            {'model': primary, 'prompt_style': 'minimal', 'use_tools': False},
++        ]
++        return configs
++
++    def _styled_prompt(self, msg, prompt_style):
++        """Render the outgoing prompt for a given prompt_style."""
++        if prompt_style == 'full':
++            return msg
++        if prompt_style == 'short':
++            return self._shortened_prompt(msg)
++        excerpt = (self.problem_statement or '')[:1000]
++        return ("Continue the task: make the next tool call (edit the solution file or run the tests). "
++                f"Do not reply with an empty message.\n\nProblem excerpt:\n{excerpt}")
++
++    def _chat_once_no_tools(self, msg, model, history):
++        """
++        One tool-less completion appended to history as a text turn. Returns the new history.
++        """
++        client, client_model = create_client(model)
++        reply = self._plain_llm_text(client, client_model,
++                                     "You are a coding agent. Answer briefly and state the next concrete action.",
++                                     msg)
++        new_history = list(history) + [{'role': 'user', 'content': [{'type': 'text', 'text': msg}]}]
++        if reply and reply.strip():
++            new_history.append({'role': 'assistant', 'content': [{'type': 'text', 'text': reply}]})
++        return new_history
++
++    def _safe_chat(self, msg, history, model=None, tool_names=None, use_tools=True):
++        """
++        Call the agent, never raising. Walks the bounded list from _attempt_configs() and returns
++        the first attempt that adds a healthy assistant turn. If every attempt fails, logs and
++        returns the sanitized input history. If `model` is given, the attempts use that model
++        as the primary backend instead of self.code_model.
++        """
++        if model:
++            configs = [{'model': model, 'prompt_style': 'full', 'use_tools': use_tools, 'tool_names': tool_names}]
++        else:
++            configs = [dict(c, tool_names=tool_names) for c in self._attempt_configs() if c['use_tools'] or not use_tools]
++        last_result = None
++        for idx, cfg in enumerate(configs, start=1):
++            prompt = self._styled_prompt(msg, cfg['prompt_style'])
++            base = self._sanitize_history(history)
++            try:
++                if cfg['use_tools']:
++                    result = chat_with_agent(prompt, model=cfg['model'], msg_history=base, logging=safe_log,
++                                             tool_names=cfg.get('tool_names'))
++                else:
++                    result = self._chat_once_no_tools(prompt, cfg['model'], base)
++                if result is None:
++                    raise ValueError("chat returned None")
++            except Exception as e:
++                safe_log(f"[safe_chat] attempt {idx}/{len(configs)} exception: {type(e).__name__}: {e}",
++                         level=logging.ERROR)
++                continue
++            last_result = result
++            if not result or result[-1].get('role') != 'assistant' or self._is_degenerate_assistant(result[-1]):
++                safe_log(f"[safe_chat] attempt {idx}/{len(configs)} ({cfg['prompt_style']}, "
++                         f"tools={cfg['use_tools']}) returned an empty assistant turn", level=logging.WARNING)
++                continue
++            if len(result) <= len(base):
++                safe_log(f"[safe_chat] attempt {idx}/{len(configs)} added no messages", level=logging.WARNING)
++                continue
++            if idx > 1:
++                safe_log(f"[safe_chat] succeeded on attempt {idx}/{len(configs)}")
++            return result
++        safe_log("[safe_chat] all attempts failed; returning sanitized history", level=logging.ERROR)
++        if last_result is not None and len(last_result) > len(self._sanitize_history(history)):
++            return self._sanitize_history(last_result)
++        return self._sanitize_history(history)
+ 
+     def _shortened_prompt(self, msg):
+         """
+@@ -716,6 +773,145 @@ class AgenticSystem:
+             error_feedback = reason
+         return False
+ 
++    REDUCED_TOOLS = ['editor', 'bash']
++
++    def _is_empty_run(self, history):
++        """True if the history has no assistant turn with text or a tool call (empty or degenerate run)."""
++        if not history:
++            return True
++        last = None
++        for msg in reversed(history):
++            if isinstance(msg, dict) and msg.get('role') == 'assistant':
++                last = msg
++                break
++        return last is None or self._is_degenerate_assistant(last)
++
++    def _log_reply_meta(self, label, history):
++        """Log reply metadata for the last assistant turn: length, block types, and empty status."""
++        last = None
++        for msg in reversed(history or []):
++            if isinstance(msg, dict) and msg.get('role') == 'assistant':
++                last = msg
++                break
++        if last is None:
++            safe_log(f"[diag] {label}: no assistant turn", level=logging.WARNING)
++            return
++        content = last.get('content')
++        if isinstance(content, str):
++            kinds, length = ['text'], len(content)
++        elif isinstance(content, list):
++            kinds = [b.get('type') if isinstance(b, dict) else getattr(b, 'type', None) for b in content]
++            length = sum(len(b.get('text') or '') if isinstance(b, dict) else len(getattr(b, 'text', '') or '')
++                         for b in content)
++        else:
++            kinds, length = [type(content).__name__], 0
++        status = 'EMPTY' if self._is_degenerate_assistant(last) else 'ok'
++        safe_log(f"[diag] {label}: status={status} reply_len={length} blocks={kinds}",
++                 level=logging.INFO if status == 'ok' else logging.WARNING)
++
++    def _preflight(self):
++        """
++        Diagnose empty replies. Step 1: a tiny tool-free prompt on the primary model (logs raw
++        reply, stop reason and exceptions). Step 2: the same prompt with the full tool list.
++        Returns True if the full tool list is the culprit (no-tools works, tools-on is empty).
++        """
++        probe = "Reply with the single word OK."
++        plain_ok = False
++        try:
++            client, client_model = create_client(self.code_model)
++            reply = self._plain_llm_text(client, client_model, "You are a helpful assistant.", probe)
++            plain_ok = bool(reply and reply.strip())
++            safe_log(f"[preflight] no-tools reply len={len(reply or '')} text={(reply or '')[:80]!r}")
++        except Exception as e:
++            safe_log(f"[preflight] no-tools call raised {type(e).__name__}: {e}", level=logging.ERROR)
++        try:
++            hist = chat_with_agent(probe, model=self.code_model, msg_history=[], logging=safe_log)
++            self._log_reply_meta('preflight-tools', hist)
++            tools_ok = not self._is_empty_run(hist)
++        except Exception as e:
++            safe_log(f"[preflight] tool call raised {type(e).__name__}: {e}", level=logging.ERROR)
++            tools_ok = False
++        if plain_ok and not tools_ok:
++            safe_log("[preflight] API answers without tools but not with the tool list: use reduced tools")
++            return True
++        safe_log(f"[preflight] plain_ok={plain_ok} tools_ok={tools_ok}")
++        return False
++
++    def _attempt_configs_full(self):
++        """Attempt configs with a per-attempt temperature and tool filter (used by forward)."""
++        primary = self.code_model
++        alternate = CLAUDE_MODEL if 'claude' not in primary else OPENAI_MODEL
++        return [
++            {'model': primary, 'prompt_style': 'compact', 'use_tools': True, 'tool_names': None, 'temperature': 0.0},
++            {'model': primary, 'prompt_style': 'compact', 'use_tools': True, 'tool_names': self.REDUCED_TOOLS, 'temperature': 0.3},
++            {'model': alternate, 'prompt_style': 'compact', 'use_tools': True, 'tool_names': self.REDUCED_TOOLS, 'temperature': 0.3},
++            {'model': alternate, 'prompt_style': 'direct', 'use_tools': False, 'tool_names': None, 'temperature': 0.7},
++        ]
++
++    def _compact_task_prompt(self, task_text):
++        """Compact core prompt: task plus a 4-line workflow."""
++        return (f"{task_text}\n\nWorkflow: (1) read the sample inputs and outputs; (2) write the solution with the "
++                "editor tool; (3) run run_samples on the problem statement and fix any mismatch; "
++                "(4) run a brute-force stress_test on small random inputs and fix disagreements.\n"
++                "Always make the tool call rather than announcing a next step.")
++
++    def _snapshot_base(self):
++        """Reset the repo to base_commit so every attempt starts clean."""
++        try:
++            reset_to_commit(self.git_tempdir, self.base_commit)
++        except Exception as e:
++            safe_log(f"[attempt] reset failed: {type(e).__name__}: {e}", level=logging.ERROR)
++
++    def _score_candidate(self, msg_history):
++        """
++        Score the current repo state. Returns (score tuple, diff). Score is higher-is-better:
++        (validity, sample_passed, not_failed). Empty patches score (-1, 0, 0).
++        """
++        status = self._patch_status()
++        if status == 'empty':
++            return (-1, 0, 0), ''
++        if status != 'ok':
++            return (-1, 0, 0), diff_versus_commit(self.git_tempdir, self.base_commit)
++        failed, excerpt = self._current_verification(msg_history)
++        diff = diff_versus_commit(self.git_tempdir, self.base_commit)
++        return (1, 0 if failed else 1, 0 if failed else 1), diff
++
++    def _direct_completion_lenient(self, task, temperature):
++        """
++        One direct-generation attempt. Accepts a ```python block, then any ``` fence, then raw code
++        containing 'class Solution' or 'def '. Logs stop reason and content length.
++        Returns the code string or None.
++        """
++        try:
++            client, client_model = create_client(self.code_model)
++        except Exception as e:
++            safe_log(f"[lenient] cannot create client: {type(e).__name__}: {e}", level=logging.ERROR)
++            return None
++        filename = self._output_filename()
++        prompt = (f"Problem statement:\n{self.problem_statement}\n\nTarget file: {filename}\n"
++                  "Write the complete final content of the target file. Reply with the full file in one ```python block.")
++        try:
++            text = self._plain_llm_text(client, client_model, "You write complete, correct Python source files.", prompt)
++        except Exception as e:
++            safe_log(f"[lenient] LLM call failed: {type(e).__name__}: {e}", level=logging.ERROR)
++            return None
++        safe_log(f"[lenient] temperature={temperature} content_len={len(text or '')}")
++        for pattern in (r"```python\s*\n(.*?)```", r"```[a-zA-Z]*\s*\n(.*?)```"):
++            m = re.search(pattern, text or '', re.DOTALL)
++            if m and m.group(1).strip():
++                return m.group(1)
++        if text and ('class Solution' in text or 'def ' in text):
++            return text
++        return None
++
++    def _write_candidate(self, code):
++        path = self._target_path()
++        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++        with open(path, 'w') as f:
++            f.write(code)
++        if self._is_method_task(self._output_filename()):
++            self._ensure_typing_import(path)
++
+     def _verify_and_repair(self, msg_history, task, max_rounds=5):
+         """
+         Bounded verify-and-repair loop. While the last verification failed or is missing,
+@@ -790,86 +986,109 @@ class AgenticSystem:
+         safe_log(f"[forward] final verification state: {state} {final_excerpt[:200]!r}")
+         return not final_failed
+ 
+-    def forward(self):
++    def _build_proxy_tests(self):
+         """
+-        The forward function for the AgenticSystem.
++        One tool-free call that writes solve_bruteforce(input_text)->output_text and a random input
++        generator in a single python block, saved under /tmp. Returns (brute_path, gen_path) or None.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        workflow = """
+-Follow this workflow:
+-1. Explore the repository: look at the relevant files, the existing tests and the sample inputs/outputs in the problem statement.
+-2. Work out a brute force (a simple, obviously-correct reference) and a correct algorithm with a short correctness argument. Then write a first implementation early with the editor tool, and refine it.
+-3. Run the implementation on ALL sample inputs with bash and compare with the expected outputs.
+-4. Write a stress test that compares your implementation against the brute force on many small random inputs. If they disagree, fix the solution.
+-5. Check performance on maximum-size inputs (time limits matter). Optimize if needed.
+-6. Fix any discrepancies and re-verify everything from steps 3-5.
+-7. After writing the solution, call run_samples with the problem statement (or run_examples if the problem has only Input/Output examples). Any sample mismatch on a problem with a unique answer is a failure. Use run_samples and stress_test to verify correctness.
+-8. Multi-answer problems (the statement says any valid answer, any of them, or multiple solutions are accepted): do not chase sample bytes. Instead require (a) a validator that checks any output against the statement's rules, (b) a brute-force *existence* answer (Yes/No) at moderate n (about 8-12), and (c) a generator that biases toward both outcomes (Yes and No instances, including many likely Yes cases). Run stress_test with the solution, brute force, generator, and checker_path=validator, and fix the solution until it reports ALL OK. run_samples will report a MULTI-ANSWER line for such problems; that is expected once the validator passes.
+-9. Use the stress_test tool (not ad hoc heredoc harnesses) for randomized comparison. It takes absolute paths and a timeout, and reports the first failing seed with input and outputs.
+-
+-10. Performance gate: before coding, count the basic operations at the maximum constraints and state the complexity. Then write at least 2 maximum-size inputs (for example a worst-case no-answer input and a many-distinct-values or many-duplicates input) to /tmp/perf_inputs/ and run perf_check on them; a Python solution must finish within 3s per input.
+-
+-Environment facts: python3 is available; numpy is NOT installed (check with `python3 -c 'import numpy'` before relying on it). Use only the standard library unless you verify otherwise.
+-
+-Keep the required output file complete: a program file must read stdin and write stdout, and a method-style file must keep the `Solution` class and its method signatures. Put your work in the non-test source file.
+-"""
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.\n{workflow}"
++        try:
++            client, client_model = create_client(self.code_model)
++            text = self._plain_llm_text(
++                client, client_model, "You write small, obviously-correct reference code.",
++                "Write, in ONE ```python code block, two things for this problem:\n"
++                "1. a function solve_bruteforce(input_text) that returns the expected output as a string (exhaustive, obviously correct, for small inputs);\n"
++                "2. a program that, when run with one integer seed argument, prints one random SMALL valid input to stdout.\n"
++                "The brute force must be a standalone program reading stdin and writing stdout, so put the brute force "
++                "in a main that reads stdin. Put both parts in the one block, with the generator under `if __name__ == '__main__'` "
++                "reading sys.argv[1] as the seed.\n\n"
++                f"Problem statement:\n{self.problem_statement}")
++        except Exception as e:
++            safe_log(f"[proxy] proxy test call failed: {type(e).__name__}: {e}", level=logging.ERROR)
++            return None
++        m = re.search(r"```python\s*\n(.*?)```", text or '', re.DOTALL)
++        if not m:
++            safe_log("[proxy] no python block in proxy test reply", level=logging.WARNING)
++            return None
++        os.makedirs('/tmp/proxy_tests', exist_ok=True)
++        path = '/tmp/proxy_tests/brute_and_gen.py'
++        with open(path, 'w') as f:
++            f.write(m.group(1))
++        safe_log(f"[proxy] wrote {path}")
++        return path, path
+ 
+-        msg_history = self._safe_chat(instruction, [])
+-        status = self._patch_status()
+-        safe_log(f"[forward] attempt 0 (initial) patch status: {status}")
++    def _stress_candidate(self, brute_path, gen_path):
++        """Run stress_test of the current target against the brute/generator. Returns mismatch count (or None)."""
++        try:
++            from tools.stress_test import tool_function as stress
++            report = stress(self._target_path(), brute_path, gen_path, iterations=50, timeout=5)
++        except Exception as e:
++            safe_log(f"[stress] failed: {type(e).__name__}: {e}", level=logging.WARNING)
++            return None
++        safe_log(f"[stress] report tail: {str(report)[-200:]!r}")
++        return 0 if 'ALL OK' in str(report) else 1
+ 
+-        max_retries = 3
+-        for attempt in range(1, max_retries + 1):
+-            if status == 'ok':
+-                break
+-            msg_history = self._sanitize_history(msg_history)
+-            if status == 'test_only':
+-                short = "You only changed test files. Edit the solution file itself with the editor tool."
+-            elif status == 'invalid':
+-                short = ("The solution file is no longer valid (it fails to compile, lost the Solution class or "
+-                         "method, or still contains a stub). Restore it with the editor tool so it is a complete, "
+-                         "working solution.")
+-            else:
+-                short = "No file has been edited yet. Use the editor tool to write your solution now."
+-            # Retries use a short, simple prompt: long prompts seem to correlate with empty replies.
+-            if attempt == 1:
+-                corrective = short
+-            else:
+-                corrective = f"{short}\n\nTask: {self.problem_statement}"
+-            safe_log(f"[forward] retry {attempt} due to status '{status}'")
+-            msg_history = self._safe_chat(corrective, msg_history)
++    def forward(self):
++        """
++        The forward function for the AgenticSystem. Runs a bounded list of attempt configurations
++        from the base commit, scores each candidate, stops early on a clean pass, and applies the
++        best candidate's patch.
++        """
++        task = (f"I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the "
++                f"following problem.\n\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Make changes to the files in {self.git_tempdir} to address the problem.")
++        use_reduced = self._preflight()
++        configs = self._attempt_configs_full()
++        if use_reduced:
++            for c in configs:
++                if c['use_tools'] and c['tool_names'] is None:
++                    c['tool_names'] = self.REDUCED_TOOLS
++
++        candidates = []
++        prev_failures = ''
++        for idx, cfg in enumerate(configs, start=1):
++            self._snapshot_base()
++            prompt = self._compact_task_prompt(task)
++            if prev_failures:
++                prompt += f"\n\nPrevious candidates failed:\n{prev_failures}"
++            safe_log(f"[attempt {idx}/{len(configs)}] model={cfg['model']} style={cfg['prompt_style']} "
++                     f"tools={('none' if not cfg['use_tools'] else (cfg['tool_names'] or 'all'))} temp={cfg['temperature']}")
++            hist = self._safe_chat(prompt, [], model=cfg['model'], tool_names=cfg['tool_names'],
++                                   use_tools=cfg['use_tools'])
++            self._log_reply_meta(f"attempt {idx}", hist)
++            empty = self._is_empty_run(hist)
+             status = self._patch_status()
+-            safe_log(f"[forward] retry {attempt} patch status: {status}")
+-
+-        if status == 'ok':
+-            if not self._perf_input_files():
+-                safe_log("[forward] no perf inputs found; asking the agent to create them")
+-                perf_request = (
+-                    f"Before finishing, create at least 2 maximum-size inputs for the problem (a worst-case no-answer "
+-                    f"input and a many-distinct or many-duplicates input) and write them to {_PERF_DIR}/ "
+-                    "(create the directory first). Then run perf_check on them with the solution file "
+-                    f"{self._output_filename()}. A Python solution must finish within 3s per input. "
+-                    "If it does not, optimize it and re-run perf_check."
+-                )
+-                msg_history = self._safe_chat(perf_request, self._sanitize_history(msg_history))
+-            self._verify_and_repair(msg_history, task)
++            score, diff = self._score_candidate(hist)
++            safe_log(f"[attempt {idx}] empty_run={empty} patch_status={status} score={score} diff_len={len(diff)}")
++            if diff.strip():
++                candidates.append((score, diff, idx))
++            if score == (1, 1, 1):
++                safe_log(f"[attempt {idx}] clean pass; stopping early")
++                break
++            prev_failures = f"attempt {idx}: status={status} score={score}"
++
++        # Guaranteed fallback if no non-empty agentic candidate exists
++        if not candidates:
++            for idx, temp in enumerate([0.0, 0.5], start=1):
++                self._snapshot_base()
++                code = self._direct_completion_lenient(task, temp)
++                if code:
++                    self._write_candidate(code)
++                    score, diff = self._score_candidate([])
++                    safe_log(f"[fallback {idx}] score={score} diff_len={len(diff)}")
++                    if diff.strip():
++                        candidates.append((score, diff, f"fallback{idx}"))
++                        break
++
++        if not candidates:
++            safe_log("[forward] all configurations produced empty patches", level=logging.WARNING)
++            self._snapshot_base()
+             return
+ 
+-        safe_log(f"[forward] status '{status}' after retries; trying the direct completion fallback")
+-        if self._direct_completion_fallback(task):
+-            safe_log("[forward] direct completion produced a valid target")
+-            self._verify_and_repair(self._sanitize_history([]), task)
+-            return
++        best_score, best_diff, best_id = max(candidates, key=lambda c: c[0])
++        safe_log(f"[forward] applying best candidate {best_id} score={best_score}")
++        self._snapshot_base()
++        apply_patch(self.git_tempdir, best_diff)
+ 
+-        safe_log(f"[forward] direct completion failed; status '{self._patch_status()}'", level=logging.WARNING)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..be442c3 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -279,7 +279,15 @@ def convert_msg_history(msg_history, model=None):
+     else:
+         return msg_history
+ 
+-def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
++def _filter_tools(all_tools, tool_names=None):
++    """Keep only tools whose name is in tool_names. None keeps every tool."""
++    if tool_names is None:
++        return all_tools
++    wanted = set(tool_names)
++    return [t for t in all_tools if t['info']['name'] in wanted]
++
++
++def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print, tool_names=None):
+     # Construct message
+     if msg_history is None:
+         msg_history = []
+@@ -288,7 +296,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+ 
+     try:
+         # Load all tools
+-        all_tools = load_all_tools(logging=logging)
++        all_tools = _filter_tools(load_all_tools(logging=logging), tool_names)
+         tools_dict = {tool['info']['name']: tool for tool in all_tools}
+         
+         # Create client
+@@ -340,6 +348,7 @@ def chat_with_agent_claude(
+         model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+         msg_history=None,
+         logging=print,
++        tool_names=None,
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -361,7 +370,7 @@ def chat_with_agent_claude(
+         client, client_model = create_client(model)
+ 
+         # Load all tools
+-        all_tools = load_all_tools(logging=logging)
++        all_tools = _filter_tools(load_all_tools(logging=logging), tool_names)
+         tools_dict = {tool['info']['name']: tool for tool in all_tools}
+         tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+ 
+@@ -429,6 +438,7 @@ def chat_with_agent_openai(
+         model='o3-mini-2025-01-31',
+         msg_history=None,
+         logging=print,
++        tool_names=None,
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -451,7 +461,7 @@ def chat_with_agent_openai(
+         client, client_model = create_client(model)
+ 
+         # Load all tools
+-        all_tools = load_all_tools(logging=logging)
++        all_tools = _filter_tools(load_all_tools(logging=logging), tool_names)
+         tools_dict = {tool['info']['name']: tool for tool in all_tools}
+         tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+ 
+@@ -517,13 +527,14 @@ def chat_with_agent(
+     msg_history=None,
+     logging=print,
+     convert=False,  # Convert the message history to a generic format, so that msg_history can be used across models
++    tool_names=None,  # Optional list of tool names to expose; None exposes all tools
+ ):
+     if msg_history is None:
+         msg_history = []
+ 
+     if 'claude' in model:
+         # Claude models
+-        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging, tool_names=tool_names)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         logging(conv_msg_history)
+         if convert:
+@@ -532,14 +543,14 @@ def chat_with_agent(
+ 
+     elif model.startswith('o3-'):
+         # OpenAI models
+-        new_msg_history = chat_with_agent_openai(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_openai(msg, model=model, msg_history=msg_history, logging=logging, tool_names=tool_names)
+         # Current version does not support cross-model conversion
+         # new_msg_history = convert_msg_history(new_msg_history, model=model)
+         new_msg_history = msg_history + new_msg_history
+ 
+     else:
+         # Models without in-built tool calling
+-        new_msg_history = chat_with_agent_manualtools(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_manualtools(msg, model=model, msg_history=msg_history, logging=logging, tool_names=tool_names)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         if convert:
+             new_msg_history = conv_msg_history
+diff --git a/tools/perf_check.py b/tools/perf_check.py
+index c12d839..2415616 100644
+--- a/tools/perf_check.py
++++ b/tools/perf_check.py
+@@ -29,7 +29,6 @@ def tool_info():
+                     'type': 'array',
+                     'items': {
+                         'type': 'string',
+-                        'description': 'Absolute path to one input file.',
+                     },
+                     'description': 'Absolute paths of the input files to run the solution on (e.g. max-size inputs).',
+                 },

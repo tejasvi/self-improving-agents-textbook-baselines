@@ -1,0 +1,311 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 4d455c5..5fb6ca2 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,10 +4,16 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
++import shutil
++import tempfile
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++MAX_ATTEMPTS = 3  # K independent attempts
++MAX_EMPTY_RETRIES = 2  # fresh-history retries per attempt when solution.py is missing/broken
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -191,10 +197,175 @@ class AgenticSystem:
+         )
+         return compile_result.returncode == 0
+ 
+-    def forward(self):
++    # ------------------------------------------------------------------
++    # Multi-attempt, harness-verified solve loop helpers
++    # ------------------------------------------------------------------
++    def _extract_text(self, msg):
++        """Return the concatenated text of a single message (str or content-list)."""
++        content = msg.get('content') if isinstance(msg, dict) else None
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            parts = []
++            for block in content:
++                if isinstance(block, dict) and isinstance(block.get('text'), str):
++                    parts.append(block['text'])
++            return '\n'.join(parts)
++        return ''
++
++    def _last_assistant_text(self, history):
++        """Return the text of the last assistant message in history, or ''."""
++        for msg in reversed(history or []):
++            if isinstance(msg, dict) and msg.get('role') == 'assistant':
++                text = self._extract_text(msg).strip()
++                if text:
++                    return text
++        return ''
++
++    def _extract_samples(self, problem_statement):
++        """
++        Parse sample (input, expected_output) pairs from the statement.
++        Supports 'Sample Input N' / 'Sample Output N' blocks, with a fallback
++        for 'Example N' blocks that contain 'Input:' / 'Output:' lines.
++        """
++        text = problem_statement or ''
++        header_re = re.compile(r'Sample\s+(Input|Output)\s*\d*\s*:?[ \t]*\n', re.IGNORECASE)
++        headers = list(header_re.finditer(text))
++        pairs = []
++        i = 0
++        while i < len(headers) - 1:
++            cur, nxt = headers[i], headers[i + 1]
++            if cur.group(1).lower() == 'input' and nxt.group(1).lower() == 'output':
++                end_out = headers[i + 2].start() if i + 2 < len(headers) else len(text)
++                inp = self._clean_block(text[cur.end():nxt.start()])
++                out = self._clean_block(text[nxt.end():end_out], stop_at_prose=True)
++                if inp is not None and out is not None:
++                    pairs.append((inp, out))
++                i += 2
++            else:
++                i += 1
++        if pairs:
++            return pairs
++
++        ex_re = re.compile(
++            r'Input:?[ \t]*\n(.*?)\n[ \t]*Output:?[ \t]*\n(.*?)(?=\n[ \t]*(?:Example|Explanation|Note|Constraints|Input:)|\Z)',
++            re.DOTALL | re.IGNORECASE,
++        )
++        for m in ex_re.finditer(text):
++            inp = self._clean_block(m.group(1))
++            out = self._clean_block(m.group(2), stop_at_prose=True)
++            if inp is not None and out is not None:
++                pairs.append((inp, out))
++        return pairs
++
++    def _clean_block(self, block, stop_at_prose=False):
++        """Strip code fences/blank edges; for outputs keep only the first paragraph."""
++        lines = []
++        for ln in block.splitlines():
++            s = ln.strip()
++            if s.startswith('```'):
++                continue
++            if stop_at_prose and (not s or re.match(r'(Note|Explanation|Example|Sample|Constraints)\b', s, re.I)):
++                if lines:
++                    break
++                continue
++            lines.append(ln.rstrip())
++        result = '\n'.join(lines).strip()
++        return result + '\n' if result else None
++
++    def _evaluate_solution(self, samples=None):
+         """
+-        The forward function for the AgenticSystem.
++        Harness-side check of solution.py: compiles, runs on each sample (stdin programs),
++        then runs stress.py if the agent wrote one. Returns a dict of scores and raw text.
+         """
++        if samples is None:
++            samples = self._extract_samples(self.problem_statement)
++        result = {
++            'compiles': False,
++            'samples_passed': 0,
++            'samples_total': len(samples),
++            'samples_ok': False,
++            'stress_ok': False,
++            'stress_present': False,
++            'timed_out': False,
++            'raw': '',
++        }
++        sol = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(sol):
++            result['raw'] = 'solution.py does not exist.'
++            return result
++        comp = subprocess.run(['python3', '-m', 'py_compile', sol],
++                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++        if comp.returncode != 0:
++            result['raw'] = 'solution.py fails to compile:\n' + comp.stderr.decode(errors='replace')[-2000:]
++            return result
++        result['compiles'] = True
++
++        raw_parts = []
++        passed = 0
++        for idx, (inp, expected) in enumerate(samples, 1):
++            try:
++                proc = subprocess.run(['python3', 'solution.py'], input=inp, text=True,
++                                      capture_output=True, cwd=self.git_tempdir, timeout=10)
++                got = proc.stdout
++                err = proc.stderr
++            except subprocess.TimeoutExpired:
++                result['timed_out'] = True
++                raw_parts.append(f'Sample {idx}: TIMEOUT (>10s) on input:\n{inp[:500]}')
++                continue
++            if got.strip() == expected.strip():
++                passed += 1
++            else:
++                raw_parts.append(
++                    f'Sample {idx} FAILED.\nInput:\n{inp[:500]}\nExpected:\n{expected[:500]}\n'
++                    f'Got:\n{got[:500]}\nStderr:\n{err[-800:]}'
++                )
++        result['samples_passed'] = passed
++        result['samples_ok'] = passed == len(samples)
++
++        stress = os.path.join(self.git_tempdir, 'stress.py')
++        if os.path.isfile(stress):
++            result['stress_present'] = True
++            try:
++                proc = subprocess.run(['python3', 'stress.py'], capture_output=True, text=True,
++                                      cwd=self.git_tempdir, timeout=120)
++                result['stress_ok'] = proc.returncode == 0
++                if proc.returncode != 0:
++                    out = (proc.stdout + proc.stderr)[-2000:]
++                    raw_parts.append('stress.py FAILED (first mismatch):\n' + out)
++            except subprocess.TimeoutExpired:
++                result['timed_out'] = True
++                raw_parts.append('stress.py TIMEOUT (>120s)')
++        result['raw'] = '\n'.join(raw_parts)[:4000]
++        return result
++
++    def _score_key(self, score):
++        return (score['samples_ok'], score['stress_ok'], score['samples_passed'],
++                not score['timed_out'], score['compiles'])
++
++    def _score_text(self, score):
++        return (f"compiles={score['compiles']}, samples={score['samples_passed']}/{score['samples_total']}, "
++                f"stress_present={score['stress_present']}, stress_ok={score['stress_ok']}, "
++                f"timed_out={score['timed_out']}")
++
++    def _run_attempt(self, attempt_idx, prior_summaries):
++        """
++        Run one independent attempt from a clean repo state and a fresh history.
++        Empty/broken replies are retried with a fresh history and a short editor-only prompt.
++        Returns (summary_text, history).
++        """
++        reset_to_commit(self.git_tempdir, self.base_commit)
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
++
++        prior_block = ''
++        if prior_summaries:
++            lines = ['\n# Previous attempts (all failed to fully pass; do NOT repeat the same approach)']
++            for p in prior_summaries:
++                lines.append(f"\n## Attempt {p['attempt']}\nApproach summary: {p['summary'][:1500]}\n"
++                             f"Score: {p['score_text']}\nRaw failing output:\n{p['raw'][:1500]}")
++            lines.append('\nTry a DIFFERENT algorithm, or fix the specific failure shown above.')
++            prior_block = '\n'.join(lines) + '\n'
++
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -203,34 +374,90 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool within your first few tool calls. A correct-but-slow or best-guess version (even a brute force) is acceptable as a checkpoint; refine it afterwards. Exploration scripts must not replace this file. Keep long derivations in files or tool calls rather than long replies, so your replies are not cut off by the output limit.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Adversarial performance check (do this after correctness passes):
+-   a. Write the worst-case operation count of solution.py as a number at maximum constraints (e.g. n=2*10^5 with a nested loop gives about 4*10^10). Show the estimate.
+-   b. List at least 5 adversarial max-size inputs, including inputs that defeat any pruning or early-break logic in your solution: all identical elements (e.g. `'a'*20000`), a single value repeated the maximum number of times, all distinct values, skewed sizes, sorted or reverse-sorted input, and inputs with maximum distinct values so that every loop runs to its maximum.
+-   c. Generate them with Python expressions (e.g. `'a'*20000`, `list(range(200000))`) and time them with the bench_solution tool (or bash with `timeout 10 python3 solution.py < big.txt`).
+-   d. If any case takes more than about 1s, or the estimated operation count is over about 5*10^7, throw away the heuristic approach and look for a lower-complexity formulation. Do not micro-optimize a bad algorithm.
+-   e. Pruning/early-break heuristics do not count as a complexity guarantee; test inputs that defeat them.
+-   f. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored. Do not stop until solution.py contains a real solution (not just a placeholder comment)."""
++        method = f"""Work like a careful competitive programmer. Keep replies short; put long reasoning in files.
++Phase (a): your FIRST action must be an editor tool call creating {solution_path} with your best algorithm (a brute force is fine if unsure). Do this before anything else.
++Phase (b): write brute.py: a DIFFERENT method from the optimized solution (e.g. exhaustive BFS/DP over small parameters, not a copy of your idea). Write gen.py producing small random inputs that include edge cases: minimum and maximum sizes, duplicates, already-satisfied conditions. Write stress.py that imports/runs solution and brute on many generated inputs, exits non-zero on any mismatch and prints the first mismatching input. Run stress.py.
++Phase (c): run solution.py on every sample in the statement and compare exactly (for stdin programs: `python3 solution.py < sample.txt`; for a `Solution` class method use a small driver script; add `from typing import *` and needed imports at top of solution.py). Fix every failure from the actual output. Then check complexity against the constraints (n up to the maximum, count operations) and test adversarial max-size inputs (identical values, all distinct, sorted, reverse-sorted, skewed). If too slow, switch to a lower-complexity algorithm.
++Finish by stating the approach in one short paragraph and writing it to notes.md.
++{prior_block}"""
+         instruction = f"{task}\n\n{method}"
+-        history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Guard: ensure solution.py was really edited; retry a bounded number of times.
+-        solution_path = os.path.join(self.git_tempdir, 'solution.py')
+-        for attempt in range(3):
++        history = []
++        try:
++            history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log) or []
++        except Exception as e:
++            safe_log(f"chat_with_agent failed in attempt {attempt_idx}: {e}")
++            history = []
++
++        for retry in range(MAX_EMPTY_RETRIES):
+             if self._has_primary_edit():
+                 break
+-            retry_msg = f"""No valid solution.py edit exists yet (the patch is empty, only helper/test files changed, or solution.py does not compile). Do not analyze further. Using the editor tool, write {solution_path} now with your best current algorithm (a brute force is acceptable if nothing better), then run the samples and improve it.
+-
+-Reminder of the problem:
++            safe_log(f"Attempt {attempt_idx}: no valid solution.py (retry {retry + 1}); fresh history.")
++            retry_msg = f"""Call the editor tool now to create {solution_path} with the best algorithm you have (a brute force is acceptable). Do not analyze or explain. Problem:
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>"""
+-            history = chat_with_agent(retry_msg, model=self.code_model, msg_history=history or [], logging=safe_log)
++            try:
++                history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log) or []
++            except Exception as e:
++                safe_log(f"retry chat failed: {e}")
++                history = []
++
++        summary = ''
++        notes = os.path.join(self.git_tempdir, 'notes.md')
++        if os.path.isfile(notes):
++            try:
++                with open(notes, 'r', errors='replace') as f:
++                    summary = f.read()[:2000]
++            except OSError:
++                summary = ''
++        if not summary:
++            summary = self._last_assistant_text(history)[:2000]
++        return summary, history
++
++    def forward(self):
++        """
++        Run up to MAX_ATTEMPTS independent attempts, evaluate each with the harness,
++        keep the best solution.py, and restore it into the repo at the end.
++        """
++        samples = self._extract_samples(self.problem_statement)
++        safe_log(f"Parsed {len(samples)} sample(s) from the statement.")
++        save_dir = tempfile.mkdtemp(prefix='agent_attempts_')
++
++        best = None  # (key, path_to_saved_solution, score)
++        prior = []
++        for k in range(MAX_ATTEMPTS):
++            summary, _ = self._run_attempt(k + 1, prior)
++            score = self._evaluate_solution(samples)
++            safe_log(f"Attempt {k + 1} score: {self._score_text(score)}")
++
++            sol_path = os.path.join(self.git_tempdir, 'solution.py')
++            if os.path.isfile(sol_path):
++                saved = os.path.join(save_dir, f'attempt_{k + 1}_solution.py')
++                shutil.copyfile(sol_path, saved)
++                key = self._score_key(score)
++                if best is None or key > best[0]:
++                    best = (key, saved, score)
++
++            if score['samples_ok'] and score['stress_ok'] and score['compiles']:
++                safe_log(f"Attempt {k + 1} fully passed; stopping early.")
++                break
++
++            prior.append({
++                'attempt': k + 1,
++                'summary': summary or '(no summary)',
++                'score_text': self._score_text(score),
++                'raw': score['raw'] or '(no raw output)',
++            })
++
++        # Restore the best solution into a clean repo state.
++        reset_to_commit(self.git_tempdir, self.base_commit)
++        if best is not None:
++            shutil.copyfile(best[1], os.path.join(self.git_tempdir, 'solution.py'))
++            safe_log(f"Restored best attempt (score: {self._score_text(best[2])}).")
++        else:
++            safe_log("No attempt produced a solution.py; nothing restored.")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

@@ -1,0 +1,147 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 39bfae0..7e7dbd5 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -93,6 +94,48 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++
++def _changed_files(diff):
++    """
++    Parse `diff --git a/X b/Y` lines and return the list of changed paths (Y, falling back to X).
++    """
++    files = []
++    for line in diff.splitlines():
++        if not line.startswith("diff --git "):
++            continue
++        parts = line[len("diff --git "):].split(" b/")
++        if len(parts) >= 2:
++            path = parts[-1].strip()
++        else:
++            tokens = line.split()
++            path = tokens[-1][2:] if tokens and tokens[-1].startswith("b/") else tokens[-1]
++        files.append(path)
++    return files
++
++_TEST_FILE_PATTERNS = [
++    r"^test_.*",        # test_*.py
++    r".*_test\.[^.]+$",  # *_test.py
++    r"^tests?\.[^.]+$",  # test.py / tests.js
++    r".*\.(test|spec)\.[^.]+$",  # *.spec.js, *.test.ts
++    r".*_spec\.[^.]+$",  # *_spec.rb
++    r"^spec\.[^.]+$",
++]
++
++def _is_test_path(path):
++    """
++    Return True if the path looks like a test file (any directory component named like a test
++    directory, or a filename matching common test naming patterns).
++    """
++    lowered = path.lower().replace("\\", "/")
++    parts = [p for p in lowered.split("/") if p]
++    if not parts:
++        return False
++    *dirs, filename = parts
++    for d in dirs:
++        if "test" in d or "spec" in d:
++            return True
++    return any(re.match(pat, filename) for pat in _TEST_FILE_PATTERNS)
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -137,10 +180,22 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _has_source_patch(self):
++        """
++        Return (has_any, has_non_test) describing the current diff versus the base commit.
++        """
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        files = _changed_files(diff)
++        has_any = bool(diff.strip()) and len(files) > 0
++        has_non_test = any(not _is_test_path(f) for f in files)
++        return has_any, has_non_test
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+         """
++        language_line = f"The task is a competitive programming problem to be solved in {self.language}."
++        test_line = f"\nHow the solution can be tested: {self.test_description}" if self.test_description else ""
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -148,9 +203,60 @@ class AgenticSystem:
+ </problem_description>
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++{language_line}{test_line}
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        instruction = f"""{task}
++Follow this workflow:
++1. Explore the repository: use the editor tool `view` on {self.git_tempdir} and bash `ls` to see what exists.
++2. Identify the file to create or modify (e.g. `solution.py`, or the file implied by the problem statement).
++3. Write the implementation with the editor tool. If the file does not exist, use the `create` command; if it exists, use `edit`.
++4. Run the implementation with bash against the sample inputs from the problem and compare the output with the expected output.
++5. Check performance on a maximum-size input to make sure it runs within the limits.
++6. Stop only when the solution file exists on disk and passes the samples.
++
++You MUST create or edit files using the editor tool; replying with text only, without creating or editing files, is a failure. Do not stop until the solution file exists and passes the samples.
++"""
++        msg_history = []
++        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        msg_history = init_edit if init_edit else []
++        safe_log("Attempt 0: initial call completed")
++
++        for attempt in range(3):
++            has_any, has_non_test = self._has_source_patch()
++            if has_any and has_non_test:
++                safe_log(f"Patch check {attempt}: non-test source change found; done")
++                break
++
++            if not has_any:
++                reason = "no changes were made: the repository diff is empty."
++                history_for_retry = []
++                prefix = f"{task}\n"
++            else:
++                reason = "only test files were changed: no source file was modified."
++                history_for_retry = msg_history
++                prefix = ""
++            safe_log(f"Patch check {attempt + 1}: {reason} Re-prompting agent.")
++            corrective = (
++                f"{prefix}Previous attempt failed: {reason} "
++                f"Implement the solution in the actual source/solution file (not only test files) "
++                f"using the editor tool: view the directory first, use `create` for a new file or `edit` for an existing one. "
++                f"Then run it against the sample inputs with bash and stop only when it passes the samples."
++            )
++            retry_history = history_for_retry
++            result = chat_with_agent(corrective, model=self.code_model, msg_history=retry_history, logging=safe_log)
++            if result:
++                msg_history = result
++        else:
++            has_any, has_non_test = self._has_source_patch()
++            if not (has_any and has_non_test):
++                safe_log("Final fallback: diff still lacks a source change; requesting simplest solution.")
++                final_msg = (
++                    f"{task}\nWrite the simplest correct solution to the required file now using the editor create command "
++                    f"(or edit it if the file already exists; view the directory first to check)."
++                )
++                chat_with_agent(final_msg, model=self.code_model, msg_history=[], logging=safe_log)
++                has_any, has_non_test = self._has_source_patch()
++                safe_log(f"Final fallback outcome: has_any={has_any}, has_non_test={has_non_test}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

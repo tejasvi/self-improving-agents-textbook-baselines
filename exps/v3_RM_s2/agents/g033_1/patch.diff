@@ -1,0 +1,365 @@
+diff --git a/llm.py b/llm.py
+index d6b4da1..7416a96 100644
+--- a/llm.py
++++ b/llm.py
+@@ -1,13 +1,33 @@
+ # Code adapted from https://github.com/SakanaAI/AI-Scientist/blob/main/ai_scientist/llm.py.
+ import json
+ import os
++import random
+ import re
++import time
+ 
+ import anthropic
+ import backoff
+ import openai
+ 
+ MAX_OUTPUT_TOKENS = 4096
++
++# Retry policy for transient model API failures.
++MAX_API_RETRIES = 5
++API_BASE_DELAY = 1.0
++API_MAX_DELAY = 60.0
++
++# HTTP status codes that indicate a transient failure worth retrying.
++TRANSIENT_STATUS_CODES = {408, 409, 429, 529}
++
++# Exception types raised by the SDKs for connection problems and timeouts.
++TRANSIENT_ERROR_TYPES = (
++    openai.APIConnectionError,
++    openai.RateLimitError,
++    openai.InternalServerError,
++    anthropic.APIConnectionError,
++    anthropic.RateLimitError,
++    anthropic.InternalServerError,
++)
+ AVAILABLE_LLMS = [
+     # Anthropic models
+     "claude-3-5-sonnet-20240620",
+@@ -41,6 +61,52 @@ AVAILABLE_LLMS = [
+     "deepseek-reasoner",
+ ]
+ 
++def is_transient_api_error(e):
++    """
++    Return True if the exception from a model API call is likely transient
++    (rate limit, timeout, connection error, overload, or 5xx) and worth retrying.
++    Client errors such as bad requests or authentication failures are not retried.
++    """
++    if isinstance(e, TRANSIENT_ERROR_TYPES):
++        return True
++    status = getattr(e, "status_code", None)
++    if isinstance(status, int):
++        return status in TRANSIENT_STATUS_CODES or status >= 500
++    return False
++
++def backoff_delay(attempt, base_delay=API_BASE_DELAY, max_delay=API_MAX_DELAY):
++    """Exponential backoff with jitter for the given zero-based retry attempt."""
++    delay = min(max_delay, base_delay * (2 ** attempt))
++    return delay * random.uniform(0.5, 1.0)
++
++def call_with_retries(
++        fn,
++        *args,
++        max_retries=MAX_API_RETRIES,
++        logging=print,
++        sleep=None,
++        **kwargs,
++):
++    """
++    Call `fn(*args, **kwargs)`, retrying transient API failures with exponential backoff.
++    Non-transient errors are re-raised immediately. After `max_retries` retries the
++    last error is re-raised.
++    """
++    if sleep is None:
++        sleep = time.sleep
++    for attempt in range(max_retries + 1):
++        try:
++            return fn(*args, **kwargs)
++        except Exception as e:
++            if not is_transient_api_error(e) or attempt >= max_retries:
++                raise
++            delay = backoff_delay(attempt)
++            logging(
++                f"Transient API error ({type(e).__name__}: {e}). "
++                f"Retry {attempt + 1}/{max_retries} in {delay:.1f}s."
++            )
++            sleep(delay)
++
+ def create_client(model: str):
+     """
+     Create and return an LLM client based on the specified model.
+@@ -85,7 +151,6 @@ def create_client(model: str):
+         raise ValueError(f"Model {model} not supported.")
+ 
+ # Get N responses from a single message, used for ensembling.
+-@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
+ def get_batch_responses_from_llm(
+         msg,
+         client,
+@@ -105,7 +170,8 @@ def get_batch_responses_from_llm(
+         "gpt-4o-2024-08-06",
+     ]:
+         new_msg_history = msg_history + [{"role": "user", "content": msg}]
+-        response = client.chat.completions.create(
++        response = call_with_retries(
++            client.chat.completions.create,
+             model=model,
+             messages=[
+                 {"role": "system", "content": system_message},
+@@ -123,7 +189,8 @@ def get_batch_responses_from_llm(
+         ]
+     elif model == "llama-3-1-405b-instruct":
+         new_msg_history = msg_history + [{"role": "user", "content": msg}]
+-        response = client.chat.completions.create(
++        response = call_with_retries(
++            client.chat.completions.create,
+             model="meta-llama/llama-3.1-405b-instruct",
+             messages=[
+                 {"role": "system", "content": system_message},
+@@ -166,8 +233,10 @@ def get_batch_responses_from_llm(
+ 
+ @backoff.on_exception(
+     backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=120,
++    Exception,
++    giveup=lambda e: not is_transient_api_error(e),
++    max_tries=MAX_API_RETRIES + 1,
++    max_time=300,
+ )
+ def get_response_from_llm(
+         msg,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 5aa1d28..b6a6067 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -1,12 +1,9 @@
+ import ast
+ import json
+ import re
+-import anthropic
+-import backoff
+-import openai
+ import copy
+ 
+-from llm import create_client, get_response_from_llm
++from llm import create_client, get_response_from_llm, call_with_retries, MAX_API_RETRIES
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+@@ -50,47 +47,43 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=600,
+-    max_value=60,
+-)
++def _create_response(client, model, messages, tools, tool_choice):
++    """
++    Make a single model API call with tools. Raises on failure.
++    """
++    if 'claude' in model:
++        return client.messages.create(
++            model=model,
++            messages=messages,
++            max_tokens=4096,
++            tool_choice=tool_choice,
++            tools=tools,
++        )
++    elif model.startswith('o3-'):
++        return client.responses.create(
++            model=model,
++            input=messages,
++            tool_choice=tool_choice,
++            tools=tools,
++            parallel_tool_calls=False
++        )
++    raise ValueError(f"Unsupported model: {model}")
++
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=print, max_retry=MAX_API_RETRIES,
+ ):
+-    try:
+-        if 'claude' in model:
+-            response = client.messages.create(
+-                model=model,
+-                messages=messages,
+-                max_tokens=4096,
+-                tool_choice=tool_choice,
+-                tools=tools,
+-            )
+-        elif model.startswith('o3-'):
+-            response = client.responses.create(
+-                model=model,
+-                input=messages,
+-                tool_choice=tool_choice,
+-                tools=tools,
+-                parallel_tool_calls=False
+-            )
+-            response = response
+-        else:
+-            raise ValueError(f"Unsupported model: {model}")
+-        return response
+-    except Exception as e:
+-        logging(f"Error in get_response_withtools: {str(e)}")
+-        if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+-
+-        # Hitting the context window limit
+-        if 'Input is too long for requested model' in str(e):
+-            pass
+-
+-        raise  # Re-raise the exception after logging
++    """
++    Call the model with tools. Transient failures (rate limits, timeouts, connection
++    errors, overload, 5xx) are retried with exponential backoff up to `max_retry` times.
++    Non-transient errors are raised immediately.
++    """
++    return call_with_retries(
++        _create_response,
++        client, model, messages, tools, tool_choice,
++        max_retries=max_retry,
++        logging=logging,
++    )
+ 
+ def check_for_tool_use(response, model=''):
+     """
+@@ -358,8 +351,8 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+             # Check for next tool use
+             tool_use = check_for_tool_use(response, model=client_model)
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Agent loop aborted after API/tool error: {type(e).__name__}: {e}")
+ 
+     return new_msg_history
+ 
+@@ -449,8 +442,8 @@ def chat_with_agent_claude(
+             ],
+         })
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Agent loop aborted after API/tool error: {type(e).__name__}: {e}")
+ 
+     return new_msg_history
+ 
+@@ -538,8 +531,8 @@ def chat_with_agent_openai(
+         # Get final response
+         new_msg_history.append(response)
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Agent loop aborted after API/tool error: {type(e).__name__}: {e}")
+ 
+     return new_msg_history
+ 
+diff --git a/tests/test_llm_retry.py b/tests/test_llm_retry.py
+new file mode 100644
+index 0000000..3ac5d2b
+--- /dev/null
++++ b/tests/test_llm_retry.py
+@@ -0,0 +1,94 @@
++import anthropic
++import openai
++import httpx
++import pytest
++
++from llm import call_with_retries, is_transient_api_error
++from llm_withtools import get_response_withtools
++
++
++def _anthropic_status_error(status):
++    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
++    resp = httpx.Response(status, request=req)
++    return anthropic.APIStatusError("boom", response=resp, body=None)
++
++
++def test_transient_classification():
++    assert is_transient_api_error(anthropic.RateLimitError(
++        "x", response=httpx.Response(429, request=httpx.Request("POST", "https://x")), body=None))
++    assert is_transient_api_error(_anthropic_status_error(529))
++    assert is_transient_api_error(_anthropic_status_error(503))
++    assert not is_transient_api_error(_anthropic_status_error(400))
++    assert not is_transient_api_error(_anthropic_status_error(401))
++    assert not is_transient_api_error(ValueError("nope"))
++
++
++def test_retries_transient_then_succeeds():
++    calls = {"n": 0}
++    sleeps = []
++
++    def fn():
++        calls["n"] += 1
++        if calls["n"] < 3:
++            raise _anthropic_status_error(529)
++        return "ok"
++
++    out = call_with_retries(fn, max_retries=5, logging=lambda *_: None, sleep=sleeps.append)
++    assert out == "ok"
++    assert calls["n"] == 3
++    assert len(sleeps) == 2
++    assert all(0 < s <= 60 for s in sleeps)
++
++
++def test_non_transient_raises_immediately():
++    calls = {"n": 0}
++
++    def fn():
++        calls["n"] += 1
++        raise _anthropic_status_error(400)
++
++    with pytest.raises(anthropic.APIStatusError):
++        call_with_retries(fn, max_retries=5, logging=lambda *_: None, sleep=lambda s: None)
++    assert calls["n"] == 1
++
++
++def test_gives_up_after_max_retries():
++    calls = {"n": 0}
++
++    def fn():
++        calls["n"] += 1
++        raise openai.APITimeoutError(request=httpx.Request("POST", "https://x"))
++
++    with pytest.raises(openai.APITimeoutError):
++        call_with_retries(fn, max_retries=3, logging=lambda *_: None, sleep=lambda s: None)
++    assert calls["n"] == 4
++
++
++class _FakeClaude:
++    def __init__(self, errors):
++        self.errors = list(errors)
++        self.calls = 0
++        self.messages = self
++
++    def create(self, **kwargs):
++        self.calls += 1
++        if self.errors:
++            raise self.errors.pop(0)
++        return "response"
++
++
++def test_get_response_withtools_retries(monkeypatch):
++    monkeypatch.setattr("llm.time.sleep", lambda s: None)
++    client = _FakeClaude([_anthropic_status_error(429), _anthropic_status_error(500)])
++    out = get_response_withtools(client, "claude-3-5-sonnet-20241022", [], [], {"type": "auto"},
++                                 logging=lambda *_: None)
++    assert out == "response"
++    assert client.calls == 3
++
++
++def test_get_response_withtools_bad_request_not_retried():
++    client = _FakeClaude([_anthropic_status_error(400)])
++    with pytest.raises(anthropic.APIStatusError):
++        get_response_withtools(client, "claude-3-5-sonnet-20241022", [], [], {"type": "auto"},
++                               logging=lambda *_: None)
++    assert client.calls == 1

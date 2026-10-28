@@ -1,0 +1,222 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index cf52026..b9b736a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,7 +6,7 @@ import os
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, find_candidate_source_files
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -137,6 +137,36 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _read_candidate(self, rel_path, limit=4000):
++        """Read a repository file as text, truncated to `limit` characters (None = no limit)."""
++        try:
++            with open(os.path.join(self.git_tempdir, rel_path), 'r', encoding='utf-8', errors='replace') as f:
++                text = f.read()
++        except OSError as e:
++            return f"(could not read file: {e})"
++        if limit is not None and len(text) > limit:
++            text = text[:limit] + "\n... [truncated]"
++        return text
++
++    @staticmethod
++    def _extract_code_block(msg_history):
++        """Return the contents of the first ```python block in the last assistant message, or None."""
++        import re
++        for msg in reversed(msg_history):
++            if msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            if isinstance(content, list):
++                text = "\n".join(
++                    block.get("text", "") for block in content
++                    if isinstance(block, dict) and block.get("type") == "text"
++                )
++            else:
++                text = str(content or "")
++            match = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
++            return match.group(1) if match else None
++        return None
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -149,8 +179,21 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"""{task}
++        # Pre-resolve the likely target file(s) so the agent does not have to hunt for them.
++        candidates = find_candidate_source_files(self.git_tempdir)[:3]
++        target_section = ""
++        if candidates:
++            target_section = "\n# Target source file(s)\n"
++            for rel_path in candidates:
++                content = self._read_candidate(rel_path)
++                target_section += f"\n## {rel_path}\n```\n{content}\n```\n"
++            target_section += (
++                "\nEdit this file directly with the editor tool (command=edit, full file text); "
++                "you do not need to search for it.\n"
++            )
+ 
++        instruction = f"""{task}
++{target_section}
+ Follow these steps in order:
+ 1. Inspect the repository: read the starter file(s) (e.g. with bash `cat`, `ls`, `find`) to learn the required function/class signature and any existing tests.
+ 2. Design the algorithm: reason carefully about the problem's constraints and the most efficient correct approach.
+@@ -162,6 +205,7 @@ Rules:
+ - You MUST modify the source file using the editor tool; never finish your turn with an empty reply or only a plan.
+ - Do not only modify test files; the primary source file must contain the solution.
+ - Do not end your turn until the implementation is written to disk.
++- Avoid command substitution and commands that read stdin; keep inspection to at most 2 bash calls.
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+         safe_log(f"[forward] Initial pass complete; {len(msg_history)} messages in history.")
+@@ -172,16 +216,43 @@ Rules:
+                 break
+             safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Re-prompting agent.")
+             patch_display = patch.strip() if patch.strip() else "EMPTY (no changes at all)"
++            candidate_list = ", ".join(candidates) if candidates else "(none identified)"
+             retry_msg = f"""No source edits were detected in {self.git_tempdir}. The current diff against the base commit is:
+ 
+ {patch_display}
+ 
+-You have NOT yet modified the primary source file with a solution. Implement the solution NOW: use the editor tool to replace the starter stub (`pass`) in the main source file with a full implementation, adding any missing imports. Do not reply with only a plan or an empty message. After editing, reply with a short summary of the change."""
++You have NOT yet modified the primary source file with a solution. Candidate source file(s): {candidate_list}.
++Implement the solution NOW: use the editor tool (command=edit, full file text) to replace the starter stub (`pass`) in the main source file (preferably {candidates[0] if candidates else 'the candidate above'}) with a full implementation, adding any missing imports. Do not reply with only a plan or an empty message. After editing, reply with a short summary of the change."""
+             msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        else:
+-            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if not has_source_edits(patch):
+-                safe_log("[forward] Warning: agent finished without source edits after retries.")
++        patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++
++        # Last resort: ask the model for the complete file content and write it ourselves.
++        if not has_source_edits(patch) and candidates:
++            target = candidates[0]
++            safe_log(f"[forward] Still no source edits; requesting full file content for {target}.")
++            fallback_msg = f"""Reply with ONLY the full content of {target} implementing the solution, in a single ```python block. No other text.
++
++Problem:
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Current content of {target}:
++```
++{self._read_candidate(target, limit=None)}
++```"""
++            msg_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            code = self._extract_code_block(msg_history)
++            if code:
++                with open(os.path.join(self.git_tempdir, target), 'w', encoding='utf-8') as f:
++                    f.write(code)
++                safe_log(f"[forward] Wrote fallback solution to {target}.")
++                patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++            else:
++                safe_log("[forward] Fallback produced no code block.")
++
++        if not has_source_edits(patch):
++            safe_log("[forward] Warning: agent finished without source edits after retries.")
+ 
+         # Optional verification pass once a source edit exists
+         if has_source_edits(patch):
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..856bc94 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -11,13 +11,18 @@ def tool_info():
+ * State is persistent across command calls and discussions with the user.\n
+ * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+ * Please avoid commands that may produce a very large amount of output.\n
+-* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""",
++* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.\n
++* Each call uses a fresh shell, so no restart is needed (including after a timeout). Commands get no stdin (it is /dev/null), so commands like `cat` with no arguments return immediately. Avoid command substitution such as $(...) that may expand to nothing.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "command": {
+                     "type": "string",
+                     "description": "The bash command to run."
++                },
++                "restart": {
++                    "type": "boolean",
++                    "description": "Optional; ignored. Each call uses a fresh shell."
+                 }
+             },
+             "required": ["command"]
+@@ -30,7 +35,7 @@ class BashSession:
+         self._started = False
+         self._process = None
+         self._timed_out = False
+-        self._timeout = 120.0  # seconds
++        self._timeout = 60.0  # seconds
+         self._sentinel = "<<exit>>"
+         self._output_delay = 0.2  # seconds
+ 
+@@ -64,10 +69,11 @@ class BashSession:
+             raise ValueError(
+                 f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+             )
+-        
+-        # Send command
++
++        # Send command. Stdin is redirected from /dev/null inside a brace group so that
++        # commands such as `cat` with no arguments cannot block waiting for input.
+         self._process.stdin.write(
+-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
++            f"{{ {command}\n}} < /dev/null; echo '{self._sentinel}'\n".encode()
+         )
+         await self._process.stdin.drain()
+ 
+@@ -75,19 +81,19 @@ class BashSession:
+         try:
+             output = ''
+             start_time = asyncio.get_event_loop().time()
+-            
++
+             while True:
+                 if asyncio.get_event_loop().time() - start_time > self._timeout:
+                     self._timed_out = True
+                     raise ValueError(
+                         f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+                     )
+-                
++
+                 await asyncio.sleep(self._output_delay)
+                 # Read from the internal buffer
+                 stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+                 stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
++
+                 if self._sentinel in stdout_data:
+                     output = stdout_data[: stdout_data.index(self._sentinel)]
+                     break
+@@ -147,7 +153,12 @@ async def tool_function_call(command):
+     except Exception as e:
+         return f"Error: {str(e)}"
+ 
+-def tool_function(command):
++def tool_function(command, restart=False):
++    # `restart` is accepted for compatibility and ignored: each call already uses a fresh shell.
++    if command is None or not str(command).strip():
++        if restart:
++            return "Shell restarted (each call already uses a fresh shell)."
++        return "Error: no command given."
+     return asyncio.run(tool_function_call(command))
+ 
+ if __name__ == "__main__":
+@@ -162,4 +173,4 @@ if __name__ == "__main__":
+         input_command = ' '.join(sys.argv[1:])
+         # Run the tool_function asynchronously
+         result = tool_function(input_command)
+-        print(result)
+\ No newline at end of file
++        print(result)

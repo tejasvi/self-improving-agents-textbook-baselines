@@ -1,0 +1,216 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 39bfae0..db8f412 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,6 +8,13 @@ import threading
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++# Maximum number of bounded refinement rounds in forward()
++MAX_REFINE = 3
++# Marker the agent emits when all checks pass (ends refinement early)
++ALL_CHECKS_PASSED_MARKER = 'ALL CHECKS PASSED'
++# Scratch directory for stress-test helpers (kept outside the git repo)
++STRESS_DIR = '/tmp/stress'
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -137,9 +144,30 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _response_has_marker(self, msg_history, marker=ALL_CHECKS_PASSED_MARKER):
++        """Return True if the most recent assistant message contains the marker."""
++        for msg in reversed(msg_history):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                texts = [content]
++            elif isinstance(content, list):
++                texts = [
++                    (b.get('text') if isinstance(b, dict) else getattr(b, 'text', None)) or ''
++                    for b in content
++                ]
++            else:
++                texts = []
++            return any(marker in t for t in texts)
++        return False
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++
++        Runs a multi-phase workflow; every phase is a chat_with_agent call that
++        receives the msg_history returned by the previous phase.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -149,8 +177,66 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        stress_dir = STRESS_DIR
++        phase_prompts = [
++            # Phase 1: understand and plan (no edits)
++            f"""{task}
++
++## Phase 1: Understand and plan (DO NOT edit any files yet)
++Do not modify any files in this phase. Only read files in {self.git_tempdir} if needed.
++Produce a written analysis containing:
++1. A short restatement of the problem.
++2. Constraints (input sizes, value ranges, time/memory limits if given).
++3. The I/O format: is this a complete program reading stdin and writing stdout, or a method of a given `Solution` class? Identify the exact file and function/signature that must be implemented (inspect the repository to find it, e.g. existing stubs, tests, or README).
++4. A list of edge cases (e.g. n=1, empty input, duplicates, extreme values, worst-case structure).
++5. The chosen algorithm, with its time and space complexity checked against the constraints.
++Do not write the solution yet.""",
++            # Phase 2: implement
++            f"""## Phase 2: Implement
++Now implement the solution in the file and signature identified in your plan, using edits to files in {self.git_tempdir}.
++Guidelines:
++- Use fast input parsing (e.g. sys.stdin.buffer.read) when reading stdin.
++- Avoid deep recursion; use iteration or raise the recursion limit only if truly needed.
++- Do not leave debug prints or extra output on stdout.
++- Keep the output format exactly as the problem specifies.
++- Prefer the `str_replace` command of the editor tool for targeted changes; use `edit` only for full rewrites.
++When done, briefly summarize what you implemented.""",
++            # Phase 3: verify
++            f"""## Phase 3: Verify
++Verify the solution thoroughly. Do all of the following:
++1. Run every example from the problem statement through the solution and compare outputs exactly. Also run the repository's existing tests if any exist.
++2. Create helper files ONLY under the temporary directory {stress_dir} (create it with `mkdir -p {stress_dir}`). Do NOT create any helper, brute-force, generator, or test files inside {self.git_tempdir}.
++3. Write {stress_dir}/brute_force.py: a simple, obviously-correct reference solution for the same problem (same I/O format).
++4. Write {stress_dir}/gen.py: a random generator of small valid inputs (include edge cases such as n=1, duplicates, and extreme values), using a seed from the command line.
++5. Run a stress loop of 200-500 random cases. For each seed, generate the input, run the solution and the brute force each under `timeout 10`, and compare outputs (ignoring insignificant whitespace only if the problem allows it). Report the first failing input and both outputs if any mismatch or timeout occurs.
++6. Benchmark: generate a worst-case max-size input (per the constraints) and run the solution under `timeout 10`, measuring time with `time`. Report whether it runs well within the limit; if not, optimize the algorithm.
++Report all results clearly: examples passed or failed, stress result, benchmark time. Do not claim success unless these were actually run.""",
++        ]
++
++        msg_history = []
++        for prompt in phase_prompts:
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        # Phase 4: bounded refinement loop
++        refine_prompt = f"""## Phase 4: Refine
++Review the verification results above. If any example, stress test, or benchmark failed or timed out, debug the root cause, fix the solution in {self.git_tempdir}, and re-run the failing checks (and the stress test) under `timeout 10`.
++If everything passes, do not make unnecessary edits. When every check passes (examples, stress loop, benchmark), reply with the exact marker {ALL_CHECKS_PASSED_MARKER} on its own line and summarize the final results. If something still fails, describe what you tried and what remains failing; do not write the marker in that case."""
++        for _ in range(MAX_REFINE):
++            msg_history = chat_with_agent(refine_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            if self._response_has_marker(msg_history):
++                break
++
++        # Phase 5: final review
++        review_prompt = f"""## Phase 5: Final review
++Do a final checklist pass over the solution in {self.git_tempdir}:
++- Edge cases: n=1, empty or minimal input, duplicate values, extreme values, worst-case inputs.
++- Recursion limits: no deep recursion that could overflow the stack.
++- Fast input parsing for large inputs.
++- No debug prints or extra output on stdout; output format matches the problem exactly.
++- Correct I/O signature (stdin/stdout program, or the required `Solution` method).
++- Remove any helper files you may have created inside {self.git_tempdir} (e.g. brute_force.py, gen.py, scratch files, build dirs). Helper files belong only in {stress_dir}. Confirm with `git -C {self.git_tempdir} status`.
++Make any necessary final fixes, re-run the examples once more, and then give a brief final summary."""
++        msg_history = chat_with_agent(review_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/edit.py b/tools/edit.py
+index 244d440..cd20c2f 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -10,14 +10,15 @@ def tool_info():
+ * The `create` command cannot be used if the specified `path` already exists as a file.\n
+ * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+ * The `edit` command overwrites the entire file with the provided `file_text`.\n
+-* No partial/line-range edits or partial viewing are supported.""",
++* The `str_replace` command replaces the exact text `old_str` with `new_str` in an existing file. `old_str` must match exactly once in the file (include enough surrounding lines to make it unique). Prefer this over `edit` for targeted changes.\n
++* No partial viewing is supported.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "command": {
+                     "type": "string",
+-                    "enum": ["view", "create", "edit"],
+-                    "description": "The command to run: `view`, `create`, or `edit`."
++                    "enum": ["view", "create", "edit", "str_replace"],
++                    "description": "The command to run: `view`, `create`, `edit`, or `str_replace`."
+                 },
+                 "path": {
+                     "description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.",
+@@ -26,6 +27,14 @@ def tool_info():
+                 "file_text": {
+                     "description": "Required parameter of `create` or `edit` command, containing the content for the entire file.",
+                     "type": "string"
++                },
++                "old_str": {
++                    "type": "string",
++                    "description": "Required parameter of `str_replace` command: the exact existing text to replace (including whitespace and newlines). Must occur exactly once in the file."
++                },
++                "new_str": {
++                    "type": "string",
++                    "description": "Required parameter of `str_replace` command: the replacement text. Use an empty string to delete `old_str`."
+                 }
+             },
+             "required": ["command", "path"]
+@@ -61,7 +70,7 @@ def validate_path(path: str, command: str) -> Path:
+         # Path must not exist
+         if path_obj.exists():
+             raise ValueError(f"Cannot create new file; {path} already exists.")
+-    elif command == "edit":
++    elif command in ("edit", "str_replace"):
+         # Path must exist and must be a file
+         if not path_obj.exists():
+             raise ValueError(f"The file {path} does not exist.")
+@@ -119,12 +128,30 @@ def view_path(path_obj: Path) -> str:
+     content = read_file(path_obj)
+     return format_output(content, str(path_obj))
+ 
+-def tool_function(command: str, path: str, file_text: str = None) -> str:
++def str_replace(path_obj: Path, old_str: str, new_str: str) -> str:
++    """Replace a single exact occurrence of old_str with new_str in the file."""
++    content = read_file(path_obj)
++    count = content.count(old_str)
++    if count == 0:
++        raise ValueError(f"`old_str` was not found in {path_obj}. Make sure it matches the file exactly, including whitespace.")
++    if count > 1:
++        raise ValueError(f"`old_str` occurs {count} times in {path_obj}; include more surrounding context so it is unique.")
++    write_file(path_obj, content.replace(old_str, new_str, 1))
++    return f"The file {path_obj} has been edited successfully."
++
++def tool_function(
++    command: str,
++    path: str,
++    file_text: str = None,
++    old_str: str = None,
++    new_str: str = None,
++) -> str:
+     """
+     Main tool function that handles:
+-      - 'view'  : View the entire file or directory listing
+-      - 'create': Create a new file with the given file_text
+-      - 'edit'  : Overwrite an existing file with file_text
++      - 'view'       : View the entire file or directory listing
++      - 'create'     : Create a new file with the given file_text
++      - 'edit'       : Overwrite an existing file with file_text
++      - 'str_replace': Replace the unique occurrence of old_str with new_str
+     """
+     try:
+         path_obj = validate_path(path, command)
+@@ -144,6 +171,15 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
+             write_file(path_obj, file_text)
+             return f"File at {path} has been overwritten with new content."
+ 
++        elif command == "str_replace":
++            if old_str is None:
++                raise ValueError("Missing required `old_str` for 'str_replace' command.")
++            if new_str is None:
++                raise ValueError("Missing required `new_str` for 'str_replace' command.")
++            if old_str == "":
++                raise ValueError("`old_str` must not be empty.")
++            return str_replace(path_obj, old_str, new_str)
++
+         else:
+             raise ValueError(f"Unknown command: {command}")
+ 

@@ -1,0 +1,196 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f3e2be3..7d9e988 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,8 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
++import difflib
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -93,6 +95,84 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def find_target_file(git_tempdir):
++    """Return the path of the file the agent should write: solution.py if present,
++    otherwise the first .py file (sorted, skipping hidden dirs). None if no .py file."""
++    sol = os.path.join(git_tempdir, 'solution.py')
++    if os.path.exists(sol):
++        return sol
++    for root, dirs, files in os.walk(git_tempdir):
++        dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
++        for fname in sorted(files):
++            if fname.endswith('.py'):
++                return os.path.join(root, fname)
++    return None
++
++def read_file_or_none(path):
++    if path is None or not os.path.exists(path):
++        return None
++    with open(path, 'r', errors='replace') as f:
++        return f.read()
++
++def extract_samples(problem_statement):
++    """Extract (input, expected_output) pairs from 'Sample Input N' / 'Sample Output N' blocks."""
++    pattern = re.compile(
++        r"Sample Input\s*(\d*)[^\n]*\n(.*?)Sample Output\s*\1[^\n]*\n(.*?)(?=Sample Input|\Z)",
++        re.S | re.I,
++    )
++    samples = []
++    for _, inp, out in pattern.findall(problem_statement or ''):
++        inp = '\n'.join(l for l in inp.strip().splitlines() if not l.strip().startswith('```')).strip()
++        out = '\n'.join(l for l in out.strip().splitlines() if not l.strip().startswith('```')).strip()
++        if inp and out:
++            samples.append((inp, out))
++    return samples
++
++def run_samples(target, samples, timeout=10):
++    """Run `python3 target` on each sample. Returns None if all pass, otherwise a raw report string."""
++    if not samples:
++        return None
++    report = []
++    for idx, (inp, expected) in enumerate(samples, 1):
++        try:
++            proc = subprocess.run(
++                ['python3', target], input=inp + '\n', capture_output=True,
++                text=True, timeout=timeout, cwd=os.path.dirname(target) or '.',
++            )
++        except subprocess.TimeoutExpired:
++            report.append(f"Sample {idx}: TIMEOUT after {timeout}s\nInput:\n{inp}")
++            continue
++        actual = proc.stdout
++        if proc.returncode != 0:
++            report.append(f"Sample {idx}: CRASH (exit {proc.returncode})\nInput:\n{inp}\n"
++                          f"stdout:\n{actual}\nstderr:\n{proc.stderr}")
++            continue
++        actual_lines = [l.rstrip() for l in actual.strip().splitlines()]
++        expected_lines = [l.rstrip() for l in expected.strip().splitlines()]
++        if actual_lines != expected_lines:
++            diff = '\n'.join(difflib.unified_diff(
++                expected_lines, actual_lines, fromfile='expected', tofile='actual', lineterm=''))
++            report.append(f"Sample {idx}: MISMATCH\nInput:\n{inp}\nRaw stdout:\n{actual}\n"
++                          f"stderr:\n{proc.stderr}\nDiff:\n{diff}")
++    return '\n\n'.join(report) if report else None
++
++def last_assistant_text(msg_history):
++    """Text of the most recent assistant turn ('' if it ended empty or has no text)."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') != 'assistant':
++            continue
++        content = msg.get('content')
++        if isinstance(content, str):
++            return content.strip()
++        parts = []
++        for block in content or []:
++            text = block.get('text') if isinstance(block, dict) else getattr(block, 'text', None)
++            if text:
++                parts.append(text)
++        return '\n'.join(parts).strip()
++    return ''
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -153,6 +233,8 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 
+ Please follow these steps carefully. You MUST create or modify files; a task with no file changes is a failure.
+ 
++Your FIRST action after reading the files must be to write a candidate solution.py via the editor tool before writing any brute force. Write files with the editor tool, not bash heredocs. If you cannot find the formula, first write the brute-force BFS directly as solution.py to guarantee a valid baseline, then optimize.
++
+ 1. Explore the repository (list files, read any README, problem statement files, existing tests and the target file). Identify the target file to write the solution to (usually `solution.py`, or the file containing the `Solution` class named in the problem). If the problem is a complete program that reads standard input, write it as a Python script in the target file; if it is a method of a `Solution` class, implement the method in the class.
+ 2. Write an initial working solution to the target file RIGHT AWAY. A simple brute-force version is acceptable as a first step. Do not spend long analysis before writing a file.
+ 3. Build a brute-force reference implementation (e.g. BFS/DFS or exhaustive search over small parameters) in a separate scratch file, and a random stress test that generates many small random inputs, runs both the solution and the brute force, and compares outputs.
+@@ -167,19 +249,39 @@ Please follow these steps carefully. You MUST create or modify files; a task wit
+ 6. Re-run the samples and the stress test after every change to confirm the solution is still correct and efficient. Keep fixing until all samples pass and the stress test shows no discrepancies.
+ 7. Make sure the final solution file is saved in the repository and that you finish only after the tests pass. Briefly summarize what you implemented and the test results.
+ """
++        target = find_target_file(self.git_tempdir)
++        original_content = read_file_or_none(target)
++        samples = extract_samples(self.problem_statement)
++        safe_log(f"Target file: {target}; extracted {len(samples)} sample(s).")
++
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Ensure a non-empty patch exists; re-prompt if the agent made no file changes.
+-        for attempt in range(3):
++        # (a) Verification loop: non-empty repo diff, target changed from stub, no empty assistant turn.
++        for attempt in range(5):
+             diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if diff.strip():
++            current = read_file_or_none(target)
++            problems = []
++            if not diff.strip():
++                problems.append("The repository has NO file changes.")
++            if target is not None and current == original_content:
++                problems.append(f"The target file {target} is unchanged from its original stub.")
++            last_text = last_assistant_text(msg_history)
++            if not last_text:
++                problems.append("Your last turn ended with an empty message.")
++            if not problems:
+                 break
+-            safe_log(f"Empty patch after attempt {attempt + 1}; re-prompting agent.")
++            safe_log(f"Check failed after attempt {attempt + 1}: {problems}")
++            if attempt == 0:
++                escalation = "Use the editor tool create/edit command to write solution.py now with a straightforward solution (even brute force)."
++            else:
++                escalation = ("Write solution.py NOW using the editor tool; a simple brute force is acceptable; "
++                              "a partially working solution is better than none.")
+             retry_msg = (
+-                "Your previous attempt produced no file changes, so the task is not solved. "
+-                f"Write the complete solution into the target file inside {self.git_tempdir} NOW, "
+-                "starting with a simple brute-force version if necessary, then test it on the samples "
+-                "using the bash tool. Do not just describe the solution: use the file editing tools to save it."
++                f"Verification failed: {' '.join(problems)}\n"
++                f"Target file: {target}\n"
++                f"Current contents of the target file:\n```\n{current if current is not None else '(missing)'}\n```\n"
++                f"{escalation}\n"
++                "Then test it on the samples using the bash tool, and finish with a short summary."
+             )
+             msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+@@ -188,6 +290,23 @@ Please follow these steps carefully. You MUST create or modify files; a task wit
+             safe_log("Warning: still no file changes after retries.")
+             return
+ 
++        # (b) Sample verification loop: run the program on extracted samples, feed raw output back.
++        if target is not None and samples:
++            for round_idx in range(3):
++                report = run_samples(target, samples)
++                if report is None:
++                    safe_log("All extracted samples pass.")
++                    break
++                safe_log(f"Sample run failed in round {round_idx + 1}.")
++                retry_msg = (
++                    "Running your solution on the sample inputs from the problem statement failed. "
++                    "Here are the raw results (stdout, stderr, and diff of expected vs actual):\n\n"
++                    f"{report}\n\n"
++                    f"Fix {target} so it runs without crashing and matches every sample output exactly. "
++                    "Use the editor tool to save the fix, then re-run the samples with the bash tool."
++                )
++                msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
+         # Final verification pass on the non-empty patch.
+         verification_msg = f"""Now perform a final verification of your solution in {self.git_tempdir}:
+ 1. Write a brute-force reference checker (BFS or exhaustive search) for small inputs.
+@@ -196,7 +315,7 @@ Please follow these steps carefully. You MUST create or modify files; a task wit
+ 4. If any sample mismatches, even when your answer is valid, try at least 4-5 alternative deterministic constructions (reverse the order of basis vectors or bit positions, reverse vertex or free-variable iteration, choose the smallest or largest valid values, use a standard reference-style construction). Keep the variant that matches all samples byte-for-byte and still passes a separate validity checker. If none matches, document this explicitly.
+ 5. If any test fails or any discrepancy appears, fix the solution and re-run all tests until they all pass.
+ 6. Make sure the final solution is saved in the repository, is efficient enough for the stated constraints, and summarize the test results."""
+-        chat_with_agent(verification_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        msg_history = chat_with_agent(verification_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+         # Follow-up turn: enforce exact sample-output matching.
+         exact_match_msg = (
+@@ -207,6 +326,7 @@ Please follow these steps carefully. You MUST create or modify files; a task wit
+         )
+         chat_with_agent(exact_match_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

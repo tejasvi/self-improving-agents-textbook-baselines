@@ -1,0 +1,534 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ab6e636..88fd3e0 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -11,6 +11,7 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.stress import stress_check, shortest_failure, format_failure
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -46,7 +47,9 @@ TEST_COMMANDS = {
+ # Harness settings for the multi-attempt loop (all loops are bounded `for` loops)
+ MAX_ATTEMPTS = 4          # total solve attempts
+ MAX_NUDGES = 2            # re-prompts when solution.py is missing / unchanged
++EMPTY_RETRIES = 2        # immediate short-prompt retries for empty / tool-less replies (not counted as nudges)
+ STRESS_SEEDS = 200        # random seeds for brute-vs-solution stress test
++STRESS_MAX_FAILURES = 5  # collect this many failing seeds, report the shortest input
+ STRESS_BUDGET_S = 120     # wall-clock cap for the stress phase
+ RUN_TIMEOUT_S = 10        # timeout for every solution / generator / brute run
+ REPORT_CLIP = 2000        # max chars of any raw input/output in a report
+@@ -81,11 +84,11 @@ Do NOT read or use solution.py; write the helpers independently from the stateme
+ </problem_description>
+ 
+ Create these three files in {d}:
+-1. brute.py: an obviously correct exhaustive solution that reads stdin and writes stdout exactly like the problem requires. No optimisation; it only has to be correct on small inputs.
+-2. gen.py: a random generator of SMALL valid inputs that respects the constraints. Usage `python3 gen.py SEED` prints one input to stdout. Use random.Random(int(sys.argv[1])) so it is deterministic per seed.
++1. brute.py: an obviously correct exhaustive solution that reads stdin and writes stdout exactly like the problem requires. No optimisation; it only has to be correct on small inputs. For movement / game / state-transition problems (moves, paths, grids, tokens, swaps, operations applied step by step, win/lose games) the brute MUST be a BFS or exhaustive search over the raw state graph, implementing the literal move/operation rules from the statement exactly (no derived formulas, no case analysis). Check brute.py on every sample: `python3 brute.py < sample_input` must match the expected output exactly. Fix brute.py until it does.
++2. gen.py: a random generator of SMALL valid inputs that respects the constraints. Usage `python3 gen.py SEED` prints one input to stdout. Use random.Random(int(sys.argv[1])) so it is deterministic per seed. Keep inputs small enough that brute.py runs in well under a second.
+ 3. gen_big.py: a generator of MAX-SIZE valid inputs. Usage `python3 gen_big.py SEED` prints one input at the largest allowed constraints. Cycle through adversarial shapes by seed (e.g. seed%4: all-equal values, random values, sorted/reverse-sorted, many distinct values or skewed sizes), so that pruning/early-break heuristics are stressed.
+ 
+-Then check brute.py by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Finish by making sure all three files exist."""
++Then run gen.py for a few seeds and check that its output is valid per the constraints. Finish by making sure all three files exist and brute.py passes all samples."""
+ 
+ 
+ # Thread-local storage for logger instances
+@@ -251,7 +254,7 @@ class AgenticSystem:
+             samples.append((int(m.group(1)), inp + '\n', out))
+         return samples
+ 
+-    def _run_samples(self):
++    def _run_samples(self, program='solution.py'):
+         """
+         Run solution.py on each parsed sample. Returns (passed, total, timed_out, report).
+         For Solution-class tasks nothing is run; the report tells the agent to check samples itself.
+@@ -269,7 +272,7 @@ class AgenticSystem:
+         passed, timed_out, parts = 0, False, []
+         for idx, inp, exp in samples:
+             try:
+-                p = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=inp,
++                p = subprocess.run(['python3', program], cwd=self.git_tempdir, input=inp,
+                                    capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+             except subprocess.TimeoutExpired:
+                 timed_out = True
+@@ -290,54 +293,25 @@ class AgenticSystem:
+ 
+     def _run_stress(self):
+         """
+-        If gen.py and brute.py exist, compare solution.py against brute.py on STRESS_SEEDS seeds.
+-        Returns (mismatch_found, ran, report). Stops at the first mismatch.
++        If gen.py and brute.py exist, compare solution.py against brute.py on up to STRESS_SEEDS seeds.
++        Collects up to STRESS_MAX_FAILURES failing seeds and reports the one with the shortest input.
++        Returns (mismatch_found, ran, report). Helper (gen/brute) crashes never count as mismatches.
+         """
+         gen = os.path.join(self.git_tempdir, 'gen.py')
+         brute = os.path.join(self.git_tempdir, 'brute.py')
+         if not (os.path.isfile(gen) and os.path.isfile(brute)):
+             return False, 0, "Stress skipped: gen.py and/or brute.py missing."
+-        start = time.monotonic()
+-        ran = 0
+-        for seed in range(1, STRESS_SEEDS + 1):
+-            if time.monotonic() - start > STRESS_BUDGET_S:
+-                break
+-            try:
+-                g = subprocess.run(['python3', 'gen.py', str(seed)], cwd=self.git_tempdir,
+-                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+-            except subprocess.TimeoutExpired:
+-                return True, ran, f"gen.py timed out on seed {seed}."
+-            if g.returncode != 0:
+-                return False, ran, (f"helper script failed: gen.py crashed on seed {seed} (not counted against solution.py).\n"
+-                                    f"stderr:\n{(g.stderr or '')[-REPORT_CLIP:]}")
+-            inp = g.stdout
+-            try:
+-                b = subprocess.run(['python3', 'brute.py'], cwd=self.git_tempdir, input=inp,
+-                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+-                b_out, b_err, b_rc = b.stdout, b.stderr, b.returncode
+-            except subprocess.TimeoutExpired:
+-                return False, ran, (f"helper script failed: brute.py timed out on seed {seed} "
+-                                    f"(not counted against solution.py); input:\n{inp[:REPORT_CLIP]}")
+-            try:
+-                s = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=inp,
+-                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+-                s_out, s_err, s_rc = s.stdout, s.stderr, s.returncode
+-            except subprocess.TimeoutExpired:
+-                return True, ran, (f"solution.py TIMED OUT on seed {seed} (limit {RUN_TIMEOUT_S}s).\n"
+-                                   f"input:\n{inp[:REPORT_CLIP]}\nbrute output:\n{b_out[:REPORT_CLIP]}")
+-            ran += 1
+-            if b_rc != 0:
+-                # The helper is broken, not the solution: report it, but do not penalise solution.py.
+-                return False, ran, (f"helper script failed: brute.py crashed on seed {seed} "
+-                                    f"(not counted against solution.py; fix brute.py).\n"
+-                                    f"input:\n{inp[:REPORT_CLIP]}\nbrute stderr:\n{b_err[-REPORT_CLIP:]}")
+-            if s_out.split() != b_out.split():
+-                return True, ran, (f"MISMATCH on seed {seed}.\ninput:\n{inp[:REPORT_CLIP]}"
+-                                   f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
+-                                   f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
+-                                   f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}\n"
+-                                   f"Note: brute.py itself may be wrong; verify it against the statement.")
+-        return False, ran, f"Stress: {ran} seeds run, no mismatch."
++        res = stress_check(self._sol_path(), brute, gen, seeds=STRESS_SEEDS, timeout_s=RUN_TIMEOUT_S,
++                           max_failures=STRESS_MAX_FAILURES, budget_s=STRESS_BUDGET_S)
++        if res['status'] == 'helper_failed':
++            return False, res['ran'], res['message'] + "\n(fix the helper; solution.py is not penalised)"
++        if res['status'] == 'mismatch':
++            f = shortest_failure(res)
++            return True, res['ran'], (
++                f"MISMATCH: {len(res['failures'])} failing seed(s) among {res['ran']} run. "
++                f"Smallest failing input:\n" + format_failure(f) +
++                "\nNote: brute.py itself may be wrong; verify it against the statement.")
++        return False, res['ran'], f"Stress: {res['ran']} seeds run, no mismatch."
+ 
+     def _run_timing(self):
+         """Run solution.py on max-size inputs from gen_big.py. Returns (ok, report)."""
+@@ -385,7 +359,8 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+ 
+     def _method_text(self):
+-        return """Work like a careful competitive programmer:
++        return """Tool rule: never call a tool with empty arguments; every bash call must include a `command`, and every editor call must include a path and the required fields.
++Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Brute force first. Write brute.py with the editor tool: an exhaustive / BFS / DP over the complete state space, obviously correct, only for small inputs. Run it on every sample and check that it matches the expected output exactly.
+ 3. Write the optimized solution in solution.py with the editor tool, starting with the simplest correct approach.
+@@ -401,25 +376,23 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+    f. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
+ 6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+ 
+-    def _brute_fallback(self):
+-        """Copy brute.py over solution.py if brute.py passes the samples. Returns a message or None."""
+-        brute = os.path.join(self.git_tempdir, 'brute.py')
+-        if not os.path.isfile(brute):
+-            return None
+-        prev = self._read_solution()
+-        try:
+-            shutil.copyfile(brute, self._sol_path())
+-        except OSError:
++    def _brute_passes_samples(self):
++        """True if brute.py exists, compiles-by-running, and passes every parsed sample."""
++        if not os.path.isfile(os.path.join(self.git_tempdir, 'brute.py')):
++            return False
++        passed, total, timed_out, _ = self._run_samples(program='brute.py')
++        return total > 0 and passed == total and not timed_out
++
++    def _brute_fallback(self, k):
++        """If brute.py passes the samples, snapshot it as a candidate (solution.py is left untouched).
++        Returns (message, snapshot_path) or None."""
++        if not self._brute_passes_samples():
+             return None
+-        ok, _ = self._check_basic()
+-        if ok:
+-            passed, total, timed_out, _ = self._run_samples()
+-            if passed == total and total > 0 and not timed_out:
+-                return f"brute.py passes {passed}/{total} samples"
+-        if prev is not None:
+-            with open(self._sol_path(), 'w') as f:
+-                f.write(prev)
+-        return None
++        snap_dir = os.path.join('/tmp/attempts', self._run_id)
++        os.makedirs(snap_dir, exist_ok=True)
++        dst = os.path.join(snap_dir, f'brute_{k}.py')
++        shutil.copyfile(os.path.join(self.git_tempdir, 'brute.py'), dst)
++        return "brute.py passes all samples (small-input-only fallback)", dst
+ 
+     def _retry_prompt(self, feedback, prev_code):
+         code = (prev_code or '')[:CODE_CLIP]
+@@ -429,13 +402,14 @@ You are on a retry. A previous attempt at this problem was judged by an independ
+ 
+ {code_block}
+ 
+-Harness report:
++Harness report (the first item, if present, is a MINIMAL COUNTEREXAMPLE that the harness found with brute.py; fix it first):
+ {feedback}
+ 
+-Diagnose the root cause first. If your algorithm is fundamentally wrong, derive a different one; do not just patch special cases.
+-If the previous solution failed stress or relied on heavy case analysis (modular wrap-around enumeration, sign tracking), re-derive a simpler formulation: start from brute.py's state definition and use a DP over the single free coordinate with O(Q*N) transitions, so that it matches the brute force by construction.
++Diagnose the root cause first, starting from the counterexample: trace solution.py by hand on it and compare with brute.py's output. If your algorithm is fundamentally wrong, derive a different one; do not just patch special cases.
++If a counterexample persists after two repairs, stop patching: re-derive solution.py from brute.py's state definition (a DP or search over the same state space the brute uses), so it matches the brute by construction.
++If the previous solution relied on heavy case analysis (modular wrap-around enumeration, sign tracking, special cases for blocked moves), replace it with the simpler formulation.
+ {HYPOTHESIS_LINE}
+-Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
++Then update solution.py with the editor tool, run the samples yourself, and re-run the stress comparison with brute.py (the stress_compare tool is available with solution_path, brute_path, gen_path, seeds, timeout_s) and max-size timing. Keep reasoning brief and never end your turn without having written the file.
+ """
+ 
+     def _oracle_prompt(self):
+@@ -509,34 +483,41 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                 f"Solution file: {self._sol_path()}\n{SHORT_NUDGE_LINES}")
+ 
+     def _ask_until_changed(self, prompt, before):
+-        """Call the agent; re-prompt (bounded) if solution.py is still missing, empty or unchanged.
++        """Call the agent until solution.py changes. Bounded: at most MAX_NUDGES nudges plus
++        EMPTY_RETRIES immediate retries for empty / tool-less replies (these do not use a nudge).
+         A 'no change needed' conclusion is answered with an assumption audit instead of a forced rewrite."""
+         follow_up = None
+-        self._last_reply_text_ok = True
+-        self._last_tool_used = True
+-        for n in range(MAX_NUDGES + 1):
+-            if n == 0:
+-                p = prompt
+-            elif not self._last_reply_text_ok or not self._last_tool_used:
+-                p = self._short_prompt()
++        empty_retries = 0
++        nudges = 0
++        last_empty = False  # local: a stale flag from a previous attempt must not change the first prompt
++        for _ in range(MAX_NUDGES + EMPTY_RETRIES + 1):
++            if nudges > MAX_NUDGES:
++                break
++            if last_empty:
++                p = self._short_prompt()          # immediate re-prompt, no nudge consumed
+             elif follow_up is not None:
+                 p = f"{follow_up}\n\n{prompt}"
+             else:
+-                p = f"{NUDGE_LINE}\n\n{prompt}"
++                p = prompt if nudges == 0 and empty_retries == 0 else f"{NUDGE_LINE}\n\n{prompt}"
+             reply = self._ask(p)
+-            self._last_reply_text_ok = bool(reply.strip())
++            last_empty = (not reply.strip()) or (not self._last_tool_used)
+             cur = self._read_solution()
+             if cur is not None and cur.strip() and cur != before:
+                 return True
+-            if not reply.strip() or not self._last_tool_used:
++            if last_empty:
++                empty_retries += 1
+                 follow_up = None
+-                safe_log(f"Empty or tool-less reply after call {n + 1}; re-prompting with the short prompt.")
+-            elif self._says_no_change(reply):
++                safe_log(f"Empty or tool-less reply (retry {empty_retries}); re-prompting with the short prompt.")
++                if empty_retries > EMPTY_RETRIES:
++                    break
++                continue
++            nudges += 1
++            if self._says_no_change(reply):
+                 follow_up = ASSUMPTION_AUDIT_LINE
+-                safe_log(f"Agent concluded no change is needed after call {n + 1}; running assumption audit.")
++                safe_log(f"Agent concluded no change is needed after call; running assumption audit.")
+             else:
+                 follow_up = NUDGE_LINE
+-                safe_log(f"solution.py missing/empty/unchanged after call {n + 1}; re-prompting.")
++                safe_log(f"solution.py missing/empty/unchanged after call; re-prompting.")
+         return False
+ 
+     # ------------------------------------------------------------------
+@@ -545,11 +526,14 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+ 
+     def forward(self):
+         """
+-        Bounded multi-attempt loop. Each attempt is judged by the harness; the best snapshot wins.
++        Bounded multi-attempt loop. Each compiling attempt is judged by the harness (samples, then the
++        oracle phase, stress and timing); the best snapshot wins.
+         Score = (samples_passed, stress_ok, no_timeout); ties go to the later attempt.
++        A mismatch never stops the loop; the minimal counterexample goes to the next attempt.
+         """
+         self._run_id = uuid.uuid4().hex[:12]
+         best = None  # (score, k, snapshot_path)
++        fallback = None  # (score, k, brute_snapshot_path): brute.py when it passes samples
+         feedback = None
+         prev_code = self._read_solution()
+         class_task = self._is_class_task()
+@@ -562,7 +546,7 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                 prompt = self._retry_prompt(feedback, prev_code)
+             changed = self._ask_until_changed(prompt, before)
+             if not changed:
+-                safe_log(f"Attempt {k}: agent produced no solution.py change after {MAX_NUDGES + 1} calls.")
++                safe_log(f"Attempt {k}: agent produced no solution.py change after the bounded re-prompts.")
+ 
+             ok, basic_msg = self._check_basic()
+             if not ok:
+@@ -576,29 +560,31 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+             report_parts = [basic_msg, sample_report]
+             stress_mismatch = False
+             timing_ok = True
+-
+-            # No parseable samples is not a failure: the stress phase still runs.
+-            samples_all_pass = passed == total and not samples_timeout
+             interactive = self._is_interactive() and not class_task
++            counterexample = None
++
+             if class_task:
+                 # Solution-class tasks: the harness cannot run them; the agent checks samples itself.
+                 pass
+             elif interactive:
+                 # Interactive tasks: plain-pipe stress/timing would feed brute.py / solution.py the wrong protocol.
+                 report_parts.append("Stress/timing skipped: interactive problem; the harness cannot drive the judge.")
+-            elif samples_all_pass:
+-                # Oracle phase: make brute.py / gen.py / gen_big.py if missing, then stress and time.
+-                # Stress always runs once samples pass (not only when the first attempt is clean).
++            else:
++                # Oracle phase runs after every compiling attempt, even when samples fail.
+                 if not all(os.path.isfile(os.path.join(self.git_tempdir, f))
+                            for f in ('brute.py', 'gen.py', 'gen_big.py')):
+                     self._ask(self._oracle_prompt())
+-                stress_mismatch, _, stress_report = self._run_stress()
+-                report_parts.append(stress_report)
+-                if not stress_mismatch:
+-                    timing_ok, timing_report = self._run_timing()
+-                    report_parts.append(timing_report)
+-            else:
+-                report_parts.append("Oracle/stress phase skipped until all samples pass.")
++                if self._brute_passes_samples():
++                    stress_mismatch, _, stress_report = self._run_stress()
++                    report_parts.append(stress_report)
++                    if stress_mismatch:
++                        counterexample = stress_report
++                    elif passed == total and not samples_timeout:
++                        timing_ok, timing_report = self._run_timing()
++                        report_parts.append(timing_report)
++                else:
++                    report_parts.append("Stress skipped: brute.py is missing or does not pass the samples; "
++                                        "fix brute.py first (it must match every sample).")
+ 
+             if class_task or interactive:
+                 score = (0, True, True)
+@@ -606,28 +592,38 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                 score = (passed, not stress_mismatch, not samples_timeout and timing_ok)
+             snap = self._snapshot(k)
+             safe_log(f"Attempt {k} score={score} snapshot={snap}\n" + "\n".join(report_parts))
++            if snap is not None and (best is None or score >= best[0]):
++                best = (score, k, snap)
+ 
+-            # Final attempt: if the best candidate so far fails samples or stress, fall back to brute.py
+-            # when it passes the samples.
+-            if k == MAX_ATTEMPTS - 1 and (best is None or best[0][0] < total or not best[0][1]):
+-                fb = self._brute_fallback()
++            # Brute-fallback check on every attempt: brute.py is a valid small-input candidate when it
++            # passes the samples and the solution does not pass both samples and stress.
++            if not (class_task or interactive) and (passed < total or stress_mismatch or samples_timeout):
++                fb = self._brute_fallback(k)
+                 if fb is not None:
+-                    safe_log(f"Final attempt: brute.py used as solution.py ({fb}).")
+-                    snap = self._snapshot(k)
+-                    if snap is not None:
+-                        score = (total, False, True)
+-                        best = (score, k, snap)
++                    msg, fb_snap = fb
++                    safe_log(f"Attempt {k}: {msg} ({fb_snap}); kept as fallback candidate.")
++                    fallback = ((total, False, True), k, fb_snap)
+ 
+-            # ">=" so a later attempt wins ties, but never loses to a better earlier one.
+-            if snap is not None and (best is None or score >= best[0]):
+-                best = (score, k, snap)
+             prev_code = self._read_solution()
+             feedback = "\n\n".join(p for p in report_parts if p)
+-
+-            clean = class_task or interactive or (samples_all_pass and not stress_mismatch and timing_ok and not samples_timeout)
+-            if clean and (class_task or interactive or not stress_mismatch):
++            if counterexample is not None:
++                # The counterexample goes first so the retry prompt leads with it.
++                rest = [p for p in report_parts if p and p != counterexample]
++                feedback = "\n\n".join(["COUNTEREXAMPLE (minimal failing input; trace it by hand):\n" + counterexample]
++                                        + rest)
++
++            clean = class_task or interactive or (passed == total and not samples_timeout and
++                                                  not stress_mismatch and timing_ok)
++            if clean:
+                 break  # all harness checks passed for this attempt
+ 
++        # Final choice: a brute fallback replaces the best solution only when the solution is not clean
++        # (failed samples or a stress mismatch) and brute.py is valid on the samples.
++        if fallback is not None and (best is None or best[0][0] < total or not best[0][1]):
++            fb_score, fb_k, fb_snap = fallback
++            best = (fb_score, fb_k, fb_snap)
++            safe_log(f"Final: brute.py fallback (attempt {fb_k}) chosen over the solution.py candidate.")
++
+         if best is None:
+             safe_log("No valid solution.py was produced by any attempt.")
+             return
+diff --git a/tools/stress.py b/tools/stress.py
+new file mode 100644
+index 0000000..053db47
+--- /dev/null
++++ b/tools/stress.py
+@@ -0,0 +1,152 @@
++import os
++import subprocess
++import time
++
++MAX_SEEDS = 1000        # hard cap on seeds per call
++MAX_FAILURES = 5        # collect this many failing seeds, then report the shortest input
++REPORT_CLIP = 2000      # max chars of any raw input/output in a report
++
++
++def tool_info():
++    return {
++        "name": "stress_compare",
++        "description": """Stress-compare solution.py against an independent brute-force reference.\n
++* For each seed in 1..seeds it runs `python3 gen_path SEED`, feeds the generated input to brute_path and to solution_path, and compares their whitespace-split stdout.
++* Returns 'all N seeds passed' when every seed matches. Otherwise it returns the SMALLEST failing input (shortest input text among the first few failing seeds) with the brute output, the solution output, the solution stderr and exit code.
++* Helper failures are reported separately: if gen_path or brute_path crashes or times out, the report says 'helper script failed' and the solution is not blamed.
++* Use it after writing brute.py and gen.py (both Python files, reading stdin / writing stdout).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution Python program (reads stdin, writes stdout)."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference Python program (reads stdin, writes stdout)."
++                },
++                "gen_path": {
++                    "type": "string",
++                    "description": "Path to the generator; it is run as `python3 gen_path SEED` and prints one input to stdout."
++                },
++                "seeds": {
++                    "type": "integer",
++                    "description": "Number of seeds to run (1..seeds). Capped at 1000."
++                },
++                "timeout_s": {
++                    "type": "integer",
++                    "description": "Timeout in seconds for each single run of the generator, brute and solution."
++                }
++            },
++            "required": ["solution_path", "brute_path", "gen_path", "seeds", "timeout_s"]
++        }
++    }
++
++
++def _clip(s):
++    s = s or ''
++    return s if len(s) <= REPORT_CLIP else s[:REPORT_CLIP] + "\n...(clipped)"
++
++
++def stress_check(solution_path, brute_path, gen_path, seeds=200, timeout_s=10,
++                 max_failures=MAX_FAILURES, budget_s=None):
++    """
++    Run gen -> brute -> solution for seeds 1..seeds.
++    Returns a dict:
++      status: 'ok' | 'mismatch' | 'helper_failed' | 'missing'
++      ran: number of seeds whose brute and solution both finished
++      failures: list of dicts (seed, input, brute_out, sol_out, sol_err, sol_rc, kind)
++      message: human-readable note (used for helper failures)
++    """
++    sol = os.path.abspath(solution_path)
++    brute = os.path.abspath(brute_path)
++    gen = os.path.abspath(gen_path)
++    for name, p in (('solution', sol), ('brute', brute), ('gen', gen)):
++        if not os.path.isfile(p):
++            return {'status': 'missing', 'ran': 0, 'failures': [],
++                    'message': f"{name} file not found: {p}"}
++    seeds = max(0, min(int(seeds), MAX_SEEDS))
++    timeout_s = max(1, int(timeout_s))
++    cwd = os.path.dirname(sol)
++    start = time.monotonic()
++    ran = 0
++    failures = []
++    for seed in range(1, seeds + 1):
++        if budget_s is not None and time.monotonic() - start > budget_s:
++            break
++        try:
++            g = subprocess.run(['python3', gen, str(seed)], cwd=os.path.dirname(gen),
++                               capture_output=True, text=True, timeout=timeout_s)
++        except subprocess.TimeoutExpired:
++            return {'status': 'helper_failed', 'ran': ran, 'failures': failures,
++                    'message': f"helper script failed: gen.py timed out on seed {seed} "
++                               f"(not counted against solution.py)."}
++        if g.returncode != 0:
++            return {'status': 'helper_failed', 'ran': ran, 'failures': failures,
++                    'message': f"helper script failed: gen.py crashed on seed {seed} "
++                               f"(exit {g.returncode}, not counted against solution.py).\n"
++                               f"stderr:\n{_clip(g.stderr[-REPORT_CLIP:])}"}
++        inp = g.stdout
++        try:
++            b = subprocess.run(['python3', brute], cwd=os.path.dirname(brute), input=inp,
++                               capture_output=True, text=True, timeout=timeout_s)
++        except subprocess.TimeoutExpired:
++            return {'status': 'helper_failed', 'ran': ran, 'failures': failures,
++                    'message': f"helper script failed: brute.py timed out on seed {seed} "
++                               f"(not counted against solution.py).\ninput:\n{_clip(inp)}"}
++        if b.returncode != 0:
++            return {'status': 'helper_failed', 'ran': ran, 'failures': failures,
++                    'message': f"helper script failed: brute.py crashed on seed {seed} "
++                               f"(exit {b.returncode}, not counted against solution.py; fix brute.py).\n"
++                               f"input:\n{_clip(inp)}\nbrute stderr:\n{_clip(b.stderr[-REPORT_CLIP:])}"}
++        ran += 1
++        try:
++            s = subprocess.run(['python3', sol], cwd=cwd, input=inp,
++                               capture_output=True, text=True, timeout=timeout_s)
++            s_out, s_err, s_rc, kind = s.stdout, s.stderr, s.returncode, None
++            if s_rc != 0:
++                kind = 'crash'
++            elif s_out.split() != b.stdout.split():
++                kind = 'wrong'
++        except subprocess.TimeoutExpired:
++            s_out, s_err, s_rc, kind = '', f"solution.py TIMED OUT (limit {timeout_s}s)", None, 'timeout'
++        if kind is not None:
++            failures.append({'seed': seed, 'input': inp, 'brute_out': b.stdout, 'sol_out': s_out,
++                             'sol_err': s_err, 'sol_rc': s_rc, 'kind': kind})
++            if len(failures) >= max_failures:
++                break
++    status = 'mismatch' if failures else 'ok'
++    return {'status': status, 'ran': ran, 'failures': failures, 'message': ''}
++
++
++def shortest_failure(result):
++    """The failing case with the shortest input text (earliest seed on ties), or None."""
++    fails = result.get('failures') or []
++    if not fails:
++        return None
++    return min(fails, key=lambda f: (len(f['input']), f['seed']))
++
++
++def format_failure(f):
++    kind_txt = {'wrong': 'WRONG ANSWER', 'crash': 'RUNTIME ERROR (non-zero exit)',
++                'timeout': 'TIME LIMIT EXCEEDED'}.get(f['kind'], f['kind'])
++    return (f"{kind_txt} on seed {f['seed']} (input length {len(f['input'])} chars).\n"
++            f"input:\n{_clip(f['input'])}"
++            f"brute (expected) output:\n{_clip(f['brute_out'])}\n"
++            f"solution (actual) output:\n{_clip(f['sol_out'])}\n"
++            f"solution stderr (exit {f['sol_rc']}):\n{_clip((f['sol_err'] or '')[-REPORT_CLIP:])}")
++
++
++def tool_function(solution_path, brute_path, gen_path, seeds, timeout_s):
++    res = stress_check(solution_path, brute_path, gen_path, seeds=seeds, timeout_s=timeout_s)
++    if res['status'] == 'missing':
++        return f"Error: {res['message']}"
++    if res['status'] == 'helper_failed':
++        return res['message']
++    if res['status'] == 'ok':
++        return f"all {res['ran']} seeds passed"
++    f = shortest_failure(res)
++    return (f"Stress MISMATCH: {len(res['failures'])} failing seed(s) among {res['ran']} run; "
++            f"smallest failing input shown below.\n" + format_failure(f) +
++            "\nNote: brute.py itself may be wrong; verify it against the statement.")

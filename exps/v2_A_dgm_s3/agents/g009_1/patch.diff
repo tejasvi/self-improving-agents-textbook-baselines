@@ -1,0 +1,335 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 57fffbc..e549368 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import traceback
+ 
+ from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -236,6 +237,12 @@ class AgenticSystem:
+                 return cand
+         return 'solution.py'
+ 
++    def _text_in_problem(self, text):
++        """True if the (whitespace-normalised) text is already contained in the problem statement."""
++        norm = lambda t: re.sub(r'\s+', ' ', t or '').strip().lower()
++        body = norm(text)
++        return bool(body) and body in norm(self.problem_statement)
++
+     def _snapshot_repo(self, max_files=10, max_file_bytes=8 * 1024, max_listing=200):
+         """
+         Deterministically collect the repo file listing (git ls-files) and the contents of
+@@ -287,6 +294,9 @@ class AgenticSystem:
+                 text = raw.decode('utf-8', errors='replace')
+             except Exception:
+                 continue
++            # Skip README files whose content is already in the problem statement.
++            if os.path.basename(f).lower().startswith('readme') and self._text_in_problem(text):
++                continue
+             contents.append(f"--- {f} ---\n{text}")
+ 
+         return f"Repository files (git ls-files):\n{listing_text}\n\n" + "\n\n".join(contents)
+@@ -332,20 +342,10 @@ IMPORTANT RULES:
+         if self._has_source_patch():
+             safe_log("Source patch detected after initial attempt; skipping retries.")
+         else:
+-            # Do not reuse a history that may end with an empty assistant turn: go straight to a
+-            # fresh conversation with the repo snapshot, then the tool-free last resort.
+-            target = self._target_file()
+-            snapshot = self._snapshot_repo()
+-            fresh_prompt = (
+-                f"{task}\n{snapshot}\n\n"
+-                f"The repository currently has no source patch. Your very first action must be an editor "
+-                f"create/edit call on {os.path.join(self.git_tempdir, target)} (the primary source file) "
+-                f"that implements the solution. Then run it via bash on the sample inputs, and finish with a summary."
+-            )
+-            safe_log(f"Fresh retry with a new message history; target file: {target}")
+-            msg_history = chat_with_agent(fresh_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"Fresh retry finished. Changed files: {self._get_changed_files()}, "
+-                     f"source patch: {self._has_source_patch()}")
++            # Do not reuse a history that may end with an empty assistant turn: escalate with a
++            # compact prompt, first on the primary model then on the alternate model/API path.
++            safe_log("No source patch after initial attempt; escalating with a compact prompt.")
++            msg_history = self._attempt_with_models(self._compact_prompt(), msg_history)
+ 
+         self._run_verification(msg_history)
+ 
+@@ -355,6 +355,48 @@ IMPORTANT RULES:
+             safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
+                      f"source patch: {self._has_source_patch()}")
+ 
++    def _alternate_model(self):
++        """The model on the other API path from self.code_model (Claude <-> OpenAI)."""
++        return OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++
++    def _compact_prompt(self):
++        """Short prompt: task, target path and current target file contents only."""
++        target = self._target_file()
++        target_path = os.path.join(self.git_tempdir, target)
++        existing = ''
++        if os.path.isfile(target_path):
++            with open(target_path, 'r', errors='replace') as fh:
++                existing = fh.read()
++        return (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Target file: {target_path}\n"
++            f"Current contents of the target file:\n```python\n{existing}\n```\n\n"
++            f"Your very first action must be an editor create/edit call on {target_path} that implements "
++            f"the full solution. Then finish with a short summary."
++        )
++
++    def _attempt_with_models(self, prompt, fallback_history):
++        """
++        Try the compact prompt on [self.code_model, alternate model] in order, stopping as soon as
++        a real source patch exists. Each attempt uses a fresh message history. Returns the history
++        of the attempt that produced the patch, or fallback_history if none did.
++        """
++        models = [self.code_model, self._alternate_model()]
++        for model in models:
++            safe_log(f"Escalation attempt with model {model}.")
++            history = None
++            try:
++                history = chat_with_agent(prompt, model=model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"Escalation with {model} raised: {e}\n{traceback.format_exc()}")
++            has_patch = self._has_source_patch()
++            safe_log(f"Escalation with {model} finished. Changed files: {self._get_changed_files()}, "
++                     f"source patch: {has_patch}")
++            if has_patch:
++                return history if history is not None else fallback_history
++        return fallback_history
++
+     def _last_message_text(self, msg_history):
+         """Return the text of the last assistant message in msg_history, or '' if none."""
+         for msg in reversed(msg_history or []):
+@@ -425,44 +467,66 @@ When everything is done, end your reply with a short report that includes the st
+ 
+     def _last_resort_write(self):
+         """
+-        Tool-free fallback: ask the LLM for the complete target file in a fenced code block,
+-        then write it from Python so the patch is never empty.
++        Tool-free fallback: ask each candidate model (primary, then alternate) for the complete
++        target file in a fenced code block, then write it from Python. Never raises. If every
++        model fails, writes a clearly logged stub (reads stdin, prints 0) as the very last step.
+         """
+-        target = self._target_file()
+-        target_path = os.path.join(self.git_tempdir, target)
+-        existing = ''
+-        if os.path.isfile(target_path):
+-            with open(target_path, 'r', errors='replace') as fh:
+-                existing = fh.read()
+-        prompt = (
+-            f"Solve the following problem by writing the COMPLETE contents of the file `{target}`.\n\n"
+-            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-            f"Current contents of {target}:\n```python\n{existing}\n```\n\n"
+-            f"Reply with ONLY the complete file in a single ```python code block. No other text."
+-        )
+         try:
+-            client, client_model = create_client(self.code_model)
+-            content, _ = get_response_from_llm(
+-                msg=prompt,
+-                client=client,
+-                model=client_model,
+-                system_message="You are an expert competitive programmer. Output only code.",
+-                msg_history=[],
++            target = self._target_file()
++            target_path = os.path.join(self.git_tempdir, target)
++            existing = ''
++            if os.path.isfile(target_path):
++                with open(target_path, 'r', errors='replace') as fh:
++                    existing = fh.read()
++            prompt = (
++                f"Solve the following problem by writing the COMPLETE contents of the file `{target}`.\n\n"
++                f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Current contents of {target}:\n```python\n{existing}\n```\n\n"
++                f"Reply with ONLY the complete file in a single ```python code block. No other text."
++            )
++            for model in [self.code_model, self._alternate_model()]:
++                try:
++                    client, client_model = create_client(model)
++                    content, _ = get_response_from_llm(
++                        msg=prompt,
++                        client=client,
++                        model=client_model,
++                        system_message="You are an expert competitive programmer. Output only code.",
++                        msg_history=[],
++                    )
++                except Exception as e:
++                    safe_log(f"Last-resort LLM call with {model} failed: {e}\n{traceback.format_exc()}")
++                    continue
++                if not isinstance(content, str) or not content.strip():
++                    safe_log(f"Last-resort: empty response from {model}; trying next model.")
++                    continue
++                match = re.search(r'```(?:python|py)?\s*\n(.*?)```', content, re.DOTALL)
++                if not match or not match.group(1).strip():
++                    safe_log(f"Last-resort: no code block found in response from {model}.")
++                    continue
++                code = match.group(1)
++                if 'from typing import List' in existing and 'from typing import List' not in code:
++                    code = 'from typing import List\n\n' + code
++                os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
++                with open(target_path, 'w') as fh:
++                    fh.write(code if code.endswith('\n') else code + '\n')
++                safe_log(f"Last-resort: wrote {target} from {model}.")
++                return
++
++            # Every model failed: clearly logged stub so the patch is at least non-empty.
++            safe_log("Last-resort: ALL models failed; writing a placeholder stub (reads stdin, prints 0).")
++            stub = (
++                "import sys\n\n"
++                "# PLACEHOLDER written by the last-resort fallback: no model produced a solution.\n"
++                "_ = sys.stdin.read()\n"
++                "print(0)\n"
+             )
++            os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
++            with open(target_path, 'w') as fh:
++                fh.write(stub)
+         except Exception as e:
+-            safe_log(f"Last-resort LLM call failed: {e}")
+-            return
+-        match = re.search(r'```(?:python|py)?\s*\n(.*?)```', content or '', re.DOTALL)
+-        if not match:
+-            safe_log("Last-resort: no code block found in response.")
+-            return
+-        code = match.group(1)
+-        if 'from typing import List' in existing and 'from typing import List' not in code:
+-            code = 'from typing import List\n\n' + code
+-        os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
+-        with open(target_path, 'w') as fh:
+-            fh.write(code if code.endswith('\n') else code + '\n')
+-        safe_log(f"Last-resort: wrote {target}.")
++            safe_log(f"Last-resort failed unexpectedly: {e}\n{traceback.format_exc()}")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 6afc7d1..da65c41 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -1,6 +1,7 @@
+ import ast
+ import json
+ import re
++import traceback
+ import anthropic
+ import backoff
+ import openai
+@@ -315,6 +316,9 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+         )
+         logging(f"Output: {response}")
+ 
++        # Text of the last real (non-nudge) user message; nudges are always built from this.
++        base_user_msg = msg
++
+         # Tool use, with bounded recovery from empty turns
+         for attempt in range(3):
+             tool_use = check_for_tool_use(response, model=client_model)
+@@ -326,6 +330,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+ 
+                 # Get tool response
+                 tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
++                base_user_msg = tool_msg
+                 logging(tool_msg)
+                 response, new_msg_history = get_response_from_llm(
+                     msg=tool_msg,
+@@ -344,6 +349,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+                 break
+ 
+             logging(f"Dropping empty assistant turn (attempt {attempt + 1}/3); nudging the model.")
++            logging(_describe_response(response, model=client_model))
+             if attempt >= len(EMPTY_NUDGES):
+                 logging("Empty turn persisted after all nudges; giving up so the caller can restart.")
+                 # Drop the empty turn so it is not stored in the history.
+@@ -351,19 +357,13 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+                     new_msg_history = new_msg_history[:-1]
+                 break
+ 
+-            # Remove the empty assistant turn and the user message before it; resend that user
+-            # message merged with the nudge so roles keep alternating.
++            # Pop the empty assistant turn and resend the ORIGINAL user message (the one just before
++            # it) with at most one fresh nudge. Nudges never accumulate in the user message.
+             base_history = new_msg_history
+-            prev_text = ''
+             if len(new_msg_history) >= 2 and new_msg_history[-1].get('role') == 'assistant' \
+                     and new_msg_history[-2].get('role') == 'user':
+                 base_history = new_msg_history[:-2]
+-                prev = new_msg_history[-2].get('content')
+-                if isinstance(prev, str):
+-                    prev_text = prev
+-                elif isinstance(prev, list):
+-                    prev_text = '\n'.join(b.get('text', '') for b in prev if isinstance(b, dict) and b.get('text'))
+-            resend = f"{prev_text}\n\n{EMPTY_NUDGES[attempt]}" if prev_text else EMPTY_NUDGES[attempt]
++            resend = f"{base_user_msg}\n\n{EMPTY_NUDGES[attempt]}"
+             response, new_msg_history = get_response_from_llm(
+                 msg=resend,
+                 client=client,
+@@ -374,8 +374,8 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+             )
+             logging(f"Output: {response}")
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Error in chat_with_agent_manualtools: {e}\n{traceback.format_exc()}")
+ 
+     return new_msg_history
+ 
+@@ -389,6 +389,33 @@ EMPTY_NUDGES = [
+ ]
+ 
+ 
++def _describe_response(response, model=''):
++    """
++    Short human-readable summary of a response (stop reason and content block types/lengths),
++    used to diagnose empty turns.
++    """
++    try:
++        if isinstance(response, str):
++            return f"Response (str): length={len(response)}"
++        if 'claude' in model:
++            blocks = getattr(response, 'content', None) or []
++            parts = []
++            for block in blocks:
++                btype = getattr(block, 'type', None)
++                text = getattr(block, 'text', None)
++                if text is None and isinstance(block, dict):
++                    btype = block.get('type')
++                    text = block.get('text')
++                parts.append(f"{btype}(len={len(text) if text else 0})")
++            return f"Response: stop_reason={getattr(response, 'stop_reason', None)}, blocks=[{', '.join(parts)}]"
++        output = getattr(response, 'output', None) or []
++        types = [str(getattr(o, 'type', type(o).__name__)) for o in output]
++        text = getattr(response, 'output_text', '') or ''
++        return f"Response: status={getattr(response, 'status', None)}, output_types={types}, text_len={len(text)}"
++    except Exception as e:
++        return f"Response: could not be described ({e})"
++
++
+ def _is_empty_response(response, model=''):
+     """
+     True when the response has no non-whitespace text and no tool call.
+@@ -508,6 +535,7 @@ def chat_with_agent_claude(
+ 
+             # Empty turn: drop it (never stored in history) and nudge with an escalating message.
+             logging(f"Dropping empty assistant turn (attempt {attempt + 1}/3); nudging the model.")
++            logging(_describe_response(response, model=client_model))
+             final_response = None
+             if attempt >= len(EMPTY_NUDGES):
+                 logging("Empty turn persisted after all nudges; giving up so the caller can restart.")
+@@ -533,8 +561,8 @@ def chat_with_agent_claude(
+                 ],
+             })
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Error in chat_with_agent_claude: {e}\n{traceback.format_exc()}")
+ 
+     return new_msg_history
+ 

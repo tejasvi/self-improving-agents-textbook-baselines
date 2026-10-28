@@ -1,0 +1,169 @@
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..1c89661 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -9,6 +9,7 @@ import copy
+ from llm import create_client, get_response_from_llm
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
++from utils.truncate import truncate_msg_history, truncate_tool_result
+ 
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+@@ -315,7 +316,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+             tool_result = process_tool_call(tools_dict, tool_name, tool_input)
+ 
+             # Get tool response
+-            tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
++            tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {truncate_tool_result(tool_result)}'
+             logging(tool_msg)
+             response, new_msg_history = get_response_from_llm(
+                 msg=tool_msg,
+@@ -369,7 +370,7 @@ def chat_with_agent_claude(
+         response = get_response_withtools(
+             client=client,
+             model=client_model,
+-            messages=msg_history + new_msg_history,
++            messages=truncate_msg_history(msg_history) + new_msg_history,
+             tool_choice={"type": "auto"},
+             tools=tools,
+             logging=logging,
+@@ -391,14 +392,14 @@ def chat_with_agent_claude(
+                     {
+                         "type": "tool_result",
+                         "tool_use_id": tool_use['tool_id'],
+-                        "content": tool_result,
++                        "content": truncate_tool_result(tool_result),
+                     }
+                 ],
+             })
+             response = get_response_withtools(
+                 client=client,
+                 model=client_model,
+-                messages=msg_history + new_msg_history,
++                messages=truncate_msg_history(msg_history) + new_msg_history,
+                 tool_choice={"type": "auto"},
+                 tools=tools,
+                 logging=logging,
+diff --git a/utils/truncate.py b/utils/truncate.py
+new file mode 100644
+index 0000000..97ddb8f
+--- /dev/null
++++ b/utils/truncate.py
+@@ -0,0 +1,116 @@
++"""
++Helpers to keep the agent's context small by truncating long tool outputs and
++old conversation turns. Only string fields are rewritten; message structure
++(roles, block types, tool_use_id pairing) is always preserved.
++"""
++import copy
++import os
++import tempfile
++
++DEFAULT_MAX_CHARS = 8000
++DEFAULT_OLD_TURN_MAX_CHARS = 2000
++DEFAULT_KEEP_LAST_N = 6
++
++
++def truncate_text(text, max_chars=DEFAULT_MAX_CHARS, full_output_path=None):
++    """
++    Keep the head and tail of `text` so that the result is at most roughly
++    `max_chars` characters, inserting a marker that reports how many characters
++    were removed. Returns the text unchanged when it already fits.
++    """
++    if not isinstance(text, str):
++        text = str(text)
++    if max_chars is None or max_chars < 0 or len(text) <= max_chars:
++        return text
++
++    marker_template = "\n... [truncated {removed} characters{where}] ...\n"
++    where = f"; full output saved to {full_output_path}" if full_output_path else ""
++    # Reserve room for the marker itself (its length depends on the removed count,
++    # so compute with a generous upper bound).
++    reserve = len(marker_template.format(removed=len(text), where=where)) + 8
++    budget = max(max_chars - reserve, 0)
++    head_len = budget // 2
++    tail_len = budget - head_len
++    removed = len(text) - head_len - tail_len
++    marker = marker_template.format(removed=removed, where=where)
++    tail = text[len(text) - tail_len:] if tail_len > 0 else ""
++    return text[:head_len] + marker + tail
++
++
++def save_full_output(text, prefix="tool_output_"):
++    """
++    Write the full text to a temporary file and return its path, or None if the
++    write fails. Used so the agent can still reach the complete output.
++    """
++    try:
++        fd, path = tempfile.mkstemp(prefix=prefix, suffix=".txt")
++        with os.fdopen(fd, "w") as f:
++            f.write(text if isinstance(text, str) else str(text))
++        return path
++    except Exception:
++        return None
++
++
++def truncate_tool_result(text, max_chars=DEFAULT_MAX_CHARS):
++    """
++    Truncate a tool result, saving the complete output to a file first if it
++    is too long so the agent can still inspect it.
++    """
++    if not isinstance(text, str):
++        text = str(text)
++    if max_chars is None or len(text) <= max_chars:
++        return text
++    path = save_full_output(text)
++    return truncate_text(text, max_chars=max_chars, full_output_path=path)
++
++
++def _truncate_block_text(block, max_chars):
++    """Truncate string payloads of a dict content block in place (on a copy)."""
++    if not isinstance(block, dict):
++        # SDK objects are left untouched; they are not the bulk of the context.
++        return block
++    block = dict(block)
++    if block.get("type") == "text" and isinstance(block.get("text"), str):
++        block["text"] = truncate_text(block["text"], max_chars=max_chars)
++    elif block.get("type") == "tool_result":
++        content = block.get("content")
++        if isinstance(content, str):
++            block["content"] = truncate_text(content, max_chars=max_chars)
++        elif isinstance(content, list):
++            new_items = []
++            for item in content:
++                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
++                    item = dict(item)
++                    item["text"] = truncate_text(item["text"], max_chars=max_chars)
++                new_items.append(item)
++            block["content"] = new_items
++    return block
++
++
++def truncate_msg_history(
++    msg_history,
++    keep_last_n=DEFAULT_KEEP_LAST_N,
++    max_chars=DEFAULT_OLD_TURN_MAX_CHARS,
++):
++    """
++    Return a new message list where every message except the last `keep_last_n`
++    has its long string content truncated. Messages are never added or removed,
++    and tool_use / tool_result blocks keep their ids, so pairing is intact.
++    The input list is not modified.
++    """
++    if not msg_history:
++        return []
++    cutoff = max(len(msg_history) - max(keep_last_n, 0), 0)
++    result = []
++    for idx, msg in enumerate(msg_history):
++        if idx >= cutoff or not isinstance(msg, dict):
++            result.append(msg)
++            continue
++        new_msg = dict(msg)
++        content = msg.get("content")
++        if isinstance(content, str):
++            new_msg["content"] = truncate_text(content, max_chars=max_chars)
++        elif isinstance(content, list):
++            new_msg["content"] = [_truncate_block_text(b, max_chars) for b in content]
++        result.append(new_msg)
++    return copy.copy(result)

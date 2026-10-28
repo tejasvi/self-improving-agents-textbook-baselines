@@ -1,0 +1,364 @@
+diff --git a/llm.py b/llm.py
+index d6b4da1..bdafefa 100644
+--- a/llm.py
++++ b/llm.py
+@@ -4,9 +4,10 @@ import os
+ import re
+ 
+ import anthropic
+-import backoff
+ import openai
+ 
++from utils.api_retry import api_retry
++
+ MAX_OUTPUT_TOKENS = 4096
+ AVAILABLE_LLMS = [
+     # Anthropic models
+@@ -85,7 +86,7 @@ def create_client(model: str):
+         raise ValueError(f"Model {model} not supported.")
+ 
+ # Get N responses from a single message, used for ensembling.
+-@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
++@api_retry()
+ def get_batch_responses_from_llm(
+         msg,
+         client,
+@@ -164,11 +165,7 @@ def get_batch_responses_from_llm(
+ 
+     return content, new_msg_history
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=120,
+-)
++@api_retry()
+ def get_response_from_llm(
+         msg,
+         client,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..f3bfa3f 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -1,14 +1,13 @@
+ import ast
+ import json
+ import re
+-import anthropic
+-import backoff
+-import openai
++import traceback
+ import copy
+ 
+ from llm import create_client, get_response_from_llm
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
++from utils.api_retry import api_retry
+ 
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+@@ -22,16 +21,15 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
+-@backoff.on_exception(
+-    backoff.expo,
+-    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+-    max_time=600,
+-    max_value=60,
+-)
++@api_retry()
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=None,
+ ):
++    # Transient failures are retried by the api_retry decorator (bounded, with backoff).
++    # Non-transient errors propagate immediately.
++    if logging is None:
++        logging = print
+     try:
+         if 'claude' in model:
+             response = client.messages.create(
+@@ -49,20 +47,12 @@ def get_response_withtools(
+                 tools=tools,
+                 parallel_tool_calls=False
+             )
+-            response = response
+         else:
+             raise ValueError(f"Unsupported model: {model}")
+         return response
+     except Exception as e:
+         logging(f"Error in get_response_withtools: {str(e)}")
+-        if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+-
+-        # Hitting the context window limit
+-        if 'Input is too long for requested model' in str(e):
+-            pass
+-
+-        raise  # Re-raise the exception after logging
++        raise
+ 
+ def check_for_tool_use(response, model=''):
+     """
+@@ -330,8 +320,8 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+             # Check for next tool use
+             tool_use = check_for_tool_use(response, model=client_model)
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Agent error: {e}\n{traceback.format_exc()}")
+ 
+     return new_msg_history
+ 
+@@ -419,8 +409,8 @@ def chat_with_agent_claude(
+             ],
+         })
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Agent error: {e}\n{traceback.format_exc()}")
+ 
+     return new_msg_history
+ 
+@@ -506,8 +496,8 @@ def chat_with_agent_openai(
+         # Get final response
+         new_msg_history.append(response)
+ 
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f"Agent error: {e}\n{traceback.format_exc()}")
+ 
+     return new_msg_history
+ 
+diff --git a/tests/test_api_retry.py b/tests/test_api_retry.py
+new file mode 100644
+index 0000000..ebc6021
+--- /dev/null
++++ b/tests/test_api_retry.py
+@@ -0,0 +1,163 @@
++import httpx
++import anthropic
++import openai
++import pytest
++
++import llm
++import llm_withtools
++from utils.api_retry import api_retry, is_transient_api_error, DEFAULT_MAX_TRIES
++
++
++def _oai_status(code):
++    req = httpx.Request("POST", "http://x")
++    resp = httpx.Response(code, request=req)
++    return openai.APIStatusError(f"status {code}", response=resp, body=None)
++
++
++def _anth_status(code):
++    req = httpx.Request("POST", "http://x")
++    resp = httpx.Response(code, request=req)
++    return anthropic.APIStatusError(f"status {code}", response=resp, body=None)
++
++
++@pytest.fixture(autouse=True)
++def no_sleep(monkeypatch):
++    # Make backoff waits instantaneous.
++    import backoff._sync as bs
++    monkeypatch.setattr(bs.time, "sleep", lambda s: None)
++
++
++@pytest.mark.parametrize("code", [408, 409, 429, 500, 502, 503, 529])
++def test_transient_status_codes_retryable(code):
++    assert is_transient_api_error(_oai_status(code))
++    assert is_transient_api_error(_anth_status(code))
++
++
++@pytest.mark.parametrize("code", [400, 401, 403, 404, 422])
++def test_client_errors_not_retryable(code):
++    assert not is_transient_api_error(_oai_status(code))
++    assert not is_transient_api_error(_anth_status(code))
++
++
++def test_connection_and_timeout_errors_retryable():
++    req = httpx.Request("POST", "http://x")
++    assert is_transient_api_error(openai.APIConnectionError(request=req))
++    assert is_transient_api_error(openai.APITimeoutError(request=req))
++    assert is_transient_api_error(anthropic.APIConnectionError(request=req))
++    assert is_transient_api_error(anthropic.APITimeoutError(request=req))
++
++
++def test_unrelated_errors_not_retryable():
++    assert not is_transient_api_error(ValueError("nope"))
++    assert not is_transient_api_error(KeyError("x"))
++
++
++def test_retry_then_success():
++    calls = []
++
++    @api_retry()
++    def f():
++        calls.append(1)
++        if len(calls) < 3:
++            raise _oai_status(429)
++        return "ok"
++
++    assert f() == "ok"
++    assert len(calls) == 3
++
++
++def test_non_transient_called_once():
++    calls = []
++
++    @api_retry()
++    def f():
++        calls.append(1)
++        raise _anth_status(400)
++
++    with pytest.raises(anthropic.APIStatusError):
++        f()
++    assert len(calls) == 1
++
++
++def test_exhaustion_is_bounded():
++    calls = []
++
++    @api_retry(max_tries=4)
++    def f():
++        calls.append(1)
++        raise _oai_status(503)
++
++    with pytest.raises(openai.APIStatusError):
++        f()
++    assert len(calls) == 4
++
++
++def test_default_tries_bounded():
++    calls = []
++
++    @api_retry()
++    def f():
++        calls.append(1)
++        raise openai.APIConnectionError(request=httpx.Request("POST", "http://x"))
++
++    with pytest.raises(openai.APIConnectionError):
++        f()
++    assert len(calls) == DEFAULT_MAX_TRIES
++
++
++def test_get_response_from_llm_retries_connection_error(monkeypatch):
++    class FakeMessages:
++        def __init__(self):
++            self.n = 0
++
++        def create(self, **kwargs):
++            self.n += 1
++            if self.n == 1:
++                raise anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
++            block = type("B", (), {"text": "hello"})()
++            return type("R", (), {"content": [block]})()
++
++    class FakeClient:
++        def __init__(self):
++            self.messages = FakeMessages()
++
++    client = FakeClient()
++    content, hist = llm.get_response_from_llm(
++        "hi", client=client, model="claude-3-5-sonnet-20241022", system_message="sys"
++    )
++    assert content == "hello"
++    assert client.messages.n == 2
++
++
++def test_get_response_withtools_none_logging_no_crash(monkeypatch):
++    calls = []
++
++    class FakeMessages:
++        def create(self, **kwargs):
++            calls.append(1)
++            raise _anth_status(500)
++
++    class FakeClient:
++        messages = FakeMessages()
++
++    with pytest.raises(anthropic.APIStatusError):
++        llm_withtools.get_response_withtools(
++            client=FakeClient(), model="claude-3-5-sonnet-20241022",
++            messages=[], tools=[], tool_choice={"type": "auto"}, logging=None,
++        )
++    # Bounded by the shared policy, not multiplied by a second retry layer.
++    assert len(calls) == DEFAULT_MAX_TRIES
++
++
++def test_chat_with_agent_logs_instead_of_silent_swallow(monkeypatch):
++    logged = []
++
++    def boom(model):
++        raise RuntimeError("client creation failed")
++
++    monkeypatch.setattr(llm_withtools, "create_client", boom)
++    out = llm_withtools.chat_with_agent_claude(
++        "hi", model="claude-3-5-sonnet-20241022", msg_history=[], logging=logged.append
++    )
++    assert isinstance(out, list)
++    assert any("Agent error" in str(m) and "client creation failed" in str(m) for m in logged)
+diff --git a/utils/api_retry.py b/utils/api_retry.py
+new file mode 100644
+index 0000000..447f196
+--- /dev/null
++++ b/utils/api_retry.py
+@@ -0,0 +1,52 @@
++"""Shared retry policy for model API calls (OpenAI and Anthropic SDKs).
++
++Only transient failures (rate limits, timeouts, connection problems, 5xx and
++overloaded responses) are retried, with exponential backoff and jitter. Client
++errors such as 400/401/403/404 and unrelated exceptions fail immediately.
++"""
++import anthropic
++import backoff
++import openai
++
++# 408 request timeout, 409 conflict, 429 rate limit, 5xx server errors,
++# 529 Anthropic "overloaded".
++RETRYABLE_STATUS_CODES = {408, 409, 429, 529}
++RETRYABLE_TRANSIENT_TYPES = (
++    openai.RateLimitError,
++    openai.APITimeoutError,
++    openai.APIConnectionError,
++    anthropic.RateLimitError,
++    anthropic.APITimeoutError,
++    anthropic.APIConnectionError,
++)
++
++DEFAULT_MAX_TRIES = 5
++DEFAULT_MAX_TIME = 300
++DEFAULT_MAX_BACKOFF = 60
++
++
++def is_transient_api_error(exc):
++    """Return True if the exception is a transient API failure worth retrying."""
++    if isinstance(exc, RETRYABLE_TRANSIENT_TYPES):
++        return True
++    status = getattr(exc, "status_code", None)
++    if isinstance(status, int):
++        return status in RETRYABLE_STATUS_CODES or 500 <= status <= 599
++    return False
++
++
++def api_retry(max_tries=DEFAULT_MAX_TRIES, max_time=DEFAULT_MAX_TIME, max_value=DEFAULT_MAX_BACKOFF):
++    """Decorator: retry transient model API failures with exponential backoff and jitter.
++
++    Retries are bounded by both `max_tries` and `max_time`. Non-transient
++    exceptions are re-raised immediately.
++    """
++    return backoff.on_exception(
++        backoff.expo,
++        Exception,
++        giveup=lambda e: not is_transient_api_error(e),
++        max_tries=max_tries,
++        max_time=max_time,
++        max_value=max_value,
++        jitter=backoff.full_jitter,
++    )

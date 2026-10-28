@@ -1,0 +1,522 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 384a727..11cf35c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,10 +6,29 @@ import os
+ import re
+ import py_compile
+ import threading
++import time
++import json
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++MAX_ATTEMPTS = 3
++SAMPLE_TIMEOUT = 5
++MAX_INPUT_TIMEOUT = 3
++DIFF_CASES = 20
++DIFF_TIMEOUT = 5
++DIFF_BUDGET = 60
++
++METHOD_PROMPT = """Work like a careful competitive programmer:
++1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++2. Write the solution in solution.py with the editor tool. The final solution.py must be a stdin/stdout program (read input with sys.stdin, print the answer), unless the statement asks for a Solution class method.
++3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++4. Write brute.py: a verified-correct brute force written directly from the statement (plain simulation or full enumeration, NOT your fast idea), as a stdin/stdout program. Write gen.py exposing gen(rng, size) that returns a small random input as a string, including degenerate cases (minimum size, all equal values, extreme values). Then run the `stress_test` tool comparing solution.py with brute.py using gen.py. Do not skip degenerate inputs. Fix every mismatch. Also enumerate all tiny inputs when feasible (enumerate_all() in gen.py).
++5. Save a maximum-size input allowed by the constraints as max_input.txt in the repository directory, and check that `python3 solution.py < max_input.txt` finishes well under 2 seconds. The harness uses a 3 second limit on max_input.txt.
++6. Audit every early return and special-case branch in the final code against inputs where its condition is false but the branch is still reached.
++7. Limit exploration: after about 15 tool calls you must have a candidate fast solution in solution.py, and then test it. Do not do open-ended analysis or long experiments.
++8. Before finishing, run the stress_test tool once more on the final solution.py. The final answer must beat the time limit and must NOT be the brute force. Keep iterating until all checks pass."""
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -152,6 +171,8 @@ class AgenticSystem:
+ 
+         changed = []
+         for m in re.finditer(r'^diff --git a/(\S+) b/(\S+)', diff, flags=re.MULTILINE):
++            if '__pycache__' in m.group(2):
++                continue
+             changed.append(m.group(2))
+         safe_log(f"_solution_edited: changed files = {changed}")
+ 
+@@ -192,9 +213,267 @@ class AgenticSystem:
+         except Exception as e:
+             safe_log(f"Failed to write fallback solution.py: {e}", level=logging.ERROR)
+ 
++    # ------------------------------------------------------------------
++    # Objective verification helpers
++    # ------------------------------------------------------------------
++    def _extract_samples(self):
++        """
++        Parse 'Sample Input k' / 'Sample Output k' blocks from the problem statement.
++        Returns a list of (input_text, expected_output) pairs; [] if none are found.
++        """
++        text = self.problem_statement
++        if not isinstance(text, str) or not text:
++            return []
++        in_re = re.compile(r"Sample\s+Input\s*(\d+)\s*:?", re.I)
++        out_re = re.compile(r"Sample\s+Output\s*(\d+)\s*:?", re.I)
++        headers = []
++        for m in in_re.finditer(text):
++            headers.append(("in", int(m.group(1)), m.start(), m.end()))
++        for m in out_re.finditer(text):
++            headers.append(("out", int(m.group(1)), m.start(), m.end()))
++        headers.sort(key=lambda h: h[2])
++
++        def clean(block):
++            lines = [ln.rstrip() for ln in block.splitlines() if not ln.strip().startswith("```")]
++            return "\n".join(lines)
++
++        samples = []
++        for i, h in enumerate(headers):
++            if h[0] != "in":
++                continue
++            # The matching output header is the next 'out' header with the same index.
++            nxt = None
++            for h2 in headers[i + 1:]:
++                if h2[0] == "out" and h2[1] == h[1]:
++                    nxt = h2
++                    break
++                if h2[0] == "in":
++                    break
++            if nxt is None:
++                continue
++            inp_end = nxt[2]
++            inp_block = clean(text[h[3]:inp_end])
++            # Output runs until the next header or the first blank line.
++            after = [h2[2] for h2 in headers if h2[2] > nxt[3]]
++            out_end = min(after) if after else len(text)
++            out_lines = []
++            for ln in clean(text[nxt[3]:out_end]).splitlines():
++                if not ln.strip():
++                    if out_lines:
++                        break
++                    continue
++                if re.match(r"\s*(Explanation|Note|Example|Constraints)\b", ln, re.I):
++                    break
++                out_lines.append(ln)
++            inp_text = inp_block.strip("\n")
++            exp_text = "\n".join(out_lines).strip()
++            if inp_text.strip() and exp_text:
++                samples.append((inp_text + "\n", exp_text))
++        return samples
++
++    def _run_program(self, script, input_text, timeout):
++        """
++        Run `python3 <script>` in git_tempdir with input_text on stdin.
++        Returns (status, output, elapsed) where status is ok | tle | error.
++        """
++        start = time.time()
++        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
++        try:
++            proc = subprocess.run(
++                ["python3", script],
++                input=input_text,
++                capture_output=True,
++                text=True,
++                timeout=timeout,
++                cwd=self.git_tempdir,
++                env=env,
++            )
++        except subprocess.TimeoutExpired as e:
++            out = e.stdout
++            if isinstance(out, bytes):
++                out = out.decode(errors="replace")
++            return "tle", out or "", time.time() - start
++        except Exception as e:
++            return "error", f"failed to launch {script}: {e}", time.time() - start
++        elapsed = time.time() - start
++        if proc.returncode != 0:
++            return "error", (proc.stdout or "") + (proc.stderr or ""), elapsed
++        return "ok", proc.stdout or "", elapsed
++
++    def _run_solution(self, input_text, timeout):
++        return self._run_program("solution.py", input_text, timeout)
++
++    @staticmethod
++    def _clip(s, limit=600):
++        s = "" if s is None else str(s)
++        return s if len(s) <= limit else s[:limit] + "...<clipped>"
++
++    def _failure_text(self, label, inp, expected, status, output):
++        lines = [f"[{label}] FAILED ({status})"]
++        head = "\n".join(str(inp).splitlines()[:5])
++        lines.append(f"input head:\n{self._clip(head, 300)}")
++        if expected is not None:
++            lines.append(f"expected:\n{self._clip(expected, 300)}")
++        if status == "tle":
++            lines.append("TLE: exceeded time limit.")
++        if status == "error":
++            tail = "\n".join(str(output).strip().splitlines()[-6:])
++            lines.append(f"traceback tail:\n{self._clip(tail, 600)}")
++        else:
++            lines.append(f"actual:\n{self._clip(output, 300)}")
++        return "\n".join(lines)
++
++    def _generate_cases(self, gen_file):
++        """Use gen.py's gen(rng, size) (returning input text) to build a few small test inputs."""
++        driver = (
++            "import random, json, sys\n"
++            "sys.path.insert(0, '.')\n"
++            "import gen\n"
++            "rng = random.Random(12345)\n"
++            "out = []\n"
++            "for s in range(1, 6):\n"
++            "    for _ in range(4):\n"
++            "        out.append(str(gen.gen(rng, s)))\n"
++            "print(json.dumps(out))\n"
++        )
++        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
++        try:
++            proc = subprocess.run(
++                ["python3", "-c", driver],
++                capture_output=True, text=True, timeout=20,
++                cwd=self.git_tempdir, env=env,
++            )
++            if proc.returncode != 0:
++                return []
++            cases = json.loads(proc.stdout.strip().splitlines()[-1])
++            return [c if c.endswith("\n") else c + "\n" for c in cases if isinstance(c, str)]
++        except Exception as e:
++            safe_log(f"_generate_cases failed for {gen_file}: {e}", level=logging.WARNING)
++            return []
++
++    def _evaluate(self):
++        """
++        Objectively evaluate solution.py. Returns a dict with:
++          score:  (samples_passed, max_input_ok, brute_agreement)  -- higher is better
++          report: short text describing failures
++          passed: True when every available check passes
++        """
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(path) or os.path.getsize(path) == 0:
++            return {"score": (-1, 0, 0), "report": "solution.py is missing or empty.", "passed": False, "has_solution": False}
++        try:
++            with open(path) as f:
++                compile(f.read(), path, 'exec')
++        except Exception as e:
++            return {"score": (-1, 0, 0), "report": f"solution.py does not compile:\n{self._clip(e, 600)}",
++                    "passed": False, "has_solution": True}
++
++        report = []
++
++        # 1. Samples from the statement (token-wise comparison).
++        samples = self._extract_samples()
++        samples_ok = 0
++        for idx, (inp, exp) in enumerate(samples, 1):
++            status, out, _ = self._run_solution(inp, SAMPLE_TIMEOUT)
++            if status == "ok" and out.split() == exp.split():
++                samples_ok += 1
++            else:
++                report.append(self._failure_text(f"Sample {idx}", inp, exp, status, out))
++        if not samples:
++            safe_log("_evaluate: no parseable samples in statement", level=logging.WARNING)
++
++        # 2. Max-size input saved by the agent.
++        max_ok = 1
++        max_path = os.path.join(self.git_tempdir, 'max_input.txt')
++        if os.path.isfile(max_path):
++            try:
++                with open(max_path) as f:
++                    max_text = f.read()
++            except Exception as e:
++                max_text = ""
++                report.append(f"[max_input] could not read max_input.txt: {e}")
++            if max_text.strip():
++                status, out, elapsed = self._run_solution(max_text, MAX_INPUT_TIMEOUT)
++                if status != "ok":
++                    max_ok = 0
++                    report.append(self._failure_text(
++                        f"max_input (limit {MAX_INPUT_TIMEOUT}s)", max_text, None, status, out))
++                else:
++                    safe_log(f"_evaluate: max_input ran in {elapsed:.2f}s")
++
++        # 3. Optional differential check against brute.py using gen.py.
++        brute_ok = 1
++        brute_path = os.path.join(self.git_tempdir, 'brute.py')
++        gen_file = None
++        for cand in ('gen.py', 'generator.py'):
++            if os.path.isfile(os.path.join(self.git_tempdir, cand)):
++                gen_file = cand
++                break
++        if os.path.isfile(brute_path) and gen_file is not None:
++            cases = self._generate_cases(gen_file)
++            total = agree = 0
++            deadline = time.time() + DIFF_BUDGET
++            for inp in cases[:DIFF_CASES]:
++                if time.time() > deadline:
++                    break
++                bstat, bout, _ = self._run_program("brute.py", inp, DIFF_TIMEOUT)
++                if bstat != "ok":
++                    continue  # brute itself failed on this input; not evidence against solution
++                total += 1
++                sstat, sout, _ = self._run_solution(inp, DIFF_TIMEOUT)
++                if sstat == "ok" and sout.split() == bout.split():
++                    agree += 1
++                else:
++                    report.append(self._failure_text("brute mismatch", inp, bout, sstat, sout))
++                    break  # one counterexample is enough; avoids long repeated timeouts
++            if total > 0 and agree < total:
++                brute_ok = 0
++            safe_log(f"_evaluate: differential {agree}/{total} agree")
++
++        score = (samples_ok, max_ok, brute_ok)
++        passed = (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1
++        if not report:
++            report_text = "All available checks passed."
++        else:
++            report_text = "\n\n".join(report)
++            if len(report_text) > 3000:
++                report_text = report_text[:3000] + "\n...<report clipped>"
++        return {"score": score, "report": report_text, "passed": passed, "has_solution": True}
++
++    @staticmethod
++    def _last_message_text(msg_history):
++        """Text of the last assistant message, or '' if empty/absent/unrecognized."""
++        for msg in reversed(msg_history or []):
++            if not isinstance(msg, dict) or msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            if isinstance(content, str):
++                return content.strip()
++            if isinstance(content, list):
++                parts = [c.get("text", "") for c in content
++                         if isinstance(c, dict) and isinstance(c.get("text"), str)]
++                return "\n".join(parts).strip()
++            return ""
++        return ""
++
++    def _read_solution(self):
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        try:
++            with open(path) as f:
++                return f.read()
++        except Exception:
++            return None
++
++    def _write_solution(self, text):
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        with open(path, 'w') as f:
++            f.write(text)
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Run up to MAX_ATTEMPTS agent attempts. Each attempt is verified by _evaluate();
++        feedback from failed attempts is passed to the next one. The best-scoring
++        solution.py snapshot is restored at the end.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -204,38 +483,60 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch. You can use the `stress_test` tool, which runs an optional exhaustive enumeration (`enumerate_all()` in the generator file) followed by random cases from `gen(rng, size)`, and reports a shrunk failing input with expected and actual outputs.
+-   - The brute force must be independent of the algorithm under test: write it directly from the problem statement (e.g. plain simulation or full enumeration), not by reusing your fast idea.
+-   - Your generator must NOT discard or skip degenerate inputs (no special/missing values, all special, minimum length, all equal values, max values). Do not add filters such as `if a.count(-1) == 0: continue` that exclude cases your solution handles specially.
+-   - Before finishing, list the edge cases explicitly (e.g. no special elements, all elements special, minimum size, all elements equal, extreme values, sorted and reverse-sorted input) and run each one through both the brute force and the solution.
+-   - Also exhaustively enumerate all inputs of tiny size and value range where feasible (use `enumerate_all()` in the generator).
+-5. Audit every early return and special-case branch in the final code and confirm it is correct for every input that can reach it, not only for the input it was written for. A branch such as "return 0 when all elements are -1" must be checked against inputs where its condition is false but the branch is still reached.
+-6. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-7. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++        method = METHOD_PROMPT
+         first_line = ("Your first action must be a tool call that writes a complete draft solution.py; "
+                       "avoid long analysis before writing the file.\n\n")
+-        instruction = f"{first_line}{task}\n\n{method}"
+-        init_msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log("Initial attempt finished")
+ 
+-        for attempt in range(3):
+-            if self._solution_edited():
++        best_score = None
++        best_text = None
++        prev_score = None
++        prev_report = ""
++        init_msg_history = []
++
++        for attempt in range(MAX_ATTEMPTS):
++            if attempt == 0:
++                instruction = f"{first_line}{task}\n\n{method}"
++            else:
++                feedback = (
++                    f"\n\n=== FEEDBACK FROM THE PREVIOUS ATTEMPT (attempt {attempt}) ===\n"
++                    f"Verification score (samples_passed, max_input_ok, brute_agreement): {prev_score}\n"
++                    "The previous solution.py was INCORRECT or TOO SLOW according to the harness.\n"
++                    f"Harness report:\n{prev_report}\n\n"
++                    "A brute-force-only solution is NOT acceptable. Find the efficient algorithm: derive it, "
++                    "or find patterns in brute-force data and verify them against brute.py.\n"
++                    "Keep the verified-correct brute force as brute.py; do not overwrite it with a fast version.\n"
++                    "Avoid unbounded exploration: commit a candidate fast solution to solution.py early "
++                    "(within about 15 tool calls), then test it on the samples, on max_input.txt, and with stress_test.\n"
++                )
++                instruction = f"{task}\n\n{method}{feedback}"
++            try:
++                history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"Attempt {attempt + 1} raised an exception: {e}", level=logging.WARNING)
++                history = []
++            if attempt == 0:
++                init_msg_history = history or []
++            if not self._last_message_text(history):
++                safe_log(f"Attempt {attempt + 1}: final assistant message empty or cut off; evaluating anyway",
++                         level=logging.WARNING)
++
++            result = self._evaluate()
++            safe_log(f"Attempt {attempt + 1} score={result['score']} passed={result['passed']}")
++            text = self._read_solution() if result["has_solution"] else None
++            if text is not None and (best_score is None or result["score"] > best_score):
++                best_score = result["score"]
++                best_text = text
++            prev_score = result["score"]
++            prev_report = result["report"]
++            if result["passed"]:
+                 break
+-            safe_log(f"Retry attempt {attempt + 1}: no valid solution.py edit yet", level=logging.WARNING)
+-            retry_instruction = (
+-                f"{task}\n\n"
+-                "IMPORTANT: Previous attempts produced no edit to solution.py. "
+-                f"Immediately use the editor tool `create` command to write {self.git_tempdir}/solution.py "
+-                "with a complete solution. Keep thinking short; write the file first, then run the samples and fix issues."
+-            )
+-            chat_with_agent(retry_instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        if not self._solution_edited():
+-            safe_log("All retries failed; writing fallback solution.py", level=logging.WARNING)
++        if best_text is not None:
++            if self._read_solution() != best_text:
++                safe_log(f"Restoring best solution.py (score={best_score})")
++                self._write_solution(best_text)
++        elif not self._solution_edited():
++            safe_log("No valid solution.py after all attempts; writing fallback solution.py", level=logging.WARNING)
+             self._write_fallback_solution()
+         return init_msg_history
+ 
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..fdc2b4f
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,116 @@
++"""Standalone verifier: extracts 'Sample Input k' / 'Sample Output k' pairs from a
++problem statement and checks a stdin/stdout solution.py against them (token-wise).
++
++Usage: python3 solution.py <statement.txt> [solution_path]
++Exit code 0 when all samples pass, 1 otherwise.
++"""
++import os
++import re
++import subprocess
++import sys
++
++SAMPLE_TIMEOUT = 5
++
++
++def extract_samples(text):
++    """Return a list of (input_text, expected_output) pairs; [] if none are found."""
++    if not isinstance(text, str) or not text:
++        return []
++    in_re = re.compile(r"Sample\s+Input\s*(\d+)\s*:?", re.I)
++    out_re = re.compile(r"Sample\s+Output\s*(\d+)\s*:?", re.I)
++    headers = []
++    for m in in_re.finditer(text):
++        headers.append(("in", int(m.group(1)), m.start(), m.end()))
++    for m in out_re.finditer(text):
++        headers.append(("out", int(m.group(1)), m.start(), m.end()))
++    headers.sort(key=lambda h: h[2])
++
++    def clean(block):
++        lines = [ln.rstrip() for ln in block.splitlines() if not ln.strip().startswith("```")]
++        return "\n".join(lines)
++
++    samples = []
++    for i, h in enumerate(headers):
++        if h[0] != "in":
++            continue
++        nxt = None
++        for h2 in headers[i + 1:]:
++            if h2[0] == "out" and h2[1] == h[1]:
++                nxt = h2
++                break
++            if h2[0] == "in":
++                break
++        if nxt is None:
++            continue
++        inp_block = clean(text[h[3]:nxt[2]])
++        after = [h2[2] for h2 in headers if h2[2] > nxt[3]]
++        out_end = min(after) if after else len(text)
++        out_lines = []
++        for ln in clean(text[nxt[3]:out_end]).splitlines():
++            if not ln.strip():
++                if out_lines:
++                    break
++                continue
++            if re.match(r"\s*(Explanation|Note|Example|Constraints)\b", ln, re.I):
++                break
++            out_lines.append(ln)
++        inp_text = inp_block.strip("\n")
++        exp_text = "\n".join(out_lines).strip()
++        if inp_text.strip() and exp_text:
++            samples.append((inp_text + "\n", exp_text))
++    return samples
++
++
++def run_program(script, input_text, timeout, cwd=None):
++    """Return (status, output) with status in ok | tle | error."""
++    try:
++        proc = subprocess.run(
++            [sys.executable, script], input=input_text, capture_output=True,
++            text=True, timeout=timeout, cwd=cwd,
++        )
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout
++        if isinstance(out, bytes):
++            out = out.decode(errors="replace")
++        return "tle", out or ""
++    except Exception as e:
++        return "error", f"failed to launch {script}: {e}"
++    if proc.returncode != 0:
++        return "error", (proc.stdout or "") + (proc.stderr or "")
++    return "ok", proc.stdout or ""
++
++
++def check(statement_text, solution_path):
++    """Return (passed_count, total, report_lines)."""
++    samples = extract_samples(statement_text)
++    report = []
++    ok = 0
++    cwd = os.path.dirname(os.path.abspath(solution_path))
++    for idx, (inp, exp) in enumerate(samples, 1):
++        status, out = run_program(solution_path, inp, SAMPLE_TIMEOUT, cwd=cwd)
++        if status == "ok" and out.split() == exp.split():
++            ok += 1
++        else:
++            report.append(f"[Sample {idx}] {status}: expected {exp!r}, got {out.strip()[:200]!r}")
++    return ok, len(samples), report
++
++
++def main(argv):
++    if len(argv) < 2:
++        print(__doc__)
++        return 1
++    with open(argv[1]) as f:
++        statement = f.read()
++    sol = argv[2] if len(argv) > 2 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "solution.py")
++    ok, total, report = check(statement, sol)
++    if total == 0:
++        print("No parseable samples found.")
++        return 1
++    print(f"{ok}/{total} samples passed")
++    for line in report:
++        print(line)
++    return 0 if ok == total else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))

@@ -1,0 +1,219 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3a103d6..e594c03 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm import create_client, get_response_from_llm
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -94,6 +95,43 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _last_assistant_text(msg_history):
++    """
++    Return the text of the last assistant message in msg_history ('' if none/empty).
++    Handles plain-string content and Claude-style lists of blocks.
++    """
++    if not msg_history:
++        return ""
++    for msg in reversed(msg_history):
++        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++            continue
++        content = msg.get('content')
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            texts = []
++            for block in content:
++                if isinstance(block, dict):
++                    if block.get('type') == 'text' and block.get('text'):
++                        texts.append(block['text'])
++                elif getattr(block, 'type', None) == 'text' and getattr(block, 'text', None):
++                    texts.append(block.text)
++            return "\n".join(texts)
++        return ""
++    return ""
++
++def _extract_last_code_block(text):
++    """
++    Return the content of the last ```python (or bare ```) fenced block in text, or None.
++    """
++    if not text:
++        return None
++    blocks = re.findall(r'```(?:python|py)?[ \t]*\n(.*?)```', text, re.DOTALL)
++    if not blocks:
++        return None
++    code = blocks[-1].strip('\n')
++    return code + "\n" if code.strip() else None
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -178,6 +216,92 @@ class AgenticSystem:
+         """
+         return any(not self._is_test_path(p) for p in self._changed_files())
+ 
++    def _find_deliverable_file(self):
++        """
++        Pick the most likely main source file from tracked files in git_tempdir.
++        Returns a relative path or None.
++        """
++        result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        files = [f.strip() for f in result.stdout.decode(errors='replace').splitlines() if f.strip()]
++        candidates = []
++        for f in files:
++            base = os.path.basename(f)
++            lower = f.lower()
++            if base.startswith('.') or any(part.startswith('.') for part in f.split('/')):
++                continue
++            if lower.endswith(('.md', '.markdown', '.rst', '.txt')) or 'readme' in lower or 'license' in lower:
++                continue
++            if self._is_test_path(f):
++                continue
++            candidates.append(f)
++        if not candidates:
++            return None
++        preferred = ['solution.py', 'main.py']
++        for name in preferred:
++            for f in candidates:
++                if os.path.basename(f) == name:
++                    return f
++        # Stub-like: small file consisting only of comments/blank lines
++        for f in candidates:
++            try:
++                with open(os.path.join(self.git_tempdir, f), 'r', errors='replace') as fh:
++                    lines = [l.strip() for l in fh.read().splitlines() if l.strip()]
++            except OSError:
++                continue
++            if lines and all(l.startswith('#') for l in lines):
++                return f
++        py = [f for f in candidates if f.endswith('.py')]
++        return py[0] if py else candidates[0]
++
++    def _read_deliverable(self, deliverable):
++        try:
++            with open(os.path.join(self.git_tempdir, deliverable), 'r', errors='replace') as fh:
++                return fh.read()
++        except OSError:
++            return "(unreadable)"
++
++    def _fallback_write_solution(self, deliverable):
++        """
++        Tool-free LLM request for only the full solution; writes the last fenced code block
++        to the deliverable file. Returns True if the file was written.
++        """
++        current = self._read_deliverable(deliverable)
++        prompt = f"""Write the complete solution for the following competitive programming problem in Python.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++The file `{deliverable}` currently contains:
++```python
++{current}
++```
++
++Respond with ONLY the complete, final contents of `{deliverable}` inside a single ```python fenced code block. Do not include any other code blocks, explanations, or tool calls.
++"""
++        safe_log(f"[fallback] requesting full solution for {deliverable} without tools")
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                prompt, client=client, model=client_model,
++                system_message="You are an expert competitive programmer. Output only code.",
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"[fallback] LLM request failed: {e}")
++            return False
++        code = _extract_last_code_block(content)
++        if not code:
++            safe_log("[fallback] no fenced code block found in response")
++            return False
++        with open(os.path.join(self.git_tempdir, deliverable), 'w') as fh:
++            fh.write(code)
++        safe_log(f"[fallback] wrote {len(code)} chars to {deliverable}")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -207,32 +331,53 @@ Do not end your turn with an empty message, and do not end with only a plan: you
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         msg_history = init_edit if init_edit else []
+ 
+-        # Verify that source edits exist; retry with a corrective prompt if not
+-        for attempt in range(3):
++        deliverable = self._find_deliverable_file()
++        safe_log(f"[verify] deliverable file: {deliverable}")
++
++        # Verification: nudge on the existing history first, then fresh-slate retries
++        for attempt in range(4):
+             if self._has_source_edits():
+                 break
+             changed = self._changed_files()
+-            safe_log(f"[verify] attempt {attempt + 1}: no source edits yet. Changed files: {changed}")
+-            status = subprocess.run(
+-                ["git", "-C", self.git_tempdir, "status", "--porcelain"],
+-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-            ).stdout.decode(errors='replace').strip() or "(no changes)"
+-            corrective = f"""Your previous turn did not modify any source file. The task is NOT complete yet.
++            last_text = _last_assistant_text(msg_history).strip()
++            target = deliverable or "the main solution file"
++            safe_log(f"[verify] attempt {attempt + 1}: no source edits yet. Changed files: {changed}. "
++                     f"Last assistant text empty: {not last_text}")
++            if attempt == 0:
++                nudge = (f"You ended your turn without editing any file. Use the editor tool now to write "
++                         f"the full solution into {target} in {self.git_tempdir}. Do not reply with text only.")
++                new_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                msg_history = new_history if new_history else msg_history
++                continue
++            # Fresh-slate retry with a new conversation
++            current = self._read_deliverable(deliverable) if deliverable else "(no deliverable file found)"
++            escalation = ["", "IMPORTANT: ", "FINAL WARNING: the task fails unless the file is written. "][min(attempt - 1, 2)]
++            fresh = f"""{escalation}Your previous attempts did not modify any source file. The task is NOT complete yet.
+ 
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+ 
+-Current `git status --porcelain` output in {self.git_tempdir}:
+-{status}
++Deliverable file: {target} (in {self.git_tempdir})
++Current contents:
++```python
++{current}
++```
+ 
+-Implement the solution NOW. Use the editor tool to write the full, complete solution into the main source/stub file (e.g. solution.py) in {self.git_tempdir}. Do not reply with an empty message or only a plan. After writing it, run the sample inputs with bash and fix any failures, then confirm with `git diff`.
++The very first action must be the editor tool with command=edit (or create) that writes the ENTIRE file_text containing the complete working solution to {target}. Do not plan first, do not reply with an empty message. After writing, run the sample inputs with bash and fix any failures.
+ """
+-            retry_history = msg_history if msg_history else []
+-            new_history = chat_with_agent(corrective, model=self.code_model, msg_history=retry_history, logging=safe_log)
+-            msg_history = new_history if new_history else []
+-
+-        # Optional final pass: run the samples and fix failures
++            new_history = chat_with_agent(fresh, model=self.code_model, msg_history=[], logging=safe_log)
++            if new_history:
++                msg_history = new_history
++
++        # Deterministic fallback: tool-free request, write the code block directly
++        if not self._has_source_edits() and deliverable:
++            safe_log("[verify] still no source edits; using deterministic fallback")
++            self._fallback_write_solution(deliverable)
++        elif not self._has_source_edits():
++            safe_log("[verify] no source edits and no deliverable file found; skipping fallback")
++
++        # Final pass: run the samples and fix failures, only if source edits exist
+         if self._has_source_edits():
+             final_prompt = f"""Now run the sample tests for the problem (from the problem statement or README) against your solution in {self.git_tempdir} using bash. If any sample fails, fix the source file with the editor tool and rerun until all samples pass. Then confirm with `git diff` that the changes are in place.
+ 

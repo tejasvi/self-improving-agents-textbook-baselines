@@ -1,0 +1,696 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0068c48..5ccd215 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,9 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import shutil
++import tempfile
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -40,6 +43,20 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++# Workflow settings
++WORK_DIR = '/work/t'          # scratch dir for ref.py, gen.py, cand_k.py
++ORACLE_ATTEMPTS = 2
++NUM_CANDIDATES = 3
++REPAIR_ROUNDS = 1
++JUDGE_CASES = 200             # random seeds compared against ref.py
++JUDGE_TIMEOUT = 10
++TIME_LIMIT_S = 2.0            # max-size run limit for a candidate
++HINTS = [
++    "Derive a DP over the state: list every state component that affects future cost and build the transitions.",
++    "Try a different state decomposition or a characterization (greedy / math / sweep) that avoids the reference's brute-force search.",
++    "Think about the complexity budget: precompute, use prefix sums / hashing, or meet-in-the-middle, and check the bound at max size.",
++]
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -138,28 +155,407 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    # ------------------------------------------------------------------
++    # Helpers for the oracle-first, multi-attempt workflow
++    # ------------------------------------------------------------------
++    def _work_dir(self):
++        """Scratch directory for ref.py, gen.py and cand_k.py (created once)."""
++        if getattr(self, '_wd', None):
++            return self._wd
++        wd = WORK_DIR
++        try:
++            os.makedirs(wd, exist_ok=True)
++        except OSError:
++            wd = tempfile.mkdtemp(prefix='dgm_work_')
++        self._wd = wd
++        return wd
++
++    def _sol_path(self):
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _base_solution_text(self):
++        """Content of solution.py at the base commit (the placeholder), or None."""
++        try:
++            res = subprocess.run(
++                ['git', '-C', self.git_tempdir, 'show', f'{self.base_commit}:solution.py'],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
++            )
++            if res.returncode != 0:
++                return None
++            return res.stdout.decode('utf-8', errors='replace')
++        except (OSError, subprocess.SubprocessError):
++            return None
++
++    def _compiles(self, path):
++        try:
++            result = subprocess.run(
++                ["python3", "-m", "py_compile", path],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
++                env={**os.environ, "PYTHONPYCACHEPREFIX": "/tmp/dgm_pycache"},
++            )
++            return result.returncode == 0
++        except (OSError, subprocess.SubprocessError):
++            return False
++
++    def _is_echo_stub(self, samples, path):
++        """True if the program on every sample just echoes the first input token."""
++        if not samples:
++            return False
++        for inp, _exp in samples:
++            toks = inp.split()
++            if not toks:
++                return False
++            try:
++                proc = subprocess.run(['python3', path], input=inp, capture_output=True, text=True,
++                                      timeout=10, cwd=self.git_tempdir)
++            except (OSError, subprocess.SubprocessError):
++                return False
++            if proc.stdout.split() != [toks[0]]:
++                return False
++        return True
++
+     def _solution_ready(self):
+         """
+-        True only if solution.py exists, is non-empty, compiles, and shows up in the repo diff.
++        True only if solution.py exists, is non-empty, compiles, differs from the base-commit
++        placeholder, is not an echo-the-first-token stub, and passes every extracted sample.
+         """
+-        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        sol_path = self._sol_path()
+         try:
+             if not os.path.isfile(sol_path):
+                 return False
+             with open(sol_path, 'r', encoding='utf-8', errors='replace') as f:
+-                if not f.read().strip():
+-                    return False
+-            result = subprocess.run(
+-                ["python3", "-m", "py_compile", sol_path],
+-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
+-                env={**os.environ, "PYTHONPYCACHEPREFIX": "/tmp/dgm_pycache"},
+-            )
+-            if result.returncode != 0:
+-                return False
+-        except (OSError, subprocess.SubprocessError):
++                text = f.read()
++        except OSError:
+             return False
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        return 'solution.py' in diff
++        if not text.strip():
++            return False
++        base = self._base_solution_text()
++        if base is not None and text.strip() == base.strip():
++            return False
++        if not self._compiles(sol_path):
++            return False
++        samples = self._extract_samples()
++        if self._run_samples_on(sol_path, samples):
++            return False
++        if self._is_echo_stub(samples, sol_path):
++            return False
++        return True
++
++    def _run_samples_on(self, path, samples=None):
++        """Run `python3 path` on each sample; returns failure report strings (empty = all pass)."""
++        if samples is None:
++            samples = self._extract_samples()
++        failures = []
++        if not samples:
++            return failures
++        if not os.path.isfile(path):
++            return [f"{os.path.basename(path)} does not exist."]
++        for i, (inp, exp) in enumerate(samples, 1):
++            try:
++                proc = subprocess.run(
++                    ['python3', path], input=inp, capture_output=True, text=True,
++                    timeout=10, cwd=self.git_tempdir,
++                )
++            except subprocess.TimeoutExpired:
++                failures.append(f"Sample {i}: TIMEOUT (>10s).\nInput:\n{inp}\nExpected:\n{exp}\n")
++                continue
++            except OSError as e:
++                failures.append(f"Sample {i}: could not run program: {e}\nInput:\n{inp}\nExpected:\n{exp}\n")
++                continue
++            if proc.stdout.split() != exp.split():
++                stderr_tail = '\n'.join(proc.stderr.strip().splitlines()[-15:])
++                failures.append(
++                    f"Sample {i}: WRONG OUTPUT.\nInput:\n{inp}\nExpected:\n{exp}\n"
++                    f"Actual:\n{proc.stdout}\nStderr tail:\n{stderr_tail}\n"
++                )
++        return failures
++
++    def _run_samples(self):
++        return self._run_samples_on(self._sol_path())
++
++    def _task_text(self):
++        return (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. "
++            f"I have already taken care of the required dependencies.\n"
++        )
++
++    @staticmethod
++    def _is_truncated(msg_history):
++        """True if the last assistant turn is empty or the output was cut off by the output limit."""
++        if not msg_history:
++            return True
++        last_assistant = None
++        for msg in reversed(msg_history):
++            if msg.get('role') == 'assistant':
++                last_assistant = msg
++                break
++        if last_assistant is None:
++            return True
++        text = AgenticSystem._last_assistant_text([last_assistant])
++        if not text:
++            return True
++        last = msg_history[-1]
++        if last.get('role') == 'user':
++            content = last.get('content')
++            s = content if isinstance(content, str) else ' '.join(
++                b.get('text', '') for b in content if isinstance(b, dict))
++            if 'cut off by the output limit' in s:
++                return True
++        return False
++
++    def _run_phase_oracle(self):
++        """Session that writes ref.py and gen.py and verifies the samples. Returns True if ref.py passes."""
++        wd = self._work_dir()
++        ref_path = os.path.join(wd, 'ref.py')
++        gen_path = os.path.join(wd, 'gen.py')
++        ok = False
++        for attempt in range(ORACLE_ATTEMPTS):
++            prompt = (
++                f"{self._task_text()}\n"
++                f"Write {ref_path} (simple brute force, correctness only) and {gen_path} (seeded small-input generator), "
++                f"verify the samples, then stop. Do not write the fast solution. Keep every turn short; write files in small pieces.\n"
++                f"Requirements:\n"
++                f"- {gen_path} takes a seed as sys.argv[1] and prints one small random valid input to stdout. "
++                f"If a second argument 'max' is given, it prints one maximum-size valid input instead.\n"
++                f"- {ref_path} reads stdin and writes stdout, exactly like the problem requires.\n"
++                f"- Run {ref_path} on every sample in the problem statement and make sure its output matches the expected output.\n"
++                f"- Your final message should state whether the samples pass and the paths of both files."
++            )
++            if attempt > 0:
++                prompt += "\nThe previous attempt did not leave a verified " + ref_path + " that passes the samples. Fix that now."
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            if self._is_truncated(msg_history):
++                safe_log(f"[oracle] attempt {attempt + 1} ended empty or truncated.")
++            if os.path.isfile(ref_path) and os.path.isfile(gen_path):
++                samples = self._extract_samples()
++                if not self._run_samples_on(ref_path, samples):
++                    ok = True
++                    break
++                safe_log(f"[oracle] ref.py fails samples on attempt {attempt + 1}.")
++        if ok:
++            shutil.copyfile(ref_path, self._sol_path())
++            safe_log("[oracle] ref.py verified on samples; copied to solution.py.")
++        return ok
++
++    def _run_candidate(self, k, history):
++        """Fresh session that writes cand_k.py using the oracle files and compact history."""
++        wd = self._work_dir()
++        ref_path = os.path.join(wd, 'ref.py')
++        gen_path = os.path.join(wd, 'gen.py')
++        cand_path = os.path.join(wd, f'cand_{k}.py')
++        hint = HINTS[k % len(HINTS)]
++        hist_text = "\n\n".join(history) if history else "(none yet)"
++        prompt = (
++            f"{self._task_text()}\n"
++            f"A verified brute-force reference is at {ref_path} and a seeded generator is at {gen_path} "
++            f"(`python3 {gen_path} SEED` prints one small input; `python3 {gen_path} SEED max` prints a max-size input). "
++            f"Do not modify them.\n\n"
++            f"# Attempt history\n{hist_text}\n\n"
++            f"# This attempt\n{hint}\n\n"
++            f"Write {cand_path} with a fast correct solution (stdin/stdout, Python, within the time limit). "
++            f"Check it on the samples, then use the stress_test tool with ref_path={ref_path}, cand_path={cand_path}, "
++            f"gen_path={gen_path} and fix any counterexample. Also use stress_test with time_input_path set to a max-size input "
++            f"(create it with the generator) to check speed. Keep every turn short; write files in small pieces. "
++            f"Always end turns with a tool call until you have verified the file, then stop with a short summary."
++        )
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        truncated = self._is_truncated(msg_history)
++        if truncated:
++            safe_log(f"[candidate {k}] session ended empty or truncated; counted as failed.")
++        return cand_path, truncated
++
++    def _judge(self, cands):
++        """
++        Plain-Python judge. For each (k, path, truncated) in cands: check samples, compare with ref.py
++        on random seeds, and time a max-size input. Returns a list of report dicts.
++        """
++        wd = self._work_dir()
++        ref_path = os.path.join(wd, 'ref.py')
++        gen_path = os.path.join(wd, 'gen.py')
++        samples = self._extract_samples()
++        reports = []
++        for k, path, truncated in cands:
++            rep = {'k': k, 'path': path, 'samples_ok': False, 'sample_fail': '', 'agree': 0,
++                   'n': JUDGE_CASES, 'cex': None, 'time': None, 'timing_ok': False, 'timing_note': '',
++                   'truncated': truncated, 'exists': os.path.isfile(path)}
++            reports.append(rep)
++            if not rep['exists'] or not self._compiles(path):
++                rep['sample_fail'] = 'cand file missing or does not compile'
++                continue
++            fails = self._run_samples_on(path, samples)
++            rep['sample_fail'] = "\n".join(fails)
++            rep['samples_ok'] = not fails
++            # random agreement with the reference (stop at first disagreement)
++            for seed in range(JUDGE_CASES):
++                inp = ''
++                try:
++                    g = subprocess.run(['python3', gen_path, str(seed)], capture_output=True, text=True,
++                                       timeout=10, cwd=self.git_tempdir)
++                    inp = g.stdout
++                    if g.returncode != 0 or not inp.strip():
++                        rep['timing_note'] = 'generator failed; no random agreement check'
++                        break
++                    r = subprocess.run(['python3', ref_path], input=inp, capture_output=True, text=True,
++                                       timeout=10, cwd=self.git_tempdir)
++                    c = subprocess.run(['python3', path], input=inp, capture_output=True, text=True,
++                                       timeout=JUDGE_TIMEOUT, cwd=self.git_tempdir)
++                except (subprocess.TimeoutExpired, OSError):
++                    rep['cex'] = {'input': inp, 'expected': '',
++                                  'actual': 'TIMEOUT or OS error', 'stderr': ''}
++                    break
++                if r.returncode != 0:
++                    rep['timing_note'] = 'reference failed on a random case'
++                    break
++                if c.returncode == 0 and c.stdout.split() == r.stdout.split():
++                    rep['agree'] += 1
++                    continue
++                rep['cex'] = {'input': inp.strip(), 'expected': r.stdout.strip(),
++                              'actual': c.stdout.strip(), 'stderr': '\n'.join(c.stderr.strip().splitlines()[-8:])}
++                break
++            # max-size timing run
++            try:
++                g = subprocess.run(['python3', gen_path, '0', 'max'], capture_output=True, text=True,
++                                   timeout=10, cwd=self.git_tempdir)
++                if g.returncode == 0 and g.stdout.strip():
++                    t0 = time.time()
++                    c = subprocess.run(['python3', path], input=g.stdout, capture_output=True, text=True,
++                                       timeout=TIME_LIMIT_S * 4, cwd=self.git_tempdir)
++                    rep['time'] = time.time() - t0
++                    rep['timing_ok'] = c.returncode == 0 and rep['time'] <= TIME_LIMIT_S
++                    if not rep['timing_ok']:
++                        rep['timing_note'] = (f"max-size run took {rep['time']:.2f}s (limit {TIME_LIMIT_S}s)"
++                                              f"{'; error: ' + c.stderr.strip()[-300:] if c.returncode else ''}")
++                else:
++                    rep['timing_note'] = 'generator has no max-size mode; timing not checked'
++                    rep['timing_ok'] = True
++            except subprocess.TimeoutExpired:
++                rep['timing_note'] = f'max-size run TIMEOUT (>{TIME_LIMIT_S * 4}s)'
++            except OSError as e:
++                rep['timing_note'] = f'could not run timing: {e}'
++        return reports
++
++    @staticmethod
++    def _judge_summary(rep):
++        """Compact text report used in the attempt history."""
++        lines = [f"## Candidate {rep['k']} ({os.path.basename(rep['path'])})"]
++        if not rep['exists']:
++            lines.append("- file was not written.")
++            return "\n".join(lines)
++        if rep.get('truncated'):
++            lines.append("- session ended empty or truncated.")
++        lines.append(f"- samples: {'PASS' if rep['samples_ok'] else 'FAIL'}")
++        if rep['sample_fail']:
++            lines.append("- first sample failure:\n" + rep['sample_fail'][:800])
++        lines.append(f"- agrees with reference on {rep['agree']}/{rep['n']} random cases")
++        if rep['cex']:
++            c = rep['cex']
++            lines.append("- minimal counterexample:\nInput:\n" + c['input'][:400] + "\nExpected:\n" + c['expected'][:200]
++                         + "\nActual:\n" + c['actual'][:200] + ("\nStderr tail:\n" + c['stderr'][-400:] if c['stderr'] else ''))
++        if rep['time'] is not None:
++            lines.append(f"- max-size run: {rep['time']:.2f}s ({'OK' if rep['timing_ok'] else 'TOO SLOW'})")
++        if rep['timing_note']:
++            lines.append("- note: " + rep['timing_note'][:300])
++        return "\n".join(lines)
++
++    @staticmethod
++    def _rank_key(rep):
++        """Higher is better: samples, full agreement, timing, agreement count, then speed."""
++        full = rep['samples_ok'] and rep['agree'] == rep['n'] and rep['timing_ok']
++        return (rep['samples_ok'], full, rep['agree'], rep['timing_ok'], -(rep['time'] or 1e9))
++
++    def _finalize(self, reports, ref_ok):
++        """Write the best-scoring file to solution.py: fully passing candidate > reference > best candidate."""
++        sol_path = self._sol_path()
++        full = [r for r in reports if r['samples_ok'] and r['agree'] == r['n'] and r['timing_ok']]
++        if full:
++            best = max(full, key=self._rank_key)
++            shutil.copyfile(best['path'], sol_path)
++            safe_log(f"[finalize] solution.py <- candidate {best['k']} (fully passing).")
++            return
++        if ref_ok:
++            safe_log("[finalize] no candidate fully passed; keeping the verified reference in solution.py.")
++            return
++        ranked = [r for r in reports if r['exists']]
++        if ranked:
++            best = max(ranked, key=self._rank_key)
++            shutil.copyfile(best['path'], sol_path)
++            safe_log(f"[finalize] no verified file; using best-scoring candidate {best['k']}.")
++
++    def forward(self):
++        """
++        Oracle-first, multi-attempt, judge-driven workflow.
++        1) oracle session -> ref.py, gen.py (copied to solution.py if samples pass)
++        2) up to K candidate sessions, each judged in plain Python; stop early on a full pass
++        3) bounded repair sessions on the best failing candidate, each judged
++        4) finalize solution.py
++        """
++        ref_ok = self._run_phase_oracle()
++        history = []
++        reports = []
++        found = False
++        for k in range(NUM_CANDIDATES):
++            cand_path, truncated = self._run_candidate(k, history)
++            rep_list = self._judge([(k, cand_path, truncated)])
++            rep = rep_list[0]
++            reports.append(rep)
++            history.append(self._judge_summary(rep))
++            if rep['samples_ok'] and rep['agree'] == rep['n'] and rep['timing_ok']:
++                found = True
++                safe_log(f"[forward] candidate {k} passes all checks; stopping early.")
++                break
++        for r in range(REPAIR_ROUNDS):
++            if found or not reports:
++                break
++            best = max(reports, key=self._rank_key)
++            if not best['exists']:
++                break
++            k = 100 + r
++            wd = self._work_dir()
++            fix_path = os.path.join(wd, f'cand_{k}.py')
++            cex = best['cex']
++            if cex:
++                issue = (f"minimal counterexample:\nInput:\n{cex['input']}\nExpected:\n{cex['expected']}\n"
++                         f"Actual:\n{cex['actual']}\nStderr tail:\n{cex['stderr']}")
++            elif not best['timing_ok']:
++                issue = f"timing failure: {best['timing_note']}"
++            else:
++                issue = best['sample_fail'] or 'unknown failure'
++            try:
++                with open(best['path'], 'r', encoding='utf-8', errors='replace') as f:
++                    cur = f.read()
++            except OSError:
++                cur = ''
++            prompt = (
++                f"{self._task_text()}\n"
++                f"Your previous solution {best['path']} is not correct or not fast enough. "
++                f"Fix it, keeping the algorithm if possible. Write the fixed version to {fix_path}. "
++                f"Do not patch symptoms: re-check the state model against the reference at "
++                f"{os.path.join(wd, 'ref.py')} (generator {os.path.join(wd, 'gen.py')}) and use the stress_test tool "
++                f"to confirm. Keep turns short; write files in small pieces.\n\n"
++                f"# Current code\n```python\n{cur}\n```\n\n# Problem found by the judge\n{issue}\n"
++            )
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            truncated = self._is_truncated(msg_history)
++            rep = self._judge([(k, fix_path, truncated)])[0]
++            reports.append(rep)
++            history.append(self._judge_summary(rep))
++            if rep['samples_ok'] and rep['agree'] == rep['n'] and rep['timing_ok']:
++                found = True
++
++        self._finalize(reports, ref_ok)
++
++        if not self._solution_ready():
++            safe_log("[forward] solution.py still not ready; writing a placeholder stub if empty.")
++            sol_path = self._sol_path()
++            existing = ''
++            if os.path.exists(sol_path):
++                with open(sol_path, 'r', encoding='utf-8', errors='replace') as f:
++                    existing = f.read()
++            if not existing.strip():
++                with open(sol_path, 'w') as f:
++                    f.write("# Placeholder: the agent did not produce a solution.\n")
+ 
+     def _extract_samples(self):
+         """
+@@ -189,41 +585,6 @@ class AgenticSystem:
+                 samples.append((inp + '\n', out))
+         return samples
+ 
+-    def _run_samples(self):
+-        """
+-        Run `python3 solution.py` on every sample input and compare whitespace-tokenized
+-        stdout with the expected output. Returns a list of failure report strings.
+-        """
+-        failures = []
+-        samples = self._extract_samples()
+-        sol_path = os.path.join(self.git_tempdir, 'solution.py')
+-        if not samples:
+-            return failures
+-        if not os.path.isfile(sol_path):
+-            for i, (inp, exp) in enumerate(samples, 1):
+-                failures.append(f"Sample {i}: solution.py does not exist.\nInput:\n{inp}\nExpected:\n{exp}\n")
+-            return failures
+-        for i, (inp, exp) in enumerate(samples, 1):
+-            try:
+-                proc = subprocess.run(
+-                    ['python3', 'solution.py'], input=inp, capture_output=True, text=True,
+-                    timeout=10, cwd=self.git_tempdir,
+-                )
+-            except subprocess.TimeoutExpired:
+-                failures.append(f"Sample {i}: TIMEOUT (>10s).\nInput:\n{inp}\nExpected:\n{exp}\n")
+-                continue
+-            except OSError as e:
+-                failures.append(f"Sample {i}: could not run solution.py: {e}\nInput:\n{inp}\nExpected:\n{exp}\n")
+-                continue
+-            actual = proc.stdout
+-            if actual.split() != exp.split():
+-                stderr_tail = '\n'.join(proc.stderr.strip().splitlines()[-15:])
+-                failures.append(
+-                    f"Sample {i}: WRONG OUTPUT.\nInput:\n{inp}\nExpected:\n{exp}\n"
+-                    f"Actual:\n{actual}\nStderr tail:\n{stderr_tail}\n"
+-                )
+-        return failures
+-
+     @staticmethod
+     def _last_assistant_text(msg_history):
+         """Return the text of the last assistant message in msg_history ('' if none)."""
+@@ -243,82 +604,6 @@ class AgenticSystem:
+             return '\n'.join(parts).strip()
+         return ''
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer. Keep your reasoning brief and always end each turn with a tool call until solution.py is verified.
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits (Python does roughly 10^7 simple operations per second).
+-2. Create a first-draft solution.py with the editor tool IMMEDIATELY after choosing an algorithm; refine it afterwards.
+-3. Run solution.py on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. (MANDATORY) Write a brute-force reference and a random small-input generator, stress test a few hundred cases against solution.py, and fix every mismatch. The draft solution.py must not contain placeholder or dead code.
+-5. Performance: estimate the worst-case operation count at maximum constraints, then time solution.py on a few adversarial max-size inputs (all identical, all distinct, sorted, reverse-sorted, skewed). If anything exceeds about 1s or about 5*10^7 operations, switch to a lower-complexity algorithm.
+-6. The final solution.py is what gets graded; it must contain the final solution. Helper and test files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not self._last_assistant_text(init_msg_history):
+-            safe_log("[forward] first run ended with an empty assistant message; treating as failing.")
+-
+-        # Verify solution.py was produced; retry with a bounded loop if not.
+-        sol_path = os.path.join(self.git_tempdir, 'solution.py')
+-        for attempt in range(1, 4):
+-            if self._solution_ready():
+-                break
+-            safe_log(f"[forward] solution.py not ready before retry {attempt}; retrying.")
+-            diff_now = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-            extra = ""
+-            if diff_now.strip() and 'solution.py' not in diff_now:
+-                extra = ("\nNote: other files were modified but solution.py was not. "
+-                         "solution.py must contain the final solution.\n")
+-            retry_instruction = (
+-                f"{task}\n"
+-                f"{extra}"
+-                f"Your very first action MUST be a call to the editor tool creating {self.git_tempdir}/solution.py "
+-                f"with your best attempt (a simple correct solution is fine; a simple brute-force solution first is acceptable). "
+-                f"Do not write long reasoning before that. After it exists, run it on the samples with bash and fix any failures."
+-            )
+-            init_msg_history = chat_with_agent(retry_instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # Sample-based verification and bounded repair loop.
+-        for attempt in range(3):
+-            fails = self._run_samples()
+-            if not fails:
+-                break
+-            safe_log(f"[forward] {len(fails)} sample(s) failing; repair session {attempt + 1}.")
+-            current_sol = ''
+-            if os.path.exists(sol_path):
+-                with open(sol_path, 'r', encoding='utf-8', errors='replace') as f:
+-                    current_sol = f.read()
+-            report = "\n".join(fails)
+-            repair_instruction = (
+-                f"{task}\n"
+-                f"Your solution fails the samples. Do not patch symptoms. "
+-                f"Re-derive the model: list every state component that affects future cost, "
+-                f"write a brute-force BFS/exhaustive reference for tiny inputs, "
+-                f"find a minimal counterexample with a random stress test, then fix solution.py. "
+-                f"Do not stop until all samples and the stress test pass. Always end turns with a tool call.\n\n"
+-                f"# Current solution.py\n```python\n{current_sol}\n```\n\n"
+-                f"# Failure report\n{report}\n"
+-            )
+-            chat_with_agent(repair_instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        if not self._solution_ready():
+-            safe_log("[forward] solution.py still not ready after retries; writing a placeholder stub.")
+-            existing = ''
+-            if os.path.exists(sol_path):
+-                with open(sol_path, 'r', encoding='utf-8', errors='replace') as f:
+-                    existing = f.read()
+-            if not existing.strip():
+-                with open(sol_path, 'w') as f:
+-                    f.write("# Placeholder: the agent did not produce a solution.\n")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/stress.py b/tools/stress.py
+new file mode 100644
+index 0000000..65a19e7
+--- /dev/null
++++ b/tools/stress.py
+@@ -0,0 +1,108 @@
++import os
++import signal
++import subprocess
++import time
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Stress-test a candidate stdin/stdout Python program against a reference program using a seeded generator script.
++* The generator is a Python script run as `python3 gen_path SEED`; it prints one test input to stdout.
++* For seeds 0..n_cases-1 it runs the generator, the reference and the candidate, and compares whitespace-tokenized stdout.
++* Returns the pass count and the first counterexample (input, expected output, actual output, stderr tail of the candidate). If all cases pass it says so.
++* Set time_input_path to a large input file instead to time the candidate on that file (wall time, with a hard timeout) and report whether it finished in time.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "ref_path": {"type": "string", "description": "Path to the reference (correct, slow is fine) Python program."},
++                "cand_path": {"type": "string", "description": "Path to the candidate Python program to test."},
++                "gen_path": {"type": "string", "description": "Path to the generator script; called as `python3 gen_path SEED` and prints one input."},
++                "n_cases": {"type": "integer", "description": "Number of seeds to test (seeds 0..n_cases-1). Default 300."},
++                "timeout_s": {"type": "integer", "description": "Hard timeout in seconds for each program run. Default 10."},
++                "mode": {"type": "string", "description": "Program type. Only 'stdin' is supported (programs read stdin, write stdout). Default 'stdin'."},
++                "time_input_path": {"type": "string", "description": "Optional. If given, skip stress testing and only time the candidate on this input file."}
++            },
++            "required": ["ref_path", "cand_path", "gen_path"]
++        }
++    }
++
++def _clip(s, n=1500):
++    s = (s or '').strip()
++    return s if len(s) <= n else s[: n // 2] + " ... " + s[-n // 2:]
++
++def _run(cmd, stdin_text, timeout_s, cwd=None):
++    """Run cmd; returns (status, stdout, stderr, elapsed). status is OK, ERROR or TIMEOUT."""
++    t0 = time.time()
++    try:
++        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                             text=True, cwd=cwd, start_new_session=True)
++    except OSError as e:
++        return 'ERROR', '', f'failed to start: {e}', 0.0
++    try:
++        out, err = p.communicate(stdin_text, timeout=timeout_s)
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(p.pid, signal.SIGKILL)
++        except Exception:
++            p.kill()
++        try:
++            p.communicate(timeout=5)
++        except Exception:
++            pass
++        return 'TIMEOUT', '', f'killed after {timeout_s}s', time.time() - t0
++    el = time.time() - t0
++    if p.returncode != 0:
++        return 'ERROR', out or '', (err or '') + f'\n(exit code {p.returncode})', el
++    return 'OK', out or '', err or '', el
++
++def _time_only(cand_path, time_input_path, timeout_s):
++    try:
++        with open(time_input_path, 'r', encoding='utf-8', errors='replace') as f:
++            data = f.read()
++    except OSError as e:
++        return f"ERROR: cannot read time_input_path: {e}"
++    status, out, err, el = _run(['python3', cand_path], data, timeout_s)
++    if status != 'OK':
++        return f"TIME {status} after {el:.2f}s (limit {timeout_s}s).\nStderr tail:\n{_clip(err)}"
++    return f"TIME OK: {el:.2f}s (limit {timeout_s}s). Output head: {_clip(out, 200)}"
++
++def tool_function(ref_path, cand_path, gen_path, n_cases=300, timeout_s=10, mode='stdin', time_input_path=None):
++    try:
++        timeout_s = max(1, min(int(timeout_s or 10), 120))
++    except Exception:
++        timeout_s = 10
++    if mode not in (None, '', 'stdin'):
++        return f"ERROR: unsupported mode {mode!r}; only 'stdin' is supported."
++    ref_path = os.path.abspath(str(ref_path))
++    cand_path = os.path.abspath(str(cand_path))
++    gen_path = os.path.abspath(str(gen_path))
++    for p in (ref_path, cand_path, gen_path):
++        if not os.path.isfile(p):
++            return f"ERROR: file not found: {p}"
++    if time_input_path:
++        return _time_only(cand_path, os.path.abspath(str(time_input_path)), timeout_s)
++    try:
++        n_cases = max(1, min(int(n_cases or 300), 5000))
++    except Exception:
++        n_cases = 300
++
++    passed = 0
++    for seed in range(n_cases):
++        st, inp, gerr, _ = _run(['python3', gen_path, str(seed)], '', timeout_s)
++        if st != 'OK' or not inp.strip():
++            return f"ERROR: generator failed on seed {seed} ({st}). Stderr:\n{_clip(gerr)}\nPassed {passed}/{n_cases} before this."
++        st, exp, rerr, _ = _run(['python3', ref_path], inp, timeout_s)
++        if st != 'OK':
++            return f"ERROR: reference failed on seed {seed} ({st}). Stderr:\n{_clip(rerr)}\nPassed {passed}/{n_cases} before this."
++        st, act, cerr, el = _run(['python3', cand_path], inp, timeout_s)
++        if st == 'OK' and act.split() == exp.split():
++            passed += 1
++            continue
++        return (
++            f"FAIL on seed {seed} ({st}). Passed {passed}/{n_cases} before this.\n"
++            f"Input:\n{inp.strip()}\n"
++            f"Expected:\n{_clip(exp)}\n"
++            f"Actual:\n{_clip(act)}\n"
++            f"Candidate stderr tail:\n{_clip(cerr)}"
++        )
++    return f"PASS: {passed}/{n_cases} random cases agree with the reference."

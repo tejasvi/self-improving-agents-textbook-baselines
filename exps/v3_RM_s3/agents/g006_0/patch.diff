@@ -1,0 +1,302 @@
+diff --git a/tests/test_bash_tool.py b/tests/test_bash_tool.py
+index a826846..a7a447c 100644
+--- a/tests/test_bash_tool.py
++++ b/tests/test_bash_tool.py
+@@ -1,5 +1,8 @@
++import io
++import random
+ import pytest
+-from tools.bash import tool_function, BashSession
++import tools.bash as bash_mod
++from tools.bash import tool_function, BashSession, read_clipped, CLIP_MARKER
+ 
+ @pytest.fixture
+ def bash_session():
+@@ -77,3 +80,77 @@ class TestBashTool:
+         result = tool_function(command)
+         assert "Line 1" in result
+         assert "Line 100" in result
++
++    def test_stdin_is_closed(self):
++        """A command reading stdin must get EOF instead of hanging."""
++        result = tool_function("read x; echo \"got=[$x]\"")
++        assert "got=[]" in result
++
++    def test_timeout_kills_command(self, monkeypatch):
++        """A command exceeding the timeout is killed and reported."""
++        monkeypatch.setattr(bash_mod, "TIMEOUT_SECONDS", 1)
++        result = tool_function("echo BEFORE_MARK; sleep 30; echo AFTER_MARK")
++        assert "BEFORE_MARK" in result
++        assert "AFTER_MARK" not in result
++        assert "timed out" in result
++
++    def test_timeout_kills_child_processes(self, monkeypatch):
++        """Background children in the same process group are killed too."""
++        monkeypatch.setattr(bash_mod, "TIMEOUT_SECONDS", 1)
++        result = tool_function("(sleep 30; echo leaked) & sleep 30")
++        assert "timed out" in result
++        assert "leaked" not in result
++
++    def test_long_output_is_clipped(self, monkeypatch):
++        """Very long output is truncated and marked."""
++        monkeypatch.setattr(bash_mod, "MAX_OUTPUT_CHARS", 1000)
++        result = tool_function("head -c 100000 /dev/zero | tr '\\0' 'x'; echo END")
++        assert CLIP_MARKER.strip() in result
++        assert "END" in result  # tail is kept
++        assert len(result) < 2 * 1000 + 200
++
++    def test_tool_info_schema(self):
++        info = bash_mod.tool_info()
++        schema = info["input_schema"]
++        assert schema["type"] == "object"
++        assert schema["required"] == ["command"]
++        assert schema["properties"]["command"]["type"] == "string"
++        assert "description" in schema["properties"]["command"]
++
++class TestReadClipped:
++    def _file(self, data: bytes):
++        return io.BytesIO(data)
++
++    def test_short_content_unchanged(self):
++        assert read_clipped(self._file(b"abc"), limit=10) == "abc"
++
++    def test_exact_boundary_unchanged(self):
++        data = b"a" * 20
++        assert read_clipped(self._file(data), limit=10) == data.decode()
++
++    def test_clipped_keeps_head_and_tail(self):
++        data = b"H" * 10 + b"M" * 500 + b"T" * 10
++        out = read_clipped(self._file(data), limit=10)
++        assert out == "H" * 10 + CLIP_MARKER + "T" * 10
++
++    def test_random_against_reference(self):
++        """Cross-check against a naive reference on random sizes and limits."""
++        rng = random.Random(12345)
++        for _ in range(300):
++            n = rng.randint(0, 200)
++            limit = rng.randint(1, 60)
++            data = bytes(rng.randrange(256) for _ in range(n))
++            got = read_clipped(self._file(data), limit=limit)
++            if n <= 2 * limit:
++                expected = data.decode(errors="replace")
++            else:
++                expected = (data[:limit].decode(errors="replace") + CLIP_MARKER
++                            + data[-limit:].decode(errors="replace"))
++            assert got == expected, (n, limit)
++
++    def test_bash_session_run_returns_pair(self, bash_session):
++        import asyncio
++        out, err = asyncio.run(bash_session.run("echo out; echo err >&2"))
++        assert out == "out"
++        assert err == "err"
++        assert bash_session.timed_out is False
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..a7ac135 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,5 +1,11 @@
+ import asyncio
+ import os
++import signal
++import tempfile
++
++TIMEOUT_SECONDS = 120  # per-command wall-clock limit
++MAX_OUTPUT_CHARS = 16000  # max characters returned per stream (head and tail are kept)
++CLIP_MARKER = "\n<response clipped>\n"
+ 
+ def tool_info():
+     return {
+@@ -8,10 +14,12 @@ def tool_info():
+ * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.\n
+ * You don't have access to the internet via this tool.\n
+ * You do have access to a mirror of common linux and python packages via apt and pip.\n
+-* State is persistent across command calls and discussions with the user.\n
++* Each command runs in a fresh non-interactive bash process with standard input closed, so commands that read from stdin will receive EOF. Do not rely on state (variables, working directory) persisting between calls.\n
++* Each command is killed if it runs longer than %d seconds.\n
++* Long outputs are truncated in the middle and marked with `<response clipped>`.\n
+ * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+ * Please avoid commands that may produce a very large amount of output.\n
+-* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""",
++* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""" % TIMEOUT_SECONDS,
+         "input_schema": {
+             "type": "object",
+             "properties": {
+@@ -24,125 +32,64 @@ def tool_info():
+         }
+     }
+ 
+-class BashSession:
+-    """A session of a bash shell."""
+-    def __init__(self):
+-        self._started = False
+-        self._process = None
+-        self._timed_out = False
+-        self._timeout = 120.0  # seconds
+-        self._sentinel = "<<exit>>"
+-        self._output_delay = 0.2  # seconds
+-
+-    async def start(self):
+-        if self._started:
+-            return
+-        self._process = await asyncio.create_subprocess_shell(
+-            "/bin/bash -i",
+-            preexec_fn=os.setsid,
+-            stdin=asyncio.subprocess.PIPE,
+-            stdout=asyncio.subprocess.PIPE,
+-            stderr=asyncio.subprocess.PIPE,
+-            env=os.environ.copy()  # Ensures inheritance of the current environment
+-        )
+-        self._started = True
++def read_clipped(f, limit=None):
++    """Read a binary temp file, keeping at most ~limit bytes from its head and tail."""
++    if limit is None:
++        limit = MAX_OUTPUT_CHARS  # read at call time so the module constant can be overridden
++    f.flush()
++    size = f.seek(0, os.SEEK_END)
++    if size <= 2 * limit:
++        f.seek(0)
++        return f.read().decode(errors='replace')
++    f.seek(0)
++    head = f.read(limit)
++    f.seek(size - limit)
++    tail = f.read(limit)
++    return head.decode(errors='replace') + CLIP_MARKER + tail.decode(errors='replace')
+ 
+-    def stop(self):
+-        if not self._started:
+-            return
+-        if self._process.returncode is None:
+-            self._process.terminate()
+-        self._process = None
+-        self._started = False
++class BashSession:
++    """Runs single commands in non-interactive bash processes."""
++    def __init__(self, timeout=None):
++        self._timeout = TIMEOUT_SECONDS if timeout is None else timeout
++        self.timed_out = False
+ 
+     async def run(self, command):
+-        if not self._started:
+-            raise ValueError("Session has not started.")
+-        if self._process.returncode is not None:
+-            raise ValueError(f"Bash has exited with returncode {self._process.returncode}")
+-        if self._timed_out:
+-            raise ValueError(
+-                f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
++        """Run `command`. Returns (stdout, stderr) as strings; sets self.timed_out on timeout."""
++        self.timed_out = False
++        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
++            proc = await asyncio.create_subprocess_exec(
++                "/bin/bash", "-c", command,
++                stdin=asyncio.subprocess.DEVNULL,  # stdin is closed: reads get EOF
++                stdout=out_f,
++                stderr=err_f,
++                start_new_session=True,  # own process group so the whole tree can be killed
++                env=os.environ.copy(),
+             )
+-        
+-        # Send command
+-        self._process.stdin.write(
+-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
+-        )
+-        await self._process.stdin.drain()
+-
+-        # Read output until sentinel
+-        try:
+-            output = ''
+-            start_time = asyncio.get_event_loop().time()
+-            
+-            while True:
+-                if asyncio.get_event_loop().time() - start_time > self._timeout:
+-                    self._timed_out = True
+-                    raise ValueError(
+-                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-                    )
+-                
+-                await asyncio.sleep(self._output_delay)
+-                # Read from the internal buffer
+-                stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+-                stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
+-                if self._sentinel in stdout_data:
+-                    output = stdout_data[: stdout_data.index(self._sentinel)]
+-                    break
+-
+-            # Clear buffers
+-            self._process.stdout._buffer.clear()
+-            self._process.stderr._buffer.clear()
+-
+-            output = output.strip()
+-            error = stderr_data.strip()
+-
+-            return output, error
+-
+-        except Exception as e:
+-            self._timed_out = True
+-            raise ValueError(str(e))
+-
+-def filter_error(error):
+-    # Filter out errors that we do not want to see
+-    filtered_lines = []
+-    i = 0
+-    error_lines = error.splitlines()
+-    while i < len(error_lines):
+-        line = error_lines[i]
+-
+-        # Skip the next lines if ioctl error, add relevant lines
+-        if "Inappropriate ioctl for device" in line:
+-            i += 3
+-            if '<<exit>>' in error_lines[i]:
+-                i += 1
+-            while i < len(error_lines) - 1:
+-                filtered_lines.append(error_lines[i])
+-                i += 1
+-            i += 1
+-            continue
+-
+-        filtered_lines.append(line)
+-        i += 1
+-    return '\n'.join(filtered_lines).strip()
++            try:
++                await asyncio.wait_for(proc.wait(), timeout=self._timeout)
++            except asyncio.TimeoutError:
++                self.timed_out = True
++                try:
++                    os.killpg(proc.pid, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++                await proc.wait()
++            stdout = read_clipped(out_f).strip()
++            stderr = read_clipped(err_f).strip()
++        return stdout, stderr
+ 
+ async def tool_function_call(command):
+-    """Execute a command in the bash shell."""
++    """Execute a command in a non-interactive bash process."""
+     try:
+-        bash_session = BashSession()
+-
+-        if not bash_session._started:
+-            await bash_session.start()
+-
+-        output, error = await bash_session.run(command)
+-        error = filter_error(error)
++        session = BashSession()
++        output, error = await session.run(command)
+         result = ""
+         if output:
+             result += output
+         if error:
+             result += "\nError:\n" + error
++        if session.timed_out:
++            result += f"\nError: command timed out after {TIMEOUT_SECONDS} seconds and was killed."
+         return result.strip()
+     except Exception as e:
+         return f"Error: {str(e)}"
+@@ -162,4 +109,4 @@ if __name__ == "__main__":
+         input_command = ' '.join(sys.argv[1:])
+         # Run the tool_function asynchronously
+         result = tool_function(input_command)
+-        print(result)
+\ No newline at end of file
++        print(result)

@@ -1,0 +1,165 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index fefb3ec..9f0af35 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -130,6 +130,70 @@ def _has_source_edit(diff):
+     """
+     return any(not _is_test_path(p) for p in _changed_files(diff))
+ 
++def _sanitize_history(msg_history):
++    """
++    Return a copy of msg_history without assistant messages whose text is empty or
++    whitespace-only and that contain no tool_use blocks. Handles string and list-of-block content.
++    """
++    cleaned = []
++    for msg in msg_history or []:
++        if isinstance(msg, dict) and msg.get('role') == 'assistant':
++            content = msg.get('content')
++            if isinstance(content, str):
++                if not content.strip():
++                    continue
++            elif isinstance(content, list):
++                has_tool_use = any(
++                    isinstance(b, dict) and b.get('type') == 'tool_use' for b in content
++                )
++                if not has_tool_use:
++                    text = "\n".join(
++                        b['text'] for b in content
++                        if isinstance(b, dict) and b.get('type') == 'text' and isinstance(b.get('text'), str)
++                    )
++                    if not text.strip():
++                        continue
++        cleaned.append(msg)
++    return cleaned
++
++def _guess_target_file(git_tempdir):
++    """
++    Guess the file the agent should edit using `git ls-files`.
++    Prefers solution.py, then a non-test .py file containing 'class Solution' or a stub 'pass',
++    then the first non-test .py file. Returns None if nothing is found.
++    """
++    try:
++        result = subprocess.run(
++            ["git", "-C", git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
++        )
++        files = result.stdout.decode().splitlines()
++    except Exception as e:
++        safe_log(f"_guess_target_file failed: {e}")
++        return None
++    py_files = [f for f in files if f.endswith('.py') and not _is_test_path(f)]
++    if not py_files:
++        return None
++    for f in py_files:
++        if f.split('/')[-1] == 'solution.py':
++            return f
++    for f in py_files:
++        try:
++            with open(os.path.join(git_tempdir, f), encoding='utf-8', errors='ignore') as fh:
++                text = fh.read()
++        except OSError:
++            continue
++        if 'class Solution' in text or re.search(r'^\s*pass\s*$', text, re.M):
++            return f
++    return py_files[0]
++
++def _fallback_extract_code(text):
++    """
++    Return the content of the last fenced ```python block in text, or None.
++    """
++    blocks = re.findall(r'```python[^\n]*\n(.*?)```', text or '', re.S)
++    return blocks[-1] if blocks else None
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -195,23 +259,40 @@ Follow this workflow:
+ 5. Stress and timing tests: (a) write a simple brute-force or alternate solution and a random stress test that generates many small random inputs, runs both, and compares the outputs; fix any discrepancy you find. (b) write a timing test at maximum constraints (largest allowed n and value ranges) and confirm the solution finishes well within the time limit. Save these test scripts in a scratch location (not in the solution file) and actually run them.
+ 6. Fix any failures you find and re-run the sample check, the stress test and the timing test until they all pass.
+ 
+-The task is not complete until the source files are actually modified. Do not end your turn with only a description of your plan; you must call a tool to edit the file. Replying with only a plan and no tool call ends the session without a solution.
++The task is not complete until the source files are actually modified. Do not end your turn with only a description of your plan; you must call a tool to edit the file. Replying with only a plan and no tool call ends the session without a solution. An empty reply or a reply without a tool call counts as failing the task.
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Validate that a non-test source file was actually edited; retry a bounded number of times.
+-        for attempt in range(3):
+-            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if _has_source_edit(diff):
++        # Validate that a non-test source file was actually edited; escalate over a bounded number of attempts.
++        target = _guess_target_file(self.git_tempdir) or 'the solution source file'
++        for attempt in range(2):
++            if _has_source_edit(diff_versus_commit(self.git_tempdir, self.base_commit)):
+                 break
++            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+             safe_log(f"Attempt {attempt + 1}: no source edits detected, retrying.")
+-            corrective = (
+-                "No changes to the main source code were detected "
+-                f"(current diff: {diff.strip() or '<empty>'}). "
+-                "Use the editor tool now to implement the solution in the source file. "
+-                "Do not only describe it. Replace the stub, then run it against the examples."
+-            )
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            try:
++                if attempt == 0:
++                    msg_history = _sanitize_history(msg_history)
++                    corrective = (
++                        "No changes to the main source code were detected "
++                        f"(current diff: {diff.strip() or '<empty>'}). "
++                        f"Use the editor tool NOW to implement the full solution in {target}. "
++                        "Do not reply with text only and do not reply empty. Replace the stub, then run it against the examples."
++                    )
++                    msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                else:
++                    short_prompt = (
++                        f"{self.problem_statement}\n\n"
++                        f"Use the editor tool NOW to create/overwrite {target} with a complete working solution. "
++                        "Do not reply with text only."
++                    )
++                    msg_history = chat_with_agent(short_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"Attempt {attempt + 1} failed with exception: {e!r}")
++
++        # Last-resort fallback: ask for the full file as text and write it directly.
++        if not _has_source_edit(diff_versus_commit(self.git_tempdir, self.base_commit)):
++            self._fallback_write_solution(target)
+ 
+         # Verification checklist turn once a source edit exists; re-prompt a bounded number of times.
+         if _has_source_edit(diff_versus_commit(self.git_tempdir, self.base_commit)):
+@@ -238,6 +319,36 @@ The task is not complete until the source files are actually modified. Do not en
+                 )
+                 msg_history = chat_with_agent(reprompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
++    def _fallback_write_solution(self, target):
++        """
++        Last resort: request the complete file in one ```python block (no tools) and write it to target.
++        """
++        if not target or target == 'the solution source file':
++            safe_log("Fallback skipped: no target file could be determined.")
++            return
++        prompt = (
++            f"{self.problem_statement}\n\n"
++            f"Reply with the complete contents of {target} as a single ```python fenced block. "
++            "Do not use any tools. Do not include any other code blocks."
++        )
++        try:
++            reply_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"Fallback chat failed: {e!r}")
++            return
++        code = _fallback_extract_code(_last_assistant_text(reply_history))
++        if code is None:
++            safe_log("Fallback: no fenced python block found in reply.")
++            return
++        path = os.path.join(self.git_tempdir, target)
++        try:
++            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++            with open(path, 'w', encoding='utf-8') as fh:
++                fh.write(code)
++            safe_log(f"Fallback: wrote {len(code)} chars to {target}.")
++        except OSError as e:
++            safe_log(f"Fallback write failed: {e!r}")
++
+ def _last_assistant_text(msg_history):
+     """
+     Return the concatenated text of the last assistant message in a message history.

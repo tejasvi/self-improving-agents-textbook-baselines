@@ -1,0 +1,274 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0644afc..40e2006 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -153,6 +153,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 0. Within your first few actions, create /work/repo/solution.py with a working baseline (even brute force) using the editor tool. Do all experiments in a scratch directory, but the final answer must live in solution.py. Then overwrite solution.py with better versions as you learn more. Never end a turn without a tool call; keep replies short and do not write long analyses.
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool.
++2b. If the problem is interactive, or sample_check reports no samples, first write down the I/O protocol you assume and at least one alternative (e.g. all data preloaded on stdin). Write the solution with a single token-based reader helper (e.g. `def tokens(): for line in sys.stdin: yield from line.split()`) so it does not depend on line boundaries, and ignore stray tokens that do not match the reply format. Verify with interactive_harness in both modes before finishing. Never treat a failing sample_check as a reason to skip checking; instead build samples manually from the statement.
+ 3. Run the `sample_check` tool on solution.py after each solution version: `sample_check(solution_path='/work/repo/solution.py', problem_statement_path='/tmp/problem.md')` (the full statement is saved there; or pass samples_json). Every sample must show EXACT MATCH. Treat any mismatch as a failure, even when the problem says any valid answer is accepted. If the statement allows multiple answers and your output differs from the sample, do not stop: change tie-breaking, ordering, basis choice, or bit order (try the natural alternatives such as reversed bit order, highest vs lowest pivot, ascending vs descending iteration) until your output matches all sample outputs byte for byte. Keep a separate validity checker to verify that the output is still correct.
+ 4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch. You can use the `stress_test` tool, which runs an optional exhaustive enumeration (`enumerate_all()` in the generator file) followed by random cases from `gen(rng, size)`, and reports a shrunk failing input with expected and actual outputs.
+    - The brute force must be independent of the algorithm under test: write it directly from the problem statement (e.g. plain simulation or full enumeration), not by reusing your fast idea.
+diff --git a/tools/sample_check.py b/tools/sample_check.py
+index 4559dde..f6fbf08 100644
+--- a/tools/sample_check.py
++++ b/tools/sample_check.py
+@@ -118,7 +118,8 @@ def tool_function(solution_path, problem_statement_path=None, samples_json=None,
+     except Exception as e:
+         return f"Error: could not load samples: {e}"
+     if not samples:
+-        return "Error: no samples found. Provide samples_json or a statement with 'Sample Input N'/'Sample Output N' blocks."
++        return ("Error: no samples found. Provide samples_json or a statement with 'Sample Input N'/'Sample Output N' blocks. "
++                "Do not stop here: build samples manually from the statement, and analyze the I/O protocol (input layout, interactive replies, extra data lines) before writing or trusting the solution.")
+ 
+     n = len(samples)
+     k = 0
+diff --git a/tools/interactive_harness.py b/tools/interactive_harness.py
+new file mode 100644
+index 0000000..455480f
+--- /dev/null
++++ b/tools/interactive_harness.py
+@@ -0,0 +1,242 @@
++import importlib.util
++import os
++import queue
++import subprocess
++import sys
++import tempfile
++import threading
++import traceback
++
++MAX_QUERIES = 20000
++REPR_CAP = 4000
++
++
++def tool_info():
++    return {
++        "name": "interactive_harness",
++        "description": """Run a solution against a user-provided judge simulator for interactive / underspecified-I/O problems.\n
++* `judge_path` is a Python file defining `class Judge` with: `initial_input() -> str` (text the grader sends first, may contain several lines), `respond(query_line: str) -> str | None` (given one line printed by the solution, return the reply to write to its stdin; return None when the solution prints the final answer line, and set `self.ok = True/False` there), and optionally `preload_answers(queries: list[str]) -> list[str]` (non-adaptive replies, one per query, used by flattened mode).\n
++* mode 'interactive': runs the solution with pipes; sends initial_input, reads each line the solution prints, replies via respond(). A read that gets no output within `timeout` seconds is reported as blocked (the solution is waiting for input it never got, or loops).\n
++* mode 'flattened': all stdin is preloaded into one file: initial_input, then `extra_lines` (optional extra header lines), then the replies from preload_answers for the queries observed in an interactive run; the solution is run as `python3 solution.py < file`. Reports crashes (tracebacks), malformed output and wrong answers.\n
++* mode 'both' runs both. Use it to check that the solution does not crash when extra data lines precede the reply lines, and that it tolerates whitespace/line-boundary differences.\n
++* Returns a compact report with stderr tracebacks for each failing case.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the Python solution file (run as `python3 solution_path`)."},
++                "judge_path": {"type": "string", "description": "Path to a Python file exposing `class Judge` with initial_input(), respond(query_line) and optionally preload_answers(queries)."},
++                "mode": {"type": "string", "description": "One of 'interactive', 'flattened', or 'both'. Default 'both'."},
++                "timeout": {"type": "integer", "description": "Per-read / per-run time limit in seconds (default 5)."},
++                "num_cases": {"type": "integer", "description": "Number of judge instances (fresh Judge() each) to run per mode (default 1)."},
++                "extra_lines": {"type": "string", "description": "Optional extra header lines inserted after initial_input in flattened mode only (for testing data-line layouts)."}
++            },
++            "required": ["solution_path", "judge_path"]
++        }
++    }
++
++
++def _clip(s, n=REPR_CAP):
++    s = str(s)
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n...<{len(s) - n} chars clipped>...\n" + s[-n // 2:]
++
++
++def _load_judge(judge_path):
++    d = os.path.dirname(os.path.abspath(judge_path))
++    if d not in sys.path:
++        sys.path.insert(0, d)
++    spec = importlib.util.spec_from_file_location("_harness_judge", judge_path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    if not hasattr(mod, "Judge"):
++        raise AttributeError("judge file must define class Judge")
++    return mod.Judge
++
++
++def _read_stderr(errf):
++    errf.seek(0)
++    return errf.read()
++
++
++def _run_interactive(solution_path, Judge, timeout):
++    """Returns (status, info) where status is 'ok' (answer verified), or a failure kind.
++    info is a dict with queries (list of printed query lines before the answer), detail string, stderr."""
++    judge = Judge()
++    init = judge.initial_input()
++    errf = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
++    proc = subprocess.Popen([sys.executable, solution_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                            stderr=errf, text=True, bufsize=1, errors="replace")
++    q = queue.Queue()
++
++    def reader():
++        try:
++            for ln in proc.stdout:
++                q.put(ln)
++        except Exception:
++            pass
++        q.put(None)
++
++    threading.Thread(target=reader, daemon=True).start()
++    queries = []
++    info = {"queries": queries}
++
++    def fail(kind, detail):
++        info["detail"] = detail
++        info["stderr"] = _read_stderr(errf)
++        if proc.poll() is None:
++            proc.kill()
++        proc.wait()
++        return kind, info
++
++    try:
++        proc.stdin.write(init if init.endswith("\n") else init + "\n")
++        proc.stdin.flush()
++    except (BrokenPipeError, OSError):
++        return fail("crash", "solution exited before reading the initial input")
++
++    for _ in range(MAX_QUERIES):
++        try:
++            line = q.get(timeout=timeout)
++        except queue.Empty:
++            return fail("blocked", f"no output for {timeout}s: solution is blocked on a read (it did not get the data it expects) or loops forever")
++        if line is None:
++            proc.wait()
++            return fail("crash", f"solution exited (code {proc.returncode}) without printing an answer")
++        line = line.rstrip("\r\n")
++        if not line.strip():
++            continue
++        try:
++            reply = judge.respond(line)
++        except Exception:
++            return fail("malformed", f"judge rejected solution output line {line[:200]!r}:\n{traceback.format_exc(limit=3)}")
++        if reply is None:
++            try:
++                proc.stdin.close()
++            except (BrokenPipeError, OSError):
++                pass
++            try:
++                proc.wait(timeout=timeout)
++            except subprocess.TimeoutExpired:
++                return fail("blocked", "solution did not exit after printing its answer")
++            if proc.returncode != 0:
++                info["stderr"] = _read_stderr(errf)
++                info["detail"] = f"exit code {proc.returncode} after answer"
++                return "crash", info
++            if getattr(judge, "ok", False):
++                info["stderr"] = _read_stderr(errf)
++                return "ok", info
++            info["stderr"] = _read_stderr(errf)
++            info["detail"] = f"wrong answer, final line {line[:200]!r}"
++            return "wrong", info
++        queries.append(line)
++        try:
++            proc.stdin.write(reply if reply.endswith("\n") else reply + "\n")
++            proc.stdin.flush()
++        except (BrokenPipeError, OSError):
++            return fail("crash", "solution exited early (broken pipe while sending reply)")
++    return fail("malformed", f"more than {MAX_QUERIES} queries/lines without an answer")
++
++
++def _run_flattened(solution_path, Judge, timeout, queries, extra_lines):
++    init = Judge().initial_input()
++    if not init.endswith("\n"):
++        init += "\n"
++    judge2 = Judge()
++    try:
++        answers = judge2.preload_answers(list(queries))
++    except AttributeError:
++        return "malformed", {"detail": "judge has no preload_answers(queries) needed for flattened mode"}
++    if answers is None or len(answers) != len(queries):
++        return "malformed", {"detail": "preload_answers must return one reply per query"}
++    extra = extra_lines or ""
++    if extra and not extra.endswith("\n"):
++        extra += "\n"
++    stdin_text = init + extra + "".join(a if a.endswith("\n") else a + "\n" for a in answers)
++    info = {}
++    try:
++        p = subprocess.run([sys.executable, solution_path], input=stdin_text, capture_output=True, text=True,
++                           timeout=timeout, errors="replace")
++    except subprocess.TimeoutExpired:
++        return "blocked", {"detail": f"timed out after {timeout}s"}
++    info["stderr"] = p.stderr
++    if p.returncode != 0:
++        info["detail"] = f"exit code {p.returncode}"
++        return "crash", info
++    out_lines = [l.rstrip("\r\n") for l in p.stdout.splitlines() if l.strip()]
++    printed_queries = []
++    answered = False
++    for ln in out_lines:
++        try:
++            r = judge2.respond(ln)
++        except Exception:
++            info["detail"] = f"judge rejected output line {ln[:200]!r}:\n{traceback.format_exc(limit=3)}"
++            return "malformed", info
++        if r is None:
++            answered = True
++            break
++        printed_queries.append(ln)
++    if not answered:
++        info["detail"] = "no answer line printed"
++        return "malformed", info
++    if printed_queries != list(queries):
++        info["detail"] = ("solution printed different query lines when replies were preloaded "
++                          "(its control flow depends on the reply layout)")
++        return "wrong", info
++    if not getattr(judge2, "ok", False):
++        info["detail"] = "wrong answer in flattened run"
++        return "wrong", info
++    return "ok", info
++
++
++def _format(kind, info):
++    msg = f"{kind.upper()}: {info.get('detail', '')}".rstrip()
++    st = (info.get("stderr") or "").strip()
++    if st:
++        msg += f"\nSTDERR:\n{_clip(st)}"
++    return msg
++
++
++def tool_function(solution_path, judge_path, mode="both", timeout=5, num_cases=1, extra_lines=None):
++    if not solution_path or not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    if not judge_path or not os.path.isfile(judge_path):
++        return f"Error: judge file not found: {judge_path}"
++    mode = (mode or "both").strip().lower()
++    if mode not in ("interactive", "flattened", "both"):
++        return "Error: mode must be 'interactive', 'flattened' or 'both'."
++    try:
++        timeout = max(1, int(timeout or 5))
++        num_cases = max(1, int(num_cases or 1))
++    except (TypeError, ValueError):
++        return "Error: timeout and num_cases must be integers."
++    try:
++        Judge = _load_judge(judge_path)
++    except Exception:
++        return "Error: could not load judge:\n" + traceback.format_exc(limit=4)
++
++    lines = []
++    modes = ["interactive", "flattened"] if mode == "both" else [mode]
++    for m in modes:
++        passed = 0
++        for case in range(1, num_cases + 1):
++            try:
++                if m == "interactive":
++                    kind, info = _run_interactive(solution_path, Judge, timeout)
++                else:
++                    kind1, info1 = _run_interactive(solution_path, Judge, timeout)
++                    if kind1 != "ok":
++                        kind, info = kind1, info1
++                        info = dict(info)
++                        info["detail"] = "(interactive pass needed for flattened mode) " + info.get("detail", "")
++                    else:
++                        kind, info = _run_flattened(solution_path, Judge, timeout, info1["queries"], extra_lines)
++            except Exception:
++                kind, info = "malformed", {"detail": "harness error:\n" + traceback.format_exc(limit=4)}
++            if kind == "ok":
++                passed += 1
++            else:
++                lines.append(f"[{m}] case {case}: {_format(kind, info)}")
++                break
++        lines.append(f"[{m}] {passed}/{num_cases} cases OK")
++    return "\n".join(lines)

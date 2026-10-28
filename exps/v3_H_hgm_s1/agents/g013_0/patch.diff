@@ -1,0 +1,193 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index b92e459..e7ec470 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,7 +7,7 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, is_test_file
+-from utils.common_utils import last_code_candidate
++from utils.common_utils import last_code_candidate, sanitize_msg_history, extract_code_block, file_is_stub
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -162,6 +162,18 @@ class AgenticSystem:
+         candidates.sort(key=lambda f: (not f.endswith('.py'), f))
+         return candidates[0] if candidates else None
+ 
++    def _has_effective_edits(self, patch):
++        """
++        True only if the patch touches a non-test file AND the primary source
++        file is no longer a stub.
++        """
++        if not has_source_edits(patch):
++            return False
++        starter = self.find_primary_source_file()
++        if starter is None:
++            return True
++        return not file_is_stub(os.path.join(self.git_tempdir, starter))
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -179,7 +191,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ Follow these steps in order:
+ 1. Inspect the repository: read the starter file(s) (e.g. with bash `cat`, `ls`, `find`) to learn the required function/class signature and any existing tests.
+ 2. Design the algorithm: reason carefully about the problem's constraints and the most efficient correct approach.
+-3. Using the editor tool, write your first complete draft into the starter file in the repo BEFORE any testing. Do not prototype in /tmp or other directories. Tests must import from the repo file, e.g. `cd <repo> && python3 -c ...`. Only throwaway brute-force harnesses may live in /tmp, and they must import the Solution from the repo. If a test fails, fix the repo file via the editor tool, not a copy. The starter stub (`pass`) must be replaced with a full implementation. Keep the required signature. If the stub uses names such as `List`, add the missing imports (e.g. `from typing import List`).
++3. Using the editor tool, write your first complete draft into the starter file in the repo BEFORE any testing. Your first action must be a call to the editor tool to write the solution; do not output tool calls as plain text. Do not prototype in /tmp or other directories. Tests must import from the repo file, e.g. `cd <repo> && python3 -c ...`. Only throwaway brute-force harnesses may live in /tmp, and they must import the Solution from the repo. If a test fails, fix the repo file via the editor tool, not a copy. The starter stub (`pass`) must be replaced with a full implementation. Keep the required signature. If the stub uses names such as `List`, add the missing imports (e.g. `from typing import List`).
+ 4. Test: run the problem's examples and a brute-force comparison on small random inputs against the repo file, and fix any mismatches or errors in the repo file with the editor tool.
+ 5. Final check: confirm via `git diff` (or equivalent) that the diff contains changes to the primary source file.
+ 
+@@ -193,9 +205,11 @@ Rules:
+ 
+         for attempt in range(3):
+             patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if has_source_edits(patch):
++            if self._has_effective_edits(patch):
+                 break
+             safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Re-prompting agent.")
++            # Drop empty text blocks / empty messages and merge same-role neighbours.
++            msg_history = sanitize_msg_history(msg_history)
+             msg_history = chat_with_agent(
+                 self._build_retry_message(patch, msg_history),
+                 model=self.code_model,
+@@ -204,23 +218,97 @@ Rules:
+             )
+ 
+         patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-        if not has_source_edits(patch):
++        if not self._has_effective_edits(patch):
+             # Last resort: ask for a best-effort solution even if unverified.
+             safe_log("[forward] Still no source edits after retries. Requesting best-effort solution.")
+             final_msg = self._build_final_message()
++            msg_history = sanitize_msg_history(msg_history)
+             msg_history = chat_with_agent(final_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+             patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if not has_source_edits(patch):
++            if not self._has_effective_edits(patch):
+                 safe_log("[forward] Warning: agent finished without source edits after final attempt.")
+ 
++        if not self._has_effective_edits(patch):
++            safe_log("[forward] Falling back to a direct solution write.")
++            self._fallback_write_solution()
++            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++            if not self._has_effective_edits(patch):
++                safe_log("[forward] Warning: fallback did not produce a source edit.")
++
+         # Optional verification pass once a source edit exists
+-        if has_source_edits(patch):
++        if self._has_effective_edits(patch):
+             verify_msg = """Verify your solution once more: run the problem's examples and a brute-force comparison on small random inputs against the repo file. If there are any mismatches, errors, or edge-case issues, fix them in the repo file with the editor tool. Make sure the final source file is complete and imports are correct."""
+             safe_log("[forward] Running verification pass.")
+             msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+         return msg_history
+ 
++    @staticmethod
++    def _final_assistant_text(msg_history):
++        for msg in reversed(msg_history or []):
++            if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            parts = []
++            for block in content or []:
++                if isinstance(block, dict):
++                    btype, text = block.get('type'), block.get('text')
++                else:
++                    btype, text = getattr(block, 'type', None), getattr(block, 'text', None)
++                if btype == 'text' and isinstance(text, str):
++                    parts.append(text)
++            if parts:
++                return '\n'.join(parts)
++        return ''
++
++    def _fallback_write_solution(self):
++        """
++        Deterministic last resort: ask for the complete program in one fenced block
++        (no tools) and write it directly to the primary source file.
++        """
++        starter = self.find_primary_source_file()
++        if not starter:
++            safe_log("[fallback] No primary source file found; cannot write solution.", level=logging.WARNING)
++            return False
++        starter_path = os.path.join(self.git_tempdir, starter)
++        try:
++            with open(starter_path, 'r', encoding='utf-8', errors='replace') as f:
++                starter_content = f.read()
++        except OSError:
++            starter_content = ''
++        safe_log(f"[fallback] Requesting complete solution for {starter}.")
++        prompt = f"""Solve the following competitive programming problem.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++The starter file is: {starter}
++Current content of the starter file:
++```
++{starter_content}
++```
++
++Reply with ONLY the complete final program in one ```python fenced block, no tools. The program must keep the required signature from the starter file and include all imports."""
++        history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        text = self._final_assistant_text(history)
++        code = extract_code_block(text)
++        if not code:
++            stripped = text.strip()
++            looks_like_code = ('def ' in stripped or 'class ' in stripped or 'import ' in stripped) and '\n' in stripped
++            if looks_like_code:
++                safe_log("[fallback] No fenced block found; using raw reply as code.")
++                code = stripped
++        if not code:
++            safe_log("[fallback] No code found in reply; starter file left unchanged.", level=logging.WARNING)
++            return False
++        with open(starter_path, 'w', encoding='utf-8') as f:
++            f.write(code.rstrip('\n') + '\n')
++        safe_log(f"[fallback] Wrote {len(code)} characters to {starter}.")
++        return True
++
+     def _build_retry_message(self, patch, msg_history):
+         starter = self.find_primary_source_file()
+         starter_str = starter if starter else "the main (non-test) source file in the repo"
+diff --git a/utils/common_utils.py b/utils/common_utils.py
+index c7a8f7e..316d7bb 100644
+--- a/utils/common_utils.py
++++ b/utils/common_utils.py
+@@ -199,3 +199,33 @@ def extract_code_block(text):
+         if len(b) >= len(best):
+             best = b
+     return best.strip('\n')
++
++
++_STUB_MARKERS = ('write your solution here',)
++
++
++def file_is_stub(path):
++    """
++    Return True if the file at `path` is missing, empty, contains a known
++    placeholder marker, or has no real body (only imports, comments, blank
++    lines, signatures, and `pass` / `...` statements).
++    """
++    try:
++        with open(path, 'r', encoding='utf-8', errors='replace') as f:
++            content = f.read()
++    except OSError:
++        return True
++    if not content.strip():
++        return True
++    lowered = content.lower()
++    if any(marker in lowered for marker in _STUB_MARKERS):
++        return True
++    body = []
++    for line in content.splitlines():
++        s = line.strip()
++        if not s or s.startswith('#'):
++            continue
++        if s.startswith(('import ', 'from ', 'def ', 'class ', '@')) or s.endswith(':'):
++            continue
++        body.append(s)
++    return all(s in ('pass', '...') for s in body)

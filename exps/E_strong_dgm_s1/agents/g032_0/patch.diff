@@ -1,0 +1,765 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3703691..e5ef67b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,10 +4,14 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import re
++import shutil
+ import threading
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from utils.candidate_select import pick_and_copy
++from tools.solution_check import tool_function as solution_check_tool
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -40,6 +44,10 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++def read_text(path):
++    with open(path, 'r', errors='replace') as f:
++        return f.read()
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -153,7 +161,7 @@ class AgenticSystem:
+         """True for test files and helper scripts (brute force, generators, tests dirs)."""
+         parts = path.replace('\\', '/').split('/')
+         base = parts[-1]
+-        if any(part in ('tests', 'test') for part in parts[:-1]):
++        if any(part in ('tests', 'test', 'tests_agent', 'attempts') for part in parts[:-1]):
+             return True
+         if base.startswith('test_') or base.endswith('_test.py') or base.endswith('.spec.js') or base.endswith('.test.js'):
+             return True
+@@ -184,10 +192,182 @@ class AgenticSystem:
+                 return False
+         return True
+ 
++    # ------------------------------------------------------------------
++    # Verification, reflection, adversarial testing and candidate selection
++    # ------------------------------------------------------------------
++    STRESS_TESTS = 200          # minimum stress seeds required to accept a solution
++    MAX_REPAIR_ROUNDS = 3       # K: reflection attempts after a failed verification
++    TIME_BUDGET = 3000.0        # overall wall-clock budget (seconds) for forward()
++    CHECK_TIMEOUT = 10          # per-run timeout passed to solution_check
++
++    def _solution_path(self):
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _tests_dir(self):
++        return os.path.join(self.git_tempdir, 'tests_agent')
++
++    def _sample_pairs(self):
++        """Return [(input_text, expected_text)] from tests_agent/sample_<i>.in/.out, sorted by i."""
++        d = self._tests_dir()
++        if not os.path.isdir(d):
++            return []
++        idxs = []
++        for name in os.listdir(d):
++            m = re.match(r'^sample_(\d+)\.in$', name)
++            if m and os.path.isfile(os.path.join(d, f'sample_{m.group(1)}.out')):
++                idxs.append(int(m.group(1)))
++        pairs = []
++        for i in sorted(idxs):
++            with open(os.path.join(d, f'sample_{i}.in'), 'r', errors='replace') as f:
++                s_in = f.read()
++            with open(os.path.join(d, f'sample_{i}.out'), 'r', errors='replace') as f:
++                s_out = f.read()
++            pairs.append((s_in, s_out))
++        return pairs
++
++    def _verify(self, solution_file):
++        """Run the saved samples and a stress run. Returns (ok, raw_report).
++
++        The report is returned verbatim so it can be handed to the agent; it is not parsed
++        beyond the solution_check verdict lines.
++        """
++        samples = self._sample_pairs()
++        d = self._tests_dir()
++        brute = os.path.join(d, 'brute.py')
++        gen = os.path.join(d, 'gen.py')
++        if not os.path.isfile(solution_file):
++            return False, f"solution file not found: {solution_file}"
++        if not samples:
++            return False, "No samples found: expected tests_agent/sample_<i>.in and sample_<i>.out files."
++        if not (os.path.isfile(brute) and os.path.isfile(gen)):
++            return False, "Missing tests_agent/brute.py or tests_agent/gen.py; both are required for stress testing."
++
++        sample_report = solution_check_tool(
++            solution_file,
++            inputs=[s_in for s_in, _ in samples],
++            expected_outputs=[s_out for _, s_out in samples],
++            timeout=self.CHECK_TIMEOUT,
++        )
++        stress_report = solution_check_tool(
++            solution_file,
++            brute_path=brute,
++            gen_path=gen,
++            num_tests=self.STRESS_TESTS,
++            timeout=self.CHECK_TIMEOUT,
++        )
++        report = f"## Sample check\n{sample_report}\n\n## Stress check\n{stress_report}"
++        ok = (
++            'RESULT: OK' in sample_report
++            and 'RESULT: OK' in stress_report
++            and f"stress: {self.STRESS_TESTS}/{self.STRESS_TESTS} passed" in stress_report
++        )
++        return ok, report
++
++    def _adversarial_check(self, solution_file):
++        """Run the adversary's own brute force and generator (tests_agent/adversarial/).
++
++        Returns (ok, raw_report). If the adversary produced no tests, returns (True, note)
++        so that a missing adversary does not trigger a repair.
++        """
++        d = os.path.join(self.git_tempdir, 'tests_agent', 'adversarial')
++        brute = os.path.join(d, 'brute_adv.py')
++        gen = os.path.join(d, 'gen_adv.py')
++        if not (os.path.isfile(brute) and os.path.isfile(gen)):
++            return True, "Adversarial tester produced no brute_adv.py/gen_adv.py; skipped."
++        report = solution_check_tool(
++            solution_file,
++            brute_path=brute,
++            gen_path=gen,
++            num_tests=100,
++            timeout=self.CHECK_TIMEOUT,
++        )
++        return 'RESULT: OK' in report and 'stress: 100/100 passed' in report, report
++
++    def _save_attempt(self, index):
++        """Copy the current solution.py to attempts/sol_<index>.py."""
++        attempts = os.path.join(self.git_tempdir, 'attempts')
++        os.makedirs(attempts, exist_ok=True)
++        dst = os.path.join(attempts, f'sol_{index}.py')
++        shutil.copyfile(self._solution_path(), dst)
++        return dst
++
++    def _repair(self, task, prev_code, report, round_no, context, prefer_new_algorithm=False):
++        """One fresh reflection session given the failing report. Edits solution.py."""
++        algo_hint = ""
++        if prefer_new_algorithm:
++            algo_hint = ("\nThis is a later attempt and the previous approaches did not pass. "
++                         "Prefer a substantially different algorithm or data structure from the previous code.")
++        prompt = f"""{task}
++
++# Reflection attempt {round_no}
++A previous solution was checked automatically ({context}) and FAILED. Here is the previous solution code:
++
++```python
++{prev_code}
++```
++
++Here is the raw output of the failing check (failing input, expected output, actual output, stderr, timing):
++
++{report}
++
++Please:
++1. Find the root cause. Look at the failing input and compare the expected output with the actual output by hand. If the brute force in tests_agent/ may be wrong, verify it on the failing input and fix it.
++2. If the approach is fundamentally wrong (wrong model of the problem, too slow for the constraints), switch to a correct algorithm that fits the limits. Otherwise make a minimal fix.
++3. Edit {self._solution_path()} (editor tool, command=create or str_replace). Then re-run the samples and the stress test with solution_check (solution_path={self._solution_path()}, brute_path=tests_agent/brute.py, gen_path=tests_agent/gen.py, num_tests=200) and fix any remaining failures.{algo_hint}
++"""
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _select_best(self, budget_seconds=None):
++        """Score all saved candidates and copy the best one to solution.py."""
++        sol = self._solution_path()
++        attempts_dir = os.path.join(self.git_tempdir, 'attempts')
++        candidates = [sol]
++        if os.path.isdir(attempts_dir):
++            idxs = []
++            for name in os.listdir(attempts_dir):
++                m = re.match(r'^sol_(\d+)\.py$', name)
++                if m:
++                    idxs.append(int(m.group(1)))
++            candidates += [os.path.join(attempts_dir, f'sol_{i}.py') for i in sorted(idxs)]
++        d = self._tests_dir()
++        brute = os.path.join(d, 'brute.py')
++        gen = os.path.join(d, 'gen.py')
++        best, scores = pick_and_copy(
++            candidates, sol,
++            samples=self._sample_pairs(),
++            brute_path=brute if os.path.isfile(brute) else None,
++            gen_path=gen if os.path.isfile(gen) else None,
++            budget_seconds=budget_seconds,
++        )
++        safe_log(f"Candidate selection: best={best}, scores={scores}")
++        return best, scores
++
++    def _ensure_primary_edit(self, task):
++        """Keep the existing bounded no-edit fallback."""
++        retry_prompt = f"""{task}
++
++Your previous attempt ended without editing any source file. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {self._solution_path()}, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
++"""
++        for attempt in range(3):
++            if self._has_primary_edit():
++                break
++            safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
++            chat_with_agent(retry_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++
++        Flow: attempt 0 solves the problem and writes its tests; then verification
++        (samples + stress). Up to MAX_REPAIR_ROUNDS reflection attempts follow failed
++        verifications. An adversarial tester then probes the solution; a failure
++        triggers one more repair. Finally the best candidate is copied to solution.py.
+         """
++        t0 = time.monotonic()
++
++        def remaining():
++            return self.TIME_BUDGET - (time.monotonic() - t0)
++
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -196,30 +376,85 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
++        method = f"""Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Immediately after reading the statement, write a draft solution.py with the editor tool (command=create), even if it is simple or brute-force, before any extended analysis. No turn may end without an editor call that creates or edits the source file. Keep replies concise to avoid the output limit.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Write brute.py (a simple, obviously-correct brute force) and gen.py (takes an integer seed as sys.argv[1], uses random.seed(seed), and prints one small random valid input to stdout). Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Fix every mismatch, crash or timeout it reports, then re-run it until it reports RESULT: OK.
+-6. Generate a maximum-size input (gen-style, with the largest constraints) and check that solution.py finishes in well under 2 seconds. Keep iterating on the solution until all checks pass.
++3. Save every sample of the statement as {self.git_tempdir}/tests_agent/sample_1.in, sample_1.out, sample_2.in, sample_2.out, and so on (exact text as in the statement). Run solution.py on every sample and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample_1.in`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++4. Write {self.git_tempdir}/tests_agent/brute.py: a simple, obviously-correct brute force that reads stdin and prints the answer. Write {self.git_tempdir}/tests_agent/gen.py: it takes an integer seed as sys.argv[1] and an optional mode as sys.argv[2] ('small', 'edge', 'large', default 'small'), calls random.seed(seed), and prints one valid input to stdout. Modes:
++   - small: tiny random inputs for brute-force comparison.
++   - edge: minimum sizes (n=1, empty-like cases where allowed), duplicates, all-equal values, extreme values from the constraints, degenerate structures (sorted, reversed, chains, stars, single element repeated).
++   - large: maximum constraints, and worst-case structures for timing (e.g. the input shape that maximizes the work of a naive or slow approach).
++   Make the generator cover all of these edge cases; the brute force must be trustworthy on small inputs.
++5. Run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=tests_agent/brute.py, gen_path=tests_agent/gen.py, num_tests of at least 200. Also run it on the samples in plain mode (inputs and expected_outputs from tests_agent/). Fix every mismatch, crash or timeout it reports, then re-run it until it reports RESULT: OK.
++6. Generate a maximum-size input with tests_agent/gen.py (mode 'large') and check that solution.py finishes in well under 2 seconds. Keep iterating on the solution until all checks pass.
+ 7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
+ 8. An unrun stress test means the task is NOT finished. Do not end your turn until step 5 (stress mode) has been run and reported RESULT: OK on the final version of solution.py.
+ 9. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
+ The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Bounded retries if no primary source file was edited
+-        retry_prompt = f"""{task}
++        # Attempt 0: the main session.
++        chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        self._ensure_primary_edit(task)
+ 
+-Your previous attempt ended without editing any source file. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {self.git_tempdir}/solution.py, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
+-"""
+-        for attempt in range(3):
+-            if self._has_primary_edit():
++        self._attempt_idx = 0
++        ok, report = self._verify(self._solution_path())
++        safe_log(f"Verification after attempt 0: ok={ok}")
++
++        # Reflection rounds on verification failure (bounded for-loop).
++        for i in range(1, self.MAX_REPAIR_ROUNDS + 1):
++            if ok or remaining() <= 0:
+                 break
+-            safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
+-            chat_with_agent(retry_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            prev_code = read_text(self._solution_path())
++            self._save_attempt(self._attempt_idx)
++            self._attempt_idx += 1
++            self._repair(task, prev_code, report, i, "verification",
++                         prefer_new_algorithm=(i >= 2))
++            ok, report = self._verify(self._solution_path())
++            safe_log(f"Verification after repair {i}: ok={ok}")
++
++        # Adversarial tester: independent session, then at most one repair round.
++        if remaining() > 0:
++            adv_ok, adv_report = self._run_adversary(task)
++            safe_log(f"Adversarial check: ok={adv_ok}")
++            if not adv_ok and remaining() > 0:
++                prev_code = read_text(self._solution_path())
++                self._save_attempt(self._attempt_idx)
++                self._attempt_idx += 1
++                self._repair(task, prev_code, adv_report, self.MAX_REPAIR_ROUNDS + 1,
++                             "adversarial tester", prefer_new_algorithm=False)
++                ok, report = self._verify(self._solution_path())
++                safe_log(f"Verification after adversarial repair: ok={ok}")
++
++        # Final candidate and selection.
++        if os.path.isfile(self._solution_path()):
++            self._save_attempt(self._attempt_idx)
++            self._attempt_idx += 1
++        if remaining() > 0:
++            self._select_best(budget_seconds=max(0.0, remaining()))
++        safe_log(f"Final verification: ok={ok}")
++
++    def _run_adversary(self, task):
++        """Fresh session that sees only the problem statement and solution.py."""
++        d = os.path.join(self.git_tempdir, 'tests_agent', 'adversarial')
++        prompt = f"""{task}
++
++You are an independent adversarial tester. You do NOT write the solution; you only try to break it.
++The current solution is at {self._solution_path()}:
++
++```python
++{read_text(self._solution_path())}
++```
++
++Do the following:
++1. Re-read the problem statement and the constraints carefully. Write your OWN brute-force reference, independently from the solution, at {d}/brute_adv.py. It must read stdin and print the answer, and be obviously correct even if slow.
++2. Write {d}/gen_adv.py: takes an integer seed as sys.argv[1] and an optional mode sys.argv[2] (default 'small'); calls random.seed(seed); prints one valid input. Make it produce tricky inputs: minimum sizes, extreme values, duplicates, degenerate structures, and inputs at the boundary of every constraint. Use small sizes when the mode is 'small' so the brute force can run.
++3. Run the `solution_check` tool in stress mode: solution_path={self._solution_path()}, brute_path={d}/brute_adv.py, gen_path={d}/gen_adv.py, num_tests=100.
++4. If there is any disagreement, timeout or crash, determine (by hand, on the failing input) whether the solution or your brute force is wrong, and say so in your final reply, quoting the failing input and both outputs. Do NOT edit solution.py.
++"""
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        return self._adversarial_check(self._solution_path())
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tests/test_candidate_select.py b/tests/test_candidate_select.py
+new file mode 100644
+index 0000000..f558335
+--- /dev/null
++++ b/tests/test_candidate_select.py
+@@ -0,0 +1,91 @@
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from utils.candidate_select import select_best, pick_and_copy
++
++# Problem used in tests: read n, print sum of the n numbers that follow.
++CORRECT = "n = int(input())\nprint(sum(map(int, input().split())))\n"
++WRONG = "n = int(input())\nprint(sum(map(int, input().split())) + 1)\n"   # always off by one
++SLOW = "import time\nn = int(input())\ntime.sleep(0.5)\nprint(sum(map(int, input().split())))\n"
++CRASH = "n = int(input())\nraise SystemExit(3)\n"
++
++BRUTE = "n = int(input())\nprint(sum(map(int, input().split())))\n"
++GEN = """import random, sys
++seed = int(sys.argv[1]); mode = sys.argv[2] if len(sys.argv) > 2 else 'small'
++random.seed(seed)
++n = random.randint(1, 5) if mode == 'small' else random.randint(50, 60)
++print(n)
++print(' '.join(str(random.randint(-10**9, 10**9)) for _ in range(n)))
++"""
++SAMPLES = [("3\n1 2 3\n", "6\n")]
++
++
++def _write(tmp_path, name, text):
++    p = tmp_path / name
++    p.write_text(text)
++    return str(p)
++
++
++def test_correct_beats_wrong_and_crash(tmp_path):
++    cands = [_write(tmp_path, 'wrong.py', WRONG), _write(tmp_path, 'crash.py', CRASH),
++             _write(tmp_path, 'good.py', CORRECT)]
++    brute = _write(tmp_path, 'brute.py', BRUTE)
++    gen = _write(tmp_path, 'gen.py', GEN)
++    best, scores = select_best(cands, SAMPLES, brute_path=brute, gen_path=gen,
++                               small_seeds=5, large_seeds=2, time_limit=5.0)
++    assert best == cands[2]
++    assert scores[cands[2]][0] == 1          # passes the sample
++    assert scores[cands[0]][0] == 0          # wrong answer fails the sample
++    assert scores[cands[0]] < scores[cands[2]]
++
++
++def test_sample_failure_outranks_majority(tmp_path):
++    # Two wrong candidates agree with each other on the large inputs, but the
++    # correct one passes the sample, so it must still win on the first criterion.
++    cands = [_write(tmp_path, 'w1.py', WRONG), _write(tmp_path, 'w2.py', WRONG),
++             _write(tmp_path, 'good.py', CORRECT)]
++    best, _ = select_best(cands, SAMPLES, time_limit=5.0)
++    assert best == cands[2]
++
++
++def test_tie_prefers_earlier_candidate(tmp_path):
++    cands = [_write(tmp_path, 'a.py', CORRECT), _write(tmp_path, 'b.py', CORRECT)]
++    best, _ = select_best(cands, SAMPLES, time_limit=5.0)
++    assert best == cands[0]
++
++
++def test_slow_candidate_loses_on_time(tmp_path):
++    cands = [_write(tmp_path, 'slow.py', SLOW), _write(tmp_path, 'fast.py', CORRECT)]
++    best, scores = select_best(cands, SAMPLES, time_limit=0.1)
++    assert best == cands[1]
++    assert scores[cands[0]][3] < scores[cands[1]][3]
++
++
++def test_no_candidates_returns_none(tmp_path):
++    best, scores = select_best([str(tmp_path / 'missing.py')], SAMPLES)
++    assert best is None and scores == {}
++
++
++def test_pick_and_copy_writes_winner(tmp_path):
++    good = _write(tmp_path, 'good.py', CORRECT)
++    wrong = _write(tmp_path, 'wrong.py', WRONG)
++    dest = tmp_path / 'solution.py'
++    dest.write_text(WRONG)
++    best, _ = pick_and_copy([str(dest), wrong, good], str(dest), samples=SAMPLES, time_limit=5.0)
++    assert best == good
++    assert dest.read_text() == CORRECT
++
++
++def test_budget_stops_pool_generation(tmp_path):
++    cands = [_write(tmp_path, 'good.py', CORRECT)]
++    brute = _write(tmp_path, 'brute.py', BRUTE)
++    gen = _write(tmp_path, 'gen.py', GEN)
++    # A clock that is already past the budget: no generated inputs, samples still counted.
++    ticks = iter([0.0] + [100.0] * 1000)
++    best, scores = select_best(cands, SAMPLES, brute_path=brute, gen_path=gen,
++                               small_seeds=5, large_seeds=5, time_limit=5.0,
++                               budget_seconds=1.0, clock=lambda: next(ticks))
++    assert best == cands[0]
++    assert scores[cands[0]][1] == 0  # no brute-agreement checks ran
+diff --git a/tests/test_retry_loop.py b/tests/test_retry_loop.py
+new file mode 100644
+index 0000000..3dac465
+--- /dev/null
++++ b/tests/test_retry_loop.py
+@@ -0,0 +1,184 @@
++import os
++import subprocess
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++
++GOOD = "n = int(input())\nprint(sum(map(int, input().split())))\n"
++BUGGY = "n = int(input())\nprint(sum(map(int, input().split())) + 1)  # BUGGY\n"
++ADV_BUG = "n = int(input())\nprint(sum(map(int, input().split())) + 2)  # ADVBUG\n"
++BRUTE = GOOD
++GEN = "import random, sys\nrandom.seed(int(sys.argv[1]))\nprint(random.randint(1, 3))\nprint(1, 2, 3)\n"
++
++
++def _git(repo, *args):
++    subprocess.run(["git", "-C", str(repo), *args], check=True,
++                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def _make_repo(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    _git(repo, "init", "-q")
++    _git(repo, "config", "user.email", "t@example.com")
++    _git(repo, "config", "user.name", "t")
++    (repo / "solution.py").write_text("# placeholder\n")
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-qm", "base")
++    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
++                            stdout=subprocess.PIPE, check=True).stdout.decode().strip()
++    tdir = repo / "tests_agent"
++    tdir.mkdir()
++    (tdir / "sample_1.in").write_text("3\n1 2 3\n")
++    (tdir / "sample_1.out").write_text("6\n")
++    (tdir / "brute.py").write_text(BRUTE)
++    (tdir / "gen.py").write_text(GEN)
++    return repo, commit
++
++
++def _fake_check(solution_path, inputs=None, expected_outputs=None, brute_path=None,
++                gen_path=None, num_tests=200, timeout=10):
++    """Stands in for tools.solution_check: judges by the file contents (no subprocess)."""
++    code = open(solution_path).read()
++    if inputs is not None:
++        if "BUGGY" in code:
++            return "[input 0] FAIL: output differs from expected\nRESULT: FAILED"
++        return f"1/{len(inputs)} passed, max time 0.000 s\nRESULT: OK"
++    if "ADVBUG" in code and brute_path and "brute_adv" in brute_path:
++        return "WRONG ANSWER on seed 0\nRESULT: FAILED (stress: 0/100 seeds ran before failure)"
++    if "BUGGY" in code:
++        return "WRONG ANSWER on seed 0\nRESULT: FAILED (stress: 0/200 seeds ran before failure)"
++    n = num_tests
++    return f"stress: {n}/{n} passed, max time 0.000 s\nRESULT: OK"
++
++
++def _kind(msg):
++    if "independent adversarial tester" in msg:
++        return "adversary"
++    if "# Reflection attempt" in msg:
++        return "repair"
++    return "main"
++
++
++class FakeChat:
++    """Scripted chat. script(fake, kind, n) writes files; n counts sessions of that kind."""
++
++    def __init__(self, repo, script):
++        self.repo = repo
++        self.script = script
++        self.prompts = []
++        self.kinds = []
++        self.counts = {}
++
++    def __call__(self, msg, model=None, msg_history=None, logging=print, **kw):
++        kind = _kind(msg)
++        n = self.counts.get(kind, 0)
++        self.counts[kind] = n + 1
++        self.prompts.append(msg)
++        self.kinds.append(kind)
++        self.script(self, kind, n)
++        return []
++
++
++def _solution(repo):
++    return (repo / "solution.py").read_text()
++
++
++def _agent(repo, commit, monkeypatch, script):
++    agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
++    agent.git_tempdir = str(repo)
++    agent.base_commit = commit
++    agent.code_model = "fake"
++    agent.problem_statement = "sum the numbers"
++    agent.logger = None
++    fake = FakeChat(repo, script)
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake)
++    monkeypatch.setattr(coding_agent, "solution_check_tool", _fake_check)
++    monkeypatch.setattr(coding_agent, "safe_log", lambda *a, **k: None)
++    return agent, fake
++
++
++def _write_sol(fake, text):
++    (fake.repo / "solution.py").write_text(text)
++
++
++def test_first_attempt_passes_no_repair(tmp_path, monkeypatch):
++    repo, commit = _make_repo(tmp_path)
++    agent, fake = _agent(repo, commit, monkeypatch,
++                         lambda f, kind, n: _write_sol(f, GOOD))
++    agent.forward()
++    assert fake.kinds == ["main", "adversary"]  # no repair when verification passes
++    assert os.listdir(repo / "attempts") == ["sol_0.py"]  # only the final candidate copy
++
++
++def test_failed_verification_repaired_with_context(tmp_path, monkeypatch):
++    repo, commit = _make_repo(tmp_path)
++
++    def script(fake, kind, n):
++        if kind == "main":
++            _write_sol(fake, BUGGY)
++        elif kind == "repair":
++            _write_sol(fake, GOOD)
++
++    agent, fake = _agent(repo, commit, monkeypatch, script)
++    agent.forward()
++    # main session, one repair session, then the adversary session on the repaired code
++    assert fake.kinds == ["main", "repair", "adversary"]
++    repair = fake.prompts[1]
++    assert "# Reflection attempt 1" in repair
++    assert "BUGGY" in repair                       # previous code included
++    assert "RESULT: FAILED" in repair              # raw failing report included
++    assert "root cause" in repair.lower()
++    assert (repo / "attempts" / "sol_0.py").read_text() == BUGGY
++    assert _solution(repo) == GOOD
++
++
++def test_repair_rounds_are_bounded(tmp_path, monkeypatch):
++    repo, commit = _make_repo(tmp_path)
++    agent, fake = _agent(repo, commit, monkeypatch,
++                         lambda f, kind, n: _write_sol(f, BUGGY))
++    agent.forward()
++    K = coding_agent.AgenticSystem.MAX_REPAIR_ROUNDS
++    assert K == 3
++    assert fake.kinds.count("repair") == K       # exactly K repairs, never more
++    assert fake.kinds[0] == "main"
++    # every failing candidate is kept: main + repairs before the final one, plus the final copy
++    assert sorted(os.listdir(repo / "attempts")) == ["sol_0.py", "sol_1.py", "sol_2.py", "sol_3.py"]
++
++
++def test_selection_picks_good_candidate_over_buggy(tmp_path, monkeypatch):
++    repo, commit = _make_repo(tmp_path)
++
++    def script(fake, kind, n):
++        # Main session: buggy. First repair: good. Later repairs: still buggy.
++        if kind == "main":
++            _write_sol(fake, BUGGY)
++        elif kind == "repair":
++            _write_sol(fake, GOOD if n == 0 else BUGGY)
++
++    agent, fake = _agent(repo, commit, monkeypatch, script)
++    agent.forward()
++    assert _solution(repo) == GOOD
++
++
++def test_adversarial_failure_triggers_one_repair(tmp_path, monkeypatch):
++    repo, commit = _make_repo(tmp_path)
++    adv = repo / "tests_agent" / "adversarial"
++    adv.mkdir()
++    (adv / "brute_adv.py").write_text(BRUTE)
++    (adv / "gen_adv.py").write_text(GEN)
++
++    def script(fake, kind, n):
++        if kind == "adversary":
++            return  # adversary only reports; it does not edit solution.py
++        if kind == "main":
++            _write_sol(fake, ADV_BUG)  # passes verification but fails the adversary
++        else:
++            _write_sol(fake, GOOD)
++
++    agent, fake = _agent(repo, commit, monkeypatch, script)
++    agent.forward()
++    assert fake.kinds == ["main", "adversary", "repair"]
++    assert _solution(repo) == GOOD
+diff --git a/utils/candidate_select.py b/utils/candidate_select.py
+new file mode 100644
+index 0000000..ca642dc
+--- /dev/null
++++ b/utils/candidate_select.py
+@@ -0,0 +1,150 @@
++"""Candidate selection for competitive-programming solutions.
++
++Every candidate is a stdin/stdout Python program. Candidates are run on a pool of
++inputs:
++  * samples (input, expected output) -> counted as "samples passed";
++  * small generated inputs (gen.py seed small) with the brute force as oracle
++    -> counted as "brute agreement";
++  * large generated inputs (gen.py seed large) with no oracle -> majority agreement
++    among candidates and runtime.
++Candidates are ranked by the tuple
++  (samples passed, brute agreement, majority agreement, -(runs over time limit or failing)).
++"""
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++
++RUN_TIMEOUT = 10.0
++
++
++def _norm(s):
++    lines = [line.rstrip() for line in (s or '').replace('\r\n', '\n').split('\n')]
++    while lines and lines[-1] == '':
++        lines.pop()
++    return '\n'.join(lines)
++
++
++def _run_py(path, args, stdin_text, cwd, timeout):
++    """Run `python -I path args` in cwd. Returns (ok, stdout, elapsed)."""
++    t0 = time.monotonic()
++    try:
++        p = subprocess.run([sys.executable, '-I', path] + list(args), input=stdin_text,
++                           capture_output=True, text=True, timeout=timeout, cwd=cwd,
++                           errors='replace')
++    except subprocess.TimeoutExpired:
++        return False, '', time.monotonic() - t0
++    el = time.monotonic() - t0
++    ok = p.returncode == 0 and not p.stderr.strip()
++    return ok, p.stdout, el
++
++
++def _gen_input(gen_path, seed, mode, cwd):
++    ok, out, _ = _run_py(gen_path, [str(seed), mode], '', cwd, RUN_TIMEOUT)
++    return out if ok and out.strip() else None
++
++
++def _brute_output(brute_path, inp, cwd):
++    ok, out, _ = _run_py(brute_path, [], inp, cwd, RUN_TIMEOUT)
++    return out if ok else None
++
++
++def select_best(candidates, samples, brute_path=None, gen_path=None,
++                small_seeds=20, large_seeds=10, time_limit=2.0,
++                budget_seconds=None, clock=time.monotonic):
++    """Score candidate solution files and return (best_path, scores).
++
++    candidates: list of paths; earlier entries win ties.
++    samples: list of (input_text, expected_output_text) pairs.
++    brute_path / gen_path: optional trusted brute force and generator. gen is called as
++        `python gen.py <seed> <mode>` with mode in {'small', 'large'}.
++    budget_seconds: optional overall wall-clock budget; pool generation stops when exceeded.
++    Returns (best_path or None, {path: (samples, brute, majority, -slow_or_failed)}).
++    """
++    cands = [c for c in candidates if c and os.path.isfile(c)]
++    if not cands:
++        return None, {}
++    tmpdir = tempfile.mkdtemp(prefix='select_')
++    t_start = clock()
++
++    def out_of_budget():
++        return budget_seconds is not None and clock() - t_start > budget_seconds
++
++    try:
++        # Private copies so the run is isolated from the repo.
++        local = []
++        for i, c in enumerate(cands):
++            dst = os.path.join(tmpdir, f'_cand{i}.py')
++            shutil.copyfile(c, dst)
++            local.append(dst)
++        brute_local = gen_local = None
++        if brute_path and os.path.isfile(brute_path):
++            brute_local = os.path.join(tmpdir, '_brute.py')
++            shutil.copyfile(brute_path, brute_local)
++        if gen_path and os.path.isfile(gen_path):
++            gen_local = os.path.join(tmpdir, '_gen.py')
++            shutil.copyfile(gen_path, gen_local)
++
++        # Pool entries: (kind, input_text, expected_output_or_None)
++        pool = [('sample', s_in, s_out) for s_in, s_out in samples]
++        if brute_local and gen_local:
++            for seed in range(small_seeds):
++                if out_of_budget():
++                    break
++                inp = _gen_input(gen_local, seed, 'small', tmpdir)
++                if inp is None:
++                    continue
++                exp = _brute_output(brute_local, inp, tmpdir)
++                if exp is not None:
++                    pool.append(('small', inp, exp))
++            for seed in range(large_seeds):
++                if out_of_budget():
++                    break
++                inp = _gen_input(gen_local, seed, 'large', tmpdir)
++                if inp is not None:
++                    pool.append(('large', inp, None))
++
++        # Run every candidate on every pool input.
++        # outputs[i][j] = normalised stdout, or None if the run failed.
++        outputs = [[None] * len(pool) for _ in cands]
++        slow = [0] * len(cands)
++        for i, path in enumerate(local):
++            for j, (_, inp, _) in enumerate(pool):
++                ok, out, el = _run_py(path, [], inp, tmpdir, RUN_TIMEOUT)
++                if el > time_limit or not ok:
++                    slow[i] += 1
++                outputs[i][j] = _norm(out) if ok else None
++
++        scores = {}
++        for i, c in enumerate(cands):
++            samples_ok = brute_ok = 0
++            for j, (kind, _, exp) in enumerate(pool):
++                if exp is None or outputs[i][j] is None:
++                    continue
++                if outputs[i][j] == _norm(exp):
++                    if kind == 'sample':
++                        samples_ok += 1
++                    elif kind == 'small':
++                        brute_ok += 1
++            majority = 0
++            for j, (kind, _, exp) in enumerate(pool):
++                if kind != 'large' or outputs[i][j] is None:
++                    continue
++                majority += sum(1 for k in range(len(cands))
++                                if k != i and outputs[k][j] == outputs[i][j])
++            scores[c] = (samples_ok, brute_ok, majority, -slow[i])
++
++        best = max(cands, key=lambda c: (scores[c], -cands.index(c)))
++        return best, scores
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def pick_and_copy(candidates, dest, **kwargs):
++    """Run select_best and copy the winner to dest. Returns (best, scores)."""
++    best, scores = select_best(candidates, **kwargs)
++    if best is not None and os.path.abspath(best) != os.path.abspath(dest):
++        shutil.copyfile(best, dest)
++    return best, scores

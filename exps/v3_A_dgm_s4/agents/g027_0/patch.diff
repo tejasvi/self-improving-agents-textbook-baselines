@@ -1,0 +1,359 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 952b40b..e01c244 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -246,6 +246,99 @@ class AgenticSystem:
+         name = names[0] if names else 'solution.py'
+         return os.path.abspath(os.path.join(self.git_tempdir, name))
+ 
++    def _message_texts(self, msg):
++        """Return the raw text pieces of one history message (text, tool results, tool calls)."""
++        pieces = []
++        content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', msg)
++        blocks = content if isinstance(content, list) else [content]
++        for b in blocks:
++            if isinstance(b, str):
++                pieces.append(b)
++                continue
++            if isinstance(b, dict):
++                for key in ('text', 'content'):
++                    val = b.get(key)
++                    if isinstance(val, str):
++                        pieces.append(val)
++                if not any(isinstance(b.get(k), str) for k in ('text', 'content')):
++                    pieces.append(str(b))
++            else:
++                val = getattr(b, 'text', None)
++                if isinstance(val, str):
++                    pieces.append(val)
++                else:
++                    pieces.append(str(b))
++        return pieces
++
++    def _tail_output(self, msg_history, max_chars=3000, max_msgs=4):
++        """Raw text of the last few history messages, truncated from the left."""
++        chunks = []
++        for m in (msg_history or [])[-max_msgs:]:
++            chunks.extend(self._message_texts(m))
++        text = "\n".join(c for c in chunks if c and c.strip())
++        return text[-max_chars:]
++
++    def _needs_repair(self, msg_history):
++        """
++        True if the last few history entries show a failure signal or an empty final assistant reply.
++        Plain substring checks only; the raw text is handed back to the agent.
++        """
++        if not msg_history:
++            return False
++        recent = msg_history[-6:]
++        signals = ('Traceback', 'AssertionError', 'FAILED', 'Error:')
++        for m in recent:
++            if isinstance(m, dict) and m.get('role') == 'assistant' and not any(
++                    t.strip() for t in self._message_texts(m)) and not self._has_tool_call(m):
++                return True
++        for m in recent:
++            for t in self._message_texts(m):
++                if any(sig in t for sig in signals):
++                    return True
++        last = msg_history[-1]
++        if isinstance(last, dict) and last.get('role') == 'assistant':
++            if not self._has_tool_call(last) and not any(t.strip() for t in self._message_texts(last)):
++                return True
++        return False
++
++    def _has_tool_call(self, msg):
++        content = msg.get('content') if isinstance(msg, dict) else None
++        if not isinstance(content, list):
++            return False
++        for b in content:
++            btype = b.get('type') if isinstance(b, dict) else getattr(b, 'type', None)
++            if btype in ('tool_use', 'function_call', 'tool_call'):
++                return True
++        return False
++
++    def _tool_result_texts(self, msg_history):
++        """Raw tool-result strings in the history, oldest first (not prompts or assistant text)."""
++        results = []
++        for m in (msg_history or []):
++            if not isinstance(m, dict):
++                continue
++            content = m.get('content')
++            if not isinstance(content, list):
++                continue
++            for b in content:
++                btype = b.get('type') if isinstance(b, dict) else getattr(b, 'type', None)
++                if btype == 'tool_result':
++                    val = b.get('content') if isinstance(b, dict) else getattr(b, 'content', None)
++                    if isinstance(val, list):
++                        val = "\n".join(str(x.get('text', x)) if isinstance(x, dict) else str(x) for x in val)
++                    results.append(str(val or ''))
++        return results
++
++    def _last_stress_result_passed(self, msg_history):
++        """
++        True iff the most recent stress_test tool result is exactly 'ALL PASSED'.
++        Only tool_result blocks count, so prompts or assistant prose cannot fake a pass.
++        """
++        for t in reversed(self._tool_result_texts(msg_history)):
++            if t.strip().startswith(('ALL PASSED', 'FAILED on seed', 'HARNESS', 'TIMEOUT after', 'ERROR: ')):
++                return t.strip() == 'ALL PASSED'
++        return False
++
+     def _has_source_edits(self):
+         """
+         True if at least one changed file is not a test file.
+@@ -272,6 +365,12 @@ Follow these steps:
+ 4. Write a few test inputs (including the sample inputs from the problem statement) and run them with the bash tool.
+ 5. Fix any failures or mismatches, then re-run the tests until the outputs are correct.
+ 6. Always finish with the solution file saved on disk. A text-only reply without file edits is a failure.
++
++Rules:
++- If the solution file already exists, overwrite it with the edit tool (or bash), do not create a new file under a different name.
++- Never finish while your own tests are failing. If a brute-force comparison or sample test fails, fix the code and re-run.
++- Derive and justify the algorithm from the problem statement; do not rely on a formula recalled from memory without verifying it against a brute force.
++- Keep scratch files (brute force, generators, test inputs) outside the repository, e.g. in /tmp, so they do not pollute the patch.
+ """
+ 
+     def _full_prompt(self, extra):
+@@ -337,6 +436,35 @@ Follow these steps:
+         safe_log(f"[forward] Direct generation wrote {target_path}")
+         return True
+ 
++    def _verification_loop(self, msg_history, max_rounds=4):
++        """
++        Bounded evidence-driven verify-and-repair loop on the SAME msg_history.
++        Each round asks the agent to stress-test against a brute force and repair.
++        Stops once the last stress_test result reports ALL PASSED.
++        """
++        for rnd in range(max_rounds):
++            if self._last_stress_result_passed(msg_history):
++                break
++            tail = self._tail_output(msg_history)
++            if self._needs_repair(msg_history):
++                lead = "The last reply was empty or a test failed. Continue from the raw output below instead of starting over.\n"
++            else:
++                lead = ""
++            prompt = self._full_prompt(
++                lead + f"Verification phase (round {rnd + 1} of {max_rounds}): write a brute-force reference for small inputs in /tmp "
++                "(not in the repo), generate random small cases, and use the stress_test tool to compare against "
++                f"{self._infer_target_file()}. If any mismatch or traceback appears, re-derive the algorithm "
++                "(consider runs of consecutive missing values and boundary cases), fix the solution file with the edit tool, "
++                "and re-run until all cases pass. Do not finish until the stress_test reports ALL PASSED.\n"
++                f"Last test output:\n{tail}"
++            )
++            safe_log(f"[forward] Verification round {rnd + 1}/{max_rounds}")
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            self._log_empty_response(msg_history, f"Verification {rnd + 1}")
++        passed = self._last_stress_result_passed(msg_history)
++        safe_log(f"[forward] Verification finished: stress_test ALL PASSED={passed}")
++        return msg_history
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -397,6 +525,10 @@ Follow these steps:
+                     f.write("import sys\n\ndata = sys.stdin.read()\nprint(0)\n")
+                 safe_log(f"[forward] Direct generation failed; wrote last-resort stub to {target_path}")
+ 
++        # Verification phase: only once source edits exist; keeps the same history.
++        if self._has_source_edits():
++            msg_history = self._verification_loop(msg_history)
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..7f13875
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,189 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import textwrap
++
++MAX_OUTPUT_CHARS = 4000
++
++HARNESS = textwrap.dedent('''
++import importlib.util
++import io
++import json
++import random
++import sys
++import traceback
++import contextlib
++
++solution_path, brute_path, generator_path, num_cases = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
++
++
++def load(path, name):
++    spec = importlib.util.spec_from_file_location(name, path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++sol_mod = load(solution_path, "candidate_solution")
++brute_mod = load(brute_path, "brute_reference")
++gen_mod = load(generator_path, "case_generator")
++
++# Solution mode: a Solution class method (method name 'brute' is found in brute module as `brute`)
++has_solution_class = hasattr(sol_mod, "Solution")
++brute_fn = getattr(brute_mod, "brute", None)
++gen_fn = getattr(gen_mod, "gen", None)
++if brute_fn is None or gen_fn is None:
++    print("HARNESS ERROR: brute module must define brute(...) and generator must define gen(rng).")
++    sys.exit(0)
++
++# Discover the method to call on Solution: the first public method not starting with '_'
++method_name = None
++if has_solution_class:
++    cls = sol_mod.Solution
++    for name in dir(cls):
++        if not name.startswith("_") and callable(getattr(cls, name)):
++            method_name = name
++            break
++
++
++def normalize(v):
++    try:
++        return json.dumps(v, sort_keys=True, default=str)
++    except Exception:
++        return repr(v)
++
++
++def compute(fn, args):
++    out = io.StringIO()
++    with contextlib.redirect_stdout(out):
++        result = fn(*args)
++    return result
++
++
++best = None  # (size, description)
++for seed in range(num_cases):
++    rng = random.Random(seed)
++    case = gen_fn(rng)
++    args = case if isinstance(case, tuple) else (case,)
++    try:
++        if has_solution_class and method_name is not None:
++            sol_obj = sol_mod.Solution()
++            got = compute(getattr(sol_obj, method_name), args)
++        elif hasattr(sol_mod, "solve"):
++            got = compute(sol_mod.solve, args)
++        else:
++            print("HARNESS ERROR: solution must define class Solution with a method, or a solve(...) function.")
++            sys.exit(0)
++    except Exception:
++        got = "TRACEBACK:\\n" + traceback.format_exc()
++    try:
++        expected = compute(brute_fn, args)
++    except Exception:
++        expected = "TRACEBACK:\\n" + traceback.format_exc()
++    if normalize(got) != normalize(expected):
++        size = len(normalize(args))
++        if best is None or size < best[0]:
++            best = (size, seed, args, got, expected)
++
++if best is None:
++    print("ALL PASSED")
++else:
++    _, seed, args, got, expected = best
++    print(f"FAILED on seed={seed}")
++    print("input args:", normalize(args))
++    print("solution output:", normalize(got))
++    print("brute output:", normalize(expected))
++''')
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Randomized stress test: compare a candidate solution against a brute-force reference on many small random inputs.\n
++* solution_path: the candidate file. Either a Solution class (method called with generated args) or a module with solve(...).
++* brute_path: a brute-force reference file (outside the repo, e.g. /tmp) defining brute(...), the same signature as the solution's method.
++* generator_path: a file defining gen(rng) that returns a tuple of arguments (rng is a random.Random seeded per case).
++* Runs num_cases seeded cases under a timeout. Returns 'ALL PASSED' or the smallest failing input with the raw solution output and brute output (including any traceback).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the candidate solution file (e.g. solution.py)."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference file defining brute(...)."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to the random generator file defining gen(rng) that returns the argument tuple."
++                },
++                "num_cases": {
++                    "type": "number",
++                    "description": "Number of random seeded cases to run. Defaults to 500."
++                },
++                "timeout_seconds": {
++                    "type": "number",
++                    "description": "Overall wall-clock limit in seconds. Defaults to 60."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++def _truncate(text):
++    if len(text) <= MAX_OUTPUT_CHARS:
++        return text
++    half = MAX_OUTPUT_CHARS // 2
++    return text[:half] + f"\n...[truncated {len(text) - MAX_OUTPUT_CHARS} chars]...\n" + text[-half:]
++
++
++def tool_function(solution_path, brute_path, generator_path, num_cases=500, timeout_seconds=60):
++    try:
++        num_cases = int(num_cases) if num_cases is not None else 500
++    except (TypeError, ValueError):
++        num_cases = 500
++    try:
++        timeout_seconds = float(timeout_seconds) if timeout_seconds is not None else 60.0
++    except (TypeError, ValueError):
++        timeout_seconds = 60.0
++    num_cases = max(1, min(num_cases, 100000))
++    timeout_seconds = max(1.0, min(timeout_seconds, 600.0))
++
++    for label, p in (("solution_path", solution_path), ("brute_path", brute_path), ("generator_path", generator_path)):
++        if not os.path.isfile(p):
++            return f"ERROR: {label} does not exist: {p}"
++
++    with tempfile.NamedTemporaryFile("w", suffix="_stress_harness.py", delete=False) as f:
++        f.write(HARNESS)
++        harness_path = f.name
++    try:
++        proc = subprocess.run(
++            [sys.executable, harness_path, os.path.abspath(solution_path), os.path.abspath(brute_path),
++             os.path.abspath(generator_path), str(num_cases)],
++            capture_output=True,
++            text=True,
++            timeout=timeout_seconds,
++            cwd=os.path.dirname(os.path.abspath(solution_path)),
++        )
++        out = proc.stdout.strip()
++        err = proc.stderr.strip()
++        if proc.returncode != 0:
++            return _truncate(f"HARNESS CRASHED (exit {proc.returncode}):\n--- stdout ---\n{out}\n--- stderr ---\n{err}")
++        if not out:
++            return _truncate(f"No output from harness.\n--- stderr ---\n{err}")
++        return _truncate(out + (f"\n--- stderr ---\n{err}" if err else ""))
++    except subprocess.TimeoutExpired as e:
++        partial = (e.stdout or b"")
++        if isinstance(partial, bytes):
++            partial = partial.decode(errors="replace")
++        return _truncate(f"TIMEOUT after {timeout_seconds:g}s (harness killed). Partial stdout:\n{partial.strip()}")
++    finally:
++        try:
++            os.unlink(harness_path)
++        except OSError:
++            pass

@@ -1,0 +1,252 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1a9e46c..591ff7c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,8 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import re
++import resource
++import sys
+ import threading
+ import time
+ import traceback
+@@ -44,6 +46,11 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++# Limits for running the target solution on sample inputs.
++SAMPLE_TIMEOUT_SECONDS = 5
++SAMPLE_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
++DERIVE_MAX_ROUNDS = 4
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -227,6 +234,157 @@ class AgenticSystem:
+         changed_source = any(not self._is_test_file(f) for f in self._get_changed_files())
+         return changed_source and not self._is_stub_patch()
+ 
++    def _extract_samples(self):
++        """
++        Parse 'Sample Input N' / 'Sample Output N' headings from the problem statement.
++        Each block is the text following its heading up to the next heading. Returns a list
++        of (index, input_text, expected_output_text) for indices that have both parts; [] if none.
++        """
++        text = self.problem_statement or ''
++        heading = re.compile(r'^[#*_\s]*Sample\s+(Input|Output)\s*(\d+)[*_\s:]*$',
++                             re.IGNORECASE | re.MULTILINE)
++        matches = list(heading.finditer(text))
++        blocks = {}
++        for pos, m in enumerate(matches):
++            end = matches[pos + 1].start() if pos + 1 < len(matches) else len(text)
++            body = text[m.end():end]
++            lines = [l for l in body.splitlines() if not l.strip().startswith('```')]
++            content = '\n'.join(lines).strip('\n')
++            kind, idx = m.group(1).lower(), int(m.group(2))
++            blocks.setdefault(idx, {})[kind] = content
++        samples = []
++        for idx in sorted(blocks):
++            parts = blocks[idx]
++            if 'input' in parts and 'output' in parts:
++                samples.append((idx, parts['input'].strip() + '\n', parts['output'].strip()))
++        return samples
++
++    def _run_samples(self):
++        """
++        Run the target file with python3 on every parsed sample (wall-clock timeout and address
++        space limit). Returns a list of dicts with keys: index, ok, reason, stdout, stderr,
++        runtime. Errors are returned raw; nothing is parsed out of them.
++        """
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        results = []
++
++        def limit_memory():
++            resource.setrlimit(resource.RLIMIT_AS,
++                               (SAMPLE_MEMORY_LIMIT_BYTES, SAMPLE_MEMORY_LIMIT_BYTES))
++
++        for idx, sample_in, expected in self._extract_samples():
++            result = {'index': idx, 'ok': False, 'reason': '', 'stdout': '', 'stderr': '', 'runtime': 0.0}
++            if not os.path.isfile(target_path):
++                result['reason'] = f"target file {target_path} does not exist"
++                results.append(result)
++                continue
++            start = time.time()
++            try:
++                proc = subprocess.run(
++                    [sys.executable, target_path],
++                    input=sample_in, capture_output=True, text=True,
++                    timeout=SAMPLE_TIMEOUT_SECONDS, cwd=self.git_tempdir,
++                    preexec_fn=limit_memory,
++                )
++                result['runtime'] = time.time() - start
++                result['stdout'] = proc.stdout
++                result['stderr'] = proc.stderr
++                if proc.returncode != 0:
++                    result['reason'] = f"exit code {proc.returncode}"
++                else:
++                    got = [l.rstrip() for l in proc.stdout.strip().splitlines()]
++                    want = [l.rstrip() for l in expected.strip().splitlines()]
++                    if got == want:
++                        result['ok'] = True
++                        result['reason'] = 'matches expected output'
++                    else:
++                        result['reason'] = 'wrong output'
++            except subprocess.TimeoutExpired as e:
++                result['runtime'] = time.time() - start
++                result['stdout'] = e.stdout.decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
++                result['stderr'] = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or '')
++                result['reason'] = f"timed out after {SAMPLE_TIMEOUT_SECONDS}s"
++            except Exception as e:
++                result['runtime'] = time.time() - start
++                result['reason'] = f"failed to run: {e}"
++            results.append(result)
++        return results
++
++    def _is_feasible(self):
++        """True only if the sample blocks were parsed and every sample passes."""
++        results = self._run_samples()
++        return bool(results) and all(r['ok'] for r in results)
++
++    def _sample_failure_summary(self, results, max_chars=3000):
++        """Raw per-sample output for the agent: pass/fail, runtime, stdout and stderr."""
++        parts = []
++        for r in results:
++            status = 'PASS' if r['ok'] else 'FAIL'
++            parts.append(
++                f"Sample {r['index']}: {status} ({r['reason']}), runtime {r['runtime']:.2f}s\n"
++                f"stdout:\n{r['stdout'][-max_chars:]}\nstderr:\n{r['stderr'][-max_chars:]}"
++            )
++        return "\n\n".join(parts)
++
++    def _solution_ok(self):
++        """
++        Success criterion after the initial attempt: a source patch exists AND all samples pass.
++        If no samples can be parsed, fall back to the source-patch check alone.
++        """
++        if not self._has_source_patch():
++            return False
++        if not self._extract_samples():
++            return True
++        return self._is_feasible()
++
++    def _derive_and_fit_prompt(self, round_idx, max_rounds, failure_text, previous_mismatch):
++        """Short per-round prompt for the derive-and-fit phase."""
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        prev = ''
++        if previous_mismatch:
++            prev = f"Previous round's mismatch output (raw):\n{previous_mismatch}\n\n"
++        return (
++            f"Derive-and-fit round {round_idx + 1} of {max_rounds}.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"The solution at {target_path} fails the sample tests (raw output):\n{failure_text}\n\n"
++            f"{prev}"
++            "Steps:\n"
++            "1. mkdir -p /tmp/work. Save the current brute force (or current solution) to /tmp/work/brute.py. "
++            f"Keep {target_path} itself as a brute force only until the efficient algorithm works.\n"
++            "2. Write your hypothesis for the efficient algorithm (closed form or better complexity; "
++            "the constraints are real) in at most 10 lines to /tmp/work/hypothesis.md.\n"
++            f"3. Implement it in {target_path} with the editor tool.\n"
++            "4. Validate with the stress_test tool against /tmp/work/brute.py on small parameters "
++            "(solution_cmd=\"python3 " + target_path + "\", brute_cmd=\"python3 /tmp/work/brute.py\"), "
++            "and check the samples pass and the largest constraints run within 1 second.\n\n"
++            "Keep replies brief. Prefer files and experiments over long deliberation. "
++            "End with one line: SAMPLES PASS or SAMPLES FAIL."
++        )
++
++    def _derive_and_fit(self, msg_history, max_rounds=DERIVE_MAX_ROUNDS):
++        """
++        Bounded derive-and-fit loop: while the samples fail, give the agent a short prompt with the
++        raw sample failure output (plus the previous round's mismatch from round 2 onward). Each
++        round uses a fresh conversation to keep contexts short. Returns the last message history.
++        """
++        previous_mismatch = ''
++        for round_idx in range(max_rounds):
++            results = self._run_samples()
++            if results and all(r['ok'] for r in results):
++                safe_log(f"Derive-and-fit: samples pass before round {round_idx + 1}; stopping.")
++                break
++            failure_text = self._sample_failure_summary(results) if results else \
++                "No sample blocks could be parsed from the problem statement."
++            safe_log(f"Derive-and-fit round {round_idx + 1}/{max_rounds} starting. Sample failures:\n{failure_text}")
++            prompt = self._derive_and_fit_prompt(round_idx, max_rounds, failure_text, previous_mismatch)
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            previous_mismatch = failure_text
++        else:
++            results = self._run_samples()
++            if not (results and all(r['ok'] for r in results)):
++                safe_log(f"Derive-and-fit: samples still failing after {max_rounds} rounds.")
++        return msg_history
++
+     def _target_file(self):
+         """
+         Infer the primary source file to edit: first backticked *.py name in the problem
+@@ -340,15 +498,22 @@ IMPORTANT RULES:
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
+ 
+-        if self._has_source_patch():
+-            safe_log("Source patch detected after initial attempt; skipping retries.")
++        if self._solution_ok():
++            safe_log("Source patch passes the sample gate after initial attempt; skipping retries.")
+         else:
+             # Do not reuse a history that may end with an empty assistant turn: escalate with a
+             # compact prompt, first on the primary model then on the alternate model/API path.
+-            safe_log("No source patch after initial attempt; escalating with a compact prompt.")
++            safe_log("Source patch missing or failing samples after initial attempt; escalating with a compact prompt.")
+             msg_history = self._attempt_with_models(self._compact_prompt(), msg_history)
+ 
+-        self._run_verification(msg_history)
++        if self._extract_samples() and not self._is_feasible():
++            safe_log("Samples still failing; starting bounded derive-and-fit phase.")
++            msg_history = self._derive_and_fit(msg_history)
++
++        if self._is_feasible() or not self._extract_samples():
++            msg_history = self._run_verification(msg_history)
++        else:
++            safe_log("Verification skipped: samples fail, so the solution is not feasible yet.")
+ 
+         if not self._has_source_patch():
+             safe_log("Last-resort attempt: requesting the complete solution as a code block (no tools).")
+@@ -411,9 +576,9 @@ IMPORTANT RULES:
+                 history = chat_with_agent(prompt, model=model, msg_history=[], logging=safe_log)
+             except Exception as e:
+                 safe_log(f"Escalation with {model} raised: {e}\n{traceback.format_exc()}")
+-            has_patch = self._has_source_patch()
++            has_patch = self._solution_ok()
+             safe_log(f"Escalation with {model} finished. Changed files: {self._get_changed_files()}, "
+-                     f"source patch: {has_patch}")
++                     f"source patch and samples ok: {has_patch}")
+             if has_patch:
+                 return history if history is not None else fallback_history
+         return fallback_history
+diff --git a/llm_withtools.py b/llm_withtools.py
+index ff7bdb7..6b5d0ba 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -391,6 +391,13 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+ 
+     return new_msg_history
+ 
++# Used when the empty turn was caused by hitting max_tokens (the model spent its budget on
++# deliberation): ask for a shorter reply and for findings to be stored in files.
++MAX_TOKENS_NUDGE = (
++    "Reply in under 300 words and store your intermediate findings in files "
++    "(for example /tmp/work/hypothesis.md or /tmp/work/notes.md). Keep your next step small."
++)
++
+ EMPTY_NUDGES = [
+     "Continue: call the editor tool now to implement the solution.",
+     (
+@@ -561,7 +568,10 @@ def chat_with_agent_claude(
+                 logging("Empty turn persisted after all nudges; giving up so the caller can restart.")
+                 gave_up = True
+                 break
+-            _append_nudge(new_msg_history, EMPTY_NUDGES[attempt])
++            if getattr(response, 'stop_reason', None) == 'max_tokens':
++                _append_nudge(new_msg_history, MAX_TOKENS_NUDGE)
++            else:
++                _append_nudge(new_msg_history, EMPTY_NUDGES[attempt])
+             response = get_response_withtools(
+                 client=client,
+                 model=client_model,

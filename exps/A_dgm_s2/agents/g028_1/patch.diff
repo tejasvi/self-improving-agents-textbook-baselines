@@ -1,0 +1,211 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 37cb6da..01eee01 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -209,9 +210,9 @@ class AgenticSystem:
+                     return False, f"The deliverable `{name}` is missing or empty. You must now use the editor tool to create `{name}` with a complete solution."
+         return True, "ok"
+ 
+-    def forward(self):
++    def _workflow_prompt(self):
+         """
+-        The forward function for the AgenticSystem.
++        The detailed 7-step workflow prompt used as the verify-stage follow-up.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -242,54 +243,157 @@ The problem is a competitive programming problem in Python. The final answer is
+ 
+ 7. FINISH. Only after steps 3 to 6 are complete and passing, clean up any temporary test files you do not want in the repository (keep solution.py), and give a short final summary of the algorithm, the test results, and the timing.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++        return task
++
++    def _draft_stage(self):
++        """
++        Stage 1: short prompt that forces an immediate editor-tool call to create
++        solution.py. Always starts from an empty history.
++        """
++        prompt = (
++            f"Solve the following competitive programming problem in Python 3. "
++            f"Immediately use the editor tool to create solution.py with a complete solution in the directory {self.git_tempdir}. "
++            "The program must read from standard input and write to standard output, using only the standard library. "
++            "Do not explain first; write the file now.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        safe_log("[draft] initial short call")
++        return self._call_agent(prompt, [])
++
++    def _verify_stage(self, msg_history):
++        """
++        Stage 2: once an acceptable deliverable exists, send the detailed testing
++        workflow as a follow-up on the draft's message history.
++        """
++        ok, reason = self._patch_is_acceptable()
++        safe_log(f"[verify] acceptable={ok}, reason={reason}")
++        if not ok:
++            return msg_history, False
++        workflow = self._workflow_prompt()
+         instruction = (
+-            "IMPORTANT: Your first action must be to use the editor tool to write a complete first-draft solution.py. "
+-            "Never end your turn with a text-only or empty reply; the task fails if no files are edited.\n\n"
+-            + instruction
++            "A first draft of solution.py now exists. Continue with the following workflow, "
++            "verifying and refining the existing solution.\n\n" + workflow
+         )
++        msg_history = self._call_agent(instruction, msg_history)
++        return msg_history, True
++
++    def _extract_python_code(self, text):
++        """
++        Return the longest fenced code block in text (```python / ```py / ```),
++        or None if there is none.
++        """
++        if not isinstance(text, str):
++            return None
++        blocks = re.findall(r'```(?:python|py)?\n(.*?)```', text, re.S)
++        if not blocks:
++            return None
++        return max(blocks, key=len)
+ 
+-        safe_log(f"[forward] attempt 0: initial call")
+-        msg_history = self._call_agent(instruction, [])
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        """
++        Concatenate the text blocks of the last assistant message. Handles content
++        given as a list of dict blocks or as a plain string; returns '' if unknown.
++        """
++        if not isinstance(msg_history, list):
++            return ''
++        for msg in reversed(msg_history):
++            if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                parts = []
++                for block in content:
++                    if isinstance(block, dict) and isinstance(block.get('text'), str):
++                        parts.append(block['text'])
++                    elif isinstance(block, str):
++                        parts.append(block)
++                return ''.join(parts)
++            return ''
++        return ''
++
++    def _fallback_stage(self):
++        """
++        Stage 3 (last resort): ask for the code as plain text and write it to
++        solution.py directly if the model never created the deliverable.
++        """
++        ok, reason = self._patch_is_acceptable()
++        if ok:
++            return
++        safe_log(f"[fallback] {reason}")
++        prompt = (
++            "Reply with ONLY the complete Python 3 program in one ```python block. "
++            "No explanations, no tool calls.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        msg_history = self._call_agent(prompt, [])
++        text = self._last_assistant_text(msg_history)
++        code = self._extract_python_code(text)
++        safe_log(f"[fallback] assistant empty={not text.strip()}, code_found={code is not None}")
++        if code is None or not code.strip():
++            return
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        with open(path, 'w') as f:
++            f.write(code)
++        ok, reason = self._patch_is_acceptable()
++        safe_log(f"[fallback] after writing solution.py: ok={ok}, reason={reason}")
+ 
+-        max_retries = 3
++    def forward(self):
++        """
++        The forward function for the AgenticSystem: draft -> verify -> fallback,
++        with bounded fresh-history retries in between.
++        """
++        msg_history = self._draft_stage()
++        ok, _ = self._patch_is_acceptable()
++
++        retry_prompts = [
++            "Your previous reply did not create solution.py. Use the editor tool now to create "
++            "solution.py containing a complete Python 3 solution (stdin to stdout). Do not reply with text only.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>",
++            "Create the file solution.py right now with the editor tool. It must contain the full Python 3 program "
++            "that reads stdin and prints the answer. Write the file first, then stop.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>",
++            "Task: write solution.py with the editor tool. Complete Python 3 code only, reading standard input and "
++            "writing standard output.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>",
++        ]
++        max_retries = len(retry_prompts)
+         for attempt in range(1, max_retries + 1):
+-            ok, reason = self._patch_is_acceptable()
+-            safe_log(f"[forward] verification before attempt {attempt}: ok={ok}, reason={reason}")
+             if ok:
+                 break
+-            retry_msg = (
+-                f"Previous attempt produced no usable patch: {reason}\n\n"
+-                "Use the editor tool now to create/modify the primary source file. Do not reply with text only.\n\n"
+-                f"Reminder of the task:\n<problem_description>\n{self.problem_statement}\n</problem_description>"
+-            )
+-            safe_log(f"[forward] retry {attempt}/{max_retries}")
+-            msg_history = self._call_agent(retry_msg, msg_history)
+-
+-        ok, reason = self._patch_is_acceptable()
+-        if not ok:
+-            safe_log(f"[forward] retries exhausted, final fallback call: {reason}")
+-            fallback_msg = (
+-                "Write a direct implementation of the following competitive programming problem to solution.py "
+-                "using the editor tool. Read from standard input and write to standard output. "
+-                "Do not run any tests or extra steps; just write the complete solution file.\n\n"
+-                f"<problem_description>\n{self.problem_statement}\n</problem_description>"
+-            )
+-            msg_history = self._call_agent(fallback_msg, msg_history)
++            text = self._last_assistant_text(msg_history)
++            safe_log(f"[retry {attempt}/{max_retries}] previous assistant empty={not text.strip()}")
++            # Fresh history each retry: never reuse one ending in an empty assistant turn.
++            msg_history = self._call_agent(retry_prompts[attempt - 1], [])
+             ok, reason = self._patch_is_acceptable()
+-            safe_log(f"[forward] after fallback: ok={ok}, reason={reason}")
++            safe_log(f"[retry {attempt}/{max_retries}] assistant empty={not self._last_assistant_text(msg_history).strip()}, acceptable={ok}, reason={reason}")
++
++        if ok:
++            msg_history, _ = self._verify_stage(msg_history)
++        else:
++            self._fallback_stage()
+ 
+     def _call_agent(self, msg, msg_history):
+         """
+         Call the agent once and return the updated message history (falls back to []
+-        if chat_with_agent does not return a list).
++        if chat_with_agent does not return a list). Logs whether any tool call happened.
+         """
+         history = msg_history if msg_history else []
+         result = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+         if not isinstance(result, list):
+             result = []
++        tool_calls = 0
++        for m in result:
++            if isinstance(m, dict) and isinstance(m.get('content'), list):
++                for block in m['content']:
++                    if isinstance(block, dict) and block.get('type') == 'tool_use':
++                        tool_calls += 1
++        safe_log(f"[call_agent] returned {len(result)} messages, tool_calls={tool_calls}")
+         return result
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

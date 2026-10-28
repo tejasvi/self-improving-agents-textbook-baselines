@@ -1,0 +1,964 @@
+I changed the agent so it no longer ends a run with an empty patch. I haven't run any of it, including the existing tests.
+
+**What went wrong**
+- **Runs 2–5:** Claude's first response contained no text and no tool call. The agent loop treated that as "finished", so no file was ever written.
+- **Run 1:** The `bash` tool timed out after 120 s and leaked an interactive bash process. The next reply was then cut off at the 4096-token limit while Claude was still reasoning. The loop treated the cut-off as the end of the run.
+- **Hidden failures:** `chat_with_agent_claude` swallowed all exceptions silently.
+- **Possible API error:** A `None` final text could produce an invalid empty text block if the history were re-sent.
+
+**Fixes**
+- **`llm_withtools.py`:**
+  - `max_tokens` is now 8192.
+  - If a reply stops at `max_tokens`, the agent keeps only its text and asks it to continue (up to 6 times).
+  - Exceptions are logged with a traceback instead of swallowed.
+  - The final assistant message can no longer be empty or `None`.
+- **`tools/bash.py`:**
+  - `tool_function` now runs each command with `subprocess` and a hard 120 s timeout. It kills the whole process group on timeout, uses no stdin, and truncates large output.
+  - `BashSession` is kept so the existing test import still works.
+- **`coding_agent.py`:**
+  - The prompt is much more detailed. It tells the agent to write a correct baseline to `solution.py` early, then test it against the samples, a brute force and large inputs. It also tells it to add `from typing import List` and to keep commands short.
+  - `forward()` runs a bounded loop (no `while True`). If the diff is empty after an attempt, it retries up to 3 times with a fresh context and a stronger reminder.
+  - Once a solution exists, one more fresh-context pass reviews it, stress-tests it against a brute force and checks the time limit.
+
+<file path="coding_agent.py">
+import argparse
+import subprocess
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import threading
+
+from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+
+# reset_to_commit(git_dname, commit)
+# apply_patch(git_dname, patch_str)
+
+# TEST COMMANDS for different languages
+# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+NPM_TEST_COMMANDS = [
+    ["sh", "-c", "set -e"],
+    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+    ["npm", "run", "test"]
+]
+
+CPP_TEST_COMMANDS = [
+    ["sh", "-c", "set -e"],
+    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+    ["sh", "-c", "cd build"],
+    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+    ["make"],
+    ["sh", "-c", "cd ../"]
+]
+
+TEST_COMMANDS = {
+    "python": [["pytest", "-rA", "--tb=long"]],
+    "rust": [["cargo", "test", "--", "--include-ignored"]],
+    "go": [["go", "test", "./..."]],
+    "javascript": NPM_TEST_COMMANDS,
+    "cpp": CPP_TEST_COMMANDS,
+    "java": [["./gradlew", "test"]],
+}
+
+# Thread-local storage for logger instances
+thread_local = threading.local()
+
+def get_thread_logger():
+    """
+    Get the logger instance specific to the current thread.
+    Returns None if no logger has been set for this thread.
+    """
+    return getattr(thread_local, 'logger', None)
+
+def set_thread_logger(logger):
+    """
+    Set the logger instance for the current thread.
+    """
+    thread_local.logger = logger
+
+def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+    """
+    Set up a logger with both file and console handlers.
+    """
+    # Create logger with a unique name based on thread ID
+    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+    logger.setLevel(level)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers = []
+    
+    # Create formatters
+    file_formatter = logging.Formatter('%(message)s')
+    
+    # Create and set up file handler
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+    file_handler.setLevel(level)
+    file_handler.setFormatter(file_formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    
+    # Store logger in thread-local storage
+    set_thread_logger(logger)
+    
+    return logger
+
+def safe_log(message, level=logging.INFO):
+    """
+    Thread-safe logging function that ensures messages go to the correct logger.
+    """
+    logger = get_thread_logger()
+    if logger:
+        logger.log(level, message)
+    else:
+        print(f"Warning: No logger found for thread {threading.get_ident()}")
+
+class AgenticSystem:
+    def __init__(
+            self,
+            problem_statement,
+            git_tempdir,
+            base_commit,
+            chat_history_file='./chat_history.md',
+            test_description=None,
+            self_improve=False,
+            language='python'
+        ):
+        self.problem_statement = problem_statement
+        self.git_tempdir = git_tempdir
+        self.base_commit = base_commit
+        self.chat_history_file = chat_history_file
+        self.test_description = test_description
+        self.self_improve = self_improve
+        self.language = language
+
+        # Set the code model based on whether self-improvement is enabled
+        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+
+        # Initialize logger and store it in thread-local storage
+        self.logger = setup_logger(chat_history_file)
+        
+        # Clear the log file
+        with open(chat_history_file, 'w') as f:
+            f.write('')
+
+    def get_current_edits(self):
+        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+        new_msg_history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"# Current Repo Edits\n{diff}",
+                    }
+                ],
+            }
+        ]
+        return new_msg_history
+
+    def _has_edits(self):
+        try:
+            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+            return bool(str(diff).strip())
+        except Exception as e:
+            safe_log(f"Error computing diff: {e}")
+            return False
+
+    def forward(self):
+        """
+        The forward function for the AgenticSystem.
+        """
+        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+
+<problem_description>
+{self.problem_statement}
+</problem_description>
+
+Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+"""
+        workflow = f"""
+Follow this workflow. The solution file is in {self.git_tempdir} (normally `solution.py`); the hidden tests are run against it, so the work is only counted if the file is actually written.
+
+1. Look at the repository quickly (`ls {self.git_tempdir}` and `cat` the starter file). Do NOT run `find` over large trees; keep every shell command short.
+2. Think carefully about the problem: restate it, derive constraints on complexity (e.g. n up to 1e5 / 1e6 needs O(n log n) or O(n) in Python; use fast input via sys.stdin, avoid recursion depth issues - use iterative algorithms or raise the recursion limit and avoid deep recursion). Work out the algorithm by hand against the examples before coding.
+3. WRITE A FIRST COMPLETE SOLUTION TO THE SOLUTION FILE EARLY (even if it is a simple correct baseline), using the editor tool. For a "complete program" task the file must read stdin and print to stdout. For a `Solution` class task keep the class/method signature from the starter code, and add the needed imports at the top (e.g. `from typing import List`, `import heapq`, `from collections import defaultdict`...) because the starter code may lack them. Do not read from stdin for class tasks.
+4. Test it: write a small test runner (in /tmp, not in the repo) running all the sample inputs from the problem statement and compare with the expected outputs. Always use `timeout 20 python3 ...` when running programs.
+5. Write a brute-force solution (in /tmp) that is obviously correct for small inputs, generate many random small inputs, and compare it to your solution (stress test). Fix any discrepancies. Think about edge cases (n=1, all equal, negatives, maximum values, big numbers).
+6. Test performance with maximum-size inputs (generate them in /tmp) and make sure the run time is well within a few seconds; optimize if not.
+7. Finish only when the solution file contains your final, tested solution. Keep helper/test files out of the repo directory.
+
+If your reasoning about the best algorithm is not converging, still write the best correct (possibly slower) solution you have into the file first, then improve it. Never end your turn without having written the solution file.
+"""
+        instruction = f"{task}\n{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+
+        # Main attempt
+        try:
+            chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+        except Exception as e:
+            safe_log(f"Error in main attempt: {e}")
+
+        # If no solution was written, retry (bounded) with fresh context
+        for attempt in range(3):
+            if self._has_edits():
+                break
+            retry_instruction = f"""{task}
+NOTE: A previous attempt ended without writing any solution; the repository in {self.git_tempdir} is still unchanged (or the solution file is still the starter stub). You MUST use the editor/bash tools to write a complete solution into the solution file in this attempt. Begin by looking at the starter file with `cat`, then briefly reason about the algorithm, then write the file IMMEDIATELY with a correct solution (a simple correct baseline is fine), and only afterwards test and improve it.
+{workflow}"""
+            try:
+                chat_with_agent(retry_instruction, model=self.code_model, msg_history=[], logging=safe_log)
+            except Exception as e:
+                safe_log(f"Error in retry attempt {attempt}: {e}")
+
+        # Verification pass with fresh context (only if something was written)
+        if self._has_edits():
+            review_instruction = f"""{task}
+A solution has already been written into the repository in {self.git_tempdir}. Your job now is to rigorously verify and, if necessary, fix it.
+
+Steps:
+1. `cat` the current solution file and understand it.
+2. Run it on all the sample inputs from the problem statement (use `timeout 20 python3 ...`; put test scripts in /tmp, not in the repo).
+3. Write an obviously-correct brute force solution in /tmp and stress test the solution against it on many random small inputs, including edge cases. If there is any mismatch or crash, find the bug and fix the solution file.
+4. Test with maximum-size inputs for performance (must run in a few seconds in Python); optimize if needed (fast IO, avoid recursion, avoid O(n^2)).
+5. Make sure the solution file keeps the required interface (complete stdin/stdout program, or the `Solution` class method with required imports like `from typing import List`).
+Do not leave helper files in the repo. If the solution is already correct and fast, leave it unchanged."""
+            try:
+                chat_with_agent(review_instruction, model=self.code_model, msg_history=[], logging=safe_log)
+            except Exception as e:
+                safe_log(f"Error in review pass: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+    args = parser.parse_args()
+
+    # Process the repository
+    agentic_system = AgenticSystem(
+        problem_statement=args.problem_statement,
+        git_tempdir=args.git_dir,
+        base_commit=args.base_commit,
+        chat_history_file=args.chat_history_file,
+        test_description=args.test_description,
+        self_improve=args.self_improve,
+        language=args.language,
+    )
+
+    # Run the agentic system to try to solve the problem
+    agentic_system.forward()
+
+    # Get code diff and save to model_patch.diff
+    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+    with open(model_patch_outfile, 'w') as f:
+        f.write(model_patch)
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="tools/bash.py">
+import asyncio
+import os
+import signal
+import subprocess
+
+def tool_info():
+    return {
+        "name": "bash",
+        "description": """Run commands in a bash shell\n
+* When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.\n
+* You don't have access to the internet via this tool.\n
+* You do have access to a mirror of common linux and python packages via apt and pip.\n
+* Each call runs in a fresh shell with a hard timeout of 120 seconds (the command is killed on timeout); use `timeout N` for programs that may run long.\n
+* Standard input is empty; redirect files into programs with `< file`.\n
+* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+* Please avoid commands that may produce a very large amount of output, and avoid `find` over large directory trees.\n
+* If you start a background process, redirect its stdout/stderr to a file (e.g. `cmd > out.txt 2>&1 &`).""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to run."
+                }
+            },
+            "required": ["command"]
+        }
+    }
+
+class BashSession:
+    """A session of a bash shell."""
+    def __init__(self):
+        self._started = False
+        self._process = None
+        self._timed_out = False
+        self._timeout = 120.0  # seconds
+        self._sentinel = "<<exit>>"
+        self._output_delay = 0.2  # seconds
+
+    async def start(self):
+        if self._started:
+            return
+        self._process = await asyncio.create_subprocess_shell(
+            "/bin/bash -i",
+            preexec_fn=os.setsid,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy()  # Ensures inheritance of the current environment
+        )
+        self._started = True
+
+    def stop(self):
+        if not self._started:
+            return
+        if self._process.returncode is None:
+            self._process.terminate()
+        self._process = None
+        self._started = False
+
+    async def run(self, command):
+        if not self._started:
+            raise ValueError("Session has not started.")
+        if self._process.returncode is not None:
+            raise ValueError(f"Bash has exited with returncode {self._process.returncode}")
+        if self._timed_out:
+            raise ValueError(
+                f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+            )
+        
+        # Send command
+        self._process.stdin.write(
+            command.encode() + f"; echo '{self._sentinel}'\n".encode()
+        )
+        await self._process.stdin.drain()
+
+        # Read output until sentinel
+        try:
+            output = ''
+            start_time = asyncio.get_event_loop().time()
+            
+            while True:
+                if asyncio.get_event_loop().time() - start_time > self._timeout:
+                    self._timed_out = True
+                    raise ValueError(
+                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+                    )
+                
+                await asyncio.sleep(self._output_delay)
+                # Read from the internal buffer
+                stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+                stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+                
+                if self._sentinel in stdout_data:
+                    output = stdout_data[: stdout_data.index(self._sentinel)]
+                    break
+
+            # Clear buffers
+            self._process.stdout._buffer.clear()
+            self._process.stderr._buffer.clear()
+
+            output = output.strip()
+            error = stderr_data.strip()
+
+            return output, error
+
+        except Exception as e:
+            self._timed_out = True
+            raise ValueError(str(e))
+
+def _truncate(text, max_len=20000):
+    if len(text) > max_len:
+        half = max_len // 2
+        return text[:half] + "\n<output clipped>\n" + text[-half:]
+    return text
+
+def tool_function(command):
+    """Execute a command in a fresh bash shell with a hard timeout."""
+    timeout = 120
+    try:
+        proc = subprocess.Popen(
+            ["/bin/bash", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            preexec_fn=os.setsid,
+            env=os.environ.copy(),
+        )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                out, err = proc.communicate(timeout=5)
+            except Exception:
+                out, err = "", ""
+            partial = _truncate((out or "").strip(), 5000)
+            return (
+                f"Error: command timed out after {timeout} seconds and was killed.\n"
+                f"Partial output:\n{partial}"
+            ).strip()
+
+        result = ""
+        out = (out or "").strip()
+        err = (err or "").strip()
+        if out:
+            result += out
+        if err:
+            result += "\nError:\n" + err
+        return _truncate(result.strip())
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+if __name__ == "__main__":
+    # Example usage
+    import sys
+
+    # Check if the script is called with arguments
+    if len(sys.argv) < 2:
+        print("Usage: python bash.py '<command>'")
+    else:
+        # Extract the command from the command-line arguments
+        input_command = ' '.join(sys.argv[1:])
+        result = tool_function(input_command)
+        print(result)
+</file>
+
+<file path="llm_withtools.py">
+import ast
+import json
+import re
+import traceback
+import anthropic
+import backoff
+import openai
+import copy
+
+from llm import create_client, get_response_from_llm
+from prompts.tooluse_prompt import get_tooluse_prompt
+from tools import load_all_tools
+
+CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+
+def process_tool_call(tools_dict, tool_name, tool_input):
+    try:
+        if tool_name in tools_dict:
+            return tools_dict[tool_name]['function'](**tool_input)
+        else:
+            return f"Error: Tool '{tool_name}' not found"
+    except Exception as e:
+        return f"Error executing tool '{tool_name}': {str(e)}"
+
+@backoff.on_exception(
+    backoff.expo,
+    (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+    max_time=600,
+    max_value=60,
+)
+def get_response_withtools(
+    client, model, messages, tools, tool_choice,
+    logging=None, max_retry=3
+):
+    try:
+        if 'claude' in model:
+            response = client.messages.create(
+                model=model,
+                messages=messages,
+                max_tokens=8192,
+                tool_choice=tool_choice,
+                tools=tools,
+            )
+        elif model.startswith('o3-'):
+            response = client.responses.create(
+                model=model,
+                input=messages,
+                tool_choice=tool_choice,
+                tools=tools,
+                parallel_tool_calls=False
+            )
+            response = response
+        else:
+            raise ValueError(f"Unsupported model: {model}")
+        return response
+    except Exception as e:
+        if logging:
+            logging(f"Error in get_response_withtools: {str(e)}")
+        if max_retry > 0:
+            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
+
+        # Hitting the context window limit
+        if 'Input is too long for requested model' in str(e):
+            pass
+
+        raise  # Re-raise the exception after logging
+
+def check_for_tool_use(response, model=''):
+    """
+    Checks if the response contains a tool call.
+    """
+    if 'claude' in model:
+        # Claude, check for stop_reason in response
+        if response.stop_reason == "tool_use":
+            tool_use_block = next(block for block in response.content if block.type == "tool_use")
+            return {
+                'tool_id': tool_use_block.id,
+                'tool_name': tool_use_block.name,
+                'tool_input': tool_use_block.input,
+            }
+
+    elif model.startswith('o3-'):
+        # OpenAI, check for tool_calls in response
+        for tool_call in response.output:
+            if tool_call.type == "function_call":
+                break
+
+        if tool_call:
+            return {
+                'tool_id': tool_call.call_id,
+                'tool_name': tool_call.name,
+                'tool_input': json.loads(tool_call.arguments),
+            }
+
+    else:
+        # Any other LLM, response is str, check for <tool_use> tag in response
+        pattern = r'<tool_use>(.*?)</tool_use>'
+        match = re.search(pattern, response, re.DOTALL)
+        if match:
+            tool_use_str = match.group(1).strip()
+            try:
+                tool_use_dict = ast.literal_eval(tool_use_str)
+                if isinstance(tool_use_dict, dict) and 'tool_name' in tool_use_dict and 'tool_input' in tool_use_dict:
+                    return tool_use_dict
+            except Exception:
+                pass
+
+    # No tool use found
+    return None
+
+def convert_tool_info(tool_info, model=None):
+    """
+    Converts tool_info from Claude format to the given model's format.
+    """
+    if 'claude' in model:
+        # should have no change
+        return {
+            'name': tool_info['name'],
+            'description': tool_info['description'],
+            'input_schema': tool_info['input_schema'],
+        }
+    elif model.startswith('o3-'):
+        def add_additional_properties(d):
+            if isinstance(d, dict):
+                if 'properties' in d:
+                    d['additionalProperties'] = False
+                for k, v in d.items():
+                    add_additional_properties(v)
+        add_additional_properties(tool_info['input_schema'])
+        for p in tool_info['input_schema']['properties'].keys():
+            if not p in tool_info['input_schema']['required']:
+                tool_info['input_schema']['required'].append(p)
+                t = copy.deepcopy(tool_info['input_schema']['properties'][p]["type"])
+                if isinstance(t, str):
+                    tool_info['input_schema']['properties'][p]["type"] = [t, "null"]
+                elif isinstance(t, list):
+                    tool_info['input_schema']['properties'][p]["type"] = t + ["null"]
+                
+        return {
+            'type': 'function',
+            'name': tool_info['name'],
+            'description': tool_info['description'],
+            'parameters': tool_info['input_schema'],
+            "strict": True,
+        }
+    else:
+        return tool_info
+
+def convert_block_claude(block):
+    """
+    Convert a single block of content from Claude into a standard format.
+    """
+    if isinstance(block, dict):
+        block_type = block.get('type')
+        text = block.get('text')
+        tool_name = block.get('name')
+        tool_input = block.get('input')
+        tool_result = block.get('content')
+    else:
+        block_type = getattr(block, 'type', None)
+        text = getattr(block, 'text', None)
+        tool_name = getattr(block, 'name', None)
+        tool_input = getattr(block, 'input', None)
+        tool_result = getattr(block, 'content', None)
+
+    text = text or ""
+
+    if block_type == "text":
+        return {
+            "type": "text",
+            "text": text
+        }
+    elif block_type == "tool_use":
+        # Convert to the manual tool calling format
+        return {
+            "type": "text",
+            "text": f"<tool_use>\n{{'tool_name': {tool_name}, 'tool_input': {tool_input}}}\n</tool_use>"
+        }
+    elif block_type == "tool_result":
+        return {
+            "type": "text",
+            "text": f"Tool Result: {tool_result}"
+        }
+    else:
+        # Fallback if we ever encounter an unknown block type
+        return {
+            "type": "text",
+            "text": str(block)
+        }
+
+def convert_msg_history_claude(msg_history):
+    """
+    Convert Claude-style message history into a generic format.
+    """
+    new_msg_history = []
+
+    for msg in msg_history:
+        role = msg.get('role', '')
+        content_blocks = msg.get('content', [])
+        new_content = []
+
+        for block in content_blocks:
+            new_content.append(convert_block_claude(block))
+
+        new_msg_history.append({
+            "role": role,
+            "content": new_content
+        })
+
+    return new_msg_history
+
+def convert_msg_history_openai(msg_history):
+    """
+    Convert OpenAI-style message history into a generic format.
+    """
+    new_msg_history = []
+
+    for msg in msg_history:
+        if isinstance(msg, dict):
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+
+            if role == 'tool':
+                new_msg = {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Tool Result: {content}",
+                        }
+                    ],
+                }
+            else:
+                new_msg = {
+                    "role": role,
+                    "content": content,
+                }
+        else:
+            role = getattr(msg, 'role', None)
+            content = getattr(msg, 'content', None)
+            tool_calls = getattr(msg, 'tool_calls', None)
+
+            if tool_calls:
+                tool_call = tool_calls[0]
+                function_name = getattr(tool_call.function, 'name', '')
+                function_args = getattr(tool_call.function, 'arguments', '')
+                # Convert to the manual tool calling format
+                new_msg = {
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"<tool_use>\n{{'tool_name': {function_name}, 'tool_input': {function_args}}}\n</tool_use>",
+                        }
+                    ],
+                }
+            else:
+                new_msg = {
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": content,
+                        }
+                    ],
+                }
+
+        new_msg_history.append(new_msg)
+
+    return new_msg_history
+
+def convert_msg_history(msg_history, model=None):
+    """
+    Convert message history from the model-specific format to a generic format.
+    """
+    if 'claude' in model:
+        return convert_msg_history_claude(msg_history)
+    elif model.startswith('o3-'):
+        return convert_msg_history_openai(msg_history)
+    else:
+        return msg_history
+
+def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+    # Construct message
+    if msg_history is None:
+        msg_history = []
+    system_message = f'You are a coding agent.\n\n{get_tooluse_prompt()}'
+    new_msg_history = msg_history
+
+    try:
+        # Load all tools
+        all_tools = load_all_tools(logging=logging)
+        tools_dict = {tool['info']['name']: tool for tool in all_tools}
+        
+        # Create client
+        client, client_model = create_client(model)
+
+        # Call API
+        logging(f"Input: {msg}")
+        response, new_msg_history = get_response_from_llm(
+            msg=msg,
+            client=client,
+            model=client_model,
+            system_message=system_message,
+            print_debug=False,
+            msg_history=new_msg_history,
+        )
+        logging(f"Output: {response}")
+
+        # Tool use
+        tool_use = check_for_tool_use(response, model=client_model)
+        while tool_use:
+            # Process tool call
+            tool_name = tool_use['tool_name']
+            tool_input = tool_use['tool_input']
+            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
+
+            # Get tool response
+            tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
+            logging(tool_msg)
+            response, new_msg_history = get_response_from_llm(
+                msg=tool_msg,
+                client=client,
+                model=client_model,
+                system_message=system_message,
+                print_debug=False,
+                msg_history=new_msg_history,
+            )
+            logging(f"Output: {response}")
+
+            # Check for next tool use
+            tool_use = check_for_tool_use(response, model=client_model)
+
+    except Exception:
+        pass
+
+    return new_msg_history
+
+def chat_with_agent_claude(
+        msg,
+        model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+        msg_history=None,
+        logging=print,
+    ):
+    # Construct message
+    if msg_history is None:
+        msg_history = []
+    new_msg_history = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": msg,
+                }
+            ],
+        }
+    ]
+
+    try:
+        # Create client
+        client, client_model = create_client(model)
+
+        # Load all tools
+        all_tools = load_all_tools(logging=logging)
+        tools_dict = {tool['info']['name']: tool for tool in all_tools}
+        tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+
+        # Call API
+        response = get_response_withtools(
+            client=client,
+            model=client_model,
+            messages=msg_history + new_msg_history,
+            tool_choice={"type": "auto"},
+            tools=tools,
+            logging=logging,
+        )
+
+        # Outer bounded loop: handles truncated (max_tokens) responses by asking to continue
+        for _ in range(6):
+            # Check for tool use
+            tool_use = check_for_tool_use(response, model=client_model)
+            while tool_use:
+                # Process tool call
+                tool_name = tool_use['tool_name']
+                tool_input = tool_use['tool_input']
+                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
+                if not isinstance(tool_result, str) or not tool_result:
+                    tool_result = str(tool_result) if tool_result else "(no output)"
+
+                # Get tool response
+                new_msg_history.append({"role": "assistant", "content": response.content})
+                new_msg_history.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use['tool_id'],
+                            "content": tool_result,
+                        }
+                    ],
+                })
+                response = get_response_withtools(
+                    client=client,
+                    model=client_model,
+                    messages=msg_history + new_msg_history,
+                    tool_choice={"type": "auto"},
+                    tools=tools,
+                    logging=logging,
+                )
+
+                # Check for next tool use
+                tool_use = check_for_tool_use(response, model=client_model)
+
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                # Response was cut off: keep only the text and ask to continue
+                text_blocks = [
+                    b.text for b in response.content
+                    if getattr(b, "type", None) == "text" and getattr(b, "text", None)
+                ]
+                new_msg_history.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "\n".join(text_blocks) or "(continuing)"}],
+                })
+                new_msg_history.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Your previous response was cut off because it was too long. Keep your reasoning concise, and continue the task now: use the tools to write/test the solution file (write the solution file first if you have not yet done so).",
+                    }],
+                })
+                response = get_response_withtools(
+                    client=client,
+                    model=client_model,
+                    messages=msg_history + new_msg_history,
+                    tool_choice={"type": "auto"},
+                    tools=tools,
+                    logging=logging,
+                )
+                continue
+            break
+
+        # Get final response
+        final_response = next(
+            (block.text for block in response.content if hasattr(block, "text") and block.text),
+            None,
+        )
+        new_msg_history.append({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": final_response or "Done.",
+                }
+            ],
+        })
+
+    except Exception as e:
+        try:
+            logging(f"Error in chat_with_agent_claude: {e}\n{traceback.format_exc()}")
+        except Exception:
+            pass
+
+    return new_msg_history
+
+def chat_with_agent_openai(
+        msg,
+        model='o3-mini-2025-01-31',
+        msg_history=None,
+        logging=print,
+    ):
+    # Construct message
+    if msg_history is None:
+        msg_history = []
+    new_msg_history = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": msg,
+                }
+            ],
+        }
+    ]
+    separator = '=' * 10
+    logging(f"\n{separator} User Instruction {separator}\n{msg}")
+    try:
+        # Create client
+        client, client_model = create_client(model)
+
+        # Load all tools
+        all_tools = load_all_tools(logging=logging)
+        tools_dict = {tool['info']['name']: tool for tool in all_tools}
+        tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+
+        # Call API
+        response = get_response_withtools(
+            client=client,
+            model=client_model,
+            messages=msg_history + new_msg_history,
+            tool_choice="auto",
+            tools=tools,
+            logging=logging,
+        )
+        logging(f"\n{separator} Agent Response {separator}\n{response}")
+
+        # Check for tool use
+        tool_use = check_for_tool_use(response, model=client_model)
+        logging(tool_use)
+        while tool_use:
+            # Process tool call
+            tool_name = tool_use['tool_name']
+            tool_input = tool_use['tool_input']
+            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
+
+            logging(f"Tool Used: {tool_name}")
+            logging(f"Tool Input: {tool_input}")
+            logging(f"Tool Result: {tool_result}")
+
+            # Get tool

@@ -1,0 +1,451 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 33fb485..2e0c00e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -155,6 +155,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+    Before implementing, write down the worst-case number of basic operations as an explicit formula in n (and other constraint parameters such as the alphabet size 26 or the value range). If that count is far above ~3*10^7, redesign the algorithm before writing code.
+    Prefer a simpler algorithm with a provable worst-case bound over an intricate one that relies on heuristic pruning.
+ 2. Write the solution in solution.py with the editor tool.
++1b. If values reach 1e9 or more and the natural brute force is a search or simulation, treat the task as needing a closed form; build the exact brute force first, then use extrapolate_check along each parameter axis to get slopes and periods, state the formula, and validate it with stress_test across a wide sweep (small parameters, all combinations of residues). Then write the final solution.py from the formula. A slow-but-correct search is only a fallback, never an acceptable final answer while steps remain: before finishing, the largest sample input must run under 2 s, checked with sample_check (use timeout=2). If your final answer is still a slow search, keep working on the formula until the step budget is nearly exhausted.
+ 2b. If the problem is interactive, or sample_check reports no samples, first write down the I/O protocol you assume and at least one alternative (e.g. all data preloaded on stdin). Write the solution with a single token-based reader helper (e.g. `def tokens(): for line in sys.stdin: yield from line.split()`) so it does not depend on line boundaries, and ignore stray tokens that do not match the reply format. Verify with interactive_harness in both modes before finishing. Never treat a failing sample_check as a reason to skip checking; instead build samples manually from the statement.
+ 3. Run the `sample_check` tool on solution.py after each solution version: `sample_check(solution_path='/work/repo/solution.py', problem_statement_path='/tmp/problem.md')` (the full statement is saved there; or pass samples_json). Every sample must show EXACT MATCH. Treat any mismatch as a failure, even when the problem says any valid answer is accepted. If the statement allows multiple answers and your output differs from the sample, do not stop: change tie-breaking, ordering, basis choice, or bit order (try the natural alternatives such as reversed bit order, highest vs lowest pivot, ascending vs descending iteration) until your output matches all sample outputs byte for byte. Keep a separate validity checker to verify that the output is still correct.
+ 4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch. You can use the `stress_test` tool, which runs an optional exhaustive enumeration (`enumerate_all()` in the generator file) followed by random cases from `gen(rng, size)`, and reports a shrunk failing input with expected and actual outputs.
+@@ -196,6 +197,60 @@ If you are running low on steps, stop exploring and make sure solution.py contai
+                 logging=safe_log,
+             )
+ 
++        # Bounded scalability gate: run solution.py on the largest statement sample.
++        for attempt in range(2):
++            timing = self._largest_sample_timing()
++            if timing is None or timing.startswith('OK'):
++                break
++            follow_up = (
++                f"{task}\n"
++                "Scalability check failed. Running solution.py on the largest sample from the statement gave:\n"
++                f"{timing}\n"
++                "This solution is too slow for the real constraints. Derive an asymptotically faster method: "
++                "build the exact brute force for small parameters, use the extrapolate_check tool along each parameter axis "
++                "(reference_path=brute force, family_path=input builder, t_max large enough) to find slopes and periods, "
++                "write the closed form explicitly, validate it with stress_test over a wide sweep, then overwrite solution.py. "
++                "Re-run sample_check with timeout=2 on the largest sample when done. Do not end your turn without a tool call."
++            )
++            msg_history = chat_with_agent(
++                follow_up,
++                model=self.code_model,
++                msg_history=msg_history,
++                logging=safe_log,
++            )
++
++    def _largest_sample_timing(self, limit=5):
++        """Run solution.py on the largest statement sample with a time limit.
++        Returns None if no sample/solution is available, 'OK ...' if it finished in time,
++        otherwise a raw description of the timeout or failure."""
++        import sys
++        import time
++        sol = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(sol):
++            return None
++        try:
++            from tools.sample_check import _parse_statement
++            samples = _parse_statement(self.problem_statement)
++        except Exception:
++            return None
++        if not samples:
++            return None
++        sample_in = max((inp for inp, _ in samples), key=len)
++        start = time.time()
++        try:
++            p = subprocess.run(
++                [sys.executable, sol], input=sample_in + ('\n' if not sample_in.endswith('\n') else ''),
++                capture_output=True, text=True, timeout=limit, cwd=self.git_tempdir, errors='replace',
++            )
++        except subprocess.TimeoutExpired:
++            return f"TIMEOUT: solution.py did not finish the largest sample within {limit} s (killed)."
++        elapsed = time.time() - start
++        if p.returncode != 0:
++            return f"RUNTIME ERROR (exit {p.returncode}) after {elapsed:.2f} s; stderr tail:\n{(p.stderr or '')[-1000:]}"
++        if elapsed > 2.0:
++            return f"SLOW: finished in {elapsed:.2f} s (limit 2 s) on the largest sample."
++        return f"OK: finished in {elapsed:.2f} s."
++
+     def _run_first_pass(self, instruction):
+         """Run the first chat_with_agent pass and return (result, message history)."""
+         history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+diff --git a/tools/extrapolate_check.py b/tools/extrapolate_check.py
+new file mode 100644
+index 0000000..03a7344
+--- /dev/null
++++ b/tools/extrapolate_check.py
+@@ -0,0 +1,372 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++from fractions import Fraction
++
++MAX_PERIOD = 64
++MAX_CALLS = 6000
++SHOW = 40
++
++# Driver executed in a subprocess. It loads the reference and family files, evaluates
++# the reference on a plan of (t, s) pairs read from stdin (JSON), sets a per-call alarm,
++# and prints one JSON line per call. It stops at the first failed call.
++_DRIVER = r'''
++import sys, json, os, signal, importlib.util, io, contextlib
++
++ref_path, fam_path, axis, per_call = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
++out = sys.stdout
++
++def emit(d):
++    out.write(json.dumps(d) + "\n")
++    out.flush()
++
++def load(p, name):
++    d = os.path.dirname(os.path.abspath(p))
++    if d not in sys.path:
++        sys.path.insert(0, d)
++    spec = importlib.util.spec_from_file_location(name, p)
++    m = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(m)
++    return m
++
++class _Timeout(Exception):
++    pass
++
++def _alarm(signum, frame):
++    raise _Timeout()
++
++signal.signal(signal.SIGALRM, _alarm)
++
++try:
++    ref = load(ref_path, "_ref_mod")
++    fam = load(fam_path, "_fam_mod")
++except BaseException as e:
++    emit({"fatal": "import failed: " + repr(e)})
++    sys.exit(0)
++
++req = json.loads(sys.stdin.read())
++fixed = req["fixed"]
++plan = req["plan"]
++use_f = hasattr(ref, "f")
++if not use_f and not hasattr(ref, "solve"):
++    emit({"fatal": "reference file must define f(t, params) or solve(input)"})
++    sys.exit(0)
++
++for t, s in plan:
++    kw = dict(fixed)
++    if s is not None:
++        kw["s"] = s
++    try:
++        signal.setitimer(signal.ITIMER_REAL, per_call)
++        with contextlib.redirect_stdout(io.StringIO()):
++            if use_f:
++                v = ref.f(t, dict(kw))
++            else:
++                if axis:
++                    inp = fam.AXES[axis](t, **kw)
++                else:
++                    inp = fam.make_input(t, **kw)
++                v = ref.solve(inp)
++        signal.setitimer(signal.ITIMER_REAL, 0)
++        emit({"t": t, "s": s, "v": str(v).strip()})
++    except _Timeout:
++        signal.setitimer(signal.ITIMER_REAL, 0)
++        emit({"t": t, "s": s, "error": f"timeout after {per_call}s"})
++        break
++    except BaseException as e:
++        signal.setitimer(signal.ITIMER_REAL, 0)
++        emit({"t": t, "s": s, "error": repr(e)[:300]})
++        break
++'''
++
++
++def tool_info():
++    return {
++        "name": "extrapolate_check",
++        "description": """Evaluate a reference function over a parameter sweep and fit an eventually-linear-periodic model to the results, to derive closed forms when constraints are too large for brute force.\n
++* reference_path: Python file defining `f(t, params)` (returns the integer answer; params is a dict of fixed_json plus 's' in 2D mode) OR `solve(input_obj)` (returns the answer; the input is built by family_path).
++* family_path: Python file defining `make_input(t, **fixed)` (returns the input for parameter t, with fixed keyword args from fixed_json; in 2D mode 's' is also passed as keyword). Optionally defines a dict `AXES` mapping axis names to functions `(t, **fixed) -> input`; pass the name via `axis`.
++* t_max: sweep t = 0..t_max. The tool reports the first and second differences, the smallest period p (<= 64) of the first differences, the onset t0 from which v[t] = slope*t + intercept[t mod p] holds exactly, the slope, the per-residue intercepts, and the indices where the model fails. Raw numbers only.
++* two_d=true: sweep t = 0..t_max and s = 0..s_max, residual R(t,s) = f(t,s) - a*t - b*s with a, b the slopes of row s=0 and column t=0; reports per-row (fixed s) and per-column (fixed t) period/onset/slope of R for sampled rows and columns.
++* Each reference call is limited by timeout seconds; the sweep stops at the first failing call and reports it.
++* Output is plain text; read the raw numbers and verify the formula against a brute force with stress_test.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "reference_path": {"type": "string", "description": "Path to a Python file defining f(t, params) or solve(input_obj) that computes the exact answer (brute force)."},
++                "family_path": {"type": "string", "description": "Path to a Python file defining make_input(t, **fixed) and optionally a dict AXES of named input families."},
++                "t_max": {"type": "integer", "description": "Largest parameter value in the sweep (t runs 0..t_max). Default 200."},
++                "fixed_json": {"type": "string", "description": "JSON object of fixed parameters passed as keyword arguments, e.g. {\"K\": 3}. Default {}."},
++                "two_d": {"type": "boolean", "description": "If true, sweep both t and s (s = 0..s_max) and check residual periodicity in each variable. Default false."},
++                "s_max": {"type": "integer", "description": "Largest value of the second parameter s in two_d mode. Default 20."},
++                "axis": {"type": "string", "description": "Optional name of an entry of AXES in family_path to use instead of make_input."},
++                "timeout": {"type": "integer", "description": "Per-call time limit in seconds for the reference evaluation. Default 5."}
++            },
++            "required": ["reference_path", "family_path"]
++        }
++    }
++
++
++def _fit(vals):
++    """Fit v[t] = slope*t + intercept[t % p] for t >= onset. vals: list of Fraction.
++    Returns dict with raw results (or 'error')."""
++    L = len(vals)
++    if L < 6:
++        return {"error": f"too few values ({L}) to fit"}
++    d1 = [vals[i + 1] - vals[i] for i in range(L - 1)]
++    M = len(d1)
++    found = None
++    for p in range(1, min(MAX_PERIOD, M // 3) + 1):
++        # Walk backwards to find the earliest t0 with d1[t+p] == d1[t] for all t >= t0.
++        t0 = M - p
++        for t in range(M - p - 1, -1, -1):
++            if d1[t + p] == d1[t]:
++                t0 = t
++            else:
++                break
++        # Require the periodic tail to span at least 3 periods and 8 differences.
++        if M - t0 >= max(3 * p, 8):
++            found = (p, t0)
++            break
++    if found is None:
++        return {"error": f"no period <= {MAX_PERIOD} with a periodic tail of 3 periods (>= 8 differences) in {L} values; increase t_max"}
++    p, t0 = found
++    slope = sum(d1[t0:t0 + p], Fraction(0)) / p
++    # Intercepts per residue class, from the part t >= onset.
++    intercepts = [None] * p
++    consistent = True
++    for r in range(p):
++        seen = None
++        for t in range(t0, L):
++            if t % p != r:
++                continue
++            c = vals[t] - slope * t
++            if seen is None:
++                seen = c
++            elif c != seen:
++                consistent = False
++        intercepts[r] = seen
++    bad = []
++    for t in range(L):
++        ic = intercepts[t % p]
++        if ic is None or vals[t] != slope * t + ic:
++            bad.append(t)
++    return {
++        "p": p,
++        "t0": t0,
++        "slope": slope,
++        "intercepts": intercepts,
++        "consistent": consistent,
++        "bad": bad,
++        "d1": d1,
++        "d2": [d1[i + 1] - d1[i] for i in range(len(d1) - 1)],
++    }
++
++
++def _fmt_fr(x):
++    if x is None:
++        return "None"
++    if isinstance(x, Fraction) and x.denominator != 1:
++        return f"{x} (~{float(x):.6g})"
++    return str(int(x)) if isinstance(x, Fraction) else str(x)
++
++
++def _fmt_fit(res, indent=""):
++    if "error" in res:
++        return indent + "fit: " + res["error"]
++    lines = []
++    lines.append(f"{indent}period p={res['p']}  onset t0={res['t0']}  slope={_fmt_fr(res['slope'])}")
++    ics = res["intercepts"]
++    if len(ics) <= 64:
++        lines.append(f"{indent}intercepts by t mod p: " + ", ".join(f"r{r}={_fmt_fr(c)}" for r, c in enumerate(ics)))
++    lines.append(f"{indent}residue intercepts consistent for t>=t0: {res['consistent']}")
++    bad = res["bad"]
++    lines.append(f"{indent}non-conforming indices ({len(bad)}): {bad[:SHOW]}{' ...' if len(bad) > SHOW else ''}")
++    return "\n".join(lines)
++
++
++def _parse_v(s):
++    s = s.strip()
++    try:
++        return Fraction(int(s))
++    except ValueError:
++        pass
++    try:
++        return Fraction(s)
++    except (ValueError, ZeroDivisionError):
++        raise ValueError(f"non-numeric output: {s[:100]!r}")
++
++
++def _run_driver(reference_path, family_path, axis, timeout, fixed, plan):
++    fd, drv = tempfile.mkstemp(suffix=".py", prefix="extrap_drv_")
++    with os.fdopen(fd, "w") as f:
++        f.write(_DRIVER)
++    req = json.dumps({"fixed": fixed, "plan": plan})
++    total_timeout = min(280, timeout * len(plan) + 30)
++    stdout = ""
++    timed_out = False
++    try:
++        p = subprocess.run(
++            [sys.executable, drv, reference_path, family_path, axis or "", str(timeout)],
++            input=req, capture_output=True, text=True, timeout=total_timeout, errors="replace",
++        )
++        stdout = p.stdout or ""
++        stderr = (p.stderr or "")[-1500:]
++    except subprocess.TimeoutExpired as e:
++        timed_out = True
++        stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
++        stderr = ""
++    finally:
++        try:
++            os.remove(drv)
++        except OSError:
++            pass
++    results, fatal, err = [], None, None
++    for line in stdout.splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        try:
++            d = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if "fatal" in d:
++            fatal = d["fatal"]
++        elif "error" in d:
++            err = (d["t"], d["s"], d["error"])
++        else:
++            results.append(d)
++    return results, fatal, err, timed_out, stderr
++
++
++def _parse_int_args(v, name, default, lo, hi):
++    if v is None:
++        return default
++    try:
++        x = int(v)
++    except (TypeError, ValueError):
++        raise ValueError(f"{name} must be an integer")
++    return max(lo, min(hi, x))
++
++
++def tool_function(reference_path, family_path, t_max=200, fixed_json="{}", two_d=False, s_max=20, axis=None, timeout=5):
++    try:
++        t_max = _parse_int_args(t_max, "t_max", 200, 0, 5000)
++        s_max = _parse_int_args(s_max, "s_max", 20, 0, 5000)
++        timeout = _parse_int_args(timeout, "timeout", 5, 1, 120)
++    except ValueError as e:
++        return f"Error: {e}"
++    try:
++        fixed = json.loads(fixed_json or "{}")
++        if not isinstance(fixed, dict):
++            return "Error: fixed_json must be a JSON object"
++    except json.JSONDecodeError as e:
++        return f"Error: fixed_json is not valid JSON: {e}"
++    if not os.path.isfile(reference_path):
++        return f"Error: reference_path not found: {reference_path}"
++    if not os.path.isfile(family_path):
++        return f"Error: family_path not found: {family_path}"
++
++    out = []
++    if not two_d:
++        plan = [[t, None] for t in range(t_max + 1)]
++        results, fatal, err, timed_out, stderr = _run_driver(reference_path, family_path, axis, timeout, fixed, plan)
++        if fatal:
++            return f"Error: {fatal}"
++        out.append(f"extrapolate_check (1D): t=0..{t_max}, calls ok={len(results)}")
++        vals = []
++        try:
++            vals = [_parse_v(d["v"]) for d in results]
++        except ValueError as e:
++            out.append(f"Stopped parsing: {e}")
++        if err:
++            out.append(f"Sweep stopped at t={err[0]}: {err[2]}")
++        if timed_out:
++            out.append("Driver process hit the overall time limit.")
++        if stderr.strip() and not results:
++            out.append("stderr tail:\n" + stderr)
++        if not vals:
++            out.append("No values computed.")
++            return "\n".join(out)
++        out.append("raw v[t] (first 40): " + ", ".join(_fmt_fr(x) for x in vals[:SHOW]))
++        res = _fit(vals)
++        if "d1" in res:
++            out.append("d1 (first 40): " + ", ".join(_fmt_fr(x) for x in res["d1"][:SHOW]))
++            out.append("d2 (first 40): " + ", ".join(_fmt_fr(x) for x in res["d2"][:SHOW]))
++        out.append(_fmt_fit(res))
++        return "\n".join(out)
++
++    # 2D mode
++    total = (t_max + 1) * (s_max + 1)
++    if total > MAX_CALLS:
++        return f"Error: (t_max+1)*(s_max+1)={total} exceeds {MAX_CALLS}; reduce t_max or s_max"
++    plan = [[t, s] for s in range(s_max + 1) for t in range(t_max + 1)]
++    results, fatal, err, timed_out, stderr = _run_driver(reference_path, family_path, axis, timeout, fixed, plan)
++    if fatal:
++        return f"Error: {fatal}"
++    out.append(f"extrapolate_check (2D): t=0..{t_max}, s=0..{s_max}, calls ok={len(results)}")
++    if err:
++        out.append(f"Sweep stopped at t={err[0]}, s={err[1]}: {err[2]}")
++    if timed_out:
++        out.append("Driver process hit the overall time limit.")
++    if stderr.strip() and not results:
++        out.append("stderr tail:\n" + stderr)
++    G = {}
++    for d in results:
++        try:
++            G[(d["t"], d["s"])] = _parse_v(d["v"])
++        except ValueError as e:
++            out.append(f"Stopped parsing at t={d['t']}, s={d['s']}: {e}")
++            break
++    # Complete rows only (all t present for that s).
++    full_s = [s for s in range(s_max + 1) if all((t, s) in G for t in range(t_max + 1))]
++    if not full_s or (0 not in full_s and 0 not in full_s):
++        out.append("No complete row s=0 available; cannot fit.")
++        return "\n".join(out)
++    row0 = [G[(t, 0)] for t in range(t_max + 1)]
++    r0 = _fit(row0)
++    if "error" in r0:
++        out.append("row s=0 fit: " + r0["error"])
++        return "\n".join(out)
++    a = r0["slope"]
++    out.append(f"row s=0 (1D in t): period={r0['p']} onset={r0['t0']} slope a={_fmt_fr(a)}")
++    b = None
++    col0 = [G.get((0, s)) for s in range(s_max + 1)]
++    if all(c is not None for c in col0) and s_max >= 6:
++        c0 = _fit(col0)
++        if "error" not in c0:
++            b = c0["slope"]
++            out.append(f"column t=0 (1D in s): period={c0['p']} onset={c0['t0']} slope b={_fmt_fr(b)}")
++        else:
++            out.append("column t=0 fit: " + c0["error"])
++    if b is None:
++        b = Fraction(0)
++        out.append("column slope b unavailable (need s_max >= 6); using b=0")
++
++    R = {}
++    for (t, s), v in G.items():
++        R[(t, s)] = v - a * t - b * s
++    sample_s = sorted({s for s in (0, 1, 2, 3, s_max // 2, s_max) if s in full_s})
++    sample_t = sorted({t for t in (0, 1, 2, 3, t_max // 2, t_max) if 0 <= t <= t_max})
++    out.append(f"residual R(t,s)=f-a*t-b*s; per-row fits in t for sampled s={sample_s}:")
++    for s in sample_s:
++        rv = [R[(t, s)] for t in range(t_max + 1)]
++        res = _fit(rv)
++        if "error" in res:
++            out.append(f"  s={s}: " + res["error"])
++        else:
++            out.append(f"  s={s}: period={res['p']} onset={res['t0']} slope={_fmt_fr(res['slope'])} bad={len(res['bad'])}")
++    out.append(f"residual per-column fits in s for sampled t={sample_t}:")
++    for t in sample_t:
++        cv = [R.get((t, s)) for s in range(s_max + 1)]
++        if any(c is None for c in cv):
++            out.append(f"  t={t}: incomplete column")
++            continue
++        res = _fit(cv)
++        if "error" in res:
++            out.append(f"  t={t}: " + res["error"])
++        else:
++            out.append(f"  t={t}: period={res['p']} onset={res['t0']} slope={_fmt_fr(res['slope'])} bad={len(res['bad'])}")
++    return "\n".join(out)

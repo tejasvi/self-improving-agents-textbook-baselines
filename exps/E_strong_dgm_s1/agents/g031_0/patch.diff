@@ -1,0 +1,424 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 8bba701..24547e8 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -190,6 +190,26 @@ def _gate_verdict(report, n_inputs):
+     return int(total) == n_inputs and int(ok) == n_inputs and '] FAIL' not in report
+ 
+ 
++FIDELITY_SESSIONS = 2       # bounded fix sessions when solution.py does not reproduce the sample outputs exactly
++
++
++def _sample_fidelity_check(sol_path, statement):
++    """Run the statement samples through solution_check in plain mode with float_tol=0 (exact text).
++    Returns (ok, report). With no parseable samples the gate passes vacuously (nothing to verify);
++    ok is False when solution.py is missing or any sample differs."""
++    from tools import solution_check
++    samples = _extract_samples(statement)
++    if not samples:
++        return True, 'Sample fidelity skipped: the statement has no parseable samples.'
++    if not os.path.isfile(sol_path):
++        return False, 'Sample fidelity failed: solution.py missing.'
++    inputs = [s[0] for s in samples]
++    expected = [s[1] for s in samples]
++    report = solution_check.tool_function(sol_path, inputs=inputs, expected_outputs=expected, float_tol=0)
++    ok = _gate_verdict(report, len(inputs))
++    return ok, f"[sample fidelity: {len(samples)} sample(s), exact text match]\n{report}"
++
++
+ def _read_text(path):
+     if not os.path.isfile(path):
+         return None
+@@ -216,6 +236,7 @@ CANDIDATE_METHOD = """Work like a careful competitive programmer:
+ 8. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
+ 9. An unrun stress test means the task is NOT finished. Do not end your turn until step 4 (stress mode) has reported RESULT: OK and step 5 (differential mode) has reported RESULT: OK on the final version of solution.py.
+ 10. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
++11. Sample fidelity: copy sample outputs verbatim from the statement; never round expected values by hand. For floating-point answers print at least as many decimals as the sample output (e.g. %.15f) and never reduce output precision to make a checker pass. If the checker fails on last-digit noise, use float_tol (solution_check) instead of changing the output format.
+ The final solution.py is what gets graded; helper files are ignored."""
+ 
+ class AgenticSystem:
+@@ -372,7 +393,7 @@ Requirements:
+         srcs = [f"### {p}\n```python\n{_read_text(p) or ''}\n```" for p in cand_paths]
+         hard = []
+         for d in result['disagreements'][:4]:
+-            outs = "\n".join(f"  {os.path.basename(k)}: {v[1] if v[0] == 'ok' else v[0]}" for k, v in d['outputs'].items())
++            outs = "\n".join(f"  {os.path.basename(k)}: {v[-1] if v[0] == 'ok' else v[0]}" for k, v in d['outputs'].items())
+             hard.append(f"input (gen {d['gen']} seed {d['seed']}):\n{d['input'][:1500]}\noutputs:\n{outs}")
+         oracle_src = _read_text(oracle_path) if oracle_path else None
+         prompt = f"""{task}
+@@ -403,14 +424,16 @@ Steps:
+         chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+     def _select_best(self, cand_paths, result):
+-        """Best candidate: samples pass first, then oracle agreement, then the lowest runtime on the max-size input."""
++        """Best candidate: exact sample-string match first, then samples pass (tolerant), then oracle agreement,
++        then the lowest runtime on the max-size input."""
+         best, best_key = None, None
+         for p in cand_paths:
++            exact_ok, _ = _sample_fidelity_check(p, self.problem_statement)
+             ok, total = result['samples'].get(p, (0, 0))
+             samples_ok = (total == 0) or (ok == total)
+             agree = result['agree'].get(p, 0)
+             t = result['times'].get(p)
+-            key = (0 if samples_ok else 1, -agree, t if t is not None else float('inf'))
++            key = (not exact_ok, not samples_ok, -agree, t if t is not None else float('inf'))
+             if best_key is None or key < best_key:
+                 best, best_key = p, key
+         return best
+@@ -429,6 +452,10 @@ Steps:
+                 continue
+         return "\n".join(parts) or '(none)'
+ 
++    def _sample_fidelity(self, sol_path):
++        """Exact sample-output fidelity gate (float_tol=0). Returns (ok, report)."""
++        return _sample_fidelity_check(sol_path, self.problem_statement)
++
+     def _review_rounds(self, task, sol_path, summary):
+         """Bounded adversarial review rounds (snapshot + restore fallback). Gets the hard corpus and oracle path."""
+         passed, report = _verify_solution(self.git_tempdir)
+@@ -639,6 +666,50 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         # Review rounds get the hard-test corpus and the oracle path; snapshot/restore fallback.
+         self._review_rounds(task, sol_path, summary)
+ 
++        # (g) exact sample fidelity: bounded fix sessions, then restore a candidate that matches exactly.
++        if os.path.isfile(sol_path):
++            self._enforce_fidelity(task, sol_path, cand_paths)
++
++    def _enforce_fidelity(self, task, sol_path, cand_paths):
++        """Run the exact sample-fidelity gate on solution.py. On failure run at most FIDELITY_SESSIONS fix
++        sessions; if it still fails, restore the first candidate that matches the samples exactly."""
++        ok, report = self._sample_fidelity(sol_path)
++        for session in range(FIDELITY_SESSIONS):
++            if ok:
++                break
++            safe_log(f"Sample fidelity failed; fix session {session + 1}/{FIDELITY_SESSIONS}")
++            current = _read_text(sol_path)
++            prompt = f"""{task}
++
++The current solution.py does NOT reproduce the statement's sample outputs exactly as text:
++```python
++{current}
++```
++
++Fidelity report (solution_check, exact text comparison):
++{report[-3000:]}
++
++Fix solution.py so that running it on each sample input prints exactly the sample output text.
++- Match the sample output text exactly, with at least as many decimals as the sample output shows (for example, if the sample prints 15 decimals, print at least 15).
++- Never reduce output precision, and never round or hand-edit expected values to make a comparison pass.
++- If the difference is only last-digit float noise against the true answer, keep full precision in the output; the checker accepts tolerance through float_tol, not through lower precision.
++- Keep the solution valid: after the edit, re-run the samples and the stress test (RESULT: OK).
++Use the editor tool to write solution.py, then finish with a short message.
++"""
++            self._chat_continue(prompt, [], max_continues=1)
++            ok, report = self._sample_fidelity(sol_path)
++        if ok:
++            safe_log("Sample fidelity passed")
++            return True
++        for p in cand_paths:
++            cand_ok, _ = _sample_fidelity_check(p, self.problem_statement)
++            if cand_ok:
++                safe_log(f"Sample fidelity still failing; restoring exact-matching candidate {p}")
++                _write_text(sol_path, _read_text(p))
++                return True
++        safe_log("Sample fidelity failed and no candidate matches the samples exactly")
++        return False
++
+ 
+ # Module-level prompts and knobs for the multi-candidate pipeline.
+ NUM_CANDIDATES = 3          # cand_0 (first attempt) + (NUM_CANDIDATES - 1) fresh attempts
+diff --git a/tests/test_perf_gate.py b/tests/test_perf_gate.py
+index d8d5d01..d24cafa 100644
+--- a/tests/test_perf_gate.py
++++ b/tests/test_perf_gate.py
+@@ -131,3 +131,58 @@ def test_chat_continue_continues_same_history(tmp_path, monkeypatch):
+     assert calls[1][0].startswith('continue, write files')
+     assert calls[1][1] == empty  # continued from the history returned by the first call
+     assert out == full
++
++
++SAMPLE_STMT_F = "Print the value.\nSample Input 1\n3\nSample Output 1\n256.735020470879931\n"
++
++
++def _fid(tmp_path, src):
++    (tmp_path / 'solution.py').write_text(src)
++    a = _agent(tmp_path)
++    a.problem_statement = SAMPLE_STMT_F
++    return a._sample_fidelity(str(tmp_path / 'solution.py'))
++
++
++def test_fidelity_rejects_truncated_digits(tmp_path):
++    ok, rep = _fid(tmp_path, "print('%.9f' % 256.735020470879931)\n")
++    assert not ok, rep
++
++
++def test_fidelity_accepts_full_digits(tmp_path):
++    ok, rep = _fid(tmp_path, "print('%.15f' % 256.735020470879931)\n")
++    assert ok, rep
++
++
++def test_select_best_prefers_exact_match_over_faster(tmp_path, monkeypatch):
++    a = _agent(tmp_path)
++    a.problem_statement = SAMPLE_STMT_F
++    exact = tmp_path / 'cand_exact.py'
++    exact.write_text("print('%.15f' % 256.735020470879931)\n")
++    fast = tmp_path / 'cand_fast.py'
++    fast.write_text("print('%.9f' % 256.735020470879931)\n")
++    cand_paths = [str(fast), str(exact)]
++    # the fast candidate has better agreement and runtime, but does not match the sample text exactly
++    result = {'samples': {str(fast): (1, 1), str(exact): (1, 1)},
++              'agree': {str(fast): 5, str(exact): 1},
++              'times': {str(fast): 0.01, str(exact): 0.5}}
++    assert a._select_best(cand_paths, result) == str(exact)
++
++
++def test_fidelity_gate_restores_exact_candidate(tmp_path, monkeypatch):
++    a = _agent(tmp_path)
++    a.problem_statement = SAMPLE_STMT_F
++    sol = tmp_path / 'solution.py'
++    sol.write_text("print('%.9f' % 256.735020470879931)\n")
++    exact = tmp_path / 'cand_exact.py'
++    exact.write_text("print('%.15f' % 256.735020470879931)\n")
++    calls = []
++
++    def fake_continue(msg, hist, max_continues=2):
++        calls.append(msg)
++        return []  # the fix session does nothing
++
++    monkeypatch.setattr(a, '_chat_continue', fake_continue)
++    assert a._enforce_fidelity('task', str(sol), [str(exact)])
++    assert len(calls) == ca.FIDELITY_SESSIONS
++    assert 'exactly' in calls[0] and 'never reduce' in calls[0].lower()
++    assert sol.read_text() == exact.read_text()
+diff --git a/tests/test_tools.py b/tests/test_tools.py
+index 8b2712a..f352e9d 100644
+--- a/tests/test_tools.py
++++ b/tests/test_tools.py
+@@ -100,3 +100,39 @@ def test_solution_check_schema_valid():
+         assert "type" in prop and "description" in prop, name
+     assert "ref2_path" in schema["properties"]
+     assert schema["required"] == ["solution_path"]
++
++
++def test_float_noise_accepted_by_default_tolerance_rejected_when_exact(tmp_path):
++    from tools import solution_check
++    sol = tmp_path / "sol.py"
++    # prints 15 decimals; the brute prints a value that differs only at the 1e-12 level
++    sol.write_text("print('256.735020470879931')\n")
++    brute = tmp_path / "brute.py"
++    brute.write_text("print('256.735020470879932')\n")
++    gen = tmp_path / "gen.py"
++    gen.write_text("import sys\nprint(sys.argv[1])\n")
++    # stress mode: default tolerance 1e-6 accepts and reports the note
++    out = solution_check.tool_function(str(sol), brute_path=str(brute), gen_path=str(gen), num_tests=3)
++    assert "RESULT: OK" in out, out
++    assert "matched only within tolerance" in out
++    # explicit float_tol=0 rejects the same pair
++    out = solution_check.tool_function(str(sol), brute_path=str(brute), gen_path=str(gen), num_tests=3, float_tol=0)
++    assert "RESULT: FAILED" in out and "WRONG ANSWER" in out
++    # plain mode: exact by default with expected outputs
++    exp = "256.735020470879932\n"
++    out = solution_check.tool_function(str(sol), inputs=["\n"], expected_outputs=[exp])
++    assert "RESULT: FAILED" in out
++    out = solution_check.tool_function(str(sol), inputs=["\n"], expected_outputs=[exp], float_tol=1e-9)
++    assert "RESULT: OK" in out and "matched only within tolerance" in out
++
++
++def test_outputs_equal_helper_rules():
++    from tools import solution_check as sc
++    assert sc._outputs_equal("1.0000000001\n", "1.0\n", 1e-6) == (True, True)
++    assert sc._outputs_equal("1.0000000001\n", "1.0\n", 0) == (False, False)
++    assert sc._outputs_equal("1 2\n", "1 2\n", 0) == (True, False)
++    # non-numeric tokens must match exactly even under tolerance
++    assert sc._outputs_equal("YES\n", "NO\n", 1.0)[0] is False
++    # token and line counts must match
++    assert sc._outputs_equal("1 2\n", "1\n", 1e-6)[0] is False
++    assert sc._outputs_equal("1\n2\n", "1\n", 1e-6)[0] is False
+diff --git a/tools/multi_compare.py b/tools/multi_compare.py
+index 3d015b3..e7479b2 100644
+--- a/tools/multi_compare.py
++++ b/tools/multi_compare.py
+@@ -119,11 +119,28 @@ def _check_samples(path, cwd, sample_inputs, sample_outputs, timeout):
+     return passed, total, problems
+ 
+ 
++def _bucket_token(tok):
++    """Float tokens are bucketed to 6 significant digits so last-digit noise does not split candidates."""
++    try:
++        f = float(tok)
++    except ValueError:
++        return tok
++    if f != f or f in (float('inf'), float('-inf')):
++        return tok
++    return format(f, '.6g')
++
++
++def _bucketed(text):
++    return '\n'.join(' '.join(_bucket_token(t) for t in line.split()) for line in _normalise(text).split('\n'))
++
++
+ def _result_key(r):
+-    """Comparable key for one run: ('ok', normalised stdout) or ('fail', status)."""
++    """Comparable key for one run: ('ok', bucketed stdout, raw normalised stdout) or ('fail', status).
++    Agreement uses the bucketed text (numeric tokens to 6 significant digits, so float noise within
++    the usual 1e-6 tolerance agrees); the raw text is kept for reports."""
+     if r['status'] != 'ok' or r['rc'] != 0 or r['err'].strip():
+         return ('fail', r['status'])
+-    return ('ok', _normalise(r['out']))
++    return ('ok', _bucketed(r['out']), _normalise(r['out']))
+ 
+ 
+ def tool_function(candidate_paths, gen_paths, oracle_path=None, num_tests=100, timeout=10,
+@@ -256,7 +273,7 @@ def compare_candidates(candidate_paths, gen_paths, oracle_path=None, num_tests=1
+                 record = {
+                     'gen': gname, 'seed': seed, 'input': inp, 'size': size,
+                     'reference': reference,
+-                    'outputs': {cp: keys[name][1] for cp, name in zip(candidate_paths, names)},
++                    'outputs': {cp: keys[name][-1] for cp, name in zip(candidate_paths, names)},
+                     'agrees': {cp: keys[name] == ref for cp, name in zip(candidate_paths, names)},
+                 }
+                 with open(os.path.join(corpus_dir, fname), 'w', encoding='utf-8') as f:
+diff --git a/tools/solution_check.py b/tools/solution_check.py
+index 704ddb6..546b5f5 100644
+--- a/tools/solution_check.py
++++ b/tools/solution_check.py
+@@ -16,6 +16,7 @@ from collections import Counter
+ 
+ _MAX_STREAM = 4000        # chars of stdout/stderr kept per run
+ _STRESS_BUDGET = 240.0    # total wall-clock seconds allowed for stress mode
++_DEFAULT_TOL = 1e-6       # float tolerance for stress/differential comparisons
+ 
+ 
+ def tool_info():
+@@ -28,6 +29,7 @@ def tool_info():
+ * Any stderr is shown verbatim. A nonzero exit code or any stderr output is a failure.\n
+ * Differential mode (ref2_path + gen_path): runs a second, independent reference solution and compares its output with the solution on generated inputs. No brute force needed; the generator's seed-dependent mode decides the input size.\n
+ * Stress mode also reports `brute output stats` (distinct outputs, top fraction) and input size spread. If num_tests >= 100 and the outputs are too uniform (distinct < 5 or top_frac > 0.7), the result is RESULT: WEAK_TESTS: the generator must be diversified.\n
++* Float tolerance: tokens that both parse as floats and differ textually match when abs(x-y) <= float_tol*max(1, abs(y)). Default float_tol is 1e-6 in stress/differential mode and 0 (exact text) in plain mode with expected_outputs. A match that only holds within tolerance is reported with a NOTE.\n
+ * Pass the same solution file again after every edit; the check always uses the current contents.""",
+         "input_schema": {
+             "type": "object",
+@@ -39,7 +41,8 @@ def tool_info():
+                 "gen_path": {"type": "string", "description": "Path to a random input generator; it is called as `python gen.py <seed>` and prints one test input to stdout (stress mode, needs brute_path)."},
+                 "num_tests": {"type": "integer", "description": "Number of random seeds to try in stress mode (default 200)."},
+                 "ref2_path": {"type": "string", "description": "Optional path to a second, independent reference solution for differential mode (needs gen_path; no brute needed)."},
+-                "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."}
++                "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."},
++                "float_tol": {"type": "number", "description": "Optional relative/absolute tolerance for float tokens that differ textually (match when abs(x-y) <= float_tol*max(1, abs(y))). Default 1e-6 in stress/differential mode, 0 (exact text) in plain mode with expected_outputs. Use 0 to demand exact digits."}
+             },
+             "required": ["solution_path"]
+         }
+@@ -103,6 +106,38 @@ def _fmt_run(label, status, out, err, rc, elapsed):
+     return "\n".join(lines)
+ 
+ 
++def _is_float_token(tok):
++    try:
++        float(tok)
++        return True
++    except ValueError:
++        return False
++
++
++def _outputs_equal(a, b, tol):
++    """Compare two outputs line by line, token by token. Returns (equal, used_tolerance).
++    Tokens that differ textually match only if both parse as floats and abs(x-y) <= tol*max(1, abs(y));
++    everything else must be exactly equal. Line and token counts must match."""
++    la, lb = _normalise(a), _normalise(b)
++    if len(la) != len(lb):
++        return False, False
++    used = False
++    for line_a, line_b in zip(la, lb):
++        ta, tb = line_a.split(), line_b.split()
++        if len(ta) != len(tb):
++            return False, False
++        for x, y in zip(ta, tb):
++            if x == y:
++                continue
++            if tol and _is_float_token(x) and _is_float_token(y):
++                fx, fy = float(x), float(y)
++                if abs(fx - fy) <= tol * max(1.0, abs(fy)):
++                    used = True
++                    continue
++            return False, False
++    return True, used
++
++
+ def _token_count(s):
+     return len(s.split())
+ 
+@@ -119,10 +154,12 @@ def _weak_verdict(outputs, num_tests):
+ 
+ 
+ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=None, gen_path=None,
+-                  ref2_path=None, num_tests=200, timeout=10):
++                  ref2_path=None, num_tests=200, timeout=10, float_tol=None):
+     try:
+         timeout = max(1, int(timeout or 10))
+         num_tests = max(0, int(num_tests if num_tests is not None else 200))
++        if float_tol is not None:
++            float_tol = max(0.0, float(float_tol))
+     except (TypeError, ValueError) as e:
+         return f"Error: invalid numeric argument: {e}"
+     if not solution_path or not os.path.isfile(solution_path):
+@@ -152,6 +189,8 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+         # ---- plain mode: fixed inputs ----
+         if inputs:
+             passed, max_t = 0, 0.0
++            plain_tol = 0.0 if float_tol is None else float_tol
++            tol_notes = 0
+             for i, inp in enumerate(inputs):
+                 status, out, err, rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, inp, timeout)
+                 max_t = max(max_t, el)
+@@ -166,8 +205,11 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+                 exp = expected_outputs[i] if expected_outputs is not None and i < len(expected_outputs) else None
+                 has_exp = bool(exp and exp.strip())
+                 if has_exp and status == 'ok':
+-                    if _normalise(out) != _normalise(exp):
++                    same, used_tol = _outputs_equal(out, exp, plain_tol)
++                    if not same:
+                         problems.append("output differs from expected")
++                    elif used_tol:
++                        tol_notes += 1
+                 if problems:
+                     failed = True
+                     report.append(f"[input {i}] FAIL: {', '.join(problems)}\n"
+@@ -178,6 +220,8 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+                 else:
+                     passed += 1
+             report.append(f"{passed}/{len(inputs)} passed, max time {max_t:.3f} s")
++            if tol_notes:
++                report.append(f"NOTE: outputs matched only within tolerance (float_tol={plain_tol:g}) on {tol_notes} input(s)")
+ 
+         # ---- stress / differential mode: generated inputs ----
+         if stress:
+@@ -190,6 +234,8 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+             ran, max_t, mismatch = 0, 0.0, None
+             brute_outputs, sizes = [], []
+             expected_run = None
++            stress_tol = _DEFAULT_TOL if float_tol is None else float_tol
++            tol_notes = 0
+             for seed in range(num_tests):
+                 if time.monotonic() - t_start > _STRESS_BUDGET:
+                     report.append(f"Stress budget of {_STRESS_BUDGET:.0f}s reached; stopped early.")
+@@ -233,7 +279,10 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+                                 + _fmt_run("solution", sst, sout, serr, src_rc, el)
+                                 + "\n" + exp_fmt)
+                     break
+-                if _normalise(sout) != _normalise(expected_out):
++                same, used_tol = _outputs_equal(sout, expected_out, stress_tol)
++                if used_tol:
++                    tol_notes += 1
++                if not same:
+                     kind = "WRONG ANSWER" if brute_path else "DIFFERENTIAL MISMATCH"
+                     mismatch = (f"{kind} on seed {seed}\ninput:\n{_clip(test_in).rstrip()}\n"
+                                 + _fmt_run("solution", sst, sout, serr, src_rc, el)
+@@ -246,6 +295,8 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+             else:
+                 label = "differential" if not brute_path else "stress"
+                 report.append(f"{label}: {ran}/{num_tests} passed, max time {max_t:.3f} s")
++                if tol_notes:
++                    report.append(f"NOTE: outputs matched only within tolerance (float_tol={stress_tol:g}) on {tol_notes} input(s)")
+                 if sizes:
+                     s_sorted = sorted(sizes)
+                     report.append(f"input size (tokens): min={s_sorted[0]}, median={statistics.median(s_sorted):g}, max={s_sorted[-1]}")

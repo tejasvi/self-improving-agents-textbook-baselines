@@ -1,0 +1,360 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 9201e07..6ce16c6 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -413,7 +413,12 @@ IMPORTANT RULES:
+         of the attempt that produced the patch, or fallback_history if none did.
+         """
+         models = [self.code_model, self._alternate_model()]
++        previous = None
+         for model in models:
++            if model == previous:
++                safe_log(f"Escalation attempt with {model} skipped: identical to the previous attempt.")
++                continue
++            previous = model
+             safe_log(f"Escalation attempt with model {model}.")
+             history = None
+             try:
+@@ -504,7 +509,7 @@ When everything is done, end your reply with a short report that includes the st
+             safe_log(f"Verification: marker not found after {max_rounds} rounds.")
+         return msg_history
+ 
+-    def _last_resort_llm(self, model, msg, system_message):
++    def _last_resort_llm(self, model, msg, system_message, allow_thinking=True):
+         """One tool-free LLM call. Returns the text or '' on any failure (never raises)."""
+         try:
+             client, client_model = create_client(model)
+@@ -514,6 +519,7 @@ When everything is done, end your reply with a short report that includes the st
+                 model=client_model,
+                 system_message=system_message,
+                 msg_history=[],
++                allow_thinking=allow_thinking,
+             )
+             return content if isinstance(content, str) else ''
+         except Exception as e:
+@@ -540,6 +546,7 @@ When everything is done, end your reply with a short report that includes the st
+           1. Ask for a short algorithm description (<= 300 words).
+           2. Ask for the full code given that description.
+           3. Ask for a simple brute-force solution (correct for small inputs).
++          4. Ask for a minimal prompt with extended thinking disabled.
+         If every stage fails, write a constant stub (reads stdin, prints 0) as the very last resort.
+         """
+         try:
+@@ -593,6 +600,22 @@ When everything is done, end your reply with a short report that includes the st
+                     return
+                 safe_log(f"Last-resort: no brute-force code from {model}; trying next model.")
+ 
++            # Stage 4: minimal prompt with extended thinking disabled, so the reply is not consumed by
++            # hidden reasoning.
++            minimal_prompt = (
++                f"Problem:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Output only a Python solution for {target}. Reply with only the complete Python file "
++                "in one code block."
++            )
++            for model in models:
++                code = self._extract_code(
++                    self._last_resort_llm(model, minimal_prompt, system_message, allow_thinking=False)
++                )
++                if code:
++                    self._write_target_code(target_path, code, f"{model} (minimal, thinking disabled)")
++                    return
++                safe_log(f"Last-resort: no minimal-prompt code from {model}; trying next model.")
++
+             # Every model failed: clearly logged stub so the patch is at least non-empty.
+             safe_log("Last-resort: ALL models failed; writing a placeholder stub (reads stdin, prints 0).")
+             stub = (
+diff --git a/llm.py b/llm.py
+index 1767524..a0eb02c 100644
+--- a/llm.py
++++ b/llm.py
+@@ -42,9 +42,13 @@ AVAILABLE_LLMS = [
+ ]
+ 
+ TOKEN_ESCALATION = [4096, 8192, 16384, 32000]
+-# Claude 3.x models cap output at 8192 tokens; larger requests are rejected by the API.
++# Claude 3.x models cap output at 8192 tokens and do not support the `thinking` parameter.
+ CLAUDE_3_5_OUTPUT_CAP = 8192
+ THINKING_BUDGET_FLOOR = 1024
++# Default extended-thinking budget and the max_tokens ceiling used with it. Thinking is bounded
++# on the first attempt because it can otherwise consume the whole output budget.
++THINKING_BUDGET_TOKENS = 2000
++THINKING_MAX_TOKENS = 16000
+ 
+ 
+ def _max_tokens_cap(model: str) -> int:
+@@ -70,40 +74,71 @@ def _extract_text(response) -> str:
+     return next((b.text for b in blocks if getattr(b, "text", None)), "")
+ 
+ 
+-def _log_response(response, max_tokens, log=print):
++def _log_response(response, max_tokens, log=print, thinking=None):
+     usage = getattr(response, "usage", None)
+     output_tokens = getattr(usage, "output_tokens", None)
++    details = getattr(usage, "output_tokens_details", None)
++    thinking_tokens = getattr(details, "thinking_tokens", None)
+     log(
+         f"LLM response: stop_reason={getattr(response, 'stop_reason', None)}, "
+-        f"max_tokens={max_tokens}, output_tokens={output_tokens}, usage={usage}"
++        f"max_tokens={max_tokens}, thinking={thinking}, output_tokens={output_tokens}, "
++        f"thinking_tokens={thinking_tokens}, usage={usage}"
+     )
+ 
+ 
+-def _call_with_token_escalation(create_fn, max_tokens_list=(4096, 8192, 16384, 32000), log=print, **kwargs):
++def _thinking_attempt_configs(model: str, allow_thinking: bool = True):
+     """
+-    Call create_fn(max_tokens=..., **kwargs) (kwargs include model=...). If the response was cut
+-    off at max_tokens with no text/tool_use content, retry the same request with the next larger
+-    max_tokens (bounded by the model cap). When extended thinking is enabled, the thinking budget
+-    is reduced on each retry so that it stays below max_tokens. Never loops unboundedly.
++    Bounded ladder of distinct request configs for a Claude model, most preferred first.
++    Each config is a dict {'max_tokens': int, 'thinking': dict or None}; None means the
++    `thinking` parameter must be omitted entirely.
+     """
+-    cap = _max_tokens_cap(str(kwargs.get("model", "")))
+-    budgets = [t for t in max_tokens_list if t <= cap] or [min(max_tokens_list[0], cap)]
++    cap = _max_tokens_cap(model)
++    if cap <= CLAUDE_3_5_OUTPUT_CAP and ("claude-3-" in model or "claude-3." in model):
++        # claude-3.x: no thinking parameter at all, max_tokens bounded by 8192.
++        configs = [{"max_tokens": min(4096, cap), "thinking": None}, {"max_tokens": cap, "thinking": None}]
++    else:
++        big = min(THINKING_MAX_TOKENS, cap)
++        configs = []
++        if allow_thinking:
++            # Thinking budget must be >= 1024 and strictly below max_tokens.
++            budget = max(THINKING_BUDGET_FLOOR, min(THINKING_BUDGET_TOKENS, big - 1))
++            configs.append({"max_tokens": big, "thinking": {"type": "enabled", "budget_tokens": budget}})
++        configs.append({"max_tokens": big, "thinking": {"type": "disabled"}})
++        if cap > big:
++            configs.append({"max_tokens": cap, "thinking": {"type": "disabled"}})
++    # Drop exact duplicates while keeping order.
++    unique = []
++    for c in configs:
++        if c not in unique:
++            unique.append(c)
++    return unique
++
++
++def _call_with_thinking_control(create_fn, log=print, allow_thinking=True, **kwargs):
++    """
++    Call create_fn(max_tokens=..., [thinking=...], **kwargs) (kwargs include model=...) over a
++    bounded ladder of configs from _thinking_attempt_configs. A response is returned as soon as it
++    has a text or tool_use block, or its stop_reason is not 'max_tokens'. Otherwise the next config
++    is tried. Never loops unboundedly.
++    """
++    model = str(kwargs.get("model", ""))
++    configs = _thinking_attempt_configs(model, allow_thinking=allow_thinking)
+     response = None
+-    for idx, max_tokens in enumerate(budgets):
++    for idx, cfg in enumerate(configs):
+         call_kwargs = dict(kwargs)
+-        thinking = call_kwargs.get("thinking")
+-        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+-            # Keep thinking strictly below max_tokens; halve it on each escalation.
+-            budget = max(THINKING_BUDGET_FLOOR, min(thinking.get("budget_tokens", max_tokens // 2), max_tokens // 2))
+-            call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+-        response = create_fn(max_tokens=max_tokens, **call_kwargs)
+-        _log_response(response, max_tokens, log=log)
++        if cfg["thinking"] is not None:
++            call_kwargs["thinking"] = cfg["thinking"]
++            if cfg["thinking"].get("type") == "enabled":
++                # The API requires the default temperature when extended thinking is enabled.
++                call_kwargs.pop("temperature", None)
++        response = create_fn(max_tokens=cfg["max_tokens"], **call_kwargs)
++        _log_response(response, cfg["max_tokens"], log=log, thinking=cfg["thinking"])
+         if getattr(response, "stop_reason", None) != "max_tokens" or _has_text_or_tool_block(response):
+             return response
+-        if idx + 1 < len(budgets):
+-            log(f"Empty response at max_tokens={max_tokens}; retrying with max_tokens={budgets[idx + 1]}.")
++        if idx + 1 < len(configs):
++            log(f"Empty max_tokens response with config {idx + 1}/{len(configs)}; trying the next config.")
+         else:
+-            log(f"Empty response at max_tokens={max_tokens}; token budget exhausted.")
++            log("Empty max_tokens response; thinking/token budget ladder exhausted.")
+     return response
+ 
+ 
+@@ -243,6 +278,7 @@ def get_response_from_llm(
+         print_debug=False,
+         msg_history=None,
+         temperature=0.7,
++        allow_thinking=True,
+ ):
+     if msg_history is None:
+         msg_history = []
+@@ -259,10 +295,10 @@ def get_response_from_llm(
+                 ],
+             }
+         ]
+-        response = _call_with_token_escalation(
++        response = _call_with_thinking_control(
+             client.messages.create,
+-            max_tokens_list=TOKEN_ESCALATION,
+             log=print,
++            allow_thinking=allow_thinking,
+             model=model,
+             temperature=temperature,
+             system=system_message,
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 164fb53..06efb5e 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -7,7 +7,7 @@ import backoff
+ import openai
+ import copy
+ 
+-from llm import create_client, get_response_from_llm, _call_with_token_escalation, TOKEN_ESCALATION
++from llm import create_client, get_response_from_llm, _call_with_thinking_control
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+@@ -44,9 +44,8 @@ def get_response_withtools(
+ ):
+     try:
+         if 'claude' in model:
+-            response = _call_with_token_escalation(
++            response = _call_with_thinking_control(
+                 client.messages.create,
+-                max_tokens_list=TOKEN_ESCALATION,
+                 log=logging or print,
+                 model=model,
+                 messages=messages,
+@@ -369,7 +368,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+             # text reply from the manual-tool path is most often a max_tokens cut-off, so use the
+             # concise token-exhaustion nudge.
+             nudge = TOKEN_EXHAUSTED_NUDGE if not (response or '').strip() else EMPTY_NUDGES[attempt]
+-            resend = f"{base_user_msg}\n\n{nudge}"
++            resend = base_user_msg if base_user_msg.rstrip().endswith(nudge.strip()) else f"{base_user_msg}\n\n{nudge}"
+             response, new_msg_history = get_response_from_llm(
+                 msg=resend,
+                 client=client,
+@@ -444,13 +443,29 @@ def _is_empty_response(response, model=''):
+     return (not has_text) and (not has_tool)
+ 
+ 
++def _message_text(msg):
++    """Concatenated text of a message's content (string or list of blocks)."""
++    content = msg.get("content")
++    if isinstance(content, str):
++        return content
++    parts = []
++    for block in content or []:
++        text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
++        if text:
++            parts.append(text)
++    return "\n".join(parts)
++
++
+ def _append_nudge(msg_history, text):
+     """
+     Add a nudge without stacking consecutive user messages: merge it into the last
+     message if that is a user message (tool_result or text), otherwise append a new user message.
++    A nudge is skipped when the last user message already ends with the same text.
+     """
+     if msg_history and msg_history[-1].get("role") == "user":
+         last = msg_history[-1]
++        if _message_text(last).rstrip().endswith(text.strip()):
++            return msg_history
+         content = last.get("content")
+         if isinstance(content, str):
+             last["content"] = content + "\n\n" + text
+diff --git a/tests/test_thinking_control.py b/tests/test_thinking_control.py
+new file mode 100644
+index 0000000..b3de0dd
+--- /dev/null
++++ b/tests/test_thinking_control.py
+@@ -0,0 +1,94 @@
++import os
++import sys
++from types import SimpleNamespace as NS
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import llm  # noqa: E402
++from llm import _thinking_attempt_configs, _call_with_thinking_control  # noqa: E402
++from llm_withtools import _append_nudge  # noqa: E402
++
++
++def _resp(stop_reason, text=None, tool=False, thinking_tokens=None):
++    content = []
++    if text is not None:
++        content.append(NS(type="text", text=text))
++    if tool:
++        content.append(NS(type="tool_use", id="t1", name="editor", input={}))
++    details = NS(thinking_tokens=thinking_tokens) if thinking_tokens is not None else None
++    return NS(stop_reason=stop_reason, content=content,
++              usage=NS(output_tokens=100, output_tokens_details=details))
++
++
++def test_ladder_claude35_thinking_first_then_disabled():
++    cfgs = _thinking_attempt_configs("claude-sonnet-4-20250514")
++    assert cfgs[0]["thinking"] == {"type": "enabled", "budget_tokens": 2000}
++    assert cfgs[0]["max_tokens"] == 16000
++    assert cfgs[1]["thinking"] == {"type": "disabled"}
++    assert all(c["thinking"] is None or c["thinking"]["type"] in ("enabled", "disabled") for c in cfgs)
++    for c in cfgs:
++        if c["thinking"] and c["thinking"]["type"] == "enabled":
++            assert 1024 <= c["thinking"]["budget_tokens"] < c["max_tokens"]
++    assert len(cfgs) <= 3
++    assert len({repr(c) for c in cfgs}) == len(cfgs)
++
++
++def test_ladder_claude3_has_no_thinking_param_and_8192_cap():
++    for model in ("claude-3-5-sonnet-20240620", "claude-3-opus-20240229",
++                  "bedrock/anthropic.claude-3-haiku-20240307-v1:0"):
++        cfgs = _thinking_attempt_configs(model)
++        assert cfgs, model
++        assert all(c["thinking"] is None for c in cfgs), model
++        assert all(c["max_tokens"] <= 8192 for c in cfgs), model
++
++
++def test_allow_thinking_false_omits_enabled():
++    cfgs = _thinking_attempt_configs("claude-3-5-sonnet-20241022", allow_thinking=False)
++    assert all(c["thinking"] != {"type": "enabled", "budget_tokens": 2000} for c in cfgs)
++    assert all(c["thinking"] is None or c["thinking"]["type"] == "disabled" for c in cfgs)
++
++
++def test_fallback_to_tool_call_when_thinking_exhausts_budget():
++    calls = []
++
++    def create(max_tokens, **kw):
++        calls.append((max_tokens, kw.get("thinking")))
++        if kw.get("thinking", {}).get("type") == "enabled":
++            return _resp("max_tokens", thinking_tokens=max_tokens)
++        return _resp("tool_use", tool=True)
++
++    logs = []
++    out = _call_with_thinking_control(create, log=logs.append, model="claude-sonnet-4-20250514",
++                                      messages=[], temperature=0.7)
++    assert out.stop_reason == "tool_use"
++    assert len(calls) == 2
++    assert calls[0][1]["type"] == "enabled"
++    assert calls[1][1] == {"type": "disabled"}
++    assert any("thinking_tokens=16000" in m for m in logs)
++
++
++def test_claude3_never_sends_thinking_kwarg():
++    seen = []
++
++    def create(max_tokens, **kw):
++        seen.append(kw)
++        return _resp("max_tokens")
++
++    _call_with_thinking_control(create, log=lambda m: None, model="claude-3-5-sonnet-20240620", messages=[])
++    assert seen and all("thinking" not in kw for kw in seen)
++
++
++def test_returns_text_even_at_max_tokens():
++    out = _call_with_thinking_control(lambda max_tokens, **kw: _resp("max_tokens", text="hi"),
++                                      log=lambda m: None, model="claude-3-5-sonnet-20241022", messages=[])
++    assert out.content[0].text == "hi"
++
++
++def test_nudge_not_duplicated():
++    hist = [{"role": "user", "content": [{"type": "text", "text": "task"}]}]
++    nudge = "Continue: call the editor tool now."
++    _append_nudge(hist, nudge)
++    _append_nudge(hist, nudge)
++    assert len(hist) == 1
++    texts = [b["text"] for b in hist[0]["content"]]
++    assert texts.count(nudge) == 1

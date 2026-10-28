@@ -1,0 +1,229 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2341d54..b579d68 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -379,25 +379,34 @@ class AgenticSystem:
+             safe_log(f"[sanitize] dropped {dropped} degenerate assistant message(s)")
+         return cleaned
+ 
+-    def _safe_chat(self, msg, history):
++    def _safe_chat(self, msg, history, directives=None):
+         """
+         Call chat_with_agent, never raising. On failure, log and return the sanitized input history.
++        If the reply is degenerate, retry with a fresh compact context (see _rebuild_prompt), using
++        `directives` (or the default _REBUILD_DIRECTIVES) in order.
+         """
+         try:
+             new_history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+             if new_history is None:
+                 raise ValueError("chat_with_agent returned None")
+             if new_history and self._is_degenerate_assistant(new_history[-1]):
+-                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent; retrying once with a shortened prompt",
++                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent; rebuilding a fresh compact context",
+                          level=logging.WARNING)
+-                short_prompt = self._shortened_prompt(msg)
+-                retry_history = chat_with_agent(short_prompt, model=self.code_model,
+-                                                msg_history=self._sanitize_history(history),
+-                                                logging=safe_log)
+-                if retry_history and not self._is_degenerate_assistant(retry_history[-1]):
+-                    return retry_history
+-                safe_log("[safe_chat] shortened retry still degenerate", level=logging.WARNING)
+-                return retry_history or new_history
++                for attempt, directive in enumerate(directives or self._REBUILD_DIRECTIVES, 1):
++                    needs_edit = 'edit' in directive.lower() and 'perf_check' not in directive.lower()
++                    before = _file_hash(self._target_path())
++                    rebuilt = chat_with_agent(self._rebuild_prompt(msg, directive), model=self.code_model,
++                                              msg_history=[], logging=safe_log)
++                    if not rebuilt or self._is_degenerate_assistant(rebuilt[-1]):
++                        safe_log(f"[safe_chat] rebuild attempt {attempt} still degenerate", level=logging.WARNING)
++                        continue
++                    if needs_edit and _file_hash(self._target_path()) == before:
++                        safe_log(f"[safe_chat] rebuild attempt {attempt} did not change the target file",
++                                 level=logging.WARNING)
++                        continue
++                    return rebuilt
++                safe_log("[safe_chat] all rebuild attempts degenerate", level=logging.WARNING)
++                return new_history
+             elif len(new_history) <= len(history):
+                 safe_log("[safe_chat] chat_with_agent added no messages", level=logging.WARNING)
+             return new_history
+@@ -405,6 +414,59 @@ class AgenticSystem:
+             safe_log(f"[safe_chat] exception from chat_with_agent: {type(e).__name__}: {e}", level=logging.ERROR)
+             return self._sanitize_history(history)
+ 
++    _REBUILD_DIRECTIVES = (
++        "Call the editor tool now to edit the solution file so that the failing check passes. "
++        "Do not reply with text only.",
++        "First run perf_check (or run_samples) on the current file, then edit the file with the editor tool. "
++        "Make a tool call in this reply.",
++    )
++
++    _TIMEOUT_DIRECTIVES = (
++        "Optimize: state the operation count at the maximum constraints, pick a faster algorithm and rewrite the "
++        "file with the editor tool in this reply.",
++        "First run perf_check on the maximum-size inputs, then rewrite the solution file with a faster algorithm "
++        "using the editor tool.",
++    )
++    _MISMATCH_DIRECTIVES = (
++        "Fix the first failing sample: compare the expected and got output, change the solution file with the "
++        "editor tool in this reply.",
++        "First run run_samples, then fix the first failing sample by editing the solution file with the editor tool.",
++    )
++
++    def _directives_for_report(self, excerpt):
++        """Pick rebuild directives from the failing report type (TIMEOUT / PERF FAIL -> optimize)."""
++        if 'TIMEOUT' in (excerpt or '') or 'PERF FAIL' in (excerpt or ''):
++            return self._TIMEOUT_DIRECTIVES
++        return self._MISMATCH_DIRECTIVES
++
++    def _rebuild_prompt(self, task, directive):
++        """
++        A single compact user message built from ground truth on disk: the problem statement, the current
++        target file content, the latest verification report(s) and an imperative directive. Used with a
++        fresh (empty) history when the model returned an empty turn.
++        """
++        path = self._target_path()
++        content = ''
++        if path and os.path.isfile(path):
++            try:
++                with open(path) as f:
++                    content = f.read()
++            except OSError:
++                content = ''
++        _, verify_report = self._current_verification([])
++        reports = [f"Latest verification report:\n{(verify_report or '')[-1500:]}"]
++        if not self._is_method_task(self._output_filename() or ''):
++            perf = self._direct_perf_check()
++            if perf is not None:
++                reports.append(f"Latest perf_check report:\n{perf[1][-1500:]}")
++        statement = (self.problem_statement or '')[:4000]
++        return (
++            f"Problem statement:\n{statement}\n\n"
++            f"Target file {self._output_filename()} current content:\n```python\n{content[:12000]}\n```\n\n"
++            + "\n\n".join(reports) + "\n\n"
++            f"Directive: {directive}"
++        )
++
+     def _shortened_prompt(self, msg):
+         """
+         A minimal prompt for a retry: the problem excerpt plus the instruction only.
+@@ -822,14 +884,14 @@ class AgenticSystem:
+                 f"Latest failing report:\n<report>\n{quote}\n</report>\n"
+                 "Quote the failing example's input, expected output and got value in your reasoning, then edit the file.")
+ 
+-    def _tracked_chat(self, msg, history, label):
++    def _tracked_chat(self, msg, history, label, directives=None):
+         """
+         Call _safe_chat and record the target file hash before and after. If the file did not change,
+         log it and re-prompt once asking for an actual edit. Returns (new_history, edited).
+         """
+         target = self._target_path()
+         before = _file_hash(target)
+-        new_history = self._safe_chat(msg, history)
++        new_history = self._safe_chat(msg, history, directives=directives)
+         after = _file_hash(target)
+         if before is None and after is None:
+             safe_log(f"[tracked] {label}: target file unknown or missing; edit check skipped")
+@@ -898,7 +960,8 @@ class AgenticSystem:
+                     "Always make the tool call rather than announcing a next step.\n\n"
+                     f"Original task:\n{task}"
+                 )
+-                msg_history, _ = self._tracked_chat(perf_prompt, self._sanitize_history(msg_history), f'round {rnd} perf')
++                msg_history, _ = self._tracked_chat(perf_prompt, self._sanitize_history(msg_history), f'round {rnd} perf',
++                                                    directives=self._TIMEOUT_DIRECTIVES)
+                 final_failed, final_excerpt = True, excerpt
+                 continue
+             repair_prompt = (
+@@ -914,7 +977,8 @@ class AgenticSystem:
+                 "ALL SAMPLES EXACT MATCH. Always make the tool call rather than announcing a next step.\n\n"
+                 f"Original task:\n{task}"
+             )
+-            msg_history, _ = self._tracked_chat(repair_prompt, self._sanitize_history(msg_history), f'round {rnd} repair')
++            msg_history, _ = self._tracked_chat(repair_prompt, self._sanitize_history(msg_history), f'round {rnd} repair',
++                                                directives=self._directives_for_report(excerpt))
+             final_failed, final_excerpt = True, excerpt
+         else:
+             final_failed, final_excerpt = self._current_verification(msg_history)
+@@ -993,6 +1057,19 @@ Keep the required output file complete: a program file must read stdin and write
+                     "If it does not, optimize it and re-run perf_check."
+                 )
+                 msg_history = self._safe_chat(perf_request, self._sanitize_history(msg_history))
++                if not self._perf_input_files():
++                    safe_log("[forward] perf inputs still missing; fresh-context call to write them and optimize")
++                    fresh = self._rebuild_prompt(
++                        task,
++                        f"Write at least 2 maximum-size inputs to {_PERF_DIR}/ (mkdir -p first; a worst-case input and a "
++                        "many-duplicates input). Run perf_check on them against the solution file, and if any input "
++                        "times out, optimize the algorithm and rewrite the file with the editor tool in this reply.")
++                    try:
++                        fresh_history = chat_with_agent(fresh, model=self.code_model, msg_history=[], logging=safe_log)
++                        if fresh_history and not self._is_degenerate_assistant(fresh_history[-1]):
++                            msg_history = fresh_history
++                    except Exception as e:
++                        safe_log(f"[forward] fresh perf call failed: {type(e).__name__}: {e}", level=logging.ERROR)
+             if self._is_method_task(self._output_filename() or ''):
+                 stress_request = (
+                     "Before finishing, verify the Solution method with a randomized stress test. Do the following "
+diff --git a/tools/bash.py b/tools/bash.py
+index 5ce7c13..0471838 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import os
++import shlex
+ 
+ def tool_info():
+     return {
+@@ -17,14 +18,14 @@ def tool_info():
+             "properties": {
+                 "command": {
+                     "type": "string",
+-                    "description": "The bash command to run."
++                    "description": "The bash command to run. Optional when restart is true."
+                 },
+                 "restart": {
+                     "type": "boolean",
+                     "description": "Optional. Accepted for compatibility; the shell is started fresh for every call, so this flag is ignored."
+                 }
+             },
+-            "required": ["command"]
++            "required": []
+         }
+     }
+ 
+@@ -129,14 +130,15 @@ def filter_error(error):
+     return '\n'.join(kept).strip()
+ 
+ async def tool_function_call(command):
+-    """Execute a command in the bash shell."""
++    """Execute a command in the bash shell, wrapped in `timeout` so it cannot block the shell for long."""
+     try:
+         bash_session = BashSession()
+ 
+         if not bash_session._started:
+             await bash_session.start()
+ 
+-        output, error = await bash_session.run(command)
++        wrapped = f"timeout 100 bash -c {shlex.quote(command)}"
++        output, error = await bash_session.run(wrapped)
+         error = filter_error(error)
+         result = ""
+         if output:
+@@ -147,9 +149,13 @@ async def tool_function_call(command):
+     except Exception as e:
+         return f"Error: {str(e)}"
+ 
+-def tool_function(command, restart=False):
+-    # Each call already starts a fresh shell, so `restart` needs no action; it is accepted so that
+-    # calls which pass it do not fail with an unexpected-keyword error.
++def tool_function(command="", restart=False):
++    # Each call already starts a fresh shell, so `restart` needs no action. A restart with no command
++    # just reports that the shell was restarted.
++    if not command or not str(command).strip():
++        if restart:
++            return "shell restarted"
++        return "Error: no command provided"
+     return asyncio.run(tool_function_call(command))
+ 
+ if __name__ == "__main__":

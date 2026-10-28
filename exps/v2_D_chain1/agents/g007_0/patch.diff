@@ -1,0 +1,605 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2475d6b..4c9bea7 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -195,6 +195,73 @@ class AgenticSystem:
+                     parts.append(block["text"])
+         return "\n".join(parts)
+ 
++    def _changed_python_files(self):
++        """Python files changed in the repo (tracked diff + untracked), excluding /tmp scratch files."""
++        import subprocess as sp
++        files = set()
++        for cmd in (
++            ["git", "-C", self.git_tempdir, "diff", "--name-only", "--relative", self.base_commit],
++            ["git", "-C", self.git_tempdir, "ls-files", "--others", "--exclude-standard"],
++        ):
++            res = sp.run(cmd, stdout=sp.PIPE, stderr=sp.PIPE, text=True, check=False)
++            files.update(line.strip() for line in res.stdout.splitlines() if line.strip())
++        result = []
++        for f in sorted(files):
++            if f.endswith(".py"):
++                result.append(os.path.join(self.git_tempdir, f))
++        return result
++
++    def _run_sample_harness(self, msg_history, write_samples=True):
++        """Run the saved samples on the changed solution files.
++
++        If write_samples is True, first ask the agent to save the problem's
++        examples to /tmp/verify/samples.json. Returns (report, all_passed, msg_history).
++        """
++        from utils.run_utils import run_samples
++        samples_path = "/tmp/verify/samples.json"
++        if write_samples:
++            if os.path.exists(samples_path):
++                os.remove(samples_path)
++            samples_prompt = f"""{self._task_header()}
++
++SAMPLE TESTS. Save the examples given in the problem statement to /tmp/verify/samples.json.
++The file must be a JSON list of objects, each with keys "input" and "output" (both strings, exactly as the program reads/writes them).
++Create the /tmp/verify directory first if it does not exist. Do not modify any repository files in this step.
++Reply briefly once the file is written."""
++            msg_history = chat_with_agent(samples_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        solution_files = self._changed_python_files()
++        if not solution_files:
++            return "No changed Python solution file found in the repository.", False, msg_history
++        if not os.path.exists(samples_path):
++            return f"{samples_path} was not created.", False, msg_history
++
++        reports, all_ok = [], True
++        for sol in solution_files:
++            ok, report = run_samples(sol, samples_path, timeout=10)
++            all_ok = all_ok and ok
++            reports.append(f"[{sol}]\n{report}")
++        return "\n\n".join(reports), all_ok, msg_history
++
++    def _run_stress(self):
++        """Run the stress test on each changed solution using the agent's brute.py and gen.py.
++
++        Returns (report, all_ok). all_ok is True only if every changed solution returned ALL PASSED.
++        """
++        from tools.stress_test import tool_function as stress
++        brute, gen = "/tmp/verify/brute.py", "/tmp/verify/gen.py"
++        if not (os.path.exists(brute) and os.path.exists(gen)):
++            return "Stress test not run: /tmp/verify/brute.py or /tmp/verify/gen.py is missing.", False
++        solution_files = self._changed_python_files()
++        if not solution_files:
++            return "Stress test not run: no changed Python solution file found.", False
++        parts, all_ok = [], True
++        for sol in solution_files:
++            result = stress(solution_path=sol, brute_path=brute, generator_path=gen, iterations=200, timeout=10)
++            parts.append(f"[{sol}] {result}")
++            all_ok = all_ok and result.startswith("ALL PASSED after")
++        return "\n".join(parts), all_ok
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -233,25 +300,31 @@ Do not write tests in the repository yet; that comes in the next phase.
+ {pitfalls}"""
+         msg_history = chat_with_agent(implement_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
++        # Phase 2b: harness-driven sample check (real pass/fail, not self-reported)
++        samples_report, samples_ok, msg_history = self._run_sample_harness(msg_history, write_samples=True)
++
+         # Phase 3: verification
+         verify_prompt = f"""{header}
+ 
+-PHASE 3 - VERIFICATION. Verify the implementation thoroughly. Put ALL scratch files under /tmp (for example /tmp/verify/), NOT inside the repository.
+-1. Run all examples from the problem statement against the solution and compare outputs exactly.
++PHASE 3 - VERIFICATION. Verify the implementation thoroughly. Put ALL scratch files under /tmp/verify/, NOT inside the repository.
++1. Run all examples from the problem statement against the solution with the `run_solution` tool (mode 'stdin', input = the example input) and compare outputs exactly.
+ 2. Write a naive brute-force reference solution /tmp/verify/brute.py that is obviously correct for small inputs.
+-3. Write a random generator /tmp/verify/gen.py that produces small valid random test cases (cover edge cases such as n=1, duplicates, extreme values).
+-4. Stress test: run a bash for-loop of at least 200 iterations. In each iteration generate a random case, run the solution and the brute force each with `timeout 10`, and compare outputs. Stop and report the first mismatch with its input.
+-5. Timing: generate worst-case sized inputs (maximum constraints) and run the solution with `timeout 10` to confirm it runs well within the time limit.
++3. Write a random generator /tmp/verify/gen.py. It must accept the seed as argv[1] (e.g. `random.seed(int(sys.argv[1]))`) and print one small valid random test case to stdout. Cover edge cases such as n=1, duplicates, extreme values.
++4. Stress test: call the `stress_test` tool with solution_path (the solution file), brute_path=/tmp/verify/brute.py, generator_path=/tmp/verify/gen.py, iterations=200 and timeout=10. If it reports a failure, fix the solution and call it again until it returns 'ALL PASSED'.
++5. Timing: generate worst-case sized inputs (maximum constraints) and run the solution with `run_solution` (timeout 10) to confirm it runs well within the time limit.
+ 6. Fix any bug you find in the solution file in the repository, then re-run the checks.
+-Always wrap commands in `timeout` (each command must finish well within 120 seconds).
+-Report clearly which checks passed and which failed.
++Use `run_solution` and `stress_test` rather than ad-hoc bash loops. Report clearly which checks passed and which failed.
+ 
+ {pitfalls}"""
+         msg_history = chat_with_agent(verify_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+-        # Phase 4: bounded refine loop (no unbounded loops)
++        # Phase 4: bounded refine loop. Exit only when the sample report is fully
++        # passing AND the latest stress test returned ALL PASSED.
+         max_rounds = 2
++        stress_report, stress_ok = self._run_stress()
+         for round_idx in range(max_rounds):
++            if samples_ok and stress_ok:
++                break
+             review_prompt = f"""{header}
+ 
+ PHASE 4 - REVIEW AND FIX (round {round_idx + 1} of {max_rounds}).
+@@ -260,15 +333,26 @@ Here is the current diff of the repository:
+ {self._edits_text()}
+ </current_edits>
+ 
++Sample test report (run by the harness on /tmp/verify/samples.json):
++<samples_report>
++{samples_report}
++</samples_report>
++
++Stress test result (run by the harness, brute=/tmp/verify/brute.py, gen=/tmp/verify/gen.py):
++<stress_report>
++{stress_report}
++</stress_report>
++
+ 1. Review the diff carefully for correctness, edge cases, I/O format, the required signature, and time complexity.
+-2. If any check failed or any issue exists, fix the solution file and re-run the relevant checks (examples, stress test with /tmp scratch files, worst-case timing), all wrapped in `timeout`.
++2. Fix every failing sample and any stress-test mismatch, crash or timeout shown above. Use `run_solution` to reproduce a failing sample and `stress_test` to re-check.
+ 3. Make sure the final solution file contains no debug output, no debugging print statements, and no leftover test code. Scratch files must stay outside the repository.
+-4. End your reply with exactly one line: "STATUS: ALL CHECKS PASSING" if all checks pass and you made no changes, or "STATUS: FIXES APPLIED" if you changed anything.
++4. End your reply with exactly one line: "STATUS: FIXES APPLIED" if you changed anything, or "STATUS: NO CHANGES" otherwise. The harness, not this line, decides when to stop.
+ 
+ {pitfalls}"""
+             msg_history = chat_with_agent(review_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            if "STATUS: ALL CHECKS PASSING" in self._last_assistant_text(msg_history):
+-                break
++            # Re-run the real checks after the agent's changes.
++            samples_report, samples_ok, msg_history = self._run_sample_harness(msg_history, write_samples=False)
++            stress_report, stress_ok = self._run_stress()
+ 
+ 
+ def main():
+diff --git a/tests/test_run_tools.py b/tests/test_run_tools.py
+new file mode 100644
+index 0000000..474f7ef
+--- /dev/null
++++ b/tests/test_run_tools.py
+@@ -0,0 +1,122 @@
++import json
++import os
++import time
++
++import pytest
++
++from tools.run_solution import tool_function as run_solution
++from tools.stress_test import tool_function as stress_test, tool_info as stress_info
++from tools.run_solution import tool_info as run_info
++from utils.run_utils import run_python_file, run_samples, tokens_equal, truncate
++
++
++@pytest.fixture
++def workdir(tmp_path):
++    return tmp_path
++
++
++def write(path, text):
++    path.write_text(text)
++    return str(path)
++
++
++def test_schemas_are_well_formed():
++    for info in (run_info(), stress_info()):
++        schema = info["input_schema"]
++        assert schema["type"] == "object"
++        assert "required" not in schema["properties"]
++        for name, prop in schema["properties"].items():
++            assert "type" in prop and "description" in prop, name
++        assert set(schema["required"]) <= set(schema["properties"])
++
++
++def test_run_solution_echoes_stdin(workdir):
++    p = write(workdir / "sol.py", "import sys\nprint(sum(map(int, sys.stdin.read().split())))\n")
++    out = run_solution(path=p, input="1 2 3")
++    assert "exit code: 0" in out
++    assert "6" in out
++
++
++def test_run_solution_reports_timeout_cleanly(workdir):
++    p = write(workdir / "hang.py", "import time\ntime.sleep(60)\n")
++    start = time.monotonic()
++    out = run_solution(path=p, input="", timeout=1)
++    assert time.monotonic() - start < 20
++    assert out.startswith("TIMEOUT")
++
++
++def test_run_solution_reports_nonzero_exit(workdir):
++    p = write(workdir / "bad.py", "raise SystemExit(3)\n")
++    out = run_solution(path=p)
++    assert "exit code: 3" in out
++
++
++def test_run_solution_missing_file():
++    assert run_solution(path="/nonexistent/x.py").startswith("Error")
++
++
++def test_run_solution_method_mode_passes_argv(workdir):
++    p = write(workdir / "argv.py", "import sys\nprint(sys.argv[1].upper())\n")
++    out = run_solution(path=p, input="abc", mode="method")
++    assert "ABC" in out
++
++
++def test_truncate_caps_long_output():
++    s = truncate("x" * 5000)
++    assert len(s) < 3100 and "truncated" in s
++
++
++def test_tokens_equal_ignores_whitespace():
++    assert tokens_equal("1 2\n3\n", "1  2 3")
++    assert not tokens_equal("1 2", "1 3")
++
++
++def test_stress_all_passed(workdir):
++    sol = write(workdir / "sol.py", "print(int(input())*2)\n")
++    # brute: doubling via addition, deliberately different code path
++    brute = write(workdir / "brute.py", "x = int(input())\nprint(x + x)\n")
++    gen = write(workdir / "gen.py", "import sys, random\nrandom.seed(int(sys.argv[1]))\nprint(random.randint(0, 100))\n")
++    out = stress_test(solution_path=sol, brute_path=brute, generator_path=gen, iterations=10, timeout=5)
++    assert out == "ALL PASSED after 10 iterations"
++
++
++def test_stress_reports_first_mismatch(workdir):
++    sol = write(workdir / "sol.py", "x = int(input())\nprint(x * 2 + (1 if x > 50 else 0))\n")
++    brute = write(workdir / "brute.py", "x = int(input())\nprint(x * 2)\n")
++    gen = write(workdir / "gen.py", "import sys, random\nrandom.seed(int(sys.argv[1]))\nprint(random.randint(0, 100))\n")
++    out = stress_test(solution_path=sol, brute_path=brute, generator_path=gen, iterations=50, timeout=5)
++    assert out.startswith("FAILED on seed")
++    assert "expected output" in out and "actual output" in out
++
++
++def test_stress_reports_timeout(workdir):
++    sol = write(workdir / "sol.py", "import time\ntime.sleep(60)\n")
++    brute = write(workdir / "brute.py", "print(1)\n")
++    gen = write(workdir / "gen.py", "print(1)\n")
++    out = stress_test(solution_path=sol, brute_path=brute, generator_path=gen, iterations=3, timeout=1)
++    assert "timed out" in out
++
++
++def test_run_samples_reports_wrong_answer(workdir):
++    sol = write(workdir / "sol.py", "print(int(input()) + 1)\n")
++    samples = write(workdir / "samples.json", json.dumps([
++        {"input": "1\n", "output": "2\n"},
++        {"input": "5\n", "output": "5\n"},
++    ]))
++    ok, report = run_samples(sol, samples)
++    assert not ok
++    assert "Samples passed: 1/2" in report
++    assert "expected" in report and "actual" in report
++
++
++def test_run_samples_all_pass(workdir):
++    sol = write(workdir / "sol.py", "print(int(input()) + 1)\n")
++    samples = write(workdir / "samples.json", json.dumps([{"input": "1", "output": "2"}]))
++    ok, report = run_samples(sol, samples)
++    assert ok
++
++
++def test_run_samples_bad_file(workdir):
++    sol = write(workdir / "sol.py", "print(1)\n")
++    ok, report = run_samples(sol, str(workdir / "missing.json"))
++    assert not ok and "Could not load" in report
+diff --git a/tools/run_solution.py b/tools/run_solution.py
+new file mode 100644
+index 0000000..6645aff
+--- /dev/null
++++ b/tools/run_solution.py
+@@ -0,0 +1,66 @@
++import os
++
++from utils.run_utils import run_python_file, truncate
++
++
++def tool_info():
++    return {
++        "name": "run_solution",
++        "description": """Run a Python file in a fresh subprocess with a hard timeout and return its exit code, elapsed time, and (truncated) stdout/stderr.
++
++* mode 'stdin' (default): the file is run as a program; `input` is passed to its standard input.
++* mode 'method': the file is run as a program as well, but `input` is passed to it as the single command-line argument. Use this only when the file itself expects an argument.
++* Timeouts are reported as a clean message instead of hanging the shell.
++* Use this to run the examples from the problem statement and any other single test input against a solution.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python file to run, e.g. /repo/solution.py."
++                },
++                "input": {
++                    "type": "string",
++                    "description": "Text fed to the program's standard input (or passed as argv[1] in 'method' mode). Defaults to empty."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Hard time limit in seconds before the process is killed. Defaults to 10."
++                },
++                "mode": {
++                    "type": "string",
++                    "enum": ["stdin", "method"],
++                    "description": "'stdin' to pipe `input` to standard input (default), or 'method' to pass `input` as argv[1]."
++                }
++            },
++            "required": ["path"]
++        }
++    }
++
++
++def tool_function(path, input="", timeout=10, mode="stdin"):
++    if not os.path.isfile(path):
++        return f"Error: file not found: {path}"
++    try:
++        timeout = int(timeout) if timeout is not None else 10
++    except (TypeError, ValueError):
++        timeout = 10
++    if mode == "method":
++        result = run_python_file(path, stdin_text="", timeout=timeout, args=[input or ""])
++    else:
++        result = run_python_file(path, stdin_text=input or "", timeout=timeout)
++
++    if result["status"] == "timeout":
++        return (
++            f"TIMEOUT: process killed after {timeout} seconds (elapsed {result['elapsed']:.2f}s).\n"
++            f"stdout (partial):\n{truncate(result['stdout'])}\n"
++            f"stderr (partial):\n{truncate(result['stderr'])}"
++        )
++    if result["status"] == "error":
++        return f"Error: could not start process: {result.get('message', '')}"
++    return (
++        f"exit code: {result['returncode']}\n"
++        f"elapsed: {result['elapsed']:.2f}s\n"
++        f"stdout:\n{truncate(result['stdout'])}\n"
++        f"stderr:\n{truncate(result['stderr'])}"
++    )
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..0f41397
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,123 @@
++import os
++import time
++
++from utils.run_utils import run_python_file, tokens_equal, truncate
++
++# Total wall-clock budget for one stress_test call. The bash tool gives up
++# after 120s, so stay comfortably below that.
++TOTAL_BUDGET_SECONDS = 100.0
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Randomized stress test: compare a solution against a brute-force reference on generated inputs.
++
++* For seed i in 0..iterations-1 it runs `python <generator_path> <i>` to produce an input on stdout.
++* It runs the brute-force program and the solution on that input, each with `timeout` seconds.
++* Outputs are compared token-wise, ignoring whitespace differences.
++* Returns 'ALL PASSED after N iterations' if every case matches, otherwise the first failing case with its input, expected output, and actual output.
++* Stops early if the total run time approaches about 100 seconds and reports how many iterations completed.
++* The generator must accept the seed as argv[1].""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python solution file under test."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python brute-force reference solution."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python random generator. It is called as `python generator.py <seed>` and must print one test input to stdout."
++                },
++                "iterations": {
++                    "type": "integer",
++                    "description": "Number of random cases to test (seeds 0 to iterations-1)."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-program time limit in seconds for the generator, brute force, and solution on each case."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++def _fail_report(seed, reason, case_input, expected, actual):
++    return (
++        f"FAILED on seed {seed}: {reason}\n"
++        f"input:\n{truncate(case_input)}\n"
++        f"expected output:\n{truncate(expected)}\n"
++        f"actual output:\n{truncate(actual)}"
++    )
++
++
++def tool_function(solution_path, brute_path, generator_path, iterations=100, timeout=10):
++    for name, p in (("solution_path", solution_path), ("brute_path", brute_path), ("generator_path", generator_path)):
++        if not os.path.isfile(p):
++            return f"Error: {name} not found: {p}"
++    try:
++        iterations = int(iterations) if iterations is not None else 100
++        timeout = int(timeout) if timeout is not None else 10
++    except (TypeError, ValueError):
++        return "Error: iterations and timeout must be integers."
++    if iterations <= 0:
++        return "Error: iterations must be a positive integer."
++    if timeout <= 0:
++        return "Error: timeout must be a positive integer."
++
++    start = time.monotonic()
++    completed = 0
++    for seed in range(iterations):
++        remaining = TOTAL_BUDGET_SECONDS - (time.monotonic() - start)
++        if remaining <= 0:
++            return (
++                f"STOPPED (time budget of {TOTAL_BUDGET_SECONDS:.0f}s reached): "
++                f"no failures in {completed} of {iterations} iterations."
++            )
++        per_run = min(timeout, max(1, int(remaining)))
++
++        gen = run_python_file(generator_path, timeout=per_run, args=[str(seed)])
++        if gen["status"] != "ok" or gen["returncode"] != 0:
++            reason = "generator timed out" if gen["status"] == "timeout" else f"generator failed (exit {gen['returncode']})"
++            return _fail_report(seed, reason, "", "", gen["stderr"])
++        case_input = gen["stdout"]
++
++        remaining = TOTAL_BUDGET_SECONDS - (time.monotonic() - start)
++        if remaining <= 0:
++            return (
++                f"STOPPED (time budget of {TOTAL_BUDGET_SECONDS:.0f}s reached): "
++                f"no failures in {completed} of {iterations} iterations."
++            )
++        per_run = min(timeout, max(1, int(remaining)))
++
++        brute = run_python_file(brute_path, stdin_text=case_input, timeout=per_run)
++        if brute["status"] != "ok" or brute["returncode"] != 0:
++            reason = "brute force timed out" if brute["status"] == "timeout" else f"brute force crashed (exit {brute['returncode']})"
++            return _fail_report(seed, reason, case_input, brute["stdout"], brute["stderr"])
++        expected = brute["stdout"]
++
++        remaining = TOTAL_BUDGET_SECONDS - (time.monotonic() - start)
++        if remaining <= 0:
++            return (
++                f"STOPPED (time budget of {TOTAL_BUDGET_SECONDS:.0f}s reached): "
++                f"no failures in {completed} of {iterations} iterations."
++            )
++        per_run = min(timeout, max(1, int(remaining)))
++
++        sol = run_python_file(solution_path, stdin_text=case_input, timeout=per_run)
++        if sol["status"] == "timeout":
++            return _fail_report(seed, f"solution timed out after {per_run}s", case_input, expected, sol["stdout"])
++        if sol["status"] != "ok" or sol["returncode"] != 0:
++            return _fail_report(seed, f"solution crashed (exit {sol['returncode']})", case_input, expected, sol["stderr"] or sol["stdout"])
++        if not tokens_equal(sol["stdout"], expected):
++            return _fail_report(seed, "output mismatch", case_input, expected, sol["stdout"])
++
++        completed += 1
++
++    return f"ALL PASSED after {completed} iterations"
+diff --git a/utils/run_utils.py b/utils/run_utils.py
+new file mode 100644
+index 0000000..ed0a2b6
+--- /dev/null
++++ b/utils/run_utils.py
+@@ -0,0 +1,121 @@
++"""Shared helpers for running Python solution files in a fresh subprocess.
++
++Used by the run_solution / stress_test tools and by the verification harness
++in coding_agent.py. Every run is hard-limited by a timeout so a hanging
++program can never block the caller.
++"""
++import subprocess
++import sys
++import time
++
++MAX_STREAM_CHARS = 3000
++
++
++def truncate(text, limit=MAX_STREAM_CHARS):
++    """Cap a string at `limit` characters, marking the cut."""
++    if text is None:
++        return ""
++    if len(text) > limit:
++        return text[:limit] + f"\n<truncated {len(text) - limit} chars>"
++    return text
++
++
++def run_python_file(path, stdin_text="", timeout=10, args=None):
++    """Run `python <path> [args...]` with `stdin_text` on stdin.
++
++    Returns a dict with keys:
++      - status: "ok" | "timeout" | "error"
++      - returncode: int or None
++      - stdout, stderr: str (untruncated)
++      - elapsed: float seconds
++      - message: str, only set when status == "error"
++    """
++    cmd = [sys.executable, path] + list(args or [])
++    start = time.monotonic()
++    try:
++        proc = subprocess.run(
++            cmd,
++            input=stdin_text,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired as e:
++        return {
++            "status": "timeout",
++            "returncode": None,
++            "stdout": e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
++            "stderr": e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or ""),
++            "elapsed": time.monotonic() - start,
++        }
++    except OSError as e:
++        return {
++            "status": "error",
++            "returncode": None,
++            "stdout": "",
++            "stderr": "",
++            "elapsed": time.monotonic() - start,
++            "message": str(e),
++        }
++    return {
++        "status": "ok",
++        "returncode": proc.returncode,
++        "stdout": proc.stdout,
++        "stderr": proc.stderr,
++        "elapsed": time.monotonic() - start,
++    }
++
++
++def tokens_equal(a, b):
++    """Compare two outputs token-wise, ignoring whitespace differences."""
++    return (a or "").split() == (b or "").split()
++
++
++def run_samples(solution_path, samples_path, timeout=10):
++    """Run every {input, output} sample in `samples_path` against `solution_path`.
++
++    Returns (all_passed, report) where report is a plain-text summary listing
++    each failing sample with its input, expected output and actual output.
++    """
++    import json
++
++    try:
++        with open(samples_path) as f:
++            samples = json.load(f)
++    except (OSError, ValueError) as e:
++        return False, f"Could not load {samples_path}: {e}"
++    if not isinstance(samples, list) or not samples:
++        return False, f"{samples_path} must contain a non-empty JSON list of {{input, output}} objects."
++
++    lines = []
++    passed = 0
++    for idx, sample in enumerate(samples, start=1):
++        if not isinstance(sample, dict) or "input" not in sample or "output" not in sample:
++            lines.append(f"Sample {idx}: malformed (needs 'input' and 'output' keys).")
++            continue
++        sample_input = str(sample["input"])
++        expected = str(sample["output"])
++        result = run_python_file(solution_path, stdin_text=sample_input, timeout=timeout)
++        if result["status"] == "timeout":
++            lines.append(f"Sample {idx}: TIMEOUT after {timeout}s.\ninput:\n{truncate(sample_input)}\nexpected:\n{truncate(expected)}")
++        elif result["status"] != "ok" or result["returncode"] != 0:
++            lines.append(
++                f"Sample {idx}: RUNTIME ERROR (exit {result['returncode']}).\n"
++                f"input:\n{truncate(sample_input)}\nstderr:\n{truncate(result['stderr'])}"
++            )
++        elif tokens_equal(result["stdout"], expected):
++            passed += 1
++        else:
++            lines.append(
++                f"Sample {idx}: WRONG ANSWER.\ninput:\n{truncate(sample_input)}\n"
++                f"expected:\n{truncate(expected)}\nactual:\n{truncate(result['stdout'])}"
++            )
++
++    total = len(samples)
++    all_passed = passed == total and all(
++        isinstance(s, dict) and "input" in s and "output" in s for s in samples
++    )
++    header = f"Samples passed: {passed}/{total}"
++    if all_passed:
++        return True, header + " (ALL SAMPLES PASSED)"
++    return False, header + "\n" + "\n\n".join(lines)

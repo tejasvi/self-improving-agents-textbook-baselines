@@ -1,0 +1,273 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..25a711c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import shutil
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -137,9 +138,207 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    # ------------------------------------------------------------------
++    # Helpers for the test-first / multi-attempt pipeline
++    # ------------------------------------------------------------------
++    MAX_ATTEMPTS = 3
++    TEST_TIMEOUT = 600      # seconds for one run of tests/run_tests.sh
++    CALL_OUTPUT_LIMIT = 6000
++
++    def _tests_dir(self):
++        return os.path.join(self.git_tempdir, 'tests')
++
++    def _solution_path(self):
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _attempts_dir(self):
++        return os.path.join(self.git_tempdir, 'attempts')
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        """Return the text of the last assistant message in a message history (or '')."""
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                texts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('text')]
++                if texts:
++                    return '\n'.join(texts)
++        return ''
++
++    def _run_test_script(self):
++        """Run tests/run_tests.sh under git_tempdir. Returns (returncode, raw_output)."""
++        script = os.path.join('tests', 'run_tests.sh')
++        if not os.path.exists(os.path.join(self.git_tempdir, script)):
++            return 1, f"{script} does not exist yet."
++        try:
++            result = subprocess.run(
++                ['bash', script],
++                cwd=self.git_tempdir,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                timeout=self.TEST_TIMEOUT,
++            )
++            out = result.stdout.decode(errors='replace')
++            rc = result.returncode
++        except subprocess.TimeoutExpired:
++            out = f"[run_tests.sh timed out after {self.TEST_TIMEOUT}s]"
++            rc = 1
++        except Exception as e:
++            out = f"[failed to run tests: {e}]"
++            rc = 1
++        return rc, out
++
++    def _truncate(self, text):
++        if len(text) <= self.CALL_OUTPUT_LIMIT:
++            return text
++        return "...[truncated]...\n" + text[-self.CALL_OUTPUT_LIMIT:]
++
++    @staticmethod
++    def _count_passes(output):
++        """Raw heuristic used only to rank candidates: count PASS/FAIL lines."""
++        passes = fails = 0
++        for line in output.splitlines():
++            if 'FAIL' in line:
++                fails += 1
++            elif 'PASS' in line:
++                passes += 1
++        return passes, fails
++
++    def _tests_fully_pass(self, rc, output):
++        _, fails = self._count_passes(output)
++        return rc == 0 and fails == 0
++
++    def _save_attempt(self, k):
++        os.makedirs(self._attempts_dir(), exist_ok=True)
++        dst = os.path.join(self._attempts_dir(), f'sol_{k}.py')
++        if os.path.exists(self._solution_path()):
++            shutil.copy(self._solution_path(), dst)
++        return dst
++
++    def _tester_prompt(self, task):
++        return f"""{task}
++
++Your job right now is ONLY to write an independent test suite. Do NOT write solution.py in this step (leave it absent or untouched). Do not look for a solution yet.
++Put every helper file under the directory {self._tests_dir()} (create it). Create:
++- {self._tests_dir()}/brute.py : a brute-force / straightforward reference implementation of the problem, written independently (it should be obviously correct, even if slow). If the problem is a method of a `Solution` class, the brute force should expose the same method name so it can be compared.
++- {self._tests_dir()}/gen.py : a random small-input generator. It takes an integer seed as argv[1] (use random.seed(seed)) and prints one valid input to stdout. Respect the constraints exactly.
++- {self._tests_dir()}/judge.py : ONLY if the problem is interactive. A local judge that simulates the hidden data with random and adversarial sequences, counts queries, rejects invalid queries, and independently verifies the optimality of the query count when relevant.
++- {self._tests_dir()}/run_tests.sh : a bash script that runs everything against /solution.py in the repo ({self._solution_path()}), i.e. it uses `python3` on that file, and prints one line per test of the form `PASS <name>` or `FAIL <name>: <short reason>`. It must exit non-zero if any test fails. Each individual command should use `timeout` so that nothing hangs.
++
++The test suite must include:
++1. Samples from the problem statement with the exact expected outputs.
++2. Exhaustive enumeration of ALL inputs for every small parameter combination (e.g. all N up to the largest N that brute force can handle, all values in small ranges), comparing solution vs brute force.
++3. Random small-input comparisons via gen.py with many seeds (a few hundred cases).
++4. Boundary cases: minimum and maximum constraint values, L=R or single-element cases, full range, all-equal values, etc.
++5. Max-size inputs: run the solution and check it finishes well under 2 seconds (report the time as PASS/FAIL with a generous threshold).
++6. If the problem has a secondary metric (e.g. number of queries in an interactive problem, or an optimal count), check it against the independently computed optimum for every N the brute force can handle, and as far as possible for larger N.
++
++Make the brute force genuinely independent of any idea you might later use for the solution. Keep brute.py and gen.py deterministic given the seed. Finish by running {self._tests_dir()}/run_tests.sh once to make sure the harness itself works (it is expected to FAIL because solution.py does not exist yet, but it must not crash with a Python traceback in brute.py/gen.py/judge.py). Report briefly which test files you created."""
++
++    def _solver_prompt(self, method, k, prev_attempts, last_test_output):
++        base = f"""{method}
++
++Additionally, the independent test suite has already been written under {self._tests_dir()} (brute.py, gen.py, judge.py if interactive, run_tests.sh). Run `bash {self._tests_dir()}/run_tests.sh` (cwd {self.git_tempdir}) and make it pass: every test must print PASS. Do not weaken or delete tests just to make them pass; if a test looks wrong, double-check it against the problem statement first and explain your reasoning in your reply. Iterate on solution.py until run_tests.sh passes completely."""
++        if k == 0 or not prev_attempts:
++            return base
++        history_lines = []
++        for j, (summary, code_path) in enumerate(prev_attempts):
++            history_lines.append(f"- Attempt {j+1}: earlier code saved at {code_path} (read it with the editor tool if useful). Summary of that attempt:\n{summary}")
++        return f"""{base}
++
++This is attempt {k+1} of {self.MAX_ATTEMPTS}. Earlier attempts did NOT fully pass the tests. Their information:
++{chr(10).join(history_lines)}
++
++Raw output of the test script after the most recent attempt:
++```
++{last_test_output}
++```
++
++Analyze why the previous approach failed (read the failing tests and the saved earlier code). If the same algorithm already failed twice, do NOT retry it: change the approach (different algorithm, different reduction, or a different proof of correctness). Make solution.py correct first, then run tests/run_tests.sh until it passes."""
++
++    def _reflect_prompt(self, final_msg):
++        return f"""Your previous step ended with this message:
++<last_message>
++{self._truncate(final_msg)}
++</last_message>
++
++Now do a reflection pass on solution.py. Do the following:
++1. List every claim or assumption in the current solution that no test has verified yet. Typical gaps: coverage only for small N, unproven optimality or correctness arguments, untested boundaries (min/max, L=R, full range), timing at max size, interactive query-count optimality for larger N, etc.
++2. For each gap, add a test (in {self._tests_dir()}, and wire it into run_tests.sh) that closes it. Prefer: differential testing against an independently written alternative algorithm, larger exhaustive ranges, optimality checks against an independently computed optimum, boundary and max-size cases.
++3. Run {self._tests_dir()}/run_tests.sh. If any test fails, fix solution.py (not the test, unless the test itself is wrong per the statement) and rerun until everything passes.
++4. Finish with a short summary: the claims you checked, the new tests, and any remaining unverified claim."""
++
++    def _evaluate_candidates(self, candidates):
++        """
++        candidates: list of paths to saved solution files.
++        Scores each candidate by number of PASS lines from run_tests.sh and by
++        agreement with the majority output on random generated inputs.
++        Returns the best candidate path or None.
++        """
++        candidates = [c for c in candidates if os.path.exists(c)]
++        if not candidates:
++            return None
++        sol = self._solution_path()
++        backup = sol + '.bak_eval'
++        if os.path.exists(sol):
++            shutil.copy(sol, backup)
++
++        # Differential inputs from tests/gen.py (best effort)
++        gen = os.path.join(self._tests_dir(), 'gen.py')
++        inputs = []
++        if os.path.exists(gen):
++            for seed in range(20):
++                try:
++                    r = subprocess.run(['python3', gen, str(seed)], cwd=self.git_tempdir,
++                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                                       timeout=20)
++                    if r.returncode == 0 and r.stdout:
++                        inputs.append(r.stdout)
++                except Exception:
++                    continue
++
++        def run_candidate(path, inp):
++            try:
++                r = subprocess.run(['python3', path], cwd=self.git_tempdir, input=inp,
++                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
++                return r.stdout.decode(errors='replace').strip()
++            except Exception:
++                return '<error>'
++
++        scored = []
++        try:
++            # Test-suite score for each candidate
++            for path in candidates:
++                shutil.copy(path, sol)
++                rc, out = self._run_test_script()
++                passes, fails = self._count_passes(out)
++                scored.append({'path': path, 'passes': passes, 'fails': fails, 'rc': rc, 'outputs': []})
++                safe_log(f"[evaluate] {path}: passes={passes} fails={fails} rc={rc}")
++            # Differential outputs
++            for inp in inputs:
++                outs = [run_candidate(c['path'], inp) for c in scored]
++                for c, o in zip(scored, outs):
++                    c['outputs'].append(o)
++            for i, c in enumerate(scored):
++                agree = 0
++                for j, d in enumerate(scored):
++                    if i == j:
++                        continue
++                    agree += sum(1 for a, b in zip(c['outputs'], d['outputs']) if a == b)
++                c['agree'] = agree
++            best = max(scored, key=lambda c: (c['passes'], c['agree']))
++            return best['path']
++        finally:
++            if os.path.exists(backup):
++                shutil.move(backup, sol)
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Test-first, multi-attempt, verify-and-reflect pipeline.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -155,9 +354,48 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+ 5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored.
++
++Testing guidance: cover boundary cases (min/max constraints, L=R, full range), exhaustive enumeration for all small parameters, checks of secondary metrics (e.g. query count in interactive problems, time at max size), and finally ask yourself: "what could the hidden tests check that I have not verified?" and verify it.
++
++Interactive problems: if the problem is interactive, build a judge that simulates the hidden data with random and adversarial sequences, counts queries, rejects invalid queries, and verifies the optimum query count with an independent method (do not trust a formula you have not checked for all small N)."""
++
++        os.makedirs(self._tests_dir(), exist_ok=True)
++        os.makedirs(self._attempts_dir(), exist_ok=True)
++
++        # Phase 1: independent test writing (fresh context, no solution)
++        tester_prompt = self._tester_prompt(task)
++        chat_with_agent(tester_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++        # Phases 2-4: solve, reflect, and fall back to new attempts
++        prev_attempts = []      # list of (summary, code_path)
++        candidates = []         # saved candidate solution paths
++        last_output = ''
++        for k in range(self.MAX_ATTEMPTS):
++            solver_prompt = self._solver_prompt(f"{task}\n\n{method}", k, prev_attempts, last_output)
++            solver_hist = chat_with_agent(solver_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            solver_final = self._last_assistant_text(solver_hist)
++
++            reflect_hist = chat_with_agent(self._reflect_prompt(solver_final), model=self.code_model,
++                                           msg_history=solver_hist, logging=safe_log)
++            reflect_final = self._last_assistant_text(reflect_hist)
++
++            saved = self._save_attempt(k)
++            candidates.append(saved)
++            rc, last_output = self._run_test_script()
++            last_output = self._truncate(last_output)
++            safe_log(f"[attempt {k+1}] run_tests rc={rc}\n{last_output}")
++            prev_attempts.append((self._truncate(reflect_final or solver_final)[-1500:], saved))
++
++            if self._tests_fully_pass(rc, last_output):
++                break
++
++        # Phase 5: choose the best candidate and restore it to solution.py
++        best = self._evaluate_candidates(candidates)
++        if best is not None:
++            shutil.copy(best, self._solution_path())
++            safe_log(f"[final] restored best candidate: {best}")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

@@ -1,0 +1,396 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 6e56309..f1fe06b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,13 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import json
++import sys
++
++# Ensure the repository root is in sys.path for tool imports
++repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
++if repo_root not in sys.path:
++    sys.path.insert(0, repo_root)
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -102,7 +109,9 @@ class AgenticSystem:
+             chat_history_file='./chat_history.md',
+             test_description=None,
+             self_improve=False,
+-            language='python'
++            language='python',
++            max_attempts=3,
++            attempt_timeout=30,
+         ):
+         self.problem_statement = problem_statement
+         self.git_tempdir = git_tempdir
+@@ -111,6 +120,8 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.max_attempts = max_attempts
++        self.attempt_timeout = attempt_timeout
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -141,42 +152,101 @@ class AgenticSystem:
+         """
+         The forward function for the AgenticSystem.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        # Detailed phase-based prompt guiding the agent through systematic verification
+-        instruction = (
+-            f"{task}\n\n"
+-            "Please follow these phases strictly and do not provide the final solution until all phases have completed successfully:\n"
+-            "1️⃣ **Constraint Analysis**: Examine the problem constraints and determine the required time and space complexity. If any proposed algorithm cannot meet the constraints, reject it and request a more efficient approach.\n"
+-            "2️⃣ **Implementation**: Write the solution code (or the `Solution` class method) in the appropriate language files inside the repository.\n"
+-            "3️⃣ **Sample Verification**: Run **all** sample test cases from the problem statement using the provided test harness. Compare the outputs and ensure they match exactly.\n"
+-            "4️⃣ **Reference & Stress Testing**:\n"
+-            "   - Write a brute‑force reference implementation (can be simple and slow).\n"
+-            "   - Write a small random test‑case generator and place it in `/tmp` to avoid polluting the repo.\n"
+-            "   - If the problem has multiple valid outputs, also write a checker/validator in `/tmp`.\n"
+-            "   - Use these to stress‑test the solution on many random small cases, ensuring consistency with the reference.\n"
+-            "5️⃣ **Performance Testing**:\n"
+-            "   - Generate worst‑case (maximum size) inputs, again using scripts in `/tmp`.\n"
+-            "   - Time the solution execution using the `run_python` tool (or appropriate language runner) with a reasonable timeout (e.g., 30 seconds).\n"
+-            "   - If the solution exceeds the time limit, iterate on the implementation to improve performance.\n"
+-            "6️⃣ **Finalization**: Only after all previous phases pass, provide the final answer indicating success. Do not output any solution code in your final message; the code should already be committed to the repository.\n"
+-            "\n"
+-            "**Additional Instructions**:\n"
+-            "- Save any helper scripts (test generators, brute‑force reference, validators) in `/tmp` rather than the repository.\n"
+-            "- When invoking large input files, you may pipe them using `<` syntax (e.g., `python solution.py < /tmp/large_input.txt`).\n"
+-            "- Use the `run_python` tool for executing Python scripts, specifying `stdin` if needed, and set an appropriate timeout to avoid hanging.\n"
+-            "- Avoid long‑running interactive bash sessions; each bash tool call starts a fresh process with a reduced timeout.\n"
+-            "- The generator must randomize parameter regimes (tiny and larger sizes, small value ranges for many duplicates, answer‑exists vs. not‑exists).\n"
+-            "- The performance test must use adversarial worst‑case inputs that avoid early exit (e.g., an unsatisfiable instance with N at max).\n"
+-            "- Before finalizing, state the worst‑case complexity of the solution relative to the max constraints and, if it is too slow, redesign the algorithm instead of declaring success; do not claim a test was done unless it was actually executed."
++        # Phase 1: Build test harness (once)
++        test_dir = '/tmp/agent_tests'
++        os.makedirs(test_dir, exist_ok=True)
++        test_builder_prompt = (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++            "Help construct a test harness for the problem. Create the following files in "
++            f"{test_dir}: brute.py (reference solution), gen.py (random test generator), "
++            "samples.json (sample tests from the statement). Ensure the brute solution passes the samples."
+         )
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log("[Phase 1] Building test harness")
++        chat_with_agent(test_builder_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++        best_patch = ''
++        best_score = -1
++        best_report = None
++        attempts_info = []
++
++        for attempt in range(self.max_attempts):
++            safe_log(f"[Attempt {attempt+1}/{self.max_attempts}] Resetting repo to base commit")
++            reset_to_commit(self.git_tempdir, self.base_commit)
++
++            # Build prompt for this attempt
++            previous_section = ''
++            if attempts_info:
++                prev_texts = []
++                for i, info in enumerate(attempts_info, 1):
++                    prev_texts.append(f"Attempt {i}: Score={info['score']}, Patch Summary: {info.get('patch_summary','')}, Reflection: {info.get('reflection','')}")
++                previous_section = "Previous attempts:\n" + "\n".join(prev_texts) + "\n"
++            attempt_prompt = (
++                f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++                f"Problem statement:\n{self.problem_statement}\n\n"
++                f"{previous_section}"
++                "Please modify the repository to solve the problem. Provide the changes as file edits."
++            )
++            safe_log(f"[Attempt {attempt+1}] Sending prompt to LLM")
++            chat_with_agent(attempt_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++            # Compute the patch produced by this attempt
++            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++            if not patch.strip():
++                safe_log(f"[Attempt {attempt+1}] No changes detected, skipping evaluation.")
++                attempts_info.append({'score': -1, 'patch': patch, 'reflection': 'No changes'})
++                continue
++
++            # Evaluate the patch using the evaluation tool
++            try:
++                from tools.evaluate_solution import tool_function as evaluate_tool
++                report_str = evaluate_tool(
++                    repo_path=self.git_tempdir,
++                    tests_dir=test_dir,
++                    class_name=None,
++                    iterations=100,
++                    timeout=self.attempt_timeout
++                )
++                # Simple scoring based on passed count in report
++                passed = 0
++                total = 0
++                for line in report_str.splitlines():
++                    if line.startswith('Sample') and 'PASS' in line:
++                        passed += 1
++                    if line.startswith('Sample'):
++                        total += 1
++                if 'All' in report_str and 'random tests passed' in report_str:
++                    passed += 100
++                score = passed
++            except Exception as e:
++                safe_log(f"[Attempt {attempt+1}] Evaluation tool failed: {e}")
++                score = -1
++                report_str = str(e)
++
++            safe_log(f"[Attempt {attempt+1}] Score: {score}\nReport: {report_str}")
++
++            attempts_info.append({
++                'score': score,
++                'patch': patch,
++                'report': report_str,
++                'reflection': f"Reflect on why score {score} was obtained."
++            })
++
++            if score > best_score:
++                best_score = score
++                best_patch = patch
++                best_report = report_str
++
++            if score > 0:
++                safe_log(f"[Attempt {attempt+1}] Obtained satisfactory score, breaking out of attempts.")
++                break
++
++        # Apply the best patch
++        safe_log("Applying best patch to repository")
++        reset_to_commit(self.git_tempdir, self.base_commit)
++        if best_patch:
++            apply_patch(self.git_tempdir, best_patch)
++        else:
++            safe_log("No patch to apply.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+@@ -188,6 +258,8 @@ def main():
+     parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+     parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+     parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
++    parser.add_argument('--max_attempts', type=int, default=3, help='Maximum number of solving attempts')
++    parser.add_argument('--attempt_timeout', type=int, default=30, help='Timeout per attempt in seconds')
+     args = parser.parse_args()
+ 
+     # Process the repository
+@@ -199,6 +271,8 @@ def main():
+         test_description=args.test_description,
+         self_improve=args.self_improve,
+         language=args.language,
++        max_attempts=args.max_attempts,
++        attempt_timeout=args.attempt_timeout,
+     )
+ 
+     # Run the agentic system to try to solve the problem
+diff --git a/tools/__init__.py b/tools/__init__.py
+index 89518f4..670e931 100644
+--- a/tools/__init__.py
++++ b/tools/__init__.py
+@@ -1,5 +1,12 @@
+ from pathlib import Path
+ import importlib
++import os
++import sys
++
++# Ensure the repository root is in sys.path so that imports like `import tools.edit` work when the cwd is not the repo root.
++repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
++if repo_root not in sys.path:
++    sys.path.insert(0, repo_root)
+ 
+ def load_all_tools(logging=print):
+     tools_dir = Path(__file__).parent
+diff --git a/tools/evaluate_solution.py b/tools/evaluate_solution.py
+new file mode 100644
+index 0000000..6f0d7c5
+--- /dev/null
++++ b/tools/evaluate_solution.py
+@@ -0,0 +1,180 @@
++import subprocess
++import os
++import json
++import sys
++import traceback
++from typing import Optional
++
++
++def tool_info():
++    """Return tool metadata for the evaluate_solution tool."""
++    return {
++        "name": "evaluate_solution",
++        "description": "Run a solution against generated tests and a brute-force reference, returning a report.",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "repo_path": {
++                    "type": "string",
++                    "description": "Path to the repository containing the candidate solution."
++                },
++                "tests_dir": {
++                    "type": "string",
++                    "description": "Directory containing test harness files: brute.py, gen.py, samples.json."
++                },
++                "class_name": {
++                    "type": ["string", "null"],
++                    "description": "If the problem expects a class method, the name of the class (e.g., 'Solution'). Null for script style."
++                },
++                "iterations": {
++                    "type": "integer",
++                    "description": "Number of random test iterations to run.",
++                    "default": 100
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Maximum seconds allowed for each test execution.",
++                    "default": 30
++                }
++            },
++            "required": ["repo_path", "tests_dir"]
++        }
++    }
++
++
++def _run_subprocess(cmd, cwd, timeout, input_data: str = None):
++    """Execute a command in a subprocess, returning stdout, stderr, and exit code.
++    ``input_data`` is sent to the process stdin if provided.
++    """
++    result = subprocess.run(
++        cmd,
++        cwd=cwd,
++        input=input_data,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++        timeout=timeout
++    )
++    return result.stdout, result.stderr, result.returncode
++
++
++def _load_json_file(path: str):
++    with open(path, 'r') as f:
++        return json.load(f)
++
++
++def tool_function(
++    repo_path: str,
++    tests_dir: str,
++    class_name: Optional[str] = None,
++    iterations: int = 100,
++    timeout: int = 30
++) -> str:
++    """Evaluate the candidate solution.
++
++    Expected files in ``tests_dir``:
++        - ``brute.py``: reference implementation exposing a ``solve`` function (or appropriate class method).
++        - ``gen.py``: script that prints a JSON object representing a single test input.
++        - ``samples.json``: array of ``{"input": ..., "output": ...}`` objects.
++    The repository at ``repo_path`` must contain ``solution.py`` (or appropriate file).
++    The tool runs the candidate on all samples, then on ``iterations`` random inputs generated by ``gen.py`` and compares the output to ``brute.py``.
++    It returns a textual report.
++    """
++    try:
++        repo_path = os.path.abspath(repo_path)
++        tests_dir = os.path.abspath(tests_dir)
++
++        brute_path = os.path.join(tests_dir, 'brute.py')
++        gen_path = os.path.join(tests_dir, 'gen.py')
++        samples_path = os.path.join(tests_dir, 'samples.json')
++
++        for p in (brute_path, gen_path, samples_path):
++            if not os.path.isfile(p):
++                return f"Error: required file {os.path.basename(p)} not found in {tests_dir}"
++
++        samples = _load_json_file(samples_path)
++        total_tests = len(samples)
++        passed = 0
++        report_lines = []
++
++        def run_solution(input_dict):
++            if class_name:
++                # Write a temporary runner script that imports the class and calls solve
++                runner_code = (
++                    "import json, sys; "
++                    f"sys.path.append('{repo_path}'); "
++                    f"from solution import {class_name} as Sol; "
++                    f"obj = Sol(); "
++                    "data = json.loads(sys.stdin.read()); "
++                    "result = obj.solve(**data); "
++                    "print(json.dumps(result))"
++                )
++                runner_path = os.path.join(tests_dir, 'run_solution.py')
++                with open(runner_path, 'w') as f:
++                    f.write(runner_code)
++                cmd = [sys.executable, runner_path]
++            else:
++                cmd = [sys.executable, os.path.join(repo_path, 'solution.py')]
++            stdin_data = json.dumps(input_dict)
++            return _run_subprocess(cmd, cwd=repo_path, timeout=timeout, input_data=stdin_data)
++
++        # Evaluate sample tests
++        for idx, case in enumerate(samples, 1):
++            inp = case.get('input')
++            expected = case.get('output')
++            stdout, stderr, rc = run_solution(inp)
++            try:
++                actual = json.loads(stdout.strip()) if stdout.strip() else stdout.strip()
++            except Exception:
++                actual = stdout.strip()
++            if rc == 0 and actual == expected:
++                passed += 1
++                report_lines.append(f"Sample {idx}: PASS")
++            else:
++                report_lines.append(f"Sample {idx}: FAIL (expected={expected}, actual={actual}, rc={rc})")
++                break
++
++        # Random tests against brute if all samples passed
++        if passed == total_tests:
++            # Helper to run brute
++            def run_brute(input_dict):
++                cmd = [sys.executable, brute_path]
++                stdin_data = json.dumps(input_dict)
++                return _run_subprocess(cmd, cwd=tests_dir, timeout=timeout, input_data=stdin_data)
++
++            for i in range(iterations):
++                gen_stdout, gen_stderr, gen_rc = _run_subprocess([sys.executable, gen_path], cwd=tests_dir, timeout=timeout)
++                if gen_rc != 0:
++                    report_lines.append(f"Generator failed at iteration {i+1}: rc={gen_rc}, err={gen_stderr.strip()}")
++                    break
++                try:
++                    input_dict = json.loads(gen_stdout.strip())
++                except Exception as e:
++                    report_lines.append(f"Invalid JSON from generator at iteration {i+1}: {e}")
++                    break
++                cand_stdout, cand_stderr, cand_rc = run_solution(input_dict)
++                brute_stdout, brute_stderr, brute_rc = run_brute(input_dict)
++                try:
++                    cand_output = json.loads(cand_stdout.strip()) if cand_stdout.strip() else cand_stdout.strip()
++                except Exception:
++                    cand_output = cand_stdout.strip()
++                try:
++                    brute_output = json.loads(brute_stdout.strip()) if brute_stdout.strip() else brute_stdout.strip()
++                except Exception:
++                    brute_output = brute_stdout.strip()
++                if cand_rc != 0 or cand_output != brute_output:
++                    report_lines.append(
++                        f"Random test {i+1}: FAIL (input={input_dict}, expected={brute_output}, actual={cand_output}, rc={cand_rc})"
++                    )
++                    break
++                else:
++                    passed += 1
++                    total_tests += 1
++            else:
++                report_lines.append(f"All {iterations} random tests passed.")
++
++        summary = f"Passed {passed}/{total_tests} tests."
++        return "\n".join([summary] + report_lines)
++    except Exception as e:
++        tb = traceback.format_exc()
++        return f"Evaluation tool encountered an exception: {e}\n{tb}"

@@ -1,0 +1,275 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0644afc..5baadff 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -151,6 +151,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         method = """Work like a careful competitive programmer:
+ 0. Within your first few actions, create /work/repo/solution.py with a working baseline (even brute force) using the editor tool. Do all experiments in a scratch directory, but the final answer must live in solution.py. Then overwrite solution.py with better versions as you learn more. Never end a turn without a tool call; keep replies short and do not write long analyses.
++0.5. Before coding, write the I/O contract. If the problem is interactive, or if sample_check finds no samples (it will say 'NO SAMPLES PARSED'), list how the hidden tests may feed stdin: (a) a true interactive pipe where the judge replies to each query, or (b) a static file containing the hidden data followed by the expected answer. The task says the program is run on stdin/stdout, so a static-file harness is likely: the program must not crash if the line it reads is not a single integer. Write the solution with a token-based reader (read all tokens lazily from a generator over sys.stdin, not line-based reads), and handle both modes: e.g. try parsing replies, and if the data format contains the hidden array, consume it as prefix data and compute answers locally. Never let the program crash on unexpected extra input when a safe fallback exists. Hand-build your own samples from the statement if none were parsed, and state your I/O assumptions. The final answer must be tested under both harness modes: use the `interactive_run` tool with mode 'interactive' (against a judge script) and mode 'flat' (against a static stdin file), and/or `sample_check` with `stdin_text`.
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool.
+ 3. Run the `sample_check` tool on solution.py after each solution version: `sample_check(solution_path='/work/repo/solution.py', problem_statement_path='/tmp/problem.md')` (the full statement is saved there; or pass samples_json). Every sample must show EXACT MATCH. Treat any mismatch as a failure, even when the problem says any valid answer is accepted. If the statement allows multiple answers and your output differs from the sample, do not stop: change tie-breaking, ordering, basis choice, or bit order (try the natural alternatives such as reversed bit order, highest vs lowest pivot, ascending vs descending iteration) until your output matches all sample outputs byte for byte. Keep a separate validity checker to verify that the output is still correct.
+diff --git a/tools/sample_check.py b/tools/sample_check.py
+index 4559dde..040a80c 100644
+--- a/tools/sample_check.py
++++ b/tools/sample_check.py
+@@ -22,7 +22,8 @@ def tool_info():
+                 "solution_path": {"type": "string", "description": "Path to the Python solution file to run (run as `python3 solution_path`)."},
+                 "problem_statement_path": {"type": "string", "description": "Optional path to a text file containing the problem statement with sample input/output blocks."},
+                 "samples_json": {"type": "string", "description": "Optional JSON list of objects with 'input' and 'expected' string fields (or a path to a file containing that JSON)."},
+-                "timeout": {"type": "integer", "description": "Per-sample time limit in seconds (default 10)."}
++                "timeout": {"type": "integer", "description": "Per-sample time limit in seconds (default 10)."},
++                "stdin_text": {"type": "string", "description": "Optional raw stdin text to run the solution on instead of parsing samples. The tool then reports stdout, stderr and the exit code."}
+             },
+             "required": ["solution_path"]
+         }
+@@ -106,19 +107,34 @@ def _norm_lines(text):
+     return lines
+ 
+ 
+-def tool_function(solution_path, problem_statement_path=None, samples_json=None, timeout=10):
++def _run_raw(solution_path, stdin_text, timeout):
++    try:
++        p = subprocess.run(['python3', solution_path], input=stdin_text, capture_output=True,
++                           text=True, timeout=timeout, errors='replace')
++    except subprocess.TimeoutExpired:
++        return f"TIMEOUT after {timeout} seconds (no exit code)."
++    return (f"exit code: {p.returncode}\n"
++            f"STDOUT:\n{p.stdout.rstrip()}\n"
++            f"STDERR:\n{p.stderr.rstrip()}")
++
++
++def tool_function(solution_path, problem_statement_path=None, samples_json=None, timeout=10, stdin_text=None):
+     if not solution_path or not os.path.isfile(solution_path):
+         return f"Error: solution file not found: {solution_path}"
+     try:
+         timeout = max(1, int(timeout or 10))
+     except (TypeError, ValueError):
+         timeout = 10
++    if stdin_text is not None:
++        return _run_raw(solution_path, str(stdin_text), timeout)
+     try:
+         samples = _load_samples(samples_json, problem_statement_path)
+     except Exception as e:
+         return f"Error: could not load samples: {e}"
+     if not samples:
+-        return "Error: no samples found. Provide samples_json or a statement with 'Sample Input N'/'Sample Output N' blocks."
++        return ("NO SAMPLES PARSED — construct your own from the statement and state your I/O assumptions. "
++                "Hand-build samples (samples_json) from the statement, and use stdin_text to run arbitrary stdin "
++                "(e.g. both an interactive-style reply format and a static-file format if the I/O is ambiguous).")
+ 
+     n = len(samples)
+     k = 0
+diff --git a/tools/interactive_run.py b/tools/interactive_run.py
+new file mode 100644
+index 0000000..94cd803
+--- /dev/null
++++ b/tools/interactive_run.py
+@@ -0,0 +1,206 @@
++import os
++import queue
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++
++MAX_TRANSCRIPT_LINES = 400
++MAX_QUERIES = 200000
++
++
++def tool_info():
++    return {
++        "name": "interactive_run",
++        "description": """Run a solution program under one of two harness styles and report the full transcript, stderr and exit code.\n
++* mode='interactive': spawns `judge_path` (a Python script that you write; it talks to the solution through its stdin/stdout pipes) and relays lines between the judge and the solution. Each line the solution prints is forwarded to the judge (counted as a query); each line the judge prints is forwarded to the solution. Per-line timeout applies to every wait.\n
++* mode='flat': feeds the static file `judge_path` (treated as plain data, not a script) to the solution as stdin, with no interaction. Use this to reproduce a harness that supplies all hidden data up front, followed by the expected answer.\n
++* Use both modes to check that the final solution works under every plausible harness. Output always includes the transcript (truncated in the middle if very long), the query count, stderr and the exit code.\n
++* The judge script must be general: it should only implement the problem's protocol as stated in the statement, not hardcode answers.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the Python solution file to run (run as `python3 solution_path`)."
++                },
++                "judge_path": {
++                    "type": "string",
++                    "description": "In mode 'interactive': path to a Python judge script run as `python3 judge_path`. In mode 'flat': path to a static stdin file fed verbatim to the solution."
++                },
++                "mode": {
++                    "type": "string",
++                    "description": "Either 'interactive' (relay lines between judge script and solution) or 'flat' (feed static stdin file)."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-line wait limit in seconds in interactive mode, and total run limit in seconds in flat mode (default 5)."
++                }
++            },
++            "required": ["solution_path", "judge_path", "mode"]
++        }
++    }
++
++
++def _clip_transcript(lines):
++    if len(lines) <= MAX_TRANSCRIPT_LINES:
++        return "\n".join(lines)
++    half = MAX_TRANSCRIPT_LINES // 2
++    skipped = len(lines) - 2 * half
++    return "\n".join(lines[:half] + [f"... <{skipped} transcript lines clipped> ..."] + lines[-half:])
++
++
++def _read_file(path):
++    try:
++        with open(path, 'r', encoding='utf-8', errors='replace') as f:
++            return f.read()
++    except OSError:
++        return ''
++
++
++def _run_flat(solution_path, stdin_path, timeout):
++    if not os.path.isfile(stdin_path):
++        return f"Error: stdin file not found: {stdin_path}"
++    data = _read_file(stdin_path)
++    try:
++        p = subprocess.run([sys.executable, solution_path], input=data, capture_output=True,
++                           text=True, timeout=timeout, errors='replace')
++    except subprocess.TimeoutExpired:
++        return f"mode: flat\nRESULT: TIMEOUT after {timeout} seconds\n"
++    return (f"mode: flat\nRESULT: exit code {p.returncode}\n"
++            f"STDIN ({len(data)} chars) fed from {stdin_path}\n"
++            f"STDOUT:\n{p.stdout.rstrip()}\n"
++            f"STDERR:\n{p.stderr.rstrip()}\n")
++
++
++def _reader(stream, tag, q):
++    try:
++        for line in iter(stream.readline, ''):
++            q.put((tag, line.rstrip('\r\n')))
++    except (ValueError, OSError):
++        pass
++    q.put((tag + '_eof', None))
++
++
++def _run_interactive(solution_path, judge_path, timeout):
++    if not os.path.isfile(judge_path):
++        return f"Error: judge script not found: {judge_path}"
++    tmpdir = tempfile.mkdtemp(prefix='ireq_')
++    sol_err_path = os.path.join(tmpdir, 'sol_stderr.txt')
++    judge_err_path = os.path.join(tmpdir, 'judge_stderr.txt')
++    transcript = []
++    queries = 0
++    q = queue.Queue()
++    notes = []
++    with open(sol_err_path, 'w') as sol_err, open(judge_err_path, 'w') as judge_err:
++        sol = subprocess.Popen([sys.executable, solution_path], stdin=subprocess.PIPE,
++                               stdout=subprocess.PIPE, stderr=sol_err, text=True, bufsize=1)
++        judge = subprocess.Popen([sys.executable, judge_path], stdin=subprocess.PIPE,
++                                 stdout=subprocess.PIPE, stderr=judge_err, text=True, bufsize=1)
++        threading.Thread(target=_reader, args=(sol.stdout, 'sol', q), daemon=True).start()
++        threading.Thread(target=_reader, args=(judge.stdout, 'judge', q), daemon=True).start()
++
++        result = 'OK'
++        sol_done = judge_done = False
++
++        def send(proc, text):
++            try:
++                proc.stdin.write(text + '\n')
++                proc.stdin.flush()
++                return True
++            except (BrokenPipeError, OSError, ValueError):
++                return False
++
++        # Bounded event loop: every iteration consumes one queue event or ends the run.
++        for _ in range(MAX_QUERIES * 4):
++            try:
++                tag, line = q.get(timeout=timeout)
++            except queue.Empty:
++                result = f'TIMEOUT: no output from either side for {timeout} seconds'
++                break
++            if tag == 'sol':
++                transcript.append(f"SOL> {line}")
++                queries += 1
++                if queries > MAX_QUERIES:
++                    result = f'Stopped: more than {MAX_QUERIES} lines from solution'
++                    break
++                if not judge_done and not send(judge, line):
++                    notes.append('could not write to judge (judge exited)')
++                    judge_done = True
++            elif tag == 'judge':
++                transcript.append(f"JUDGE> {line}")
++                if not sol_done and not send(sol, line):
++                    notes.append('could not write to solution (solution exited)')
++                    sol_done = True
++            elif tag == 'sol_eof':
++                sol_done = True
++                transcript.append("<solution closed stdout>")
++                if judge_done:
++                    break
++                # Let the judge finish reading and report.
++                try:
++                    judge.stdin.close()
++                except OSError:
++                    pass
++            elif tag == 'judge_eof':
++                judge_done = True
++                transcript.append("<judge closed stdout>")
++                if sol_done:
++                    break
++                try:
++                    sol.stdin.close()
++                except OSError:
++                    pass
++        else:
++            result = 'Stopped: event limit reached'
++
++        for proc in (sol, judge):
++            try:
++                if proc.stdin and not proc.stdin.closed:
++                    proc.stdin.close()
++            except OSError:
++                pass
++        for proc in (sol, judge):
++            try:
++                proc.wait(timeout=2)
++            except subprocess.TimeoutExpired:
++                proc.kill()
++                proc.wait()
++
++    sol_rc = sol.returncode
++    judge_rc = judge.returncode
++    sol_stderr = _read_file(sol_err_path).rstrip()
++    judge_stderr = _read_file(judge_err_path).rstrip()
++    if result == 'OK' and sol_rc != 0:
++        result = f'SOLUTION CRASHED (exit code {sol_rc})'
++    out = [
++        "mode: interactive",
++        f"RESULT: {result}",
++        f"queries (solution lines sent to judge): {queries}",
++        f"solution exit code: {sol_rc}",
++        f"judge exit code: {judge_rc}",
++    ]
++    out.extend(notes)
++    out.append("TRANSCRIPT:")
++    out.append(_clip_transcript(transcript))
++    out.append("SOLUTION STDERR:")
++    out.append(sol_stderr if sol_stderr else "(empty)")
++    out.append("JUDGE STDERR:")
++    out.append(judge_stderr if judge_stderr else "(empty)")
++    return "\n".join(out) + "\n"
++
++
++def tool_function(solution_path, judge_path, mode, timeout=5):
++    if not solution_path or not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    try:
++        timeout = max(1, int(timeout or 5))
++    except (TypeError, ValueError):
++        timeout = 5
++    mode = (mode or '').strip().lower()
++    if mode == 'flat':
++        return _run_flat(solution_path, judge_path, timeout)
++    if mode == 'interactive':
++        return _run_interactive(solution_path, judge_path, timeout)
++    return f"Error: mode must be 'interactive' or 'flat', got {mode!r}"

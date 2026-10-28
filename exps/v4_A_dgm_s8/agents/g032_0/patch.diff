@@ -1,0 +1,213 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e594c03..2dd2071 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,5 @@
+ import argparse
++import ast
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -128,10 +129,73 @@ def _extract_last_code_block(text):
+         return None
+     blocks = re.findall(r'```(?:python|py)?[ \t]*\n(.*?)```', text, re.DOTALL)
+     if not blocks:
+-        return None
++        # Unfenced fallback: accept the whole response if it is valid Python
++        stripped = text.strip()
++        if not stripped:
++            return None
++        try:
++            ast.parse(stripped)
++        except (SyntaxError, ValueError):
++            return None
++        return stripped + "\n"
+     code = blocks[-1].strip('\n')
+     return code + "\n" if code.strip() else None
+ 
++def _is_text_block(block):
++    if isinstance(block, dict):
++        return block.get('type') == 'text'
++    return getattr(block, 'type', None) == 'text'
++
++def _block_text(block):
++    if isinstance(block, dict):
++        return block.get('text')
++    return getattr(block, 'text', None)
++
++def _sanitize_history(msg_history):
++    """
++    Return a new history with empty/whitespace-only text blocks removed, messages with no
++    remaining content dropped, and trailing empty assistant turns removed. tool_use and
++    tool_result blocks are kept intact so tool pairing stays valid.
++    """
++    if not msg_history:
++        return []
++    cleaned = []
++    for msg in msg_history:
++        if isinstance(msg, dict):
++            role = msg.get('role')
++            content = msg.get('content')
++        else:
++            role = getattr(msg, 'role', None)
++            content = getattr(msg, 'content', None)
++        if isinstance(content, str):
++            if not content.strip():
++                continue
++            new_content = content
++        elif isinstance(content, list):
++            new_content = []
++            for block in content:
++                if _is_text_block(block):
++                    text = _block_text(block)
++                    if not isinstance(text, str) or not text.strip():
++                        continue
++                if block is None:
++                    continue
++                new_content.append(block)
++            if not new_content:
++                continue
++        else:
++            continue
++        if isinstance(msg, dict):
++            new_msg = dict(msg)
++            new_msg['content'] = new_content
++        else:
++            new_msg = {'role': role, 'content': new_content}
++        cleaned.append(new_msg)
++    # Remove trailing assistant turns with no content
++    while cleaned and cleaned[-1].get('role') == 'assistant' and not cleaned[-1].get('content'):
++        cleaned.pop()
++    return cleaned
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -263,6 +327,19 @@ class AgenticSystem:
+         except OSError:
+             return "(unreadable)"
+ 
++    def _safe_chat(self, prompt, msg_history):
++        """
++        chat_with_agent wrapper: sanitizes history before/after, never raises.
++        On error returns the sanitized previous history.
++        """
++        try:
++            hist = chat_with_agent(prompt, model=self.code_model,
++                                   msg_history=_sanitize_history(msg_history), logging=safe_log)
++            return _sanitize_history(hist) if hist else _sanitize_history(msg_history)
++        except Exception as e:
++            safe_log(f'[chat error] {e}')
++            return _sanitize_history(msg_history)
++
+     def _fallback_write_solution(self, deliverable):
+         """
+         Tool-free LLM request for only the full solution; writes the last fenced code block
+@@ -326,33 +403,35 @@ Follow this workflow:
+ 6. Confirm with `git diff` that the source file has actually changed.
+ 
+ Do not end your turn with an empty message, and do not end with only a plan: you must actually edit the source file before finishing.
++
++For interactive problems, write the full program first without trying to run it against the real judge (it cannot be run that way); then optionally test it with a small local mock judge written in Python.
+ """
+         msg_history = []
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        msg_history = init_edit if init_edit else []
+-
+-        deliverable = self._find_deliverable_file()
+-        safe_log(f"[verify] deliverable file: {deliverable}")
+-
+-        # Verification: nudge on the existing history first, then fresh-slate retries
+-        for attempt in range(4):
+-            if self._has_source_edits():
+-                break
+-            changed = self._changed_files()
+-            last_text = _last_assistant_text(msg_history).strip()
+-            target = deliverable or "the main solution file"
+-            safe_log(f"[verify] attempt {attempt + 1}: no source edits yet. Changed files: {changed}. "
+-                     f"Last assistant text empty: {not last_text}")
+-            if attempt == 0:
+-                nudge = (f"You ended your turn without editing any file. Use the editor tool now to write "
+-                         f"the full solution into {target} in {self.git_tempdir}. Do not reply with text only.")
+-                new_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-                msg_history = new_history if new_history else msg_history
+-                continue
+-            # Fresh-slate retry with a new conversation
+-            current = self._read_deliverable(deliverable) if deliverable else "(no deliverable file found)"
+-            escalation = ["", "IMPORTANT: ", "FINAL WARNING: the task fails unless the file is written. "][min(attempt - 1, 2)]
+-            fresh = f"""{escalation}Your previous attempts did not modify any source file. The task is NOT complete yet.
++        deliverable = None
++        try:
++            msg_history = self._safe_chat(instruction, msg_history)
++
++            deliverable = self._find_deliverable_file()
++            safe_log(f"[verify] deliverable file: {deliverable}")
++
++            # Verification: nudge on the existing history first, then fresh-slate retries
++            for attempt in range(4):
++                if self._has_source_edits():
++                    break
++                changed = self._changed_files()
++                last_text = _last_assistant_text(msg_history).strip()
++                target = deliverable or "the main solution file"
++                safe_log(f"[verify] attempt {attempt + 1}: no source edits yet. Changed files: {changed}. "
++                         f"Last assistant text empty: {not last_text}")
++                if attempt == 0 and last_text:
++                    nudge = (f"You ended your turn without editing any file. Use the editor tool now to write "
++                             f"the full solution into {target} in {self.git_tempdir}. Do not reply with text only.")
++                    msg_history = self._safe_chat(nudge, msg_history)
++                    continue
++                # Fresh-slate retry with a new conversation
++                current = self._read_deliverable(deliverable) if deliverable else "(no deliverable file found)"
++                escalation = ["", "IMPORTANT: ", "FINAL WARNING: the task fails unless the file is written. "][min(attempt - 1, 2) if attempt > 0 else 0]
++                fresh = f"""{escalation}Your previous attempts did not modify any source file. The task is NOT complete yet.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -366,16 +445,29 @@ Current contents:
+ 
+ The very first action must be the editor tool with command=edit (or create) that writes the ENTIRE file_text containing the complete working solution to {target}. Do not plan first, do not reply with an empty message. After writing, run the sample inputs with bash and fix any failures.
+ """
+-            new_history = chat_with_agent(fresh, model=self.code_model, msg_history=[], logging=safe_log)
+-            if new_history:
+-                msg_history = new_history
++                new_history = self._safe_chat(fresh, [])
++                if new_history:
++                    msg_history = new_history
++        except Exception as e:
++            safe_log(f"[verify] error in recovery loop: {e}")
+ 
+         # Deterministic fallback: tool-free request, write the code block directly
+-        if not self._has_source_edits() and deliverable:
+-            safe_log("[verify] still no source edits; using deterministic fallback")
+-            self._fallback_write_solution(deliverable)
+-        elif not self._has_source_edits():
+-            safe_log("[verify] no source edits and no deliverable file found; skipping fallback")
++        if not self._has_source_edits():
++            if deliverable:
++                safe_log("[verify] still no source edits; using deterministic fallback")
++                written = False
++                for fb_attempt in range(2):
++                    try:
++                        written = self._fallback_write_solution(deliverable)
++                    except Exception as e:
++                        safe_log(f"[fallback] error: {e}")
++                        written = False
++                    if written:
++                        break
++                    if fb_attempt == 0:
++                        safe_log("[fallback] first attempt failed; retrying once")
++            else:
++                safe_log("[verify] no source edits and no deliverable file found; skipping fallback")
+ 
+         # Final pass: run the samples and fix failures, only if source edits exist
+         if self._has_source_edits():
+@@ -385,7 +477,7 @@ The very first action must be the editor tool with command=edit (or create) that
+ {self.problem_statement}
+ </problem_description>
+ """
+-            chat_with_agent(final_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            self._safe_chat(final_prompt, msg_history)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

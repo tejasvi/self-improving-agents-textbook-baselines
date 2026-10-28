@@ -1,0 +1,231 @@
+diff --git a/llm.py b/llm.py
+index f896312..f8ca5ba 100644
+--- a/llm.py
++++ b/llm.py
+@@ -2,6 +2,7 @@
+ import json
+ import os
+ import re
++import threading
+ 
+ import anthropic
+ import backoff
+@@ -184,6 +185,12 @@ def _first_choice_content(response):
+         return ""
+     return getattr(choices[0].message, "content", None) or ""
+ 
++_stop_state = threading.local()
++
++def get_last_stop_reason():
++    """stop_reason of the most recent Claude response made by this thread (None if unknown)."""
++    return getattr(_stop_state, "stop_reason", None)
++
+ def get_response_from_llm(
+         msg,
+         client,
+@@ -192,11 +199,13 @@ def get_response_from_llm(
+         print_debug=False,
+         msg_history=None,
+         temperature=0.7,
++        max_tokens=MAX_OUTPUT_TOKENS,
+ ):
+     if msg_history is None:
+         msg_history = []
+ 
+     if "claude" in model:
++        _stop_state.stop_reason = None
+         new_msg_history = msg_history + [
+             {
+                 "role": "user",
+@@ -210,11 +219,12 @@ def get_response_from_llm(
+         ]
+         response = client.messages.create(
+             model=model,
+-            max_tokens=MAX_OUTPUT_TOKENS,
++            max_tokens=max_tokens,
+             temperature=temperature,
+             system=system_message,
+             messages=new_msg_history,
+         )
++        _stop_state.stop_reason = getattr(response, "stop_reason", None)
+         content = _first_text_claude(response)
+         new_msg_history = new_msg_history + [
+             {
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 59544a7..a48a558 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -6,8 +6,11 @@ import backoff
+ import openai
+ import copy
+ import time
++import threading
+ 
+-from llm import create_client, get_response_from_llm
++from llm import create_client, get_response_from_llm, _stop_state, MAX_OUTPUT_TOKENS
++
++MAX_OUTPUT_TOKENS_MANUAL = MAX_OUTPUT_TOKENS
+ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+@@ -40,17 +43,30 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+ )
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=None, max_retry=3, max_tokens=4096, thinking_budget=None,
+ ):
++    """
++    max_tokens: output cap for Claude requests.
++    thinking_budget: optional extended-thinking budget (tokens); None disables extended thinking.
++    """
++    if logging is None:
++        logging = print
+     try:
+         if 'claude' in model:
++            kwargs = {}
++            if thinking_budget:
++                kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': int(thinking_budget)}
++            logging(f"get_response_withtools params: model={model}, max_tokens={max_tokens}, "
++                    f"thinking_budget={thinking_budget}, n_messages={len(messages)}")
+             response = client.messages.create(
+                 model=model,
+                 messages=messages,
+-                max_tokens=4096,
++                max_tokens=max_tokens,
+                 tool_choice=tool_choice,
+                 tools=tools,
++                **kwargs,
+             )
++            _stop_state.stop_reason = getattr(response, 'stop_reason', None)
+         elif model.startswith('o3-'):
+             response = client.responses.create(
+                 model=model,
+@@ -66,7 +82,8 @@ def get_response_withtools(
+     except Exception as e:
+         logging(f"Error in get_response_withtools: {str(e)}")
+         if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
++            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1,
++                                          max_tokens=max_tokens, thinking_budget=thinking_budget)
+ 
+         # Hitting the context window limit
+         if 'Input is too long for requested model' in str(e):
+@@ -309,7 +326,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+         response, new_msg_history = call_with_retry(
+             get_response_from_llm,
+             msg, client, client_model, system_message,
+-            logging=logging, empty_model=client_model,
++            logging=logging, empty_model=client_model, max_tokens=4096,
+             print_debug=False, msg_history=new_msg_history,
+         ) or ("", new_msg_history)
+         logging(f"Output: {response}")
+@@ -366,7 +383,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+             response, new_msg_history = call_with_retry(
+                 get_response_from_llm,
+                 resend, client, client_model, system_message,
+-                logging=logging, empty_model=client_model,
++                logging=logging, empty_model=client_model, max_tokens=4096,
+                 print_debug=False, msg_history=base_history,
+             ) or ("", base_history)
+             logging(f"Output: {response}")
+@@ -405,31 +422,70 @@ def _is_empty_response(response, model=''):
+ 
+ NUDGE_MARKER = "[nudge]"
+ 
+-def call_with_retry(fn, *args, max_attempts=4, logging=print, empty_model='', **kwargs):
++MAX_OUTPUT_CAP = 8192  # model output cap used when growing max_tokens after an empty max_tokens stop
++
++
++def _stop_reason_of(resp):
++    """stop_reason of a raw response, or of the last Claude call in this thread for (text, history) tuples."""
++    sr = getattr(resp, 'stop_reason', None)
++    if sr is None and isinstance(resp, tuple):
++        sr = getattr(_stop_state, 'stop_reason', None)
++    return sr
++
++
++def _grow_request(kwargs, attempt):
++    """
++    Default adjustment for an empty max_tokens response: double max_tokens (capped at MAX_OUTPUT_CAP)
++    when the call carries it, and drop extended-thinking settings so the whole budget goes to output.
++    Returns the new kwargs (the original dict is not mutated).
++    """
++    new_kwargs = dict(kwargs)
++    if 'max_tokens' in new_kwargs:
++        new_kwargs['max_tokens'] = min(int(new_kwargs['max_tokens']) * 2, MAX_OUTPUT_CAP)
++    new_kwargs.pop('thinking_budget', None)
++    return new_kwargs
++
++
++def call_with_retry(fn, *args, max_attempts=4, logging=print, empty_model='', adjust=None, **kwargs):
+     """
+     Call fn(*args, **kwargs) with bounded retries (for loop, exponential backoff, no while loop).
+     Exceptions are logged with repr(e). A result is invalid when it is empty (see _is_empty_response);
+     then stop_reason and the content block count are logged. Tuple results (content, history) are
+     judged by their first element. Returns the last valid result, or the last empty result if every
+     attempt was empty, or None if every attempt raised. `empty_model` is used only for the emptiness check.
++
++    If an empty result has stop_reason == 'max_tokens', the identical request is NOT resent: the next
++    attempt uses kwargs = adjust(kwargs, attempt) (default: _grow_request, which doubles max_tokens up
++    to MAX_OUTPUT_CAP and drops extended thinking). The parameters used for each attempt are logged.
+     """
++    adjust = adjust or _grow_request
+     last_resp = None
+     for attempt in range(max_attempts):
++        logging(f"call_with_retry attempt {attempt + 1}/{max_attempts}: "
++                f"max_tokens={kwargs.get('max_tokens')}, thinking_budget={kwargs.get('thinking_budget')}")
+         try:
+             resp = fn(*args, **kwargs)
+         except Exception as e:
+             logging(f"LLM call failed (attempt {attempt + 1}/{max_attempts}): {e!r}")
++            resp = None
++            raised = True
+         else:
++            raised = False
+             judged = resp[0] if isinstance(resp, tuple) and resp else resp
+             if not _is_empty_response(judged, model=empty_model or ''):
+                 return resp
++            stop_reason = _stop_reason_of(resp)
+             logging(
+                 f"Empty LLM response (attempt {attempt + 1}/{max_attempts}): "
+-                f"stop_reason={getattr(judged, 'stop_reason', None)}, "
++                f"stop_reason={stop_reason}, "
+                 f"content_blocks={len(getattr(judged, 'content', None) or [])}"
+             )
+             last_resp = resp
+         if attempt < max_attempts - 1:
++            if not raised and _stop_reason_of(last_resp) == 'max_tokens':
++                kwargs = adjust(kwargs, attempt)
++                logging(f"Empty max_tokens stop: retrying with changed params {kwargs.get('max_tokens')=}, "
++                        f"thinking_budget={kwargs.get('thinking_budget')}")
+             time.sleep(2 ** attempt)
+     return last_resp
+ 
+@@ -498,7 +554,7 @@ def chat_with_agent_claude(
+             get_response_withtools,
+             client, client_model, msg_history + new_msg_history,
+             tools, {"type": "auto"}, logging,
+-            logging=logging, empty_model=client_model,
++            logging=logging, empty_model=client_model, max_tokens=4096,
+         )
+ 
+         final_response = None
+@@ -529,7 +585,7 @@ def chat_with_agent_claude(
+                     get_response_withtools,
+                     client, client_model, msg_history + new_msg_history,
+                     tools, {"type": "auto"}, logging,
+-                    logging=logging, empty_model=client_model,
++                    logging=logging, empty_model=client_model, max_tokens=4096,
+                 )
+ 
+                 # Check for next tool use
+@@ -552,7 +608,7 @@ def chat_with_agent_claude(
+                 get_response_withtools,
+                 client, client_model, msg_history + new_msg_history,
+                 tools, {"type": "auto"}, logging,
+-                logging=logging, empty_model=client_model,
++                logging=logging, empty_model=client_model, max_tokens=4096,
+             )
+         if final_response is not None and not gave_up:
+             new_msg_history.append({

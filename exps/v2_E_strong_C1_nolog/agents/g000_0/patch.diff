@@ -1,0 +1,400 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..e7627ca 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,8 @@
+ import argparse
++import re
+ import subprocess
++import sys
++import tempfile
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -39,6 +42,54 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++
++MAX_REPAIR_ROUNDS = 3
++
++TASK_TEMPLATE = """I have uploaded a code repository in the directory {git_tempdir}. Help solve the following problem.
++
++<problem_description>
++{problem_statement}
++</problem_description>
++
++Your task is to make changes to the files in the {git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++
++The final program is {git_tempdir}/solution.py. It is either a complete program that reads standard input and writes standard output, or a method of a given `Solution` class (if the statement defines one). If it is a `Solution` class method, solution.py must define the class at top level (start the file with `from typing import *` and any other needed imports). Test it through a separate helper driver script, which is not graded."""
++
++PLAN_PROMPT = """PHASE 1 - PLAN. Do not write solution.py yet.
++Read the problem statement carefully and write {git_tempdir}/notes.md containing:
++- the input/output format and the exact signature if a `Solution` class method is required;
++- every constraint (n, value ranges, time limit) and what they imply;
++- the chosen algorithm, its time and memory complexity, and why it fits the limits (Python does roughly 10^7 simple operations per second);
++- edge cases to check: n=1, empty input, duplicates, all equal, negatives, maximum values, worst-case structure.
++Keep it concise. Then stop; the next phase will implement it."""
++
++IMPLEMENT_PROMPT = """PHASE 2 - IMPLEMENT. Using notes.md, write these files in {git_tempdir}:
++1. solution.py: the efficient solution. For stdin programs, read via input()/sys.stdin and print the answer. For a `Solution` class method, define the class exactly as the statement specifies.
++2. brute.py: a simple, obviously-correct brute-force reference that reads the same stdin format and prints the same output (for a `Solution` class, the brute force may also be a class method, but it must be reachable from the driver described below).
++3. gen.py: a random generator of SMALL valid inputs. It takes one integer seed argument (`python3 gen.py <seed>`), seeds `random` with it, and prints exactly one test input to stdout. Keep sizes small enough that brute.py runs quickly, but include edge cases (n=1, duplicates, negatives, extreme values in the allowed range).
++For a `Solution` class problem, also write driver.py that reads a stdin test input, builds the arguments, calls the method and prints the result in the required format, so that solution.py and brute.py can both be tested through stdin. Then run the solution on every sample in the statement and compare with the expected outputs exactly."""
++
++VERIFY_PROMPT = """PHASE 3 - VERIFY. Use the tools as follows:
++1. Run the stress_test tool with solution_path={git_tempdir}/solution.py, brute_path={git_tempdir}/brute.py, generator_path={git_tempdir}/gen.py (for a `Solution` class problem, use the driver script as solution_path and brute_path). Use num_tests of at least 300.
++2. If it reports a mismatch, crash or timeout, read the printed counterexample, find the bug in solution.py (or in brute.py if the brute force is wrong), fix it, and rerun stress_test until it prints ALL N TESTS PASSED.
++3. Generate a maximum-size valid input (e.g. with a small script writing {git_tempdir}/big.txt) and run the time_check tool on solution.py with it. Make sure the wall time is well under 2 seconds; if not, optimize the algorithm (not just micro-tweaks).
++4. Re-run the samples from the statement and compare exactly.
++Repeat until all checks pass, then stop and summarize the results."""
++
++REPAIR_PROMPT = """The automatic verification of {git_tempdir} found the following problems with the current state. Fix them (raw output below, no further interpretation):
++
++{report}
++
++After fixing, make sure solution.py exists and compiles, and rerun stress_test if you changed the algorithm. Then stop."""
++
++REVIEW_PROMPT = """PHASE 4 - FINAL REVIEW. You are reviewing work done by someone else. Re-read the problem statement below and the file {git_tempdir}/solution.py.
++
++<problem_description>
++{problem_statement}
++</problem_description>
++
++List every constraint, the I/O format and the edge cases (n=1, empty, duplicates, max values, negatives, overflow-free). Mentally trace the samples, run them again, and fix any bug found. Do not rewrite working code unnecessarily. Make sure solution.py is complete, compiles, and prints/returns exactly the required format."""
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -137,27 +188,88 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _verify_state(self):
++        """
++        Sanity-check the state of the repository after the agent's edits.
++        Returns (problems, warnings): lists of raw text. Problems trigger a repair round.
++        """
++        problems, warnings = [], []
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(sol_path):
++            problems.append(f"solution.py does not exist at {sol_path}.")
++            return problems, warnings
++
++        # Compile check (bytecode is written to a temp file so the repo stays clean).
++        with tempfile.TemporaryDirectory() as tmpd:
++            p = subprocess.run(
++                [sys.executable, '-m', 'py_compile', sol_path],
++                capture_output=True, text=True, env={**os.environ, 'PYTHONPYCACHEPREFIX': tmpd},
++            )
++        if p.returncode != 0:
++            problems.append("`python3 -m py_compile solution.py` failed:\n" + (p.stderr or p.stdout).strip())
++
++        with open(sol_path, 'r', errors='replace') as f:
++            code = f.read()
++        lines = code.split('\n')
++
++        if re.search(r'class\s+Solution\b', self.problem_statement) or re.search(r'`Solution`', self.problem_statement):
++            if not re.search(r'^\s*class\s+Solution\b', code, re.M):
++                problems.append("The problem statement refers to a `Solution` class, but solution.py has no `class Solution`.")
++
++        for i, line in enumerate(lines, 1):
++            if re.search(r'\bprint\s*\(', line) and re.search(r'debug', line, re.I):
++                problems.append(f"Leftover debug output at solution.py line {i}: {line.strip()}")
++            if re.search(r'\bbreakpoint\(\)|\bpdb\.set_trace\(', line):
++                problems.append(f"Leftover debugger call at solution.py line {i}: {line.strip()}")
++
++        # Heuristic warning: input() inside a loop is slow for large inputs.
++        loop_indent = None
++        for i, line in enumerate(lines, 1):
++            stripped = line.lstrip()
++            indent = len(line) - len(stripped)
++            if loop_indent is not None and stripped and indent <= loop_indent:
++                loop_indent = None
++            if loop_indent is None and re.match(r'(for|while)\b.*:\s*$', stripped):
++                loop_indent = indent
++                continue
++            if loop_indent is not None and re.search(r'\binput\s*\(', line):
++                warnings.append(f"input() is called inside a loop at solution.py line {i}; read all input at once via sys.stdin for speed.")
++                break
++        return problems, warnings
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Phases: plan -> implement -> verify (stress test + timing) -> bounded repair loop -> fresh-context review.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++        task = TASK_TEMPLATE.format(git_tempdir=self.git_tempdir, problem_statement=self.problem_statement)
+ 
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
++        # (a) Plan
++        plan_instruction = f"{task}\n\n{PLAN_PROMPT.format(git_tempdir=self.git_tempdir)}"
++        msg_history = chat_with_agent(plan_instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++        # (b) Implement solution.py, brute.py and gen.py
++        msg_history = chat_with_agent(IMPLEMENT_PROMPT.format(git_tempdir=self.git_tempdir),
++                                      model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        # (c) Verify with the stress_test tool and a max-size timing run
++        msg_history = chat_with_agent(VERIFY_PROMPT.format(git_tempdir=self.git_tempdir),
++                                      model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        # (d) Bounded repair loop driven by the verification gate
++        for _ in range(MAX_REPAIR_ROUNDS):
++            problems, warnings = self._verify_state()
++            if not problems:
++                break
++            report = "\n\n".join(problems)
++            if warnings:
++                report += "\n\nWarnings (advisory):\n" + "\n".join(warnings)
++            msg_history = chat_with_agent(REPAIR_PROMPT.format(git_tempdir=self.git_tempdir, report=report),
++                                          model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        # (e) Final review with a fresh context
++        chat_with_agent(REVIEW_PROMPT.format(git_tempdir=self.git_tempdir, problem_statement=self.problem_statement),
++                        model=self.code_model, msg_history=[], logging=safe_log)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..61d20c1
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,133 @@
++import os
++import subprocess
++import sys
++import time
++
++MAX_CLIP = 2000
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Stress-test a solution against a brute-force reference using a random test generator.\n
++* The generator is run as `python3 <generator_path> <seed>` for seed = 0..num_tests-1 and must print ONE test input to stdout.\n
++* Each input is piped on stdin to both `solution_path` and `brute_path` (run with `python3`). Outputs are compared token-wise (whitespace-insensitive).\n
++* On the first mismatch, crash (non-zero exit) or timeout, the tool returns the failing seed, the input (clipped), both outputs and stderr. Use this counterexample to debug.\n
++* If every test passes, it returns 'ALL N TESTS PASSED' together with the maximum running time of the solution.\n
++* Only stdin-based programs are supported. For a `Solution` class, first write a stdin driver script and point solution_path at it.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution Python program (reads stdin, writes stdout)."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference Python program (reads stdin, writes stdout)."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to the random test generator. It is run as `python3 gen.py <seed>` and prints one test input."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of random tests to run (seeds 0..num_tests-1). Default 200."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-run time limit in seconds for each program. Default 5."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++def _clip(s, n=MAX_CLIP):
++    if s is None:
++        return ""
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++
++def _as_text(x):
++    if x is None:
++        return ''
++    if isinstance(x, bytes):
++        return x.decode('utf-8', errors='replace')
++    return x
++
++
++def _run(path, cwd, args=(), stdin_text="", timeout=5):
++    """Run `python3 path args...` and return (returncode, stdout, stderr, elapsed, timed_out)."""
++    start = time.time()
++    try:
++        p = subprocess.run([sys.executable, path, *args], input=stdin_text, capture_output=True,
++                           text=True, timeout=timeout, cwd=cwd, errors='replace')
++        return p.returncode, p.stdout, p.stderr, time.time() - start, False
++    except subprocess.TimeoutExpired as e:
++        out = _as_text(e.stdout)
++        err = _as_text(e.stderr)
++        return None, out, err, time.time() - start, True
++
++
++def tool_function(solution_path, brute_path, generator_path, num_tests=200, timeout=5):
++    try:
++        num_tests = max(1, min(int(num_tests or 200), 5000))
++        timeout = max(1, min(int(timeout or 5), 60))
++    except (TypeError, ValueError):
++        return "Error: num_tests and timeout must be integers."
++
++    paths = {'solution': solution_path, 'brute': brute_path, 'generator': generator_path}
++    for name, p in paths.items():
++        if not p or not os.path.isfile(p):
++            return f"Error: {name} file not found: {p}"
++    solution_path, brute_path, generator_path = (os.path.abspath(solution_path),
++                                                  os.path.abspath(brute_path),
++                                                  os.path.abspath(generator_path))
++    cwd = os.path.dirname(solution_path)
++
++    max_sol_time = 0.0
++    for seed in range(num_tests):
++        # 1. generate the input
++        rc, gen_out, gen_err, _, gen_timeout = _run(generator_path, cwd, args=[str(seed)], timeout=timeout)
++        if gen_timeout or rc != 0:
++            return (f"Generator failed at seed {seed} (rc={rc}, timeout={gen_timeout}).\n"
++                    f"STDERR:\n{_clip(gen_err)}")
++        test_input = gen_out
++
++        # 2. run the solution
++        rc, sol_out, sol_err, sol_time, sol_timeout = _run(solution_path, cwd, stdin_text=test_input, timeout=timeout)
++        max_sol_time = max(max_sol_time, sol_time)
++        if sol_timeout:
++            return _report("solution TIMEOUT", seed, test_input, sol_out, None, sol_err, None)
++        if rc != 0:
++            return _report(f"solution CRASH (exit code {rc})", seed, test_input, sol_out, None, sol_err, None)
++
++        # 3. run the brute force
++        rc, brute_out, brute_err, _, brute_timeout = _run(brute_path, cwd, stdin_text=test_input, timeout=timeout)
++        if brute_timeout:
++            return _report("brute force TIMEOUT (fix the brute or lower sizes in the generator)",
++                           seed, test_input, sol_out, brute_out, sol_err, brute_err)
++        if rc != 0:
++            return _report(f"brute force CRASH (exit code {rc})", seed, test_input, sol_out, brute_out, sol_err, brute_err)
++
++        # 4. compare token-wise
++        if sol_out.split() != brute_out.split():
++            return _report("WRONG ANSWER (outputs differ)", seed, test_input, sol_out, brute_out, sol_err, brute_err)
++
++    return f"ALL {num_tests} TESTS PASSED\nMax solution running time: {max_sol_time:.3f}s"
++
++
++def _report(kind, seed, test_input, sol_out, brute_out, sol_err, brute_err):
++    parts = [f"FAILED: {kind} at seed {seed}.", "INPUT:", _clip(test_input).rstrip(),
++             "SOLUTION OUTPUT:", _clip(sol_out or "").rstrip() or "(empty)"]
++    if brute_out is not None:
++        parts += ["BRUTE OUTPUT:", _clip(brute_out or "").rstrip() or "(empty)"]
++    if sol_err and sol_err.strip():
++        parts += ["SOLUTION STDERR:", _clip(sol_err).rstrip()]
++    if brute_err and brute_err.strip():
++        parts += ["BRUTE STDERR:", _clip(brute_err).rstrip()]
++    return "\n".join(parts)
+diff --git a/tools/time_check.py b/tools/time_check.py
+new file mode 100644
+index 0000000..cc6491a
+--- /dev/null
++++ b/tools/time_check.py
+@@ -0,0 +1,83 @@
++import os
++import re
++import subprocess
++import sys
++import time
++
++
++def tool_info():
++    return {
++        "name": "time_check",
++        "description": """Run a program on a (large) input file and report wall time and peak memory.\n
++* Runs `python3 <solution_path>` with the file at `input_path` piped to stdin.\n
++* Use it with a maximum-size generated input to check the solution finishes well within the time limit (usually 1-2 seconds).\n
++* Reports wall-clock seconds, peak resident memory in MB (when available), the exit code and the first lines of stdout.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the Python program to time (reads stdin, writes stdout)."
++                },
++                "input_path": {
++                    "type": "string",
++                    "description": "Path to the input file to pipe on stdin (e.g. a generated maximum-size test)."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Time limit in seconds for the run. Default 20."
++                }
++            },
++            "required": ["solution_path", "input_path"]
++        }
++    }
++
++
++def _peak_mb_from_time_v(stderr):
++    m = re.search(r"Maximum resident set size \(kbytes\): (\d+)", stderr)
++    return int(m.group(1)) / 1024.0 if m else None
++
++
++def tool_function(solution_path, input_path, timeout=20):
++    try:
++        timeout = max(1, min(int(timeout or 20), 300))
++    except (TypeError, ValueError):
++        return "Error: timeout must be an integer."
++    if not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    if not os.path.isfile(input_path):
++        return f"Error: input file not found: {input_path}"
++
++    cwd = os.path.dirname(os.path.abspath(solution_path))
++    use_time = os.path.exists('/usr/bin/time')
++    cmd = [sys.executable, os.path.abspath(solution_path)]
++    if use_time:
++        cmd = ['/usr/bin/time', '-v'] + cmd
++
++    with open(input_path, 'rb') as fin:
++        start = time.time()
++        try:
++            p = subprocess.run(cmd, stdin=fin, capture_output=True, timeout=timeout, cwd=cwd)
++        except subprocess.TimeoutExpired:
++            return f"TIMEOUT: solution did not finish within {timeout} seconds (wall time > {timeout}s)."
++        wall = time.time() - start
++
++    stdout = p.stdout.decode('utf-8', errors='replace')
++    stderr = p.stderr.decode('utf-8', errors='replace')
++    peak_mb = None
++    if use_time:
++        peak_mb = _peak_mb_from_time_v(stderr)
++        # Drop the verbose /usr/bin/time report from stderr; keep only the program's own stderr.
++        stderr = stderr.split('\tCommand being timed:')[0].rstrip()
++
++    head = '\n'.join(stdout.splitlines()[:10])
++    lines = [
++        f"Wall time: {wall:.3f}s",
++        f"Peak memory: {peak_mb:.1f} MB" if peak_mb is not None else "Peak memory: unknown",
++        f"Exit code: {p.returncode}",
++        "STDOUT (first 10 lines):",
++        head or "(empty)",
++    ]
++    if stderr.strip():
++        lines += ["STDERR:", stderr[-2000:].rstrip()]
++    return "\n".join(lines)

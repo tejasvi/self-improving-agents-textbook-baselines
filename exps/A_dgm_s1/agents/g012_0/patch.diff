@@ -1,0 +1,207 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e7e0da9..e882fd6 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -93,6 +93,55 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++
++def _is_non_source_path(path):
++    """True for test/spec/conftest, docs, and readme-like paths."""
++    lower = path.lower()
++    segments = lower.split('/')
++    filename = segments[-1]
++    for kw in ('test', 'spec', 'conftest'):
++        if kw in lower:
++            return True
++    if filename.startswith('readme') or filename.endswith(('.md', '.rst', '.txt')):
++        return True
++    if any(seg in ('docs', 'doc') for seg in segments[:-1]):
++        return True
++    return False
++
++
++def _is_comment_or_blank(line):
++    s = line.strip()
++    return s == '' or s.startswith('#') or s.startswith('//')
++
++
++def _is_empty_assistant_message(msg):
++    """True if msg is an assistant turn whose content is only empty/whitespace text blocks."""
++    if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++        return False
++    content = msg.get('content')
++    if isinstance(content, str):
++        return content.strip() == ''
++    if not isinstance(content, list):
++        return False
++    for block in content:
++        if not isinstance(block, dict) or block.get('type') != 'text':
++            return False
++        text = block.get('text')
++        if not isinstance(text, str) or text.strip() != '':
++            return False
++    return True
++
++
++def _sanitize_history(msg_history):
++    """Drop trailing empty assistant turns so a follow-up request is well-formed."""
++    if not isinstance(msg_history, list):
++        return []
++    cleaned = list(msg_history)
++    while cleaned and _is_empty_assistant_message(cleaned[-1]):
++        cleaned.pop()
++    return cleaned
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -122,42 +171,80 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
+-    def _patch_status(self):
+-        """
+-        Classify the current diff against base_commit.
+-        Returns 'empty' (no changes), 'tests_only' (only test/spec/conftest/docs files changed),
+-        or 'ok' (at least one non-test source file changed).
+-        """
++    def _changed_files_and_added_lines(self):
++        """Parse the diff against base_commit into {path: [added lines]} (ordered)."""
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        files = []
++        files = {}
++        current = None
+         for line in diff.splitlines():
+             if line.startswith('diff --git '):
+                 parts = line.split(' ')
++                current = None
+                 if len(parts) >= 4:
+                     path = parts[2]
+                     if path.startswith('a/'):
+                         path = path[2:]
+-                    files.append(path)
++                    current = path
++                    files.setdefault(current, [])
++            elif current is not None and line.startswith('+') and not line.startswith('+++'):
++                files[current].append(line[1:])
++        return files
++
++    def _patch_status(self):
++        """
++        Classify the current diff against base_commit.
++        Returns 'empty' (no changes), 'tests_only' (only test/spec/conftest/docs files changed),
++        'stub' (non-test files changed only by comments/blank lines, or a placeholder remains),
++        or 'ok' (a non-test source file has real content).
++        """
++        files = self._changed_files_and_added_lines()
+         if not files:
+             return 'empty'
+ 
+-        def is_non_source(path):
+-            lower = path.lower()
+-            segments = lower.split('/')
+-            filename = segments[-1]
+-            for kw in ('test', 'spec', 'conftest'):
+-                if kw in lower:
+-                    return True
+-            if filename.startswith('readme') or filename.endswith(('.md', '.rst', '.txt')):
+-                return True
+-            if any(seg in ('docs', 'doc') for seg in segments[:-1]):
+-                return True
+-            return False
+-
+-        if all(is_non_source(f) for f in files):
++        non_test = [f for f in files if not _is_non_source_path(f)]
++        if not non_test:
+             return 'tests_only'
++
++        # Only comment/blank additions in every changed non-test file -> stub
++        if all(all(_is_comment_or_blank(l) for l in files[f]) for f in non_test):
++            return 'stub'
++
++        # Placeholder left in a changed non-test file -> stub
++        for f in non_test:
++            try:
++                with open(os.path.join(self.git_tempdir, f), 'r', errors='replace') as fh:
++                    if 'Write your solution here' in fh.read():
++                        return 'stub'
++            except OSError:
++                pass
+         return 'ok'
+ 
++    def _find_target_files(self):
++        """
++        List tracked non-test, non-doc files in git_tempdir, stub-like (short or comment-only) first.
++        """
++        result = subprocess.run(
++            ['git', '-C', self.git_tempdir, 'ls-files'],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        candidates = []
++        for path in result.stdout.decode(errors='replace').splitlines():
++            if not path or _is_non_source_path(path):
++                continue
++            full = os.path.join(self.git_tempdir, path)
++            try:
++                with open(full, 'r', errors='replace') as fh:
++                    content = fh.read()
++            except OSError:
++                continue
++            lines = [l for l in content.splitlines() if l.strip()]
++            comment_only = all(_is_comment_or_blank(l) for l in lines)
++            short = len(content.encode(errors='replace')) < 200
++            stub_like = comment_only or short
++            candidates.append((0 if stub_like else 1, path))
++        candidates.sort()
++        return [p for _, p in candidates]
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -227,26 +314,32 @@ Step 5 - If anything fails in an unexpected way, investigate the environment rat
+ 
+         # Bounded follow-up loop: make sure the agent actually modified a non-test source file
+         status = self._patch_status()
++        target_files = self._find_target_files()
++        target_desc = ', '.join(target_files[:5]) if target_files else '(the main source file)'
+         for attempt in range(3):
+             if status == 'ok':
+                 break
+-            if status == 'empty':
++            safe_log(f"[patch_status={status}] follow-up attempt {attempt + 1}/3 targets={target_desc}", level=logging.WARNING)
++            if attempt == 0:
++                history = _sanitize_history(msg_history)
+                 follow_up = (
+-                    "No files in the repository were modified yet, so the task is NOT complete. "
+-                    f"You must now write the implementation into the target source file in {self.git_tempdir} "
+-                    "(for example, overwrite the stub solution file with the real code) using the editor or bash tool right now, "
+-                    "instead of describing it in prose. Then run the examples against it, fix any failures, and verify it. "
+-                    "Do not end your turn without a tool call that modifies the source file."
++                    f"The task is NOT complete: the patch status is '{status}'. Target file(s): {target_desc}. "
++                    "Immediately use the editor tool to overwrite the target file with a complete working solution "
++                    "(a simple correct version first), then run it on the examples with bash. "
++                    "Do not reply with prose only; your next turn must be a tool call."
+                 )
++                msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=history, logging=safe_log)
+             else:
+                 follow_up = (
+-                    "Only test or non-source files (e.g. tests, specs, docs, README) were modified. "
+-                    "The primary source file must be implemented. Write the real solution into the source file "
+-                    "with the editor or bash tool now, then run the examples and verify it."
++                    f"Problem:\n{self.problem_statement}\n\n"
++                    f"Repository: {self.git_tempdir}\n"
++                    f"Target file(s): {target_desc}\n\n"
++                    f"Immediately use the editor tool to overwrite {target_files[0] if target_files else 'the main source file'} "
++                    "with a complete working solution (a simple correct version first), then run it on the examples with bash."
+                 )
+-            safe_log(f"[patch_status={status}] follow-up attempt {attempt + 1}/3", level=logging.WARNING)
+-            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=[], logging=safe_log)
+             status = self._patch_status()
++            safe_log(f"[patch_status={status}] after follow-up attempt {attempt + 1}/3", level=logging.WARNING)
+ 
+         if status != 'ok':
+             safe_log(f"WARNING: final patch status is '{status}' after follow-ups", level=logging.WARNING)

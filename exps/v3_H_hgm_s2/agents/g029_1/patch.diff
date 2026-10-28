@@ -1,0 +1,204 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 6e9b47c..787f291 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,7 @@
+ import argparse
+ import ast
++import hashlib
++import shutil
+ import subprocess
+ import tempfile
+ import logging
+@@ -519,6 +521,116 @@ Return ONLY the Python code in a single ```python code block.
+             cases.append((name, payload))
+         return cases
+ 
++    @staticmethod
++    def _file_hash(path):
++        """
++        SHA-256 of a file's bytes, or None when it cannot be read. Used to detect no-op repair rounds.
++        """
++        try:
++            with open(path, "rb") as f:
++                return hashlib.sha256(f.read()).hexdigest()
++        except OSError:
++            return None
++
++    @staticmethod
++    def _summarize_perf_report(report):
++        """
++        Compact summary of a _run_perf report: counts per status plus up to two example cases.
++        Parses only the status headers that _run_perf itself writes.
++        """
++        rows = []
++        for m in re.finditer(r"^=== Case (\d+): (.*) \((TIMEOUT|SLOW|CRASH|OK)[^\n]*?time ([\d.]+)s\) ===$",
++                             report or "", re.M):
++            rows.append((m.group(1), m.group(2), m.group(3), m.group(4)))
++        if not rows:
++            return "No perf case results."
++        total = len(rows)
++        counts = {k: sum(1 for r in rows if r[2] == k) for k in ("TIMEOUT", "SLOW", "CRASH", "OK")}
++        bad = [r for r in rows if r[2] != "OK"]
++        lines = [f"{counts['TIMEOUT']} of {total} cases timed out; {counts['SLOW']} SLOW; {counts['CRASH']} CRASH; {counts['OK']} OK."]
++        for case_no, name, status, elapsed in bad[:2]:
++            lines.append(f"Example: case {case_no} ({name}) {status}, time {elapsed}s.")
++        return "\n".join(lines)
++
++    def _regenerate_solution(self, task, solution_path, report_summary, samples, oracle_dir, mode, method):
++        """
++        Tool-less fallback: ask the model for a fresh full solution from a compact prompt, with a short
++        algorithm plan first. The candidate is written to a temp file and must pass the samples and the
++        differential tests before it overwrites solution_path. Makes at most 2 LLM calls.
++        Returns True when solution_path was replaced.
++        """
++        if not solution_path or not os.path.exists(solution_path):
++            return False
++        try:
++            with open(solution_path, "r", encoding="utf-8", errors="replace") as f:
++                current_code = f.read()
++        except OSError:
++            return False
++        cand_dir = tempfile.mkdtemp(prefix="agent_candidate_")
++        cand_path = os.path.join(cand_dir, os.path.basename(solution_path))
++        failure_note = ""
++        for attempt in range(2):  # bounded: initial attempt + one retry with the failure report
++            retry_block = ""
++            if failure_note:
++                retry_block = (f"\nYour previous candidate was rejected. Failure report (clipped):\n"
++                               f"{self._clip(failure_note, 3000)}\n\nFix this in the new candidate.\n")
++            if mode == "class":
++                shape = f"a `Solution` class with method `{method}` keeping the same signature"
++            else:
++                shape = "a complete Python program that reads standard input and writes standard output"
++            prompt = f"""Rewrite the solution to the problem below as {shape}, with a faster algorithm.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++<current_solution>
++{self._clip(current_code, 6000)}
++</current_solution>
++
++Failure summary:
++{report_summary}
++{retry_block}
++Instructions:
++- First write a short plan, one line each: 'PLAN: state=...', 'PLAN: transition=...', 'PLAN: complexity=...'
++  (state the complexity of the current solution and of the new one in terms of the constraints).
++- Then output exactly one ```python code block with the complete program. No other code blocks.
++- The new algorithm must fit within about 1e8 simple operations at maximum constraints.
++- Be correct first: it must match the samples and the brute-force behavior on small inputs.
++"""
++            text = simple_chat(prompt, model=self.code_model, max_tokens=16000, logging=safe_log) or ""
++            code = self._extract_code(text)
++            if not code:
++                failure_note = "The reply contained no ```python code block."
++                safe_log(f"[regenerate attempt {attempt}] no code in reply.")
++                continue
++            try:
++                ast.parse(code)
++            except SyntaxError as e:
++                failure_note = f"Syntax error: {e}"
++                safe_log(f"[regenerate attempt {attempt}] syntax error: {e}")
++                continue
++            with open(cand_path, "w", encoding="utf-8") as f:
++                f.write(code + "\n")
++            sample_report, samples_ok = self._run_samples(cand_path, samples) if samples else ("no samples", True)
++            if not samples_ok:
++                failure_note = sample_report
++                safe_log(f"[regenerate attempt {attempt}] candidate failed samples.")
++                continue
++            if oracle_dir:
++                diff_report, n_fail = self._run_differential(cand_path, oracle_dir)
++                if n_fail:
++                    failure_note = diff_report
++                    safe_log(f"[regenerate attempt {attempt}] candidate failed differential ({n_fail} failures).")
++                    continue
++            shutil.copyfile(cand_path, solution_path)
++            safe_log(f"[regenerate attempt {attempt}] candidate accepted and written to {solution_path}.")
++            shutil.rmtree(cand_dir, ignore_errors=True)
++            return True
++        safe_log("[regenerate] no candidate passed; keeping the existing solution.")
++        shutil.rmtree(cand_dir, ignore_errors=True)
++        return False
++
+     def _run_perf(self, solution_path, cases, mode=None, method=None, timeout=3.0, slow_threshold=1.5):
+         """
+         Run the solution on each (name, payload) case with a strict timeout.
+@@ -849,7 +961,10 @@ Instructions:
+ - Do not write helper scripts with bash heredocs; write them with the editor tool.
+ - Do not reply with text only; finish only after the fix is on disk and verified.
+ """
++            before = self._file_hash(solution_path)
+             history = chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            if self._file_hash(solution_path) == before:
++                safe_log(f"[differential round {round_idx}] no-op repair round (file unchanged).")
+             summary = self._clip(self._last_assistant_text(history), 2000)
+             first_fail = report.split("=== Failing case", 2)
+             first_fail_text = ("=== Failing case" + first_fail[1]) if len(first_fail) > 1 else "(see report)"
+@@ -1100,8 +1215,12 @@ Instructions:
+ - Re-run the solution on all sample inputs with bash and confirm they pass before finishing.
+ - Do not reply with text only; finish only after the fixes are written to disk and verified.
+ """
++            before = self._file_hash(solution_path)
+             chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[verify round {round_idx}] repair chat finished.")
++            changed = self._file_hash(solution_path) != before
++            safe_log(f"[verify round {round_idx}] repair chat finished; solution changed: {changed}.")
++            if not changed:
++                safe_log(f"[verify round {round_idx}] no-op repair round (file unchanged).")
+ 
+         # Performance phase: generate adversarial max-size inputs, time the solution, and repair if slow.
+         solution_path = self._solution_path()
+@@ -1149,15 +1268,17 @@ Instructions:
+                 if not needs_repair:
+                     safe_log(f"[perf round {round_idx}] all stress cases fast enough; stopping.")
+                     break
++                perf_summary = self._summarize_perf_report(report)
++                safe_log(f"[perf round {round_idx}] perf summary:\n{perf_summary}")
+                 current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+                 perf_msg = f"""{task}
+ 
+-The solution passes the samples, but it is too slow or crashes on large adversarial inputs. Raw performance report
+-(each case: runtime, output, stderr; timeouts exceed 3 seconds, SLOW means above 1.5 seconds):
++The solution passes the samples, but it is too slow or crashes on large adversarial inputs.
++Performance summary (TIMEOUT exceeds 3 seconds, SLOW exceeds 1.5 seconds):
+ 
+-{report}
++{perf_summary}
+ 
+-Current diff:
++Current diff (the current solution file is at {solution_path}; read it before editing):
+ {current_diff if current_diff.strip() else '(empty)'}
+ 
+ Instructions:
+@@ -1168,7 +1289,27 @@ Instructions:
+ - Re-time on the max-size inputs and confirm they run comfortably within the limit.
+ - Do not reply with text only; finish only after the fixes are written to disk and verified.
+ """
++                before = self._file_hash(solution_path)
+                 chat_with_agent(perf_msg, model=self.code_model, msg_history=[], logging=safe_log)
++                if self._file_hash(solution_path) != before:
++                    safe_log(f"[perf round {round_idx}] repair chat changed the solution file.")
++                else:
++                    safe_log(f"[perf round {round_idx}] no-op repair round (file unchanged); calling regeneration fallback.")
++                    mode_now, method_now = self._detect_mode(solution_path)
++                    regen_summary = (
++                        f"{perf_summary}\n"
++                        f"Current solution is too slow or crashes on max-size inputs; the baseline's complexity is too high."
++                    )
++                    if self._regenerate_solution(task, solution_path, regen_summary, samples,
++                                                 oracle_dir, mode_now, method_now):
++                        safe_log(f"[perf round {round_idx}] regenerated solution accepted; re-running perf.")
++                        report, needs_repair = self._run_perf(solution_path, cases, mode=mode_now, method=method_now)
++                        safe_log(f"[perf round {round_idx}] re-run after regeneration:\n{report}")
++                        if not needs_repair:
++                            safe_log(f"[perf round {round_idx}] regenerated solution is fast enough; stopping.")
++                            break
++                    else:
++                        safe_log(f"[perf round {round_idx}] regeneration rejected; solution unchanged.")
+                 safe_log(f"[perf round {round_idx}] repair chat finished.")
+ 
+ def main():

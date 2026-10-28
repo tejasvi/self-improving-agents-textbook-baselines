@@ -1,0 +1,574 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 90e11dd..6efc7ef 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,11 +3,18 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import shutil
+ import threading
+ 
++from utils.evidence import file_sha256, read_evidence
++
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++MAX_ATTEMPTS = 3
++EVIDENCE_TOOLS = ('stress_test', 'scaling_test', 'run_clean')
++EVIDENCE_LOG = '/tmp/evidence.jsonl'
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -229,26 +236,108 @@ Work like a careful competitive programmer:
+ 10. Before finishing, run the final solution through the run_clean tool on all samples AND on a max-size input (run_clean runs it in a clean isolated subprocess like the grader does), and compare each output to the sample's exact expected output. Read all stderr carefully and fix any crash or traceback it shows.
+ 11. Avoid environment-fragile constructs: do not use 3-argument pow (e.g. pow(a, MOD-2, MOD)); write a small hand-written modular power helper `def mpow(b, e, m)` with a loop instead. Avoid threading and recursion-limit tricks; prefer iterative code.
+ 12. Do a last re-read of solution.py for edge cases such as N=1, empty input, and the smallest/largest constraints.
+-The final solution.py is what gets graded; helper files are ignored."""
++The final solution.py is what gets graded; helper files are ignored.
++
++ADDITIONAL REQUIREMENTS (checklist; the final answer is rejected if this checklist is incomplete):
++A. Your first brute force must follow the problem's formal definition literally (enumerate the objects the statement defines, check the conditions exactly as written), NOT your own algorithm's structure. Keep it independent of solution.py.
++B. Run stress_test (solution vs. that brute force, exact output match) on at least 200 random small cases.
++C. Run scaling_test on the final solution.py at the maximum constraint, with adversarial kinds. Fix anything over 1.5s.
++D. Run run_clean on the samples and on a max-size input, and read all stderr.
++E. Interactive problems: use the interactive_judge tool. Write a judge module exposing init(input_text, seed), respond(query_line) and final(answer_line); the judge must enforce the exact query format and the exact query budget. Derive the budget from an exhaustive brute force over all strategies for small N, not from a guessed limit. Run it on several small cases, including the edge cases N=1 and the smallest/largest allowed values.
++F. Look for a counterexample to your current solution with the brute force and fix it before finishing. Re-run every tool on the final solution.py file (the tools record the file hash, so a re-run after any edit is required).
++"""
+         instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        os.environ['DGM_EVIDENCE_LOG'] = EVIDENCE_LOG
++        with open(EVIDENCE_LOG, 'w'):  # start each run with an empty evidence log
++            pass
++        snapshots = []  # (attempt_idx, snapshot_path, score, detail)
++        msg = instruction
++        for attempt in range(MAX_ATTEMPTS):
++            safe_log(f"[attempt {attempt + 1}/{MAX_ATTEMPTS}] starting")
++            chat_with_agent(msg, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Edit guard: retry with a directive prompt if no substantive source edit exists yet.
+-        for attempt in range(3):
+-            if self._has_source_edit():
+-                safe_log(f"[edit guard] source edit present after attempt {attempt}")
++            if attempt == 0:
++                # Edit guard (first attempt only): retry with a directive prompt if no source edit exists.
++                for guard in range(3):
++                    if self._has_source_edit():
++                        safe_log(f"[edit guard] source edit present after guard step {guard}")
++                        break
++                    safe_log(f"[edit guard] no source edit detected; retry {guard + 1}/3")
++                    retry_msg = (
++                        f"{task}\n"
++                        "solution.py currently contains no implementation. Your very next action must be an editor "
++                        "`create`/`str_replace` call that writes a complete solution to solution.py. Keep reasoning brief. "
++                        "Do not run exploration commands first. After writing, run the samples and fix issues."
++                    )
++                    chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++
++            snap_path, score, unverified = self._snapshot_and_score(attempt)
++            snapshots.append((attempt, snap_path, score))
++            safe_log(f"[attempt {attempt + 1}] snapshot={snap_path} score={score} unverified={unverified}")
++            if snap_path is not None and not unverified and score == len(EVIDENCE_TOOLS):
++                safe_log("[attempt] all evidence passing; stopping")
++                break
++            if attempt + 1 >= MAX_ATTEMPTS:
+                 break
+-            safe_log(f"[edit guard] no source edit detected; retry {attempt + 1}/3")
+-            retry_msg = (
+-                f"{task}\n"
+-                "solution.py currently contains no implementation. Your very next action must be an editor "
+-                "`create`/`str_replace` call that writes a complete solution to solution.py. Keep reasoning brief. "
+-                "Do not run exploration commands first. After writing, run the samples and fix issues."
+-            )
+-            init_edit = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-        else:
+-            if not self._has_source_edit():
+-                safe_log("[edit guard] gave up: no source edit after retries")
++            msg = self._reflection_prompt(task, snap_path, unverified)
++
++        self._restore_best(snapshots)
++
++    def _snapshot_and_score(self, attempt):
++        """Copy solution.py to a snapshot and score the evidence that matches its sha256.
++
++        Returns (snapshot_path or None, score, unverified_tool_list).
++        Score: +1 per evidence type whose latest matching record passed, -1 per failing one,
++        0 for missing ones (which are listed as unverified).
++        """
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(path):
++            return None, 0, list(EVIDENCE_TOOLS)
++        snap_path = f"/tmp/snap_{attempt + 1}.py"
++        shutil.copyfile(path, snap_path)
++        sha = file_sha256(snap_path)
++        latest = {}
++        for rec in read_evidence():
++            if rec.get('sha256') == sha and rec.get('tool') in EVIDENCE_TOOLS:
++                latest[rec['tool']] = rec  # records are oldest-first, so the last one wins
++        score = 0
++        unverified = []
++        for tool in EVIDENCE_TOOLS:
++            rec = latest.get(tool)
++            if rec is None:
++                unverified.append(tool)
++            elif rec.get('outcome') == 'pass':
++                score += 1
++            else:
++                score -= 1
++                unverified.append(f"{tool} (last outcome: {rec.get('outcome')})")
++        return snap_path, score, unverified
++
++    def _reflection_prompt(self, task, snap_path, unverified):
++        tail = "\n".join(open(EVIDENCE_LOG).read().splitlines()[-20:]) if os.path.isfile(EVIDENCE_LOG) else "(no evidence recorded)"
++        items = "\n".join(f"- {u}" for u in unverified) if unverified else "- (none)"
++        return (
++            f"{task}\n"
++            f"The previous attempt left its solution at {snap_path} (a snapshot of solution.py). "
++            f"Its tool evidence (tail of {EVIDENCE_LOG}, one JSON record per tool call, matched to a file hash):\n{tail}\n\n"
++            f"You have NOT yet verified: {', '.join(unverified) if unverified else 'nothing (all evidence passed)'}.\n"
++            f"Unverified or failing items:\n{items}\n\n"
++            "Write a brute force that implements the problem definition literally (for interactive or optimization problems, an exhaustive search over all strategies or all answers, plus a judge simulator that enforces the exact limits). "
++            "Try to find a counterexample to the current solution, fix it, and re-run the missing tools on the final file. "
++            "Every tool call is recorded with the file hash, so re-run stress_test, scaling_test and run_clean after your last edit. "
++            "The final answer is rejected if the checklist is incomplete."
++        )
++
++    def _restore_best(self, snapshots):
++        """Restore the snapshot with the highest score (ties go to the later attempt)."""
++        usable = [x for x in snapshots if x[1] is not None]
++        if not usable:
++            safe_log("[restore] no snapshots taken; leaving solution.py as is")
++            return
++        best = max(usable, key=lambda x: (x[2], x[0]))
++        dst = os.path.join(self.git_tempdir, 'solution.py')
++        shutil.copyfile(best[1], dst)
++        safe_log(f"[restore] restored attempt {best[0] + 1} ({best[1]}) with score {best[2]} to {dst}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/run_clean.py b/tools/run_clean.py
+index d259806..22f8fe0 100644
+--- a/tools/run_clean.py
++++ b/tools/run_clean.py
+@@ -6,6 +6,11 @@ import sys
+ import tempfile
+ import time
+ 
++_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if _ROOT not in sys.path:
++    sys.path.insert(0, _ROOT)
++from utils.evidence import log_evidence  # noqa: E402
++
+ FRAGILE_MODULES = {'threading', 'resource', 'multiprocessing', 'signal', 'ctypes'}
+ FRAGILE_CALLS = {'setrecursionlimit', 'setswitchinterval', 'stack_size'}
+ 
+@@ -136,6 +141,7 @@ def tool_function(solution_path, inputs=None, timeout=10):
+         if pypy:
+             runners.append(('pypy3', [pypy, '_sol.py']))
+ 
++        runs = []
+         for idx, data in enumerate(inputs, 1):
+             variants = [('as given', data)]
+             stripped = data.rstrip('\n')
+@@ -144,6 +150,22 @@ def tool_function(solution_path, inputs=None, timeout=10):
+             for vlabel, vdata in variants:
+                 for rname, cmd in runners:
+                     r = _run(cmd, vdata, tmp, env, timeout)
++                    runs.append(r)
+                     out_parts.append(_fmt(idx, f"{rname}, {vlabel}", r))
+ 
++    # Evidence: pass = every run exited 0 with empty stderr; a timeout or nonzero exit is recorded as such.
++    n_timeout = sum(1 for r in runs if r['exit_code'] == 'TIMEOUT')
++    n_crash = sum(1 for r in runs if r['exit_code'] not in (0, 'TIMEOUT'))
++    n_stderr = sum(1 for r in runs if r['stderr'] and r['exit_code'] != 'TIMEOUT')
++    if n_timeout:
++        outcome = 'timeout'
++    elif n_crash:
++        outcome = 'crash'
++    elif n_stderr:
++        outcome = 'fail'
++    else:
++        outcome = 'pass'
++    log_evidence('run_clean', solution_path, outcome,
++                 {'runs': len(runs), 'timeouts': n_timeout, 'nonzero_exit': n_crash, 'stderr_nonempty': n_stderr})
++
+     return _clip("\n".join(out_parts), 20000)
+diff --git a/tools/scaling_test.py b/tools/scaling_test.py
+index 82c9656..5014d6d 100644
+--- a/tools/scaling_test.py
++++ b/tools/scaling_test.py
+@@ -7,6 +7,11 @@ import sys
+ import tempfile
+ import time
+ 
++_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if _ROOT not in sys.path:
++    sys.path.insert(0, _ROOT)
++from utils.evidence import log_evidence  # noqa: E402
++
+ DEFAULT_KINDS = ['random', 'all_same', 'two_values', 'sorted', 'max_distinct']
+ DEFAULT_MAX = 100000
+ DRIVER_NAME = '_driver.py'
+@@ -161,6 +166,8 @@ def tool_function(solution_path, generator_path, mode='stdin', method_name=None,
+     py = sys.executable
+ 
+     out = []
++    # Per-(kind,size) results collected for the evidence record.
++    ev = {'ok': 0, 'timeout': 0, 'crash': 0, 'gen_fail': 0, 'max_size': max(sizes), 'max_ok': False, 'max_time': None}
+     out.append(f"== scaling_test: mode={mode}, method={method_name}, timeout={timeout}s, sizes={sizes} ==")
+ 
+     with tempfile.TemporaryDirectory() as tmp:
+@@ -185,6 +192,7 @@ def tool_function(solution_path, generator_path, mode='stdin', method_name=None,
+                 g_status, g_out, g_err, _ = _run_isolated(
+                     [py, '-I', GEN_NAME, str(n), kind, '0'], tmp, env, '', timeout)
+                 if g_status != 'OK':
++                    ev['gen_fail'] += 1
+                     out.append(f"{n:>10} | GEN_{g_status} | generator stderr: {_clip(g_err.strip())}")
+                     prev = None
+                     continue
+@@ -218,10 +226,12 @@ def tool_function(solution_path, generator_path, mode='stdin', method_name=None,
+                                 pass
+                 if status == 'TIMEOUT':
+                     timed_out = True
++                    ev['timeout'] += 1
+                     out.append(f"{n:>10} | TIMEOUT  | >{timeout:>8.3f} | {'-':>10} | {'-':>6}")
+                     prev = None
+                     continue
+                 if status == 'CRASH':
++                    ev['crash'] += 1
+                     out.append(f"{n:>10} | CRASH    | {wall:>9.3f} | {'-':>10} | {'-':>6}")
+                     out.append(f"    stderr: {_clip(s_err.strip())}")
+                     prev = None
+@@ -231,6 +241,14 @@ def tool_function(solution_path, generator_path, mode='stdin', method_name=None,
+                 slope_s = f"{slope:6.2f}" if slope is not None else f"{'-':>6}"
+                 internal_s = f"{internal:10.4f}" if internal is not None else f"{'-':>10}"
+                 out.append(f"{n:>10} | OK       | {wall:9.4f} | {internal_s} | {slope_s}")
++                ev['ok'] += 1
++                if n == max(sizes):
++                    ev['max_ok'] = True
++                    ev['max_time'] = round(timing, 4)
+                 prev = (n, timing)
+ 
++    # Outcome: pass only if every run at every size was OK (no timeouts, crashes, or generator failures).
++    all_ok = ev['timeout'] == 0 and ev['crash'] == 0 and ev['gen_fail'] == 0 and ev['ok'] > 0 and ev['max_ok']
++    outcome = 'pass' if all_ok else ('timeout' if ev['timeout'] else ('crash' if ev['crash'] else 'fail'))
++    log_evidence('scaling_test', solution_path, outcome, ev)
+     return "\n".join(out)
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index add126d..2bf404d 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -2,6 +2,12 @@ import subprocess
+ import sys
+ import os
+ import tempfile
++import sys as _sys
++
++_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if _ROOT not in _sys.path:
++    _sys.path.insert(0, _ROOT)
++from utils.evidence import log_evidence  # noqa: E402
+ 
+ 
+ def tool_info():
+@@ -62,18 +68,28 @@ def _norm(s):
+ def tool_function(solution_path, brute_path, generator_path, num_tests=200, timeout=10):
+     num_tests = int(num_tests)
+     timeout = int(timeout)
++    counts = {'num_tests': num_tests, 'passed': 0}
+     for i in range(num_tests):
+         gen_out, gen_err, gen_rc, gen_to = _run_py(generator_path, "", timeout, args=(str(i),))
+         if gen_to or gen_rc != 0:
++            log_evidence('stress_test', solution_path, 'error', dict(counts, seed=i, reason='generator failed'))
+             return f"Generator failed for seed {i}: timeout={gen_to}, exit code={gen_rc}\nstderr:\n{gen_err}"
+         inp = gen_out
+         b_out, b_err, b_rc, b_to = _run_py(brute_path, inp, timeout)
+         s_out, s_err, s_rc, s_to = _run_py(solution_path, inp, timeout)
+         if b_to or b_rc != 0 or s_to or s_rc != 0 or _norm(s_out) != _norm(b_out):
++            if s_to:
++                outcome = 'timeout'
++            elif s_rc != 0:
++                outcome = 'crash'
++            else:
++                outcome = 'fail'
++            log_evidence('stress_test', solution_path, outcome, dict(counts, seed=i, brute_failed=bool(b_to or b_rc != 0)))
+             return (
+                 f"Mismatch at seed {i} (of {num_tests}).\n"
+                 f"INPUT:\n{inp}\n"
+                 f"BRUTE stdout:\n{b_out}\nBRUTE stderr:\n{b_err}\nBRUTE exit code: {b_rc}, timed out: {b_to}\n"
+                 f"SOLUTION stdout:\n{s_out}\nSOLUTION stderr:\n{s_err}\nSOLUTION exit code: {s_rc}, timed out: {s_to}\n"
+             )
++    log_evidence('stress_test', solution_path, 'pass', dict(counts, passed=num_tests))
+     return f"All {num_tests} tests passed (exact match after whitespace normalization)."
+diff --git a/tools/interactive_judge.py b/tools/interactive_judge.py
+new file mode 100644
+index 0000000..a2b8532
+--- /dev/null
++++ b/tools/interactive_judge.py
+@@ -0,0 +1,194 @@
++import importlib.util
++import os
++import select
++import subprocess
++import sys
++import time
++
++
++def tool_info():
++    return {
++        "name": "interactive_judge",
++        "description": """Run a solution as a subprocess against a judge for an INTERACTIVE problem, and return raw transcripts and a verdict per case.
++* You write the judge as a Python module file (judge_script_path) that defines:
++  - `init(input_text, seed)`: start one case. input_text is the problem input for that case (one of `inputs`), seed is the case index.
++  - `respond(query_line)`: receives one line the solution printed (a query). Return the response line to send back to the solution (no trailing newline needed). Return '-1' if the query is illegal or exceeds the query budget (verdict WA).
++  - `final(answer_line)`: receives the solution's answer line; return True if it is correct, False otherwise.
++  - optional `is_answer(line)`: return True if a printed line is the final answer. Default: a line starting with '!' is the answer.
++* The solution's stdout lines are read one at a time; each non-answer line goes to respond(). Its stdin receives the input_text first, then the responses.
++* Verdicts per case: AC (final returned True), WA (final False, illegal query, or exited without answering), TLE (no output within timeout), RE (nonzero exit, with stderr).
++* Write the judge's query budget from an exhaustive brute force on small N, not from a guessed limit. The judge must enforce exact limits and the exact query format.
++* Returns raw transcripts (every line sent and received) and verdicts for every case.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution Python file (reads the interactor on stdin, writes to stdout)."
++                },
++                "judge_script_path": {
++                    "type": "string",
++                    "description": "Path to a Python module defining init(input_text, seed), respond(query_line) and final(answer_line), and optionally is_answer(line)."
++                },
++                "inputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "List of initial input texts, one case each (for example the N and the hidden array parameters the judge is built from)."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Wall-clock limit per case in seconds (default 10)."
++                }
++            },
++            "required": ["solution_path", "judge_script_path", "inputs"]
++        }
++    }
++
++
++def _clip(s, n=4000):
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++
++def _load_judge(path):
++    spec = importlib.util.spec_from_file_location("_judge_mod", path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    for name in ("init", "respond", "final"):
++        if not hasattr(mod, name):
++            raise AttributeError(f"judge module must define {name}()")
++    return mod
++
++
++class _LineReader:
++    """Reads lines from a pipe with a deadline, using select on the raw fd (no buffering surprises)."""
++
++    def __init__(self, fd):
++        self.fd = fd
++        self.buf = b""
++        self.eof = False
++
++    def readline(self, deadline):
++        """Return a decoded line (without newline), or None on EOF, or 'TIMEOUT' sentinel."""
++        for _ in range(10_000_000):
++            nl = self.buf.find(b"\n")
++            if nl >= 0:
++                line, self.buf = self.buf[:nl], self.buf[nl + 1:]
++                return line.decode(errors="replace").rstrip("\r")
++            if self.eof:
++                if self.buf:
++                    line, self.buf = self.buf, b""
++                    return line.decode(errors="replace")
++                return None
++            remaining = deadline - time.time()
++            if remaining <= 0:
++                return "TIMEOUT"
++            ready, _, _ = select.select([self.fd], [], [], remaining)
++            if not ready:
++                return "TIMEOUT"
++            chunk = os.read(self.fd, 65536)
++            if not chunk:
++                self.eof = True
++            else:
++                self.buf += chunk
++        return "TIMEOUT"
++
++
++def _run_case(solution_path, judge, input_text, seed, timeout):
++    transcript = []
++    judge.init(input_text, seed)
++    proc = subprocess.Popen(
++        [sys.executable, "-I", solution_path],
++        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
++    )
++    is_answer = getattr(judge, "is_answer", None)
++    reader = _LineReader(proc.stdout.fileno())
++    verdict, reason = None, ""
++    try:
++        proc.stdin.write(input_text.encode())
++        proc.stdin.flush()
++        transcript.append(("IN", input_text.rstrip("\n")))
++        deadline = time.time() + timeout
++        for _ in range(10_000_000):
++            line = reader.readline(deadline)
++            if line == "TIMEOUT":
++                verdict, reason = "TLE", f"no output within {timeout}s"
++                break
++            if line is None:
++                verdict, reason = "WA", "solution exited without an answer"
++                break
++            transcript.append(("OUT", line))
++            if is_answer is not None:
++                answer = bool(is_answer(line))
++            else:
++                answer = line.startswith("!")
++            if answer:
++                ok = bool(judge.final(line))
++                verdict = "AC" if ok else "WA"
++                reason = "final() accepted the answer" if ok else "final() rejected the answer"
++                break
++            resp = judge.respond(line)
++            if resp is None or str(resp).strip() == "-1":
++                verdict, reason = "WA", f"judge rejected query {line!r}"
++                break
++            transcript.append(("JUDGE", str(resp)))
++            proc.stdin.write((str(resp) + "\n").encode())
++            proc.stdin.flush()
++        else:
++            verdict, reason = "WA", "too many lines printed"
++    except BrokenPipeError:
++        verdict, reason = "WA", "solution closed stdin early"
++    finally:
++        try:
++            proc.stdin.close()
++        except OSError:
++            pass
++        try:
++            proc.wait(timeout=2)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            proc.wait()
++    err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
++    if verdict is None:
++        verdict, reason = "WA", "no verdict"
++    if proc.returncode not in (0, None) and verdict != "TLE":
++        verdict, reason = "RE", f"exit code {proc.returncode}"
++    return verdict, reason, transcript, err
++
++
++def tool_function(solution_path, judge_script_path, inputs=None, timeout=10):
++    try:
++        timeout = max(1, min(int(timeout or 10), 120))
++    except (TypeError, ValueError):
++        timeout = 10
++    if not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    if not os.path.isfile(judge_script_path):
++        return f"Error: judge script not found: {judge_script_path}"
++    if isinstance(inputs, str):
++        inputs = [inputs]
++    if not inputs:
++        inputs = [""]
++    try:
++        judge = _load_judge(judge_script_path)
++    except Exception as e:  # raw error from the judge module, no parsing
++        return f"Error: could not load judge script: {type(e).__name__}: {e}"
++
++    out = []
++    verdicts = []
++    for idx, text in enumerate(inputs):
++        try:
++            verdict, reason, transcript, err = _run_case(solution_path, judge, text, idx, timeout)
++        except Exception as e:
++            verdict, reason, transcript, err = "ERROR", f"{type(e).__name__}: {e}", [], ""
++        verdicts.append(verdict)
++        lines = [f"--- case {idx} --- verdict: {verdict} ({reason})"]
++        for kind, content in transcript:
++            lines.append(f"  {kind}: {_clip(content, 400)}")
++        if err.strip():
++            lines.append(f"  stderr: {_clip(err.strip())}")
++        out.append("\n".join(lines))
++    summary = ", ".join(f"case {i}: {v}" for i, v in enumerate(verdicts))
++    return f"== interactive_judge summary: {summary} ==\n" + "\n".join(out)
+diff --git a/utils/evidence.py b/utils/evidence.py
+new file mode 100644
+index 0000000..48ebe6d
+--- /dev/null
++++ b/utils/evidence.py
+@@ -0,0 +1,65 @@
++"""Shared evidence log: every verification tool appends one JSON line per call.
++
++Records carry the sha256 of the solution file that was tested, so a verifier can
++tell whether a record is about the current file or a stale version of it.
++"""
++import hashlib
++import json
++import os
++import time
++
++DEFAULT_EVIDENCE_PATH = '/tmp/evidence.jsonl'
++
++
++def evidence_path():
++    return os.environ.get('DGM_EVIDENCE_LOG') or DEFAULT_EVIDENCE_PATH
++
++
++def file_sha256(path):
++    """sha256 hex digest of a file, or None if it cannot be read."""
++    try:
++        h = hashlib.sha256()
++        with open(path, 'rb') as f:
++            for chunk in iter(lambda: f.read(65536), b''):
++                h.update(chunk)
++        return h.hexdigest()
++    except OSError:
++        return None
++
++
++def log_evidence(tool, solution_path, outcome, counts=None):
++    """Append one record. outcome is one of pass / fail / timeout / crash / error.
++
++    Never raises: a logging failure must not break the tool call.
++    """
++    rec = {
++        'ts': round(time.time(), 3),
++        'tool': tool,
++        'sha256': file_sha256(solution_path),
++        'outcome': outcome,
++        'counts': counts or {},
++    }
++    try:
++        with open(evidence_path(), 'a') as f:
++            f.write(json.dumps(rec) + '\n')
++    except OSError:
++        pass
++    return rec
++
++
++def read_evidence(path=None):
++    """All well-formed records in the evidence log (oldest first)."""
++    path = path or evidence_path()
++    records = []
++    if not os.path.isfile(path):
++        return records
++    with open(path) as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                records.append(json.loads(line))
++            except ValueError:
++                continue
++    return records

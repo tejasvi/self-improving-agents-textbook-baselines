@@ -1,0 +1,420 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7730ca5..bb69832 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -29,6 +29,7 @@ CANDIDATE_HINTS = [
+     "simple and obviously correct: prefer the clearest algorithm that is clearly right, then check speed",
+     "optimal complexity: pick the best known algorithm for the constraints and make sure it is fast in Python",
+     "re-derive from the constraints and edge cases: carefully reread the statement, enumerate edge cases, and choose an approach that handles them",
++    "explore empirically: write a fast exploratory BFS under /tmp for small parameters, print distance tables, derive a closed-form or formula, then verify it against the tables",
+ ]
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -116,6 +117,20 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _design_hint(feedback):
++    """Specific guidance for the designer, chosen from the validator report."""
++    text = feedback or ''
++    if 'WRONG answers' in text:
++        return ("HINT: brute.py gives a wrong answer on a sample that the expected output does not match. "
++                "Re-read the statement, fix brute.py so it reproduces the expected sample output exactly (the expected output is authoritative).")
++    if 'fails or is too slow' in text:
++        return ("HINT: brute.py crashes or times out on small generator inputs. Make it finish quickly on small inputs; "
++                "print 'TOO LARGE' to stderr and exit 1 only for inputs that are truly too large.")
++    if 'failed or printed nothing' in text:
++        return "HINT: tests/gen.py failed or printed nothing for some mode. Make every mode print exactly one valid input for seeds 0..4."
++    return "HINT: keep brute-infeasible samples as sample-only; only wrong answers or crashes on small inputs are real problems."
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -235,8 +250,38 @@ class AgenticSystem:
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+ 
++    @staticmethod
++    def _split_samples(pairs):
++        """
++        Best-effort split of multi-case samples. A sample whose first line is an integer T, whose output has
++        exactly T lines and whose remaining input lines divide evenly into T groups becomes T single-case
++        samples (first line '1'). Anything else is kept unchanged.
++        """
++        result = []
++        for inp, out in pairs:
++            split = None
++            lines = inp.replace('\r\n', '\n').split('\n')
++            while lines and lines[-1].strip() == '':
++                lines.pop()
++            out_lines = [l for l in out.replace('\r\n', '\n').split('\n') if l.strip() != '']
++            try:
++                t = int(lines[0].strip()) if lines else 0
++            except ValueError:
++                t = 0
++            rest = lines[1:]
++            if t > 1 and len(out_lines) == t and rest and len(rest) % t == 0:
++                g = len(rest) // t
++                split = [("1\n" + "\n".join(rest[k * g:(k + 1) * g]) + "\n", out_lines[k] + "\n")
++                         for k in range(t)]
++            if split is None:
++                result.append((inp, out))
++            else:
++                result.extend(split)
++        return result
++
+     def _load_samples(self):
+-        """Return list of (input, output) from tests/samples.json. Raises ValueError if malformed."""
++        """Return list of (input, output) from tests/samples.json (multi-case samples split per case).
++        Raises ValueError if malformed."""
+         with open(self.samples_path, 'r') as f:
+             data = json.load(f)
+         if not isinstance(data, list) or not data:
+@@ -246,24 +291,58 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             if not isinstance(item, dict) or 'input' not in item or 'output' not in item:
+                 raise ValueError("each entry of tests/samples.json needs 'input' and 'output'")
+             pairs.append((str(item['input']), str(item['output'])))
+-        return pairs
++        return self._split_samples(pairs)
++
++    def _classify_sample(self, inp, out):
++        """Run the brute on one sample. Returns (kind, detail) with kind in verified | infeasible | wrong."""
++        res = solution_check.run_plain(self.brute_path, [inp], [out], timeout=TIME_LIMIT)
++        if res['passed'] == 1:
++            return 'verified', ''
++        rep = res['report']
++        first = rep.splitlines()[0] if rep else ''
++        if 'timeout' in first:
++            return 'infeasible', 'brute timed out'
++        if 'TOO LARGE' in rep or 'MemoryError' in rep:
++            return 'infeasible', 'brute refused a too-large input'
++        if 'output differs' in first:
++            return 'wrong', rep
++        return 'wrong', "brute crashed on the sample\n" + rep
+ 
+     def _validate_tests(self):
+-        """Harness-side check of the design-phase files. Returns (ok, report_text)."""
++        """
++        Harness-side check of the design-phase files. Returns (ok, report_text).
++        Samples are classified individually: verified / infeasible (brute timed out, MemoryError or 'TOO LARGE')
++        / wrong (brute finished with a different output). Infeasible samples become sample-only entries.
++        Fails on: missing files, unusable generator, brute crash/timeout on small or edge inputs, wrong samples.
++        Sets self.sample_only, self.brute_verified, self.validation_fatal.
++        """
++        self.sample_only = set()
++        self.brute_verified = set()
++        self.validation_fatal = False
+         problems = []
+         for p in (self.brute_path, self.gen_path, self.samples_path):
+             if not os.path.isfile(p):
+                 problems.append(f"missing file: {p}")
+         if problems:
++            self.validation_fatal = True
+             return False, "\n".join(problems)
+         try:
+             samples = self._load_samples()
+         except (ValueError, OSError) as e:
++            self.validation_fatal = True
+             return False, f"tests/samples.json is invalid: {e}"
+-        res = solution_check.run_plain(self.brute_path, [i for i, _ in samples],
+-                                       [o for _, o in samples], timeout=TIME_LIMIT)
+-        if res['passed'] != len(samples):
+-            problems.append("tests/brute.py does not reproduce the sample outputs:\n" + res['report'])
++
++        wrong, notes = [], []
++        for idx, (inp, out) in enumerate(samples):
++            kind, detail = self._classify_sample(inp, out)
++            if kind == 'verified':
++                self.brute_verified.add(idx)
++            elif kind == 'infeasible':
++                self.sample_only.add(idx)
++                notes.append(f"sample {idx + 1}: {detail}; kept as sample-only (scores candidates, does not gate the harness)")
++            else:
++                wrong.append(f"sample {idx + 1}: brute disagrees with the expected output\n{detail}")
++
+         for mode in GEN_MODES:
+             text, err = solution_check.generate_input(self.gen_path, 0, mode, timeout=TIME_LIMIT)
+             if text is None or not text.strip():
+@@ -277,10 +356,19 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             if inputs:
+                 res = solution_check.run_plain(self.brute_path, inputs, None, timeout=TIME_LIMIT)
+                 if res['crashed']:
+-                    problems.append(f"tests/brute.py fails or is too slow on small '{mode}' inputs:\n{res['report']}")
++                    problems.append(f"tests/brute.py fails or is too slow on small '{mode}' inputs "
++                                    f"(it must finish on small inputs; exit non-zero with 'TOO LARGE' for infeasible ones):\n{res['report']}")
++        self.validation_fatal = bool(problems)  # gen/brute unusable: nothing from the harness is trustworthy
++        summary = (f"samples: {len(self.brute_verified)} verified by brute, {len(self.sample_only)} sample-only "
++                   f"(brute-infeasible), {len(wrong)} wrong; generator modes {GEN_MODES} checked")
++        if notes:
++            summary += "\n" + "\n".join(notes)
++        self.wrong_samples = wrong
++        if wrong:
++            problems.append("tests/brute.py gives WRONG answers on these samples (fix the brute, the expected output is authoritative):\n\n" + "\n\n".join(wrong))
+         if problems:
+-            return False, "\n\n".join(problems)
+-        return True, f"tests valid: {len(samples)} samples reproduced by brute; generator modes {GEN_MODES} run"
++            return False, summary + "\n\n" + "\n\n".join(problems)
++        return True, "tests valid: " + summary
+ 
+     def _design_tests(self, feedback=None):
+         """Separate session that sees only the statement and writes tests/brute.py, tests/gen.py, tests/samples.json."""
+@@ -290,23 +378,26 @@ You are preparing the TEST HARNESS only. Do not solve the problem in solution.py
+ Work from the problem statement alone. Create these files with the editor tool:
+ 
+ 1. {self.brute_path}
+-   A simple, obviously-correct brute-force reference program that reads stdin and writes stdout exactly like the real solution is expected to. Keep it simple; it may be slow, but must finish on small inputs.
++   A simple, obviously-correct brute-force reference program that reads stdin and writes stdout exactly like the real solution is expected to. It only needs to handle SMALL parameters. If an input is infeasible for the brute (parameters too large for it), print 'TOO LARGE' to stderr and exit with a non-zero code immediately; never hang or run out of memory.
+ 2. {self.gen_path}
+    A random input generator. It takes an integer seed as sys.argv[1] and an optional mode as sys.argv[2]:
+    - no mode or 'small': small random valid inputs (small enough for the brute force).
+    - 'edge': edge cases (minimal sizes, equal values, boundaries of the constraints), still small.
++   The small and edge modes must cover a RANGE of values of the key parameters (for example K from 2 to 8 or more, T in 1..5) and place coordinates on or near block boundaries and multiples of the parameters, not only random values.
+    - 'max': a maximum-size valid input using the largest constraints from the statement.
+    Use random.seed(int(sys.argv[1])). Print exactly one valid input to stdout.
+ 3. {self.samples_path}
+    A JSON list of objects {{"input": "<exact stdin text>", "output": "<exact expected stdout>"}} containing every sample input and expected output given in the problem statement. Copy them exactly.
++   If a sample holds several test cases (first line T, then T cases), split it into one entry per case, each with its own T=1 input and its single expected output line. Samples with huge parameters may be kept as they are; the harness treats brute-infeasible samples as sample-only.
+ 
+ Check that the generator runs for seeds 0..4 in each mode, and that brute.py reproduces the samples (run `python3 {self.brute_path} < file`). Do not write anything else under tests/ except these files.
+ """
+         if feedback:
+             prompt += f"""
+-The harness checked your previous files and found these problems (raw report):
++The harness checked your previous files. Classified report (verified / brute-infeasible / wrong samples, then raw problems):
+ {feedback}
+ 
++{_design_hint(feedback)}
+ Fix the files so that every check passes.
+ """
+         chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+@@ -314,16 +405,21 @@ Fix the files so that every check passes.
+     def _score_candidate(self, path):
+         """
+         Harness-side scoring. Returns (score, report) where score = (samples_passed, stress_passed, no_crash).
+-        Higher is better. Perfect score means all samples pass, all stress cases pass, nothing crashes.
++        All samples (including sample-only ones) are checked against the expected outputs from samples.json.
++        If the generator/brute are unusable (self.stress_usable is False), stress is skipped and the second slot
++        becomes a max-size speed rank (-max_time in ms), so candidates are ranked on samples + max-size time.
++        Higher is better. Perfect: all samples pass, all stress cases pass (if stress ran), nothing crashes.
+         """
+         if not os.path.isfile(path):
+             return (0, 0, 0), f"candidate file not found: {path}"
+-        if not (os.path.isfile(self.brute_path) and os.path.isfile(self.gen_path) and os.path.isfile(self.samples_path)):
++        if not os.path.isfile(self.samples_path):
+             return (0, 0, 0), "test harness files are missing; cannot score"
+         try:
+             samples = self._load_samples()
+         except (ValueError, OSError) as e:
+             return (0, 0, 0), f"tests/samples.json is invalid: {e}"
++        stress_usable = getattr(self, 'stress_usable', True) and \
++            os.path.isfile(self.brute_path) and os.path.isfile(self.gen_path)
+         n = len(samples)
+         report = []
+ 
+@@ -332,29 +428,43 @@ Fix the files so that every check passes.
+             report.append(sres['report'])
+         report.append(f"samples: {sres['passed']}/{n} passed")
+ 
+-        max_text, max_err = solution_check.generate_input(self.gen_path, 0, MAX_MODE, timeout=TIME_LIMIT)
++        max_text, max_err = solution_check.generate_input(self.gen_path, 0, MAX_MODE, timeout=TIME_LIMIT) \
++            if os.path.isfile(self.gen_path) else (None, "tests/gen.py missing")
++        max_time = 0.0
+         if max_text is None:
+             max_ok = False
+             report.append(f"max-size generation failed:\n{max_err}")
++            report.append("max-size: not run")
+         else:
+             mres = solution_check.run_plain(path, [max_text], None, timeout=TIME_LIMIT)
+             max_ok = mres['crashed'] == 0
++            max_time = mres['max_time']
+             if not max_ok:
+                 report.append("max-size input FAILED:\n" + mres['report'])
+-            report.append(f"max-size: {'ok' if max_ok else 'failed'}, time {mres['max_time']:.3f} s"
+-                          if max_text is not None else "max-size: not run")
+-
+-        stress_budget = min(STRESS_BUDGET, max(10.0, self._time_left() / 4))
+-        st = solution_check.run_stress(path, self.brute_path, self.gen_path, range(STRESS_SEEDS),
+-                                       modes=STRESS_MODES, timeout=TIME_LIMIT, budget=stress_budget)
+-        if st['first_failure']:
+-            report.append(st['first_failure'])
+-        report.append(f"stress: {st['passed']}/{st['total']} passed"
+-                      + (" (budget reached)" if st['budget_hit'] else ""))
+-
+-        no_crash = int(sres['crashed'] == 0 and max_ok and st['crashed'] == 0)
+-        score = (sres['passed'], st['passed'], no_crash)
+-        perfect = score == (n, st['total'], 1) and not st['budget_hit']
++            report.append(f"max-size: {'ok' if max_ok else 'failed'}, time {max_time:.3f} s")
++
++        if stress_usable:
++            stress_budget = min(STRESS_BUDGET, max(10.0, self._time_left() / 4))
++            st = solution_check.run_stress(path, self.brute_path, self.gen_path, range(STRESS_SEEDS),
++                                           modes=STRESS_MODES, timeout=TIME_LIMIT, budget=stress_budget)
++            if st['first_failure']:
++                report.append(st['first_failure'])
++            report.append(f"stress: {st['passed']}/{st['total']} passed"
++                          + (" (budget reached)" if st['budget_hit'] else ""))
++            stress_passed, stress_total, stress_crashed = st['passed'], st['total'], st['crashed']
++            budget_hit = st['budget_hit']
++        else:
++            report.append("stress: skipped (tests/gen.py or tests/brute.py unusable; ranked on samples + max-size time)")
++            stress_passed, stress_total, stress_crashed, budget_hit = 0, 0, 0, False
++
++        no_crash = int(sres['crashed'] == 0 and max_ok and stress_crashed == 0)
++        if not stress_usable:
++            stress_passed = -int(round(max_time * 1000))  # degraded: speed rank replaces stress credit
++        score = (sres['passed'], stress_passed, no_crash)
++        if stress_usable:
++            perfect = (sres['passed'], stress_passed, no_crash) == (n, stress_total, 1) and not budget_hit
++        else:
++            perfect = sres['passed'] == n and no_crash == 1 and max_ok
+         report.append("RESULT: OK" if perfect else "RESULT: FAILED")
+         return score, "\n\n".join(report)
+ 
+@@ -390,6 +500,13 @@ Avoid shadowing Python builtins. Keep replies concise.
+         if feedback:
+             prompt += f"\nPrevious attempt feedback (raw harness report):\n{feedback}\n"
+         chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        if not os.path.isfile(out_path):
++            # empty or truncated session: retry once with a short prompt that asks for the file first
++            safe_log(f"candidate {i} wrote no file; retrying once with a short prompt")
++            short = self._task_text() + f"""
++Create the file {out_path} immediately using the editor tool (command=create) with a complete Python solution to the problem above (strategy: {hint}). Write the file first, keep replies very short, then test it on the samples in {self.samples_path}.
++"""
++            chat_with_agent(short, model=self.code_model, msg_history=[], logging=safe_log)
+         return out_path
+ 
+     def _read_file(self, path):
+@@ -460,8 +577,19 @@ Write the full repaired solution to {out_path} using the editor tool (command=cr
+             safe_log(f"test design attempt {attempt + 1}: {'OK' if ok else 'INVALID'}")
+             if ok:
+                 break
++        self.stress_usable = True
+         if not ok:
+-            safe_log("WARNING: test harness invalid after retries; candidates will score as failing.\n" + report)
++            if getattr(self, 'validation_fatal', True):
++                # gen/brute unusable: skip stress and rank candidates on samples + max-size time
++                self.stress_usable = False
++                safe_log("WARNING: test generator/brute unusable after retries; stress is skipped, "
++                         "candidates are ranked on samples + max-size time.\n" + report)
++            else:
++                # only the brute's samples are the problem: keep the usable parts and continue degraded
++                self.harness_degraded = True
++                safe_log("WARNING: harness degraded (brute disagrees with some samples); continuing with usable parts.\n" + report)
++        else:
++            self.harness_degraded = False
+ 
+         # 2. Candidates (independent sessions, different strategies)
+         entries = []
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..d75f960
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,17 @@
++# First-draft placeholder for the harness work described in the task.
++# The real changes go to /dgm/coding_agent.py (and tests/). This file is a
++# stub so the workspace has a solution artifact; it is refined below.
++
++
++def main():
++    import sys
++    data = sys.stdin.read().split()
++    if not data:
++        return
++    t = int(data[0])
++    # Brute-force placeholder: echo the number of cases back as a count.
++    print(t)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_harness.py b/tests/test_harness.py
+new file mode 100644
+index 0000000..8a812c2
+--- /dev/null
++++ b/tests/test_harness.py
+@@ -0,0 +1,83 @@
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++
++# Brute for: T cases, each "K" -> prints K*K. Refuses huge K like a real brute would.
++BRUTE_REFUSES_HUGE = (
++    "import sys\n"
++    "data = sys.stdin.read().split()\n"
++    "t = int(data[0])\n"
++    "for k in range(t):\n"
++    "    v = int(data[1 + k])\n"
++    "    if v > 1000:\n"
++    "        print('TOO LARGE', file=sys.stderr)\n"
++    "        sys.exit(1)\n"
++    "    print(v * v)\n"
++)
++GEN = ("import random, sys\n"
++       "random.seed(int(sys.argv[1]))\n"
++       "mode = sys.argv[2] if len(sys.argv) > 2 else 'small'\n"
++       "print(3)\n"
++       "for _ in range(3):\n"
++       "    print(random.randint(1, 9))\n")
++
++
++def _agent(tmp_path, brute, samples):
++    root = tmp_path / "repo"
++    (root / "tests").mkdir(parents=True)
++    (root / "cands").mkdir()
++    (root / "tests" / "brute.py").write_text(brute)
++    (root / "tests" / "gen.py").write_text(GEN)
++    (root / "tests" / "samples.json").write_text(json.dumps(samples))
++    agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
++    agent.git_tempdir = str(root)
++    agent._init_pipeline(budget_seconds=600)
++    return agent, root
++
++
++def test_split_multi_case():
++    pairs = [("2\n3\n4\n", "9\n16\n")]
++    assert coding_agent.AgenticSystem._split_samples(pairs) == [
++        ("1\n3\n", "9\n"), ("1\n4\n", "16\n")]
++
++
++def test_split_single_case_unchanged():
++    pairs = [("5\n1 2 3 4 5\n", "15\n")]
++    assert coding_agent.AgenticSystem._split_samples(pairs) == pairs
++
++
++def test_split_non_numeric_first_line_unchanged():
++    pairs = [("hello world\n1 2\n", "3\n")]
++    assert coding_agent.AgenticSystem._split_samples(pairs) == pairs
++
++
++def test_split_output_line_count_mismatch_unchanged():
++    pairs = [("2\n3\n4\n", "9\n")]  # T=2 but only one output line
++    assert coding_agent.AgenticSystem._split_samples(pairs) == pairs
++
++
++def test_validator_accepts_brute_rejecting_huge_sample(tmp_path):
++    samples = [{"input": "1\n3\n", "output": "9\n"},
++               {"input": "1\n100000\n", "output": "10000000000\n"}]  # brute refuses this one
++    agent, _ = _agent(tmp_path, BRUTE_REFUSES_HUGE, samples)
++    ok, report = agent._validate_tests()
++    assert ok, report
++    assert agent.sample_only == {1}
++    assert agent.brute_verified == {0}
++    assert not agent.validation_fatal
++
++
++def test_validator_rejects_wrong_brute_and_names_sample(tmp_path):
++    samples = [{"input": "1\n3\n", "output": "9\n"},
++               {"input": "1\n4\n", "output": "17\n"}]  # brute prints 16
++    agent, _ = _agent(tmp_path, BRUTE_REFUSES_HUGE, samples)
++    ok, report = agent._validate_tests()
++    assert not ok
++    assert "sample 2" in report
++    assert "WRONG" in report
++    assert len(agent.wrong_samples) == 1
++    assert not agent.validation_fatal

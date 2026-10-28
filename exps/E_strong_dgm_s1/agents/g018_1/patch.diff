@@ -1,0 +1,212 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..b8a777a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -153,9 +153,17 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++4. Write a brute-force reference (brute.py) that is obviously correct for small inputs, and a generator (gen.py) that takes two integer command-line arguments `seed` and `regime` and prints ONE test input to stdout. The generator MUST support at least 4 regimes, for example:
++   - regime 0: tiny n (1-6) with tiny values, so edge cases are exhaustively covered;
++   - regime 1: medium n (20-300) with a small value range and heavy duplicates;
++   - regime 2: medium n (20-300) with the full value range allowed by the constraints;
++   - regime 3: adversarial/structured inputs: all-equal values, two distinct values, sorted/reverse-sorted, boundary values (min/max limits, 0, 1, negatives if allowed).
++   Adapt these regimes to the actual problem, but keep the variety (small value ranges with many duplicates are essential, since duplicate handling is a common source of bugs).
++5. If the problem allows multiple valid answers, also write a checker (checker.py) that takes two arguments `input_file` and `output_file`, validates the solution output against the input, and exits 0 only if it is valid (exit non-zero otherwise). Use the brute force (or a provably correct computation) to decide feasibility/optimal value when needed.
++6. Run the `stress_test` tool with solution_cmd `python3 solution.py`, generator_path pointing to gen.py, brute_cmd (and/or checker_path), regimes set to the number of regimes (at least 4), iterations at least 200 per regime, and a suitable timeout. Run it on ALL regimes. When it fails, read the failing input and both outputs, find the bug, fix solution.py, and rerun the full stress test.
++7. If the solution uses a clever counting or inclusion-exclusion formula (or any combinatorial count), additionally unit-test that count against a brute-force count on random small multisets (enumerate directly, compare exact values) before relying on it.
++8. Generate a maximum-size input (n and values at their constraint limits, including heavy-duplicate and all-equal variants) and check that solution.py finishes in well under 2 seconds. If a checker exists, validate the output of the solution on these largest inputs with the checker.
++9. Do not finalize until all regimes pass the stress test with at least 200 cases each, and the largest-input checks pass. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..1a55bbb
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,181 @@
++import os
++import subprocess
++import tempfile
++import time
++
++MAX_SHOW = 3000
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Randomized stress test of a solution against a brute-force reference (or a checker).\n
++* `generator_path` is a Python script run as `python3 <generator_path> <seed> <regime>` (optionally with an extra `<size>` argument when shrinking). It must print ONE test input to stdout. `regime` is an integer in [0, regimes) selecting the kind of input (tiny, medium with heavy duplicates, medium with full range, adversarial/structured, ...).
++* `solution_cmd` is the shell command that runs the candidate solution reading the test input from stdin (e.g. `python3 solution.py`).
++* `brute_cmd` is the shell command for the trusted brute-force reference (same stdin/stdout protocol). Output is compared exactly (after whitespace normalization per line). Ignored when `checker_path` is given.
++* `checker_path` is an optional Python script run as `python3 <checker_path> <input_file> <output_file>`; it must exit 0 iff the solution output is valid. Use it when multiple answers are allowed; when given, the checker alone decides validity and brute_cmd is not run.
++* Runs `regimes` x `iterations` cases with bounded loops and a per-run `timeout` (seconds). Returns on the first failure the failing input, both outputs, and the regime/seed; on success returns per-regime pass counts and the max runtime.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {"type": "string", "description": "Shell command running the candidate solution (reads stdin, writes stdout), e.g. 'python3 solution.py'."},
++                "generator_path": {"type": "string", "description": "Path to a Python generator script; invoked as `python3 generator_path seed regime` and prints one test input."},
++                "brute_cmd": {"type": "string", "description": "Optional shell command running the brute-force reference (reads stdin, writes stdout)."},
++                "checker_path": {"type": "string", "description": "Optional path to a checker script invoked as `python3 checker_path input_file output_file`; exit 0 means the solution output is valid."},
++                "regimes": {"type": "integer", "description": "Number of generator regimes to test (regime indices 0..regimes-1). Should be at least 4."},
++                "iterations": {"type": "integer", "description": "Number of random seeds per regime (at least 200 recommended)."},
++                "timeout": {"type": "integer", "description": "Per-run timeout in seconds for the generator, solution, brute and checker."}
++            },
++            "required": ["solution_cmd", "generator_path", "regimes", "iterations", "timeout"]
++        }
++    }
++
++
++def _clip(s, n=MAX_SHOW):
++    if s is None:
++        return ""
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++
++def _norm(s):
++    return "\n".join(line.rstrip() for line in s.strip().splitlines())
++
++
++def _run(cmd, stdin_text=None, timeout=10, args=None):
++    """Run a shell command (or argv list) and return (returncode, stdout, stderr, elapsed, timed_out)."""
++    start = time.time()
++    try:
++        if args is not None:
++            p = subprocess.run(args, input=stdin_text, capture_output=True, text=True,
++                               timeout=timeout, errors="replace")
++        else:
++            p = subprocess.run(cmd, shell=True, input=stdin_text, capture_output=True, text=True,
++                               timeout=timeout, errors="replace")
++        return p.returncode, p.stdout, p.stderr, time.time() - start, False
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout if isinstance(e.stdout, str) else ""
++        err = e.stderr if isinstance(e.stderr, str) else ""
++        return None, out, err, time.time() - start, True
++
++
++def _gen(generator_path, seed, regime, timeout, size=None):
++    args = ["python3", generator_path, str(seed), str(regime)]
++    if size is not None:
++        args.append(str(size))
++    rc, out, err, _, to = _run(None, timeout=timeout, args=args)
++    if to:
++        return None, "generator timed out"
++    if rc != 0:
++        return None, f"generator failed (exit {rc}): {_clip(err, 1000)}"
++    return out, None
++
++
++def _check_case(solution_cmd, brute_cmd, checker_path, test_input, timeout, tmpdir):
++    """Return (ok, info dict)."""
++    rc, sol_out, sol_err, sol_t, sol_to = _run(solution_cmd, stdin_text=test_input, timeout=timeout)
++    info = {"sol_out": sol_out, "sol_err": sol_err, "sol_time": sol_t, "sol_rc": rc, "reason": None}
++    if sol_to:
++        info["reason"] = "solution timed out"
++        return False, info
++    if rc != 0:
++        info["reason"] = f"solution exited with code {rc}"
++        return False, info
++
++    if brute_cmd and not checker_path:
++        brc, brute_out, brute_err, _, bto = _run(brute_cmd, stdin_text=test_input, timeout=timeout * 5)
++        info["brute_out"] = brute_out
++        if bto or brc != 0:
++            info["reason"] = "brute force failed or timed out (fix the brute force / reduce input size)"
++            return False, info
++
++    if checker_path:
++        in_file = os.path.join(tmpdir, "in.txt")
++        out_file = os.path.join(tmpdir, "out.txt")
++        with open(in_file, "w") as f:
++            f.write(test_input)
++        with open(out_file, "w") as f:
++            f.write(sol_out)
++        crc, cout, cerr, _, cto = _run(None, timeout=timeout, args=["python3", checker_path, in_file, out_file])
++        if cto:
++            info["reason"] = "checker timed out"
++            return False, info
++        if crc != 0:
++            info["reason"] = f"checker rejected solution output (exit {crc}): {_clip((cout or '') + (cerr or ''), 1000)}"
++            return False, info
++        return True, info
++
++    if brute_cmd:
++        if _norm(sol_out) != _norm(info["brute_out"]):
++            info["reason"] = "output mismatch"
++            return False, info
++        return True, info
++
++    info["reason"] = "neither brute_cmd nor checker_path given"
++    return False, info
++
++
++def tool_function(solution_cmd, generator_path, regimes, iterations, timeout, brute_cmd=None, checker_path=None):
++    try:
++        regimes = int(regimes)
++        iterations = int(iterations)
++        timeout = max(1, min(int(timeout or 10), 300))
++    except (TypeError, ValueError) as e:
++        return f"Error: invalid numeric argument: {e}"
++    if not brute_cmd and not checker_path:
++        return "Error: provide brute_cmd and/or checker_path."
++    if not os.path.isfile(generator_path):
++        return f"Error: generator not found: {generator_path}"
++    if checker_path and not os.path.isfile(checker_path):
++        return f"Error: checker not found: {checker_path}"
++    regimes = max(1, min(regimes, 100))
++    iterations = max(1, min(iterations, 100000))
++
++    summary = []
++    max_time = 0.0
++    total = 0
++    with tempfile.TemporaryDirectory() as tmpdir:
++        for regime in range(regimes):
++            passed = 0
++            regime_max = 0.0
++            for seed in range(iterations):
++                test_input, gerr = _gen(generator_path, seed, regime, timeout)
++                if gerr is not None:
++                    return (f"Generator error at regime={regime}, seed={seed}: {gerr}\n"
++                            f"Fix the generator (it must print one input for `seed regime`).")
++                ok, info = _check_case(solution_cmd, brute_cmd, checker_path, test_input, timeout, tmpdir)
++                regime_max = max(regime_max, info.get("sol_time", 0.0))
++                if ok:
++                    passed += 1
++                    continue
++                # Failure: try to reproduce with a smaller size hint (generator may ignore it).
++                best_input, best_info, best_size = test_input, info, None
++                for size in (1, 2, 3, 5, 8):
++                    small_input, serr = _gen(generator_path, seed, regime, timeout, size=size)
++                    if serr is not None or small_input is None or len(small_input) >= len(best_input):
++                        continue
++                    sok, sinfo = _check_case(solution_cmd, brute_cmd, checker_path, small_input, timeout, tmpdir)
++                    if not sok:
++                        best_input, best_info, best_size = small_input, sinfo, size
++                        break
++                note = (f"(reproduced with smaller size hint {best_size})" if best_size is not None
++                        else "(no smaller reproduction found)")
++                lines = [
++                    f"FAILED at regime={regime}, seed={seed} after {passed} passing cases in this regime. {note}",
++                    f"Reason: {best_info.get('reason')}",
++                    "--- failing input ---",
++                    _clip(best_input),
++                    "--- solution output ---",
++                    _clip(best_info.get("sol_out", "")) or "(empty)",
++                ]
++                if best_info.get("sol_err"):
++                    lines += ["--- solution stderr ---", _clip(best_info["sol_err"], 1500)]
++                if brute_cmd and not checker_path:
++                    lines += ["--- brute output ---", _clip(best_info.get("brute_out", "")) or "(empty)"]
++                return "\n".join(lines)
++            total += passed
++            max_time = max(max_time, regime_max)
++            summary.append(f"regime {regime}: {passed}/{iterations} passed, max solution time {regime_max:.3f}s")
++    return ("ALL PASSED\n" + "\n".join(summary) +
++            f"\nTotal: {total}/{regimes * iterations}. Max solution runtime over all cases: {max_time:.3f}s")

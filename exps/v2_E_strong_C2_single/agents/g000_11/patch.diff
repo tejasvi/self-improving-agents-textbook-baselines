@@ -1,0 +1,412 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..c294aab 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,10 +3,22 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
++import shutil
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from utils.test_harness import run_candidate, parse_score, parse_field, best_index, normalize_output
++
++# Pipeline settings (bounded: total runtime is at most a fixed number of agent calls and harness runs)
++PIPELINE_DIRNAME = '.pipeline'   # scratch dir under git_tempdir, removed at the end
++CANDIDATES = 3                   # K: independent attempts
++REPAIR_ROUNDS = 2                # R: repair rounds for the best candidate
++STRESS_CASES = 200               # stress cases requested from run_tests.py
++DIFF_SEEDS = 3                   # max-size inputs used for differential comparison
++RUN_TIMEOUT = 10                 # seconds per candidate run
++HARNESS_TIMEOUT = 900            # seconds for one run_tests.py invocation
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -137,27 +149,276 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    # ------------------------------------------------------------------
++    # Multi-attempt, independently tested pipeline
++    #   Stage A: independent test author (checker, brute, generator, harness)
++    #   Stage B: K candidate attempts, each scored by the harness
++    #   Stage C: best candidate repaired for up to R rounds (kept only if score improves)
++    #   Final:   best candidate copied to solution.py and checked on samples
++    # Every stage starts from a fresh msg_history.
++    # All paths live under git_tempdir; the scratch dir is removed at the end so
++    # that it does not leak into the graded diff.
++    # ------------------------------------------------------------------
++    def _paths(self):
++        work = os.path.join(self.git_tempdir, PIPELINE_DIRNAME)
++        tests = os.path.join(work, 'tests')
++        return {
++            'work': work,
++            'tests': tests,
++            'harness': os.path.join(tests, 'run_tests.py'),
++            'checker': os.path.join(tests, 'checker.py'),
++            'brute': os.path.join(tests, 'brute.py'),
++            'gen': os.path.join(tests, 'gen.py'),
++            'samples': os.path.join(tests, 'samples'),
++            'solution': os.path.join(self.git_tempdir, 'solution.py'),
++        }
++
++    def _task_header(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+ 
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++The task is a competitive programming problem in Python: either a complete program that reads standard input and writes standard output, or a method of a given `Solution` class (if the statement gives a class/method signature, the grader calls that method).
++"""
++
++    def _author_prompt(self, p):
++        return self._task_header() + f"""
++Your job right now is ONLY to build an independent test suite. Another agent will write the actual solution later and will be graded against hidden tests, so the tests must be trustworthy and must not depend on any solution code. Do NOT write solution.py or any cand_*.py file.
++
++Create these files (use absolute paths, creating directories as needed) in {p['tests']}:
++
++1. samples/: one pair per sample test in the statement: `sample_1.in`, `sample_1.out`, `sample_2.in`, ... copied EXACTLY from the statement.
++
++2. checker.py: usage `python3 checker.py <input_file> <output_file>`. It must verify the output DIRECTLY against the problem constraints (do not compare with a fixed expected string when several answers may be valid). Exit code 0 if the output is valid, non-zero otherwise, and print a short human-readable message (e.g. the violated condition, expected vs. actual values). For problems with a unique answer, check the exact answer using brute.py-independent logic where possible.
++
++3. brute.py: usage `python3 brute.py <input_file>` that prints the exact answer by exhaustive search. It must be EXACT over a search space that you justify in a comment at the top of the file (e.g. "all subsets of the N vertices, valid because the statement guarantees ..."). It must be correct for every input up to a small size bound; state that bound. Keep it small enough to run in well under a second per case. If a value domain is small, enumerate it fully rather than sampling it.
++
++4. gen.py: usage `python3 gen.py --seed <int> --size <class>` printing ONE valid input (respecting every constraint in the statement) to stdout. It must be deterministic for a given seed. Size classes:
++   - `edge`: minimum sizes, degenerate/empty structures where allowed, all-equal values, extreme values;
++   - `small`: small random inputs (suitable for brute.py, within its bound), varied enough to cover many structural cases (several independent components, dependencies, ties, repeated values, etc.);
++   - `structured`: adversarial shapes such as paths, stars, chains, complete graphs, sorted/reversed arrays, cases needing many independent bits or long dependency chains;
++   - `dense` and `sparse` variants where the statement allows them;
++   - `max`: maximum N allowed by the constraints, with values at their limits (this is used for timing and differential checks).
++   Each size class must accept a seed and vary its output across seeds.
++
++5. run_tests.py: the harness. Usage: `python3 run_tests.py <candidate.py> [--stress N] [--timeout T]`. It must:
++   - run the candidate with `python3` on each sample (feed the .in as stdin; if the task is a `Solution` method, the candidate file defines `class Solution`, so run it through a small driver you write in tests/driver.py which imports the candidate file, reads the same input format, calls the method, and prints the result in the same output format; the harness always calls the driver in that case). Compare sample outputs with the expected output (whitespace-tolerant, or via checker.py if multiple answers are valid). Report PASS/FAIL per sample with raw candidate output for failures.
++   - run N stress cases: for seeds 1..N cycle through the size classes in gen.py (small/edge/structured/dense/sparse, and brute.py for every case within brute.py's bound). Validate every candidate output with checker.py. For cases within brute.py's bound also compare against brute.py's answer when the answer is unique.
++   - print the first K failures (default 3), each with the input (truncated if long), the candidate's raw stdout/stderr, and the checker/brute message. Never hide a failure; keep the failing input so it can be reproduced.
++   - time the candidate on the `max` class inputs (with --timeout per run, default 10 seconds) and report the max runtime.
++   - finish with exactly these lines at the end of stdout:
++       SAMPLES: <passed>/<total>
++       STRESS: <passed>/<total>
++       RUNTIME: <max max-size runtime in seconds, or 0 if none>
++       SCORE: <number in [0,1]>
++     where SCORE = 0 if any sample fails or any output is timed out/crashes on a max case, otherwise SCORE = (passed stress cases)/(total stress cases) with the time limit respected.
++   Timeouts and crashes must be reported, not raised. The harness must be deterministic.
++
++Verify your work:
++- Run run_tests.py on a trivial candidate you write in tests/ (e.g. a wrong one) to confirm it reports failures, and check that brute.py agrees with checker.py on a few generated small inputs using a correct throwaway solution you write in tests/. Delete throwaway solutions afterwards; they must not be left in tests/ for other agents.
++- Confirm gen.py produces valid inputs for every size class and seeds 1..5, and that brute.py finishes quickly on the small class.
++- Make sure every file runs with `python3` from any working directory given absolute paths.
++
++When done, reply with a short summary of the files and the exact command lines (paths and flags) to run the harness, checker, and generator. Do not write solution.py.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _candidate_prompt(self, p, k, prior_summary, cand_path):
++        approach_hint = ""
++        if k > 0:
++            approach_hint = (
++                "Earlier attempts already exist (see below). Do not simply copy them: pick a clearly "
++                "different algorithm or invariant if one is plausible, and avoid the failure modes listed.\n"
++            )
++        return self._task_header() + f"""
++You are attempt {k + 1} of several independent attempts at this problem. Write the full solution to the file {cand_path} (absolute path). Do not write to solution.py.
++
++Independent tests were written by a separate agent and live in {p['tests']}:
++- `python3 {p['harness']} {cand_path}` runs the samples and stress tests and prints a report ending with SAMPLES, STRESS, RUNTIME and SCORE lines. Use the first failing case in the report to find bugs; the report shows the input, your raw output and the checker/brute message.
++- `python3 {p['checker']} <input_file> <output_file>` validates an output for an input.
++- `python3 {p['brute']} <input_file>` prints the exact answer for small inputs.
++- `python3 {p['gen']} --seed <int> --size <edge|small|structured|dense|sparse|max>` generates inputs.
++Do not edit the files in {p['tests']}; if you believe a test is wrong, say so in your final reply with the evidence.
++
++Work like a careful competitive programmer:
++1. Read the constraints and choose an algorithm that fits them. Python does about 10^7 simple operations per second; aim well below that on the max size class.
++2. Write {cand_path}. Run it on every sample from {p['samples']} and compare exactly.
++3. Run the harness, read the report, fix every failing case (use the minimal failing input and brute.py to localize the bug), and repeat until SCORE is 1 or you cannot improve it.
++4. Make sure the max-size case runs well under 2 seconds.
++Read stdin/stdout with sys.stdin and print results; for a `Solution` class, define the class exactly as the statement describes.
++
++{approach_hint}{prior_summary}
++Finish with a short message listing the final SCORE and RUNTIME you observed.
++"""
++
++    def _repair_prompt(self, p, best_path, report, round_idx, cand_path):
++        return self._task_header() + f"""
++The solution file {best_path} is the best attempt so far, but the independent harness still reports failures. Fix it.
++
++Harness report for the current best (raw):
++<report>
++{report}
++</report>
++
++Instructions:
++- Copy the current best to {cand_path} (absolute path) and fix it there; do not modify {best_path}, do not write solution.py.
++- Use the failing case above: reproduce it with `python3 <file> < input`, compare with `python3 {p['brute']} <input>` where the input is small, and validate outputs with `python3 {p['checker']} <input> <output>`.
++- Do not edit the files in {p['tests']}. Do not change the algorithm wholesale unless the failure shows it is wrong.
++- Rerun `python3 {p['harness']} {cand_path}` and keep iterating until the report shows SCORE 1 or you stop improving.
++This is repair round {round_idx}. Finish with a short message listing the final SCORE and RUNTIME.
++"""
++
++    def _run_harness(self, p, cand_path, stress=STRESS_CASES, timeout=HARNESS_TIMEOUT):
++        if not os.path.exists(cand_path):
++            return {'score': None, 'runtime': None, 'report': f"Error: candidate file {cand_path} does not exist."}
++        res = run_candidate(
++            ['python3', p['harness'], cand_path, '--stress', str(stress), '--timeout', str(RUN_TIMEOUT)],
++            timeout=timeout, cwd=p['tests'],
++        )
++        report = res['stdout'] + (f"\n[stderr]\n{res['stderr']}" if res['stderr'] else '')
++        if res['timed_out']:
++            report += f"\n[harness timed out after {timeout}s]"
++        score = parse_score(res['stdout'])
++        runtime = parse_field(res['stdout'], 'RUNTIME')
++        return {'score': score, 'runtime': runtime, 'report': report}
++
++    def _failure_excerpt(self, report, limit=2500):
++        if not report:
++            return ''
++        return report if len(report) <= limit else report[:limit // 2] + "\n...<clipped>...\n" + report[-limit // 2:]
++
++    def _differential(self, p, cands):
++        """Run all valid candidates on max-size generated inputs; flag disagreements and invalid outputs."""
++        notes = []
++        for seed in range(1, DIFF_SEEDS + 1):
++            gen = run_candidate(['python3', p['gen'], '--seed', str(seed), '--size', 'max'], timeout=60, cwd=p['tests'])
++            if gen['timed_out'] or gen['returncode'] != 0 or not gen['stdout'].strip():
++                notes.append(f"seed {seed}: generator failed: {gen['stderr'][-500:]}")
++                continue
++            in_path = os.path.join(p['work'], f'diff_in_{seed}.txt')
++            with open(in_path, 'w') as f:
++                f.write(gen['stdout'])
++            outputs = {}
++            for name, path in cands:
++                r = run_candidate(['python3', path], input=gen['stdout'], timeout=RUN_TIMEOUT)
++                outputs[name] = r
++                if r['timed_out'] or r['returncode'] != 0:
++                    notes.append(f"seed {seed}: {name} timed_out={r['timed_out']} rc={r['returncode']} stderr={r['stderr'][-300:]}")
++                    continue
++                out_path = os.path.join(p['work'], f'diff_out_{name}_{seed}.txt')
++                with open(out_path, 'w') as f:
++                    f.write(r['stdout'])
++                chk = run_candidate(['python3', p['checker'], in_path, out_path], timeout=60, cwd=p['tests'])
++                if chk['returncode'] != 0:
++                    notes.append(f"seed {seed}: {name} INVALID output: {(chk['stdout'] + chk['stderr'])[-300:]}")
++            ok = {n: normalize_output(r['stdout']) for n, r in outputs.items() if not r['timed_out'] and r['returncode'] == 0}
++            distinct = {}
++            for n, v in ok.items():
++                distinct.setdefault(v, []).append(n)
++            if len(distinct) > 1:
++                groups = "; ".join(",".join(sorted(g)) for g in distinct.values())
++                notes.append(f"seed {seed}: DISAGREE between outputs of [{groups}] (may be valid if multiple answers exist; checker decides)")
++        return notes
++
++    def _run_stage_author(self, p):
++        os.makedirs(p['tests'], exist_ok=True)
++        msg = self._author_prompt(p)
++        chat_with_agent(msg, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _run_stage_candidates(self, p):
++        results = []
++        for k in range(CANDIDATES):
++            cand_path = os.path.join(p['work'], f'cand_{k}.py')
++            prior = []
++            for j, r in enumerate(results):
++                score = r['score'] if r['score'] is not None else 'n/a'
++                runtime = r['runtime'] if r['runtime'] is not None else 'n/a'
++                prior.append(f"- attempt {j + 1}: SCORE={score} RUNTIME={runtime}\n  failures:\n{self._failure_excerpt(r['report'], 1200)}")
++            prior_summary = ("Summary of previous attempts (scores and failing cases, raw):\n" + "\n".join(prior) + "\n") if prior else ""
++            msg = self._candidate_prompt(p, k, prior_summary, cand_path)
++            chat_with_agent(msg, model=self.code_model, msg_history=[], logging=safe_log)
++            r = self._run_harness(p, cand_path)
++            r['path'] = cand_path
++            results.append(r)
++            safe_log(f"[pipeline] candidate {k}: score={r['score']} runtime={r['runtime']}")
++        return results
++
++    def _select(self, results):
++        entries = [{'score': (r['score'] if r['score'] is not None else -1.0),
++                    'runtime': (r['runtime'] if r['runtime'] is not None else 1e9)} for r in results]
++        return best_index(entries)
++
++    def _run_stage_repair(self, p, best):
++        msg_history = []
++        for rnd in range(1, REPAIR_ROUNDS + 1):
++            if best['score'] is not None and best['score'] >= 1.0:
++                break
++            cand_path = os.path.join(p['work'], f'repair_{rnd}.py')
++            msg = self._repair_prompt(p, best['path'], self._failure_excerpt(best['report']), rnd, cand_path)
++            msg_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            new = self._run_harness(p, cand_path)
++            new['path'] = cand_path
++            old_score = best['score'] if best['score'] is not None else -1.0
++            new_score = new['score'] if new['score'] is not None else -1.0
++            safe_log(f"[pipeline] repair {rnd}: score {old_score} -> {new_score}")
++            if new_score > old_score:
++                best = new
++        return best
++
++    def _finalize(self, p, results, best_idx):
++        # Try the best candidate first, then the rest in rank order, until one runs on the samples.
++        order = sorted(range(len(results)), key=lambda i: (
++            results[i]['score'] if results[i]['score'] is not None else -1.0,
++            -(results[i]['runtime'] if results[i]['runtime'] is not None else 1e9)), reverse=True)
++        order = [best_idx] + [i for i in order if i != best_idx]
++        for i in order:
++            cand = results[i]
++            if not cand.get('path') or not os.path.exists(cand['path']):
++                continue
++            shutil.copy(cand['path'], p['solution'])
++            ok = self._samples_pass(p)
++            safe_log(f"[pipeline] final selection {cand['path']} score={cand['score']} samples_ok={ok}")
++            if ok:
++                return cand
++        return None
++
++    def _samples_pass(self, p):
++        # Samples are checked through the harness (it handles the Solution-class driver too).
++        res = run_candidate(['python3', p['harness'], p['solution'], '--stress', '0', '--timeout', str(RUN_TIMEOUT)],
++                            timeout=HARNESS_TIMEOUT, cwd=p['tests'])
++        m = re.search(r"^SAMPLES:\s*(\d+)/(\d+)\s*$", res['stdout'], re.MULTILINE)
++        return bool(m) and m.group(1) == m.group(2) and int(m.group(2)) > 0
++
++    def forward(self):
++        """
++        The forward function for the AgenticSystem.
++        """
++        p = self._paths()
++        try:
++            # Stage A: independent test author
++            self._run_stage_author(p)
++
++            # Stage B: K candidates, each scored by the harness
++            results = self._run_stage_candidates(p)
++            valid = [r for r in results if r.get('path')]
++            if not valid:
++                return
++
++            # Differential testing on max-size inputs (notes only; checker decides validity)
++            cands = [(f"cand_{i}", r['path']) for i, r in enumerate(results) if r.get('path') and os.path.exists(r['path'])]
++            for note in self._differential(p, cands):
++                safe_log(f"[pipeline] diff: {note}")
++
++            # Stage C: repair the best candidate; keep a fix only if the score improved
++            best_idx = self._select(results)
++            results[best_idx] = self._run_stage_repair(p, results[best_idx])
++
++            # Final selection and copy to solution.py
++            best_idx = self._select(results)
++            self._finalize(p, results, best_idx)
++        finally:
++            shutil.rmtree(p['work'], ignore_errors=True)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/utils/test_harness.py b/utils/test_harness.py
+new file mode 100644
+index 0000000..cff7bbe
+--- /dev/null
++++ b/utils/test_harness.py
+@@ -0,0 +1,87 @@
++"""
++Generic helpers for running candidate programs and ranking them.
++
++Nothing in here parses or classifies errors: raw stdout/stderr/return codes are
++returned to the caller so they can be passed back to the agent verbatim.
++"""
++import re
++import subprocess
++import time
++
++
++def run_candidate(cmd, input=None, timeout=10, cwd=None):
++    """
++    Run `cmd` (a list of args) with optional stdin text and a timeout.
++
++    Returns a dict with raw 'stdout', 'stderr', 'returncode', 'runtime' (seconds),
++    and 'timed_out' (bool). Never raises for timeouts or non-zero exits.
++    """
++    start = time.time()
++    try:
++        p = subprocess.run(
++            cmd,
++            input=input if input is not None else "",
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++            cwd=cwd,
++            errors="replace",
++        )
++        return {
++            "stdout": p.stdout,
++            "stderr": p.stderr,
++            "returncode": p.returncode,
++            "runtime": time.time() - start,
++            "timed_out": False,
++        }
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
++        err = e.stderr if isinstance(e.stderr, str) else (e.stderr or b"").decode(errors="replace")
++        return {
++            "stdout": out or "",
++            "stderr": err or "",
++            "returncode": None,
++            "runtime": time.time() - start,
++            "timed_out": True,
++        }
++
++
++_NUM = r"([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)"
++
++
++def parse_field(report_text, name):
++    """
++    Return the float value of the last line 'NAME: <number>' in a harness report, or None.
++    Only the numeric SCORE and RUNTIME lines are read from reports; everything else stays raw.
++    """
++    matches = re.findall(rf"^{name}:\s*{_NUM}\s*$", report_text or "", re.MULTILINE)
++    if not matches:
++        return None
++    return float(matches[-1])
++
++
++def parse_score(report_text):
++    """Return the numeric 'SCORE:' value of a harness report, or None."""
++    return parse_field(report_text, "SCORE")
++
++
++def rank_key(score, runtime):
++    """Sort key for selecting the best candidate: higher score first, then faster."""
++    return (score, -runtime)
++
++
++def best_index(entries):
++    """
++    `entries` is a list of dicts with 'score' and 'runtime'.
++    Returns the index of the best entry by (score, -runtime), or None if empty.
++    """
++    best = None
++    for i, e in enumerate(entries):
++        if best is None or rank_key(e["score"], e["runtime"]) > rank_key(entries[best]["score"], entries[best]["runtime"]):
++            best = i
++    return best
++
++
++def normalize_output(text):
++    """Whitespace-insensitive comparison key for two outputs."""
++    return "\n".join(line.rstrip() for line in (text or "").strip().splitlines())

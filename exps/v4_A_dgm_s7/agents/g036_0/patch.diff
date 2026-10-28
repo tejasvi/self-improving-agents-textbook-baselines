@@ -1,0 +1,484 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e2a0fd8..71208e6 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,369 +1,135 @@
+-import argparse
+-import subprocess
++"""
++coding_agent.py (revised)
++
++Assumptions about the surrounding codebase (adjust names if they differ):
++  - AgenticSystem._safe_chat(user_msg, model, msg_history) -> (response_text, msg_history)
++    where msg_history is a list of Anthropic-style dicts:
++    {"role": "user"|"assistant", "content": str | [blocks]}.
++  - utils.llm.create_client(model) and utils.llm.get_response_from_llm(client, model, msg, system, history)
++    -> (content_text, new_history) are available for the plain-text fallback.
++  - CLAUDE_MODEL and OPENAI_MODEL are module-level constants.
++  - self.git_tempdir is the repo working directory; the target file is solution.py.
++"""
++
++import ast
++import json
+ import logging
+-from logging.handlers import RotatingFileHandler
+ import os
+ import re
+-import threading
+-
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+-
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+ 
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
++logger = logging.getLogger("coding_agent")
+ 
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
++CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
++OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
++TARGET_FILE = "solution.py"
++SNAPSHOT_MAX_BYTES = 4 * 1024
++MAX_RETRIES = 3
+ 
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
++STUB_CODE = (
++    "# Fallback stub: the agent failed to produce a solution.\n"
++    "# TODO: implement the solution for the problem statement.\n"
++    "import sys\n\n\n"
++    "def main():\n"
++    "    data = sys.stdin.read()\n"
++    "    pass\n\n\n"
++    "if __name__ == '__main__':\n"
++    "    main()\n"
++)
+ 
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+ 
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
++def _other_model(model):
++    return OPENAI_MODEL if model == CLAUDE_MODEL else CLAUDE_MODEL
+ 
+-def _changed_files(diff_str):
+-    """
+-    Parse `diff --git a/X b/X` lines and return the list of changed file paths (X).
+-    """
+-    files = []
+-    for line in (diff_str or '').splitlines():
+-        if line.startswith('diff --git '):
+-            parts = line.split(' ')
+-            # Expected form: diff --git a/X b/X
+-            if len(parts) >= 4 and parts[3].startswith('b/'):
+-                path = parts[3][2:]
+-            elif len(parts) >= 3 and parts[2].startswith('a/'):
+-                path = parts[2][2:]
+-            else:
+-                continue
+-            if path not in files:
+-                files.append(path)
+-    return files
+ 
+-def _is_test_file(path):
+-    """
+-    Return True if `path` looks like a test file (test_*.py, *_test.py, *.spec.js,
+-    *_test.go, or anything under a tests/ or test/ directory).
+-    """
+-    norm = path.replace('\\', '/')
+-    name = norm.split('/')[-1]
+-    if name.startswith('test_') and name.endswith('.py'):
+-        return True
+-    if name.endswith('_test.py') or name.endswith('.spec.js') or name.endswith('_test.go'):
+-        return True
+-    padded = '/' + norm
+-    if '/tests/' in padded or '/test/' in padded:
+-        return True
+-    return False
++def _block_type(block):
++    if isinstance(block, dict):
++        return block.get("type")
++    return getattr(block, "type", None)
+ 
+-def _sanitize_history(msg_history):
+-    """
+-    Return a copy of msg_history without assistant messages whose content blocks
+-    are all empty/whitespace text blocks (and contain no tool_use blocks).
+-    """
+-    cleaned = []
+-    for msg in (msg_history or []):
+-        if msg.get('role') == 'assistant':
+-            content = msg.get('content')
+-            if isinstance(content, str):
+-                if not content.strip():
+-                    continue
+-            elif isinstance(content, list):
+-                blocks = content
+-                has_tool = any(
+-                    (b.get('type') if isinstance(b, dict) else getattr(b, 'type', None)) == 'tool_use'
+-                    for b in blocks
+-                )
+-                if not has_tool:
+-                    all_empty_text = True
+-                    for b in blocks:
+-                        btype = b.get('type') if isinstance(b, dict) else getattr(b, 'type', None)
+-                        text = b.get('text') if isinstance(b, dict) else getattr(b, 'text', None)
+-                        if btype != 'text' or (text or '').strip():
+-                            all_empty_text = False
+-                            break
+-                    if all_empty_text:
+-                        continue
+-        cleaned.append(msg)
+-    return cleaned
+ 
+-def _safe_chat(instruction, model, history):
+-    """
+-    Call chat_with_agent with exception protection. Returns a sanitized history;
+-    on failure returns the sanitized input history.
+-    """
+-    try:
+-        new_history = chat_with_agent(instruction, model=model, msg_history=history, logging=safe_log)
+-        if new_history is None:
+-            new_history = history
+-        return _sanitize_history(new_history)
+-    except Exception as e:
+-        safe_log(f"[safe_chat] exception: {type(e).__name__}: {e}", level=logging.WARNING)
+-        return _sanitize_history(history)
++def _block_text(block):
++    if isinstance(block, dict):
++        return block.get("text", "") or ""
++    return getattr(block, "text", "") or ""
+ 
+-def _detect_solution_filename(problem_statement):
+-    """
+-    Detect a referenced .py filename in the problem statement; default to solution.py.
+-    """
+-    match = re.search(r'`([\w./-]+\.py)`', problem_statement or '')
+-    if match:
+-        return match.group(1)
+-    return 'solution.py'
+ 
+-def _extract_python_code(text):
+-    match = re.search(r'```python\s*\n(.*?)```', text or '', re.DOTALL)
+-    if match:
+-        return match.group(1)
++def _last_assistant(msg_history):
++    for msg in reversed(msg_history or []):
++        if isinstance(msg, dict) and msg.get("role") == "assistant":
++            return msg
++        if isinstance(msg, dict):
++            return None  # last message is not assistant
+     return None
+ 
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+ 
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    def _has_source_patch(self):
+-        """
+-        Return (has_any_diff, has_non_test_change) for the current repo state.
+-        """
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        has_any_diff = bool(diff.strip())
+-        files = _changed_files(diff)
+-        has_non_test_change = any(not _is_test_file(f) for f in files)
+-        return has_any_diff, has_non_test_change
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        instruction = f"""{task}
+-Follow these steps in order:
+-1. Explore the repository: use the editor `view` command on {self.git_tempdir} and bash `ls` to see what files exist.
+-2. If the task names a file such as solution.py and it does not exist, create it with the editor `create` command. Otherwise, edit the relevant source file with the editor tool.
+-3. Implement the full, efficient solution in that source file. Handle the whole input range, not just the examples.
+-4. Run the solution against the example inputs from the problem statement using bash, and fix any problems you find.
+-5. Verify with `git status` or `git diff` that the non-test source file was changed.
++def _is_empty_turn(msg_history):
++    """True if the last assistant message has only empty/whitespace text and no tool_use."""
++    msg = _last_assistant(msg_history)
++    if msg is None:
++        return False
++    content = msg.get("content")
++    if isinstance(content, str):
++        empty = content.strip() == ""
++        has_tool = False
++    else:
++        blocks = content or []
++        types = [_block_type(b) for b in blocks]
++        has_tool = "tool_use" in types
++        empty = all(
++            _block_type(b) == "text" and _block_text(b).strip() == ""
++            for b in blocks
++        ) if blocks else True
++    if empty and not has_tool:
++        _log_message_structure(msg)
++        return True
++    return False
+ 
+-You must use the editor tool to create or edit files. Never end your turn with a text-only response or without having modified a non-test source file.
+-You must call the editor tool to create or edit files; do not answer with text only.
+-"""
+-        msg_history = _safe_chat(instruction, self.code_model, [])
+ 
+-        for attempt in range(3):
+-            has_any_diff, has_non_test_change = self._has_source_patch()
+-            safe_log(f"[patch check] attempt={attempt} has_any_diff={has_any_diff} has_non_test_change={has_non_test_change}")
+-            if has_non_test_change:
+-                break
++def _log_message_structure(msg):
++    """Log the structure of a message without content secrets."""
++    content = msg.get("content")
++    if isinstance(content, str):
++        desc = {"content_type": "str", "length": len(content)}
++    else:
++        desc = {
++            "content_type": "list",
++            "blocks": [
++                {"type": _block_type(b), "text_len": len(_block_text(b))}
++                for b in (content or [])
++            ],
++        }
++    logger.warning("Empty assistant turn detected: role=%s %s",
++                   msg.get("role"), json.dumps(desc))
+ 
+-            reason = 'empty' if not has_any_diff else 'tests_only'
+-            safe_log(f"[patch retry] attempt={attempt} reason={reason}")
+-            if attempt == 0:
+-                prefix = "Your previous attempt produced no file changes. Your very first action must be an editor tool call that creates or edits the solution source file. Do not reply with text only."
+-            elif attempt == 1:
+-                prefix = "IMPORTANT: Your previous attempt produced no file changes. Your very first action must be an editor tool call that creates or edits the solution source file. Do not reply with text only."
+-            else:
+-                prefix = "FINAL ATTEMPT. You failed to modify any source file twice. Immediately call the editor tool with command 'create' to write the complete solution source file. Do not reply with text only, do not explain, do not ask questions."
+-            retry_instruction = f"{task}\n\n{prefix}"
+-            # Start a fresh conversation so an empty/poisoned assistant turn is not reused.
+-            msg_history = _safe_chat(retry_instruction, self.code_model, [])
+-            has_any_diff, has_non_test_change = self._has_source_patch()
+-            safe_log(f"[patch retry result] attempt={attempt} has_any_diff={has_any_diff} has_non_test_change={has_non_test_change}")
+ 
+-        has_any_diff, has_non_test_change = self._has_source_patch()
+-        if not has_non_test_change:
+-            safe_log("[patch fallback] no non-test change after retries; forcing solution file write")
+-            try:
+-                self._force_write_solution()
+-            except Exception as e:
+-                safe_log(f"[patch fallback] exception: {type(e).__name__}: {e}", level=logging.WARNING)
++def _sanitize_history(msg_history):
++    """Drop trailing empty assistant turns; keep all prior tool results and context."""
++    cleaned = list(msg_history or [])
++    while cleaned and _is_empty_turn(cleaned):  # bounded: each pass removes one message
++        cleaned.pop()
++    return cleaned
+ 
+-        has_any_diff, has_non_test_change = self._has_source_patch()
+-        safe_log(f"[patch final] has_any_diff={has_any_diff} has_non_test_change={has_non_test_change}")
+ 
+-    def _force_write_solution(self):
+-        """
+-        Last-resort: ask the model for the complete solution file as a single python code block
+-        and write it to the filename named in the problem statement (default solution.py).
+-        """
+-        from llm import create_client, get_response_from_llm
+-        filename = _detect_solution_filename(self.problem_statement)
+-        prompt = (
+-            f"{self.problem_statement}\n\n"
+-            f"Output only the complete Python 3 solution file in a single ```python code block. "
+-            f"It must read from standard input and write to standard output (or implement the required method). "
+-            f"Do not include any other text."
+-        )
+-        client, client_model = create_client(self.code_model)
+-        content, _ = get_response_from_llm(
+-            prompt, client=client, model=client_model,
+-            system_message="You are an expert competitive programmer.", msg_history=[],
+-        )
+-        code = _extract_python_code(content)
+-        if not code:
+-            safe_log("[patch fallback] no python code block found in model output", level=logging.WARNING)
+-            return False
+-        path = os.path.join(self.git_tempdir, filename)
+-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+-        with open(path, 'w') as f:
+-            f.write(code)
+-        safe_log(f"[patch fallback] wrote {path} ({len(code)} chars)")
++def _gather_repo_snapshot(repo_dir):
++    """Directory listing plus contents of small non-.git files, gathered in Python."""
++    parts = []
++    try:
++        entries = sorted(os.listdir(repo_dir))
++    except OSError as e:
++        return f"<listing unavailable: {e}>"
++    parts.append("Directory listing: " + ", ".join(entries))
++    for name in entries:
++        if name == ".git":
++            continue
++        path = os.path.join(repo_dir, name)
+         try:
+-            result = subprocess.run(["python3", path], input="", capture_output=True, text=True, timeout=10, cwd=self.git_tempdir)
+-            safe_log(f"[patch fallback] smoke run rc={result.returncode} stderr={result.stderr[-300:]}")
+-        except Exception as e:
+-            safe_log(f"[patch fallback] smoke run exception: {type(e).__name__}: {e}", level=logging.WARNING)
+-        return True
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
++            if os.path.isfile(path) and os.path.getsize(path) < SNAPSHOT_MAX_BYTES:
++                with open(path, "r", encoding="utf-8", errors="replace") as f:
++                    parts.append(f"--- {name} ---\n{f.read()}")
++        except OSError:
++            continue
++    return "\n".join(parts)
+ 
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+ 
+-if __name__ == "__main__":
+-    main()
++def _extract_code(text):
++    """Accept a 
+\ No newline at end of file

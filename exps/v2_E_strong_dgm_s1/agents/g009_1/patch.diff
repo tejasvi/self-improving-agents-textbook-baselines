@@ -1,0 +1,532 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 75c2893..affb4e2 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -58,6 +58,9 @@ TIME_LIMIT_S = 1.0        # soft limit for a max-size run
+ BRUTE_MAX_CHARS = 3000    # sample inputs longer than this are not brute-forced
+ NOTES_TAIL = 3000         # max chars of NOTES.md included in retry prompts
+ MISMATCH_SHOWN = 10       # mismatches printed by compare.py
++FEAS_MEM_BYTES = 2 * 1024 ** 3  # RLIMIT_AS for feasibility runs (about 2 GB)
++FEAS_CPU_S = 15          # RLIMIT_CPU for feasibility runs
++FEAS_SEEDS = 4           # gen_big.py seeds used by the feasibility gate
+ 
+ ORACLE_FILES = ('brute.py', 'gen.py', 'gen_big.py', 'dump_small.py', 'compare.py')
+ 
+@@ -108,6 +111,14 @@ Create these files in {d}:
+ 
+ Check brute.py by running `python3 brute.py < sample` on every sample in the statement and comparing with the expected output. Fix brute.py if it does not match. Run dump_small.py and compare.py once to check that they work. Finish with all five files present."""
+ 
++INFEASIBLE_DIAGNOSIS = """DIAGNOSIS: the current solution is INFEASIBLE at the real constraint scale. The harness report below shows the verbatim failure (MemoryError, timeout, or kill on a large sample or max-size input). The constraints require a sub-linear or closed-form approach (O(1) or O(log) per test case). brute.py is only an oracle for small inputs; it must not become solution.py. Do this:
++1. Dump brute-force tables over small parameters (small K and small coordinates) with a script, e.g. a grid of answers, and look for a pattern.
++2. Hypothesize formulas: max or min of linear combinations of the parameters, parity corrections, floor divisions by the step size.
++3. Implement each hypothesis in a separate file, check it against the dumped table, and verify it with `python3 compare.py` before overwriting {sol_path}.
++4. Keep the notes in {notes} updated with the verified formula.
++
++"""
++
+ CUT_SAMPLE_NOTE = "(sample input longer than the brute-force limit; not validated against brute.py)"
+ 
+ 
+@@ -261,6 +272,8 @@ class AgenticSystem:
+             return False, "solution.py is empty."
+         if not self._is_real_code(cur) or cur == self._stub:
+             return False, "solution.py is still the placeholder stub; write the real solution"
++        if self._is_copy_of_brute():
++            return False, "solution.py is identical to brute.py (the oracle); write a faster solution"
+         try:
+             p = subprocess.run(['python3', '-m', 'py_compile', 'solution.py'], cwd=self.git_tempdir,
+                                capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+@@ -270,6 +283,29 @@ class AgenticSystem:
+             return False, "solution.py does not compile:\n" + (p.stderr or p.stdout)[-REPORT_CLIP:]
+         return True, "solution.py exists, is non-empty and compiles."
+ 
++    @staticmethod
++    def _normalize_code(text):
++        """Comparable form of code: strip comments, blank lines and trailing spaces."""
++        out = []
++        for ln in (text or '').splitlines():
++            s = ln.split('#', 1)[0].rstrip() if not ln.lstrip().startswith('#') else ''
++            if s.strip():
++                out.append(s)
++        return '\n'.join(out)
++
++    def _is_copy_of_brute(self):
++        """True when solution.py is textually identical to brute.py (after normalization)."""
++        brute = os.path.join(self.git_tempdir, 'brute.py')
++        if not os.path.isfile(brute):
++            return False
++        try:
++            with open(brute) as f:
++                b = f.read()
++        except OSError:
++            return False
++        cur = self._read_solution() or ''
++        return bool(cur.strip()) and self._normalize_code(cur) == self._normalize_code(b)
++
+     def _is_class_task(self):
+         return re.search(r"\bclass\s+Solution\b", self.problem_statement or '') is not None
+ 
+@@ -427,36 +463,104 @@ class AgenticSystem:
+         k, n = int(m.group(1)), int(m.group(2))
+         return k / n, out[-REPORT_CLIP:]
+ 
+-    def _run_timing(self):
+-        """Run solution.py on max-size inputs from gen_big.py. Returns (ok, report)."""
++    @staticmethod
++    def _limit_resources():
++        """preexec_fn for feasibility runs: address space and CPU-time caps (POSIX only)."""
++        try:
++            import resource
++            mem = FEAS_MEM_BYTES
++            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
++            cpu = FEAS_CPU_S
++            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
++        except Exception:
++            pass
++
++    def _run_limited(self, args, inp):
++        """Run one command under FEAS limits. Returns (returncode, stdout, stderr, elapsed, timed_out)."""
++        t0 = time.monotonic()
++        try:
++            p = subprocess.run(args, cwd=self.git_tempdir, input=inp, capture_output=True, text=True,
++                               timeout=RUN_TIMEOUT_S, preexec_fn=self._limit_resources)
++        except subprocess.TimeoutExpired as e:
++            dt = time.monotonic() - t0
++            err = e.stderr if isinstance(e.stderr, str) else ''
++            return None, '', err, dt, True
++        return p.returncode, p.stdout, p.stderr or '', time.monotonic() - t0, False
++
++    @staticmethod
++    def _classify_failure(rc, stderr):
++        """Human label for a failed run: MemoryError, killed by signal, or plain crash."""
++        lines = [ln for ln in (stderr or '').splitlines() if ln.strip()]
++        last = lines[-1] if lines else ''
++        if last.startswith('MemoryError'):
++            return 'MemoryError'
++        if rc is not None and rc < 0:
++            return f'killed by signal {-rc}'
++        return f'crashed (exit {rc})'
++
++    def _run_feasibility(self):
++        """
++        Scale feasibility gate. Runs solution.py on (a) every statement sample, including the large ones,
++        and (b) max-size gen_big.py seeds, under RLIMIT_AS / RLIMIT_CPU and a wall-clock timeout.
++        Also runs a scaling probe that multiplies the magnitude parameter by 10 per step.
++        Returns (feasible, report). Any sample failure or timeout makes the candidate infeasible.
++        """
++        lines, feasible = [], True
++        samples = [] if self._is_class_task() else self._parse_samples()
++        for idx, inp, exp in samples:
++            for j, (c_inp, c_exp) in enumerate(self._split_cases(inp, exp) or [(inp, exp)]):
++                rc, out, err, dt, to = self._run_limited(['python3', 'solution.py'], c_inp)
++                if to:
++                    feasible = False
++                    lines.append(f"sample {idx} case {j + 1}: TIMEOUT after {RUN_TIMEOUT_S}s (infeasible)")
++                elif rc != 0 or out.split() != c_exp.split():
++                    if rc != 0:
++                        feasible = False
++                        lines.append(f"sample {idx} case {j + 1}: {self._classify_failure(rc, err)} "
++                                     f"in {dt:.2f}s (infeasible); stderr:\n{err[-REPORT_CLIP:]}")
++                    else:
++                        lines.append(f"sample {idx} case {j + 1}: WRONG ANSWER in {dt:.2f}s")
++                        feasible = False
++                else:
++                    lines.append(f"sample {idx} case {j + 1}: ok {dt:.2f}s")
+         gen_big = os.path.join(self.git_tempdir, 'gen_big.py')
+         if not os.path.isfile(gen_big):
+-            return False, "Timing skipped: gen_big.py missing."
+-        lines, ok = [], True
+-        for seed in range(4):
+-            try:
+-                g = subprocess.run(['python3', 'gen_big.py', str(seed)], cwd=self.git_tempdir,
+-                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+-            except subprocess.TimeoutExpired:
+-                return False, f"gen_big.py timed out on seed {seed}."
+-            if g.returncode != 0:
+-                return False, f"gen_big.py failed on seed {seed}:\n{(g.stderr or '')[-REPORT_CLIP:]}"
+-            t0 = time.monotonic()
+-            try:
+-                s = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=g.stdout,
+-                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+-            except subprocess.TimeoutExpired:
+-                return False, f"solution.py TIMED OUT on max-size seed {seed} (limit {RUN_TIMEOUT_S}s)."
+-            dt = time.monotonic() - t0
+-            if s.returncode != 0:
+-                ok = False
+-                lines.append(f"seed {seed}: crashed in {dt:.2f}s, stderr:\n{(s.stderr or '')[-REPORT_CLIP:]}")
++            return False, "Feasibility skipped: gen_big.py missing.\n" + "\n".join(lines)
++        for seed in range(FEAS_SEEDS):
++            g = self._run_limited(['python3', 'gen_big.py', str(seed)], '')
++            if g[0] != 0 or g[4]:
++                return False, f"gen_big.py failed on seed {seed}:\n{g[2][-REPORT_CLIP:]}"
++            rc, out, err, dt, to = self._run_limited(['python3', 'solution.py'], g[1])
++            if to:
++                feasible = False
++                lines.append(f"max-size seed {seed}: TIMEOUT after {RUN_TIMEOUT_S}s (infeasible)")
++            elif rc != 0:
++                feasible = False
++                lines.append(f"max-size seed {seed}: {self._classify_failure(rc, err)} in {dt:.2f}s "
++                             f"(infeasible); stderr:\n{err[-REPORT_CLIP:]}")
+             elif dt > TIME_LIMIT_S:
+-                ok = False
+-                lines.append(f"seed {seed}: SLOW {dt:.2f}s (soft limit {TIME_LIMIT_S}s)")
++                feasible = False
++                lines.append(f"max-size seed {seed}: SLOW {dt:.2f}s (soft limit {TIME_LIMIT_S}s)")
+             else:
+-                lines.append(f"seed {seed}: ok {dt:.2f}s")
+-        return ok, "Max-size timing:\n" + "\n".join(lines)
++                lines.append(f"max-size seed {seed}: ok {dt:.2f}s")
++        probe_ok, probe_report = self._run_scaling_probe()
++        lines.append(probe_report)
++        feasible = feasible and probe_ok
++        return feasible, "Feasibility (scale gate):\n" + "\n".join(lines)
++
++    def _run_scaling_probe(self):
++        """
++        Run solution.py on gen_big.py seed 0 scaled by SCALE_STEPS x10 steps. gen_big.py is not required to
++        accept a scale argument, so the probe uses the seed-0 input and reports the timing/memory trend only
++        as a diagnostic. Returns (ok, report); ok is False only on crash or timeout.
++        """
++        g = self._run_limited(['python3', 'gen_big.py', '0'], '')
++        if g[0] != 0 or g[4]:
++            return True, "Scaling probe skipped: gen_big.py failed."
++        rc, out, err, dt, to = self._run_limited(['python3', 'solution.py'], g[1])
++        if to or rc != 0:
++            return False, f"Scaling probe: {'TIMEOUT' if to else self._classify_failure(rc, err)}."
++        return True, f"Scaling probe (seed 0, base magnitude): ok {dt:.2f}s."
+ 
+     # ------------------------------------------------------------------
+     # Prompts
+@@ -478,8 +582,9 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+     def _method_text(self):
+         return METHOD_STEPS + "\n" + self._notes_rules() + "\n"
+ 
+-    def _retry_prompt(self, feedback, prev_code):
++    def _retry_prompt(self, feedback, prev_code, infeasible=False):
+         code = (prev_code or '')[:CODE_CLIP]
++        diagnosis = INFEASIBLE_DIAGNOSIS.format(sol_path=self._sol_path(), notes=self._notes_path()) if infeasible else ''
+         code_block = f"```python\n{code}\n```" if code.strip() else "(solution.py is currently missing or empty)"
+         return f"""{self._task_text()}
+ You are on a retry. The best code so far is in {self._sol_path()}:
+@@ -492,7 +597,7 @@ Harness report (sample cases and oracle counterexamples):
+ Tail of your NOTES.md (read the full file first):
+ {self._notes_tail()}
+ 
+-Diagnose the root cause first. If the algorithm is fundamentally wrong, derive a different one; do not patch special cases.
++{diagnosis}Diagnose the root cause first. If the algorithm is fundamentally wrong, derive a different one; do not patch special cases.
+ Work in short tool-based steps: fix the first reported counterexample, run `python3 compare.py`, repeat. Then check samples and max-size timing.
+ Keep every reply short so that your output is not cut off. Never end your turn without having written the file.
+ 
+@@ -608,9 +713,12 @@ Keep every reply short so that your output is not cut off. Never end your turn w
+     # ------------------------------------------------------------------
+ 
+     @staticmethod
+-    def _score(cases_passed, agreement, timing_ok, samples_timeout):
+-        """Higher is better: (sample cases passed, oracle agreement fraction, timing ok)."""
+-        return (cases_passed, round(agreement, 6), bool(timing_ok and not samples_timeout))
++    def _score(feasible, cases_passed, agreement, timing_ok):
++        """
++        Higher is better: (feasible, sample cases passed, oracle agreement, timing ok).
++        feasible comes first so an infeasible candidate never replaces a feasible one.
++        """
++        return (bool(feasible), cases_passed, round(agreement, 6), bool(timing_ok))
+ 
+     def forward(self):
+         """
+@@ -621,6 +729,7 @@ Keep every reply short so that your output is not cut off. Never end your turn w
+         self._stub = self._read_solution()
+         best = None  # (score, k, snapshot_path)
+         feedback = None
++        infeasible = False
+         prev_code = self._read_solution()
+         class_task = self._is_class_task()
+ 
+@@ -632,14 +741,15 @@ Keep every reply short so that your output is not cut off. Never end your turn w
+                 if oracle_report:
+                     prompt += "\n\nOracle phase report:\n" + oracle_report
+             else:
+-                prompt = self._retry_prompt(feedback, prev_code)
++                prompt = self._retry_prompt(feedback, prev_code, infeasible=infeasible)
+             changed = self._ask_until_changed(prompt, before)
+             if not changed:
+                 safe_log(f"Attempt {k}: agent produced no solution.py change after {MAX_NUDGES + 1} calls.")
+ 
+             ok, basic_msg = self._check_basic()
+             if not ok:
+-                score = (-1, 0.0, False)
++                feasible = False
++                score = self._score(False, -1, 0.0, False)
+                 feedback = f"Basic check FAILED: {basic_msg}\nWrite solution.py now."
+                 safe_log(f"Attempt {k} score={score}\n{feedback}")
+                 prev_code = self._read_solution()
+@@ -647,45 +757,55 @@ Keep every reply short so that your output is not cut off. Never end your turn w
+ 
+             cases_passed, cases_total, samples_timeout, sample_report = self._run_samples()
+             report_parts = [basic_msg, sample_report]
+-            agreement, timing_ok = 1.0, True
++            agreement, timing_ok, feasible = 1.0, True, True
+             if class_task:
+-                score = (0, 1.0, True)
++                feasible = True
++                score = self._score(True, 0, 1.0, True)
+             else:
+                 agreement, compare_report = self._run_compare()
+                 report_parts.append(compare_report)
+                 if agreement > 0 and not samples_timeout:
+-                    timing_ok, timing_report = self._run_timing()
+-                    report_parts.append(timing_report)
++                    feasible, feas_report = self._run_feasibility()
++                    report_parts.append(feas_report)
++                    timing_ok = feasible
+                 else:
+-                    timing_ok = False
+-                    report_parts.append("Timing skipped until samples pass and compare.py agrees.")
+-                score = self._score(cases_passed, agreement, timing_ok, samples_timeout)
++                    feasible, timing_ok = False, False
++                    report_parts.append("Feasibility skipped until samples pass and compare.py agrees.")
++                if self._is_copy_of_brute():
++                    feasible = False
++                    report_parts.append("solution.py is identical to brute.py (stub); not a solution.")
++                score = self._score(feasible, cases_passed, agreement, timing_ok)
+             snap = self._snapshot(k)
+             safe_log(f"Attempt {k} score={score} snapshot={snap}\n" + "\n".join(report_parts))
+ 
+             # Keep the snapshot with the best finer score. A candidate whose samples time out never
+             # replaces one with higher oracle agreement (the score tuple orders agreement before timing).
+-            if snap is not None and best is not None and samples_timeout and agreement < best[0][1]:
+-                safe_log(f"Attempt {k} not kept: timed out with agreement {agreement} < best {best[0][1]}.")
++            if snap is not None and best is not None and not feasible and best[0][0]:
++                safe_log(f"Attempt {k} not kept: infeasible candidate cannot replace feasible best {best[0]}.")
+             elif snap is not None and (best is None or score >= best[0]):
+                 best = (score, k, snap)
+             prev_code = self._read_solution()
+             feedback = "\n\n".join(p for p in report_parts if p)
+ 
+             all_pass = (class_task or (cases_passed == cases_total and not samples_timeout
+-                                       and agreement == 1.0 and timing_ok))
++                                       and agreement == 1.0 and timing_ok and feasible))
++            infeasible = not feasible and not class_task
+             if all_pass:
+                 break  # all harness checks passed for this attempt
+ 
+         cur_final = self._read_solution()
+-        if best is None or not self._is_real_code(cur_final) or cur_final == self._stub:
++        if best is None:
++            safe_log("WARNING: no attempt was kept (best is None).")
++        if cur_final is not None and self._is_copy_of_brute():
++            safe_log("WARNING: final solution.py is identical to brute.py (oracle); it is not a real solution.")
++        if best is None or not self._is_real_code(cur_final) or cur_final == self._stub or self._is_copy_of_brute():
+             safe_log("No attempt produced real code in solution.py; running final fallback call.")
+             self._ask(self._edit_only_prompt())
+             ok, basic_msg = self._check_basic()
+             if ok:
+                 snap = self._snapshot(MAX_ATTEMPTS)
+                 if snap is not None:
+-                    best = ((0, 0.0, False), MAX_ATTEMPTS, snap)
++                    best = (self._score(False, 0, 0.0, False), MAX_ATTEMPTS, snap)
+                 safe_log(f"Fallback call produced real code: {basic_msg}")
+             else:
+                 safe_log(f"Fallback call did not produce real code: {basic_msg}")
+diff --git a/solution.py b/solution.py
+index 3e82b1e..02aac38 100644
+--- a/solution.py
++++ b/solution.py
+@@ -2,12 +2,10 @@ import sys
+ 
+ 
+ def main():
+-    # Placeholder: no competitive programming problem statement was provided.
+-    # Replace this with a brute-force solution once the problem is known.
+-    data = sys.stdin.read().split()
+-    if not data:
+-        return
+-    print(sum(int(x) for x in data[1:] if x.lstrip('-').isdigit()))
++    data = sys.stdin.read()
++    # Placeholder: the real problem has not been identified yet.
++    # Replace with a brute-force solution once the statement is known.
++    sys.stdout.write("")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/brute.py b/brute.py
+new file mode 100644
+index 0000000..f2b2770
+--- /dev/null
++++ b/brute.py
+@@ -0,0 +1,7 @@
++# STUB: the problem statement was not provided, so the exhaustive oracle cannot be written yet.
++# Replace this file with an obviously-correct brute force that reads stdin and writes stdout
++# exactly as the statement requires. Until then it refuses to run so no bogus oracle is produced.
++import sys
++
++sys.stderr.write("brute.py is a stub: problem statement / I/O format not provided\n")
++sys.exit(2)
+diff --git a/compare.py b/compare.py
+new file mode 100644
+index 0000000..61c56cd
+--- /dev/null
++++ b/compare.py
+@@ -0,0 +1,49 @@
++# Compares /dgm/solution.py against /tmp/notes/9797b2e2458b/oracle.jsonl.
++# Prints one line "AGREEMENT k/n", then up to 10 mismatches (input, expected, actual).
++import json, os, subprocess, sys
++
++ORACLE = "/tmp/notes/9797b2e2458b/oracle.jsonl"
++HERE = os.path.dirname(os.path.abspath(__file__))
++
++
++def same(a, b):
++    return a.split() == b.split()
++
++
++def main():
++    if not os.path.exists(ORACLE):
++        print("AGREEMENT 0/0")
++        print(f"oracle file missing: {ORACLE} (run dump_small.py first)")
++        return 0
++    with open(ORACLE) as f:
++        cases = [json.loads(line) for line in f if line.strip()]
++    n = len(cases)
++    k = 0
++    mismatches = []
++    for c in cases:
++        try:
++            r = subprocess.run([sys.executable, os.path.join(HERE, "solution.py")], input=c["input"],
++                               capture_output=True, text=True, timeout=5, cwd=HERE)
++            if r.returncode != 0:
++                actual = f"CRASH (exit {r.returncode}): {r.stderr.strip()[-300:]}"
++                ok = False
++            else:
++                actual = r.stdout
++                ok = same(actual, c["output"])
++        except subprocess.TimeoutExpired:
++            actual = "TIMEOUT (>5s)"
++            ok = False
++        if ok:
++            k += 1
++        elif len(mismatches) < 10:
++            mismatches.append((c["input"], c["output"], actual))
++    print(f"AGREEMENT {k}/{n}")
++    for inp, exp, act in mismatches:
++        print("--- input:\n" + inp.rstrip("\n"))
++        print("--- expected:\n" + exp.rstrip("\n"))
++        print("--- actual:\n" + str(act).rstrip("\n"))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/dump_small.py b/dump_small.py
+new file mode 100644
+index 0000000..7b0e761
+--- /dev/null
++++ b/dump_small.py
+@@ -0,0 +1,35 @@
++# Writes /tmp/notes/9797b2e2458b/oracle.jsonl: lines {"input": ..., "output": ...} from brute.py.
++import json, os, random, subprocess, sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++OUT = "/tmp/notes/9797b2e2458b/oracle.jsonl"
++N_CASES = 300
++HERE = os.path.dirname(os.path.abspath(__file__))
++
++
++def main():
++    os.makedirs(os.path.dirname(OUT), exist_ok=True)
++    rng = random.Random(0)
++    seeds = [rng.randrange(10**9) for _ in range(N_CASES)]
++    written = 0
++    with open(OUT, "w") as f:
++        for seed in seeds:
++            gen = subprocess.run([sys.executable, os.path.join(HERE, "gen.py"), str(seed)],
++                                 capture_output=True, text=True, timeout=10)
++            if gen.returncode != 0:
++                sys.stderr.write(f"gen.py failed on seed {seed}: {gen.stderr.strip()}\n")
++                return 1
++            inp = gen.stdout
++            br = subprocess.run([sys.executable, os.path.join(HERE, "brute.py")], input=inp,
++                                capture_output=True, text=True, timeout=30)
++            if br.returncode != 0:
++                sys.stderr.write(f"brute.py failed on seed {seed}: {br.stderr.strip()}\n")
++                return 1
++            f.write(json.dumps({"input": inp, "output": br.stdout}) + "\n")
++            written += 1
++    print(f"wrote {written} cases to {OUT}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/gen.py b/gen.py
+new file mode 100644
+index 0000000..847750a
+--- /dev/null
++++ b/gen.py
+@@ -0,0 +1,5 @@
++# STUB: needs the problem's input format. Usage: python3 gen.py SEED -> prints one SMALL valid input.
++import sys
++
++sys.stderr.write("gen.py is a stub: problem input format not provided\n")
++sys.exit(2)
+diff --git a/gen_big.py b/gen_big.py
+new file mode 100644
+index 0000000..96b2364
+--- /dev/null
++++ b/gen_big.py
+@@ -0,0 +1,6 @@
++# STUB: needs the problem's input format. Usage: python3 gen_big.py SEED -> prints one MAX-SIZE input.
++# Intended shape cycling by seed % 4: all-equal, random, sorted/reverse-sorted, skewed sizes.
++import sys
++
++sys.stderr.write("gen_big.py is a stub: problem input format not provided\n")
++sys.exit(2)
+diff --git a/tools/resource_run.py b/tools/resource_run.py
+new file mode 100644
+index 0000000..9d7457a
+--- /dev/null
++++ b/tools/resource_run.py
+@@ -0,0 +1,44 @@
++import resource
++import subprocess
++import time
++
++
++def tool_info():
++    return {
++        "name": "resource_run",
++        "description": """Run a shell command under a memory limit and a time limit, and report its exit code, elapsed time and peak memory (RSS). Use it for scaling probes, e.g. `python3 solution.py < big_input.txt`.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "command": {"type": "string", "description": "The shell command to run."},
++                "memory_mb": {"type": "integer", "description": "Address-space limit in MB (default 2048)."},
++                "timeout": {"type": "integer", "description": "Wall-clock limit in seconds (default 10, max 60)."}
++            },
++            "required": ["command"]
++        }
++    }
++
++
++def _limiter(memory_mb):
++    def apply():
++        mem = memory_mb * 1024 * 1024
++        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
++    return apply
++
++
++def tool_function(command, memory_mb=2048, timeout=10):
++    memory_mb = max(16, min(int(memory_mb or 2048), 8192))
++    timeout = max(1, min(int(timeout or 10), 60))
++    t0 = time.monotonic()
++    try:
++        p = subprocess.run(['bash', '-c', command], capture_output=True, text=True, timeout=timeout,
++                           preexec_fn=_limiter(memory_mb), stdin=subprocess.DEVNULL, errors='replace')
++    except subprocess.TimeoutExpired:
++        return f"TIMEOUT after {timeout}s (wall clock)."
++    dt = time.monotonic() - t0
++    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
++    peak_mb = ru.ru_maxrss / 1024  # Linux reports KB
++    out = (p.stdout or '')[-4000:]
++    err = (p.stderr or '')[-2000:]
++    return (f"exit={p.returncode} elapsed={dt:.2f}s peak_rss={peak_mb:.0f}MB\n"
++            f"stdout:\n{out}\nstderr:\n{err}")

@@ -1,0 +1,199 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 28a20ab..06fbd8f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -94,6 +94,59 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _block_field(block, key):
++    if isinstance(block, dict):
++        return block.get(key)
++    return getattr(block, key, None)
++
++def _is_empty_assistant_msg(msg):
++    """True if an assistant message has no non-empty text and no tool_use blocks."""
++    content = msg.get('content', [])
++    if isinstance(content, str):
++        return not content.strip()
++    for block in content or []:
++        btype = _block_field(block, 'type')
++        if btype == 'tool_use':
++            return False
++        if btype == 'text' and (_block_field(block, 'text') or '').strip():
++            return False
++        if btype not in (None, 'text'):
++            # Non-text blocks (e.g. tool results, thinking) are kept as meaningful
++            return False
++    return True
++
++def _sanitize_history(msg_history):
++    """Drop assistant messages whose content blocks are all empty text."""
++    if not msg_history:
++        return []
++    return [
++        m for m in msg_history
++        if not (m.get('role') == 'assistant' and _is_empty_assistant_msg(m))
++    ]
++
++def _last_assistant_text(msg_history):
++    """Return the concatenated text of the last assistant message in the history."""
++    for m in reversed(msg_history or []):
++        if m.get('role') != 'assistant':
++            continue
++        content = m.get('content', [])
++        if isinstance(content, str):
++            return content
++        texts = []
++        for block in content or []:
++            if _block_field(block, 'type') == 'text':
++                texts.append(_block_field(block, 'text') or '')
++        return "\n".join(texts)
++    return ""
++
++def _extract_python_code(text):
++    """Extract the last fenced python code block from text, or None."""
++    blocks = re.findall(r"```(?:python|py)?[ \t]*\n(.*?)```", text or "", flags=re.DOTALL)
++    blocks = [b for b in blocks if b.strip()]
++    if not blocks:
++        return None
++    return blocks[-1]
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -155,7 +208,14 @@ class AgenticSystem:
+         def is_test_file(path):
+             normalized = path.replace('\\', '/')
+             basename = normalized.split('/')[-1]
+-            if basename.startswith('test_') or basename.endswith('_test.py'):
++            stem, ext = os.path.splitext(basename)
++            if basename.startswith('test') and ext == '.py':
++                return True
++            if stem.endswith('_test') or stem.endswith('.test') or stem.endswith('.spec'):
++                return True
++            if basename in ('conftest.py',):
++                return True
++            if ext == '.py' and ('brute' in stem or 'stress' in stem):
+                 return True
+             if basename.endswith('.test.js') or basename.endswith('.spec.js') or basename.endswith('_test.go'):
+                 return True
+@@ -201,31 +261,101 @@ Follow this workflow step by step:
+ (f) Verify before finishing: confirm that the primary source file was actually modified (view it), and that it contains the final solution. Only then give your final answer.
+ """
+ 
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not msg_history:
+-            msg_history = []
++        msg_history = self._run_agent(instruction, [])
++
++        short_prompts = [
++            (
++                "Your previous attempt produced no source changes (status: {status}). "
++                "Your very first action must be an editor tool call that creates or edits the source file "
++                "(e.g. solution.py inside {repo}). Write a straightforward correct solution first, then test and optimize it.\n\n"
++                "Problem:\n{problem}"
++            ),
++            (
++                "Still no source changes (status: {status}). Do not explain. Immediately call the editor tool to write "
++                "the solution into the primary source file (e.g. solution.py inside {repo}). Then test and optimize it.\n\n"
++                "Problem:\n{problem}"
++            ),
++            (
++                "Stage 1: write a simple solution now, no analysis in text. Call the editor tool immediately to create or "
++                "edit the primary source file (e.g. solution.py inside {repo}) with a correct solution. Optimize later.\n\n"
++                "Problem:\n{problem}"
++            ),
++        ]
+ 
+         for attempt in range(3):
+             status = self._classify_patch()
+             safe_log(f"Patch check attempt {attempt}: status={status}")
+             if status == 'ok':
+                 break
+-            corrective = (
+-                f"Your previous attempt produced no changes to the main source code (status: {status}). "
+-                "Use the editor tool now to view the directory, open the starter file, and implement the solution there. "
+-                "Do not respond without making edits."
++            prompt = short_prompts[attempt].format(status=status, problem=self.problem_statement, repo=self.git_tempdir)
++            # Always restart from a fresh history; the degenerate history is discarded.
++            msg_history = self._run_agent(prompt, [])
++        else:
++            status = self._classify_patch()
++            safe_log(f"Patch check attempt 3: status={status}")
++
++        if status in ('empty', 'tests_only'):
++            safe_log(f"Patch still {status} after retries; running last-resort code write.")
++            last_msg = (
++                "Output ONLY a single ```python fenced code block containing the complete solution "
++                "to the problem below. No other text.\n\n"
++                f"Problem:\n{self.problem_statement}"
+             )
+-            if msg_history:
+-                retry_history = msg_history
+-                retry_msg = corrective
++            resp_history = self._run_agent(last_msg, [])
++            code = _extract_python_code(_last_assistant_text(resp_history))
++            if code is None:
++                safe_log("Last-resort call did not return a python code block.")
+             else:
+-                retry_history = []
+-                retry_msg = f"{instruction}\n\n{corrective}"
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=retry_history, logging=safe_log)
+-            if not msg_history:
+-                msg_history = []
+-        else:
+-            safe_log(f"Patch check final status after retries: {self._classify_patch()}")
++                target = self._find_starter_file()
++                with open(target, 'w') as f:
++                    f.write(code if code.endswith('\n') else code + '\n')
++                safe_log(f"Last-resort code written to {target}")
++            status = self._classify_patch()
++            safe_log(f"Patch check after last-resort: status={status}")
++        elif status == 'ok':
++            refine = (
++                "Run the sample inputs from the problem statement against your solution (use the bash tool, "
++                "feeding the sample input via stdin or calling the function directly). If any output does not match "
++                "the expected sample output, fix the source file with the editor tool. Do not create new source files; "
++                "keep the solution in the primary source file.\n\n"
++                f"Problem:\n{self.problem_statement}"
++            )
++            msg_history = self._run_agent(refine, _sanitize_history(msg_history))
++            safe_log(f"Patch check after sample refinement: status={self._classify_patch()}")
++
++    def _run_agent(self, msg, history):
++        """Call chat_with_agent, logging errors; returns sanitized history ([] on failure)."""
++        try:
++            new_history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
++        except Exception as e:
++            safe_log(f"chat_with_agent failed: {type(e).__name__}: {e}", level=logging.ERROR)
++            return []
++        return _sanitize_history(new_history or [])
++
++    def _find_starter_file(self):
++        """Return path of an existing non-test .py file in the repo, else solution.py in the repo."""
++        try:
++            result = subprocess.run(
++                ["git", "-C", self.git_tempdir, "ls-files"],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++            )
++            files = result.stdout.decode().splitlines()
++        except Exception:
++            files = []
++        for f in files:
++            if f.endswith('.py') and not self._is_test_path(f):
++                return os.path.join(self.git_tempdir, f)
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _is_test_path(self, path):
++        basename = os.path.basename(path)
++        stem, ext = os.path.splitext(basename)
++        if (basename.startswith('test') and ext == '.py') or stem.endswith(('_test', '.test', '.spec')):
++            return True
++        if basename == 'conftest.py' or (ext == '.py' and ('brute' in stem or 'stress' in stem)):
++            return True
++        parts = path.replace('\\', '/').split('/')[:-1]
++        return 'tests' in parts or 'test' in parts
+ 
+ 
+ def main():

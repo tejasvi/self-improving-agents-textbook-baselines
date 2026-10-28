@@ -1,0 +1,321 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 34d46ed..57fffbc 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,5 @@
+ import argparse
++import ast
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -174,11 +175,55 @@ class AgenticSystem:
+         words = re.split(r'[^a-z0-9]+', filename)
+         return any(w in test_tokens for w in words)
+ 
++    def _is_stub_patch(self):
++        """
++        True if the target file is unchanged from base_commit, or if it still contains only
++        stub bodies (`pass` or `NotImplementedError`).
++        """
++        target = self._target_file()
++        unchanged = subprocess.run(
++            ["git", "-C", self.git_tempdir, "diff", "--quiet", self.base_commit, "--", target],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        ).returncode == 0
++        if unchanged:
++            return True
++        path = os.path.join(self.git_tempdir, target)
++        if not os.path.isfile(path):
++            return True
++        try:
++            with open(path, 'r', errors='replace') as fh:
++                tree = ast.parse(fh.read())
++        except Exception:
++            return False  # Unparseable code is not a recognised stub; let it count as a patch.
++        bodies = []
++        for node in ast.walk(tree):
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                body = [s for s in node.body
++                        if not (isinstance(s, ast.Expr) and isinstance(getattr(s, 'value', None), ast.Constant)
++                                and isinstance(s.value.value, str))]  # skip docstrings
++                bodies.append(body)
++        if not bodies:
++            return False
++        def is_stub(body):
++            if not body:
++                return True
++            if len(body) != 1:
++                return False
++            stmt = body[0]
++            if isinstance(stmt, ast.Pass):
++                return True
++            if isinstance(stmt, ast.Raise) and stmt.exc is not None:
++                exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
++                return isinstance(exc, ast.Name) and exc.id == 'NotImplementedError'
++            return False
++        return all(is_stub(b) for b in bodies)
++
+     def _has_source_patch(self):
+         """
+-        True if at least one changed file is not a test file.
++        True if at least one changed file is not a test file, and the target is not just a stub.
+         """
+-        return any(not self._is_test_file(f) for f in self._get_changed_files())
++        changed_source = any(not self._is_test_file(f) for f in self._get_changed_files())
++        return changed_source and not self._is_stub_patch()
+ 
+     def _target_file(self):
+         """
+@@ -272,31 +317,23 @@ IMPORTANT RULES:
+ - Responding with text only and no file edits counts as failure.
+ - Modifying only test files does not solve the task; the primary source file must be changed.
+ """
+-        instruction = f"{task}\n{workflow}"
++        target = self._target_file()
++        snapshot = self._snapshot_repo()
++        instruction = (
++            f"{task}\n{workflow}\n"
++            f"Current repository contents:\n{snapshot}\n\n"
++            f"Your first action must be an editor create/edit on {os.path.join(self.git_tempdir, target)} "
++            f"(the primary source file) that implements the solution."
++        )
+         msg_history = []
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
+ 
+-        for attempt in range(3):
+-            if self._has_source_patch():
+-                safe_log(f"Source patch detected before retry {attempt + 1}; stopping retries.")
+-                break
+-            changed = self._get_changed_files()
+-            if not changed:
+-                reason = "No file changes detected."
+-            else:
+-                reason = f"Only test files were modified: {', '.join(changed)}."
+-            feedback = (
+-                f"{reason} The task is not complete. Use the editor tool to create or edit the primary source file "
+-                f"in {self.git_tempdir} that solves the problem (not test files). Run it via bash to check it, "
+-                f"then verify with `git status` and `git diff`, and then finish."
+-            )
+-            safe_log(f"Retry attempt {attempt + 1}/3: {reason}")
+-            msg_history = chat_with_agent(feedback, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            safe_log(f"Retry attempt {attempt + 1}/3 finished. Changed files: {self._get_changed_files()}")
+-
+-        if not self._has_source_patch():
+-            # Fresh conversation: the old history may be stuck (e.g. empty responses or a broken shell).
++        if self._has_source_patch():
++            safe_log("Source patch detected after initial attempt; skipping retries.")
++        else:
++            # Do not reuse a history that may end with an empty assistant turn: go straight to a
++            # fresh conversation with the repo snapshot, then the tool-free last resort.
+             target = self._target_file()
+             snapshot = self._snapshot_repo()
+             fresh_prompt = (
+diff --git a/llm_withtools.py b/llm_withtools.py
+index b90a7cd..6afc7d1 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -315,35 +315,116 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+         )
+         logging(f"Output: {response}")
+ 
+-        # Tool use
+-        tool_use = check_for_tool_use(response, model=client_model)
+-        while tool_use:
+-            # Process tool call
+-            tool_name = tool_use['tool_name']
+-            tool_input = tool_use['tool_input']
+-            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++        # Tool use, with bounded recovery from empty turns
++        for attempt in range(3):
++            tool_use = check_for_tool_use(response, model=client_model)
++            while tool_use:
++                # Process tool call
++                tool_name = tool_use['tool_name']
++                tool_input = tool_use['tool_input']
++                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
+ 
+-            # Get tool response
+-            tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
+-            logging(tool_msg)
++                # Get tool response
++                tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
++                logging(tool_msg)
++                response, new_msg_history = get_response_from_llm(
++                    msg=tool_msg,
++                    client=client,
++                    model=client_model,
++                    system_message=system_message,
++                    print_debug=False,
++                    msg_history=new_msg_history,
++                )
++                logging(f"Output: {response}")
++
++                # Check for next tool use
++                tool_use = check_for_tool_use(response, model=client_model)
++
++            if not _is_empty_response(response, model=client_model):
++                break
++
++            logging(f"Dropping empty assistant turn (attempt {attempt + 1}/3); nudging the model.")
++            if attempt >= len(EMPTY_NUDGES):
++                logging("Empty turn persisted after all nudges; giving up so the caller can restart.")
++                # Drop the empty turn so it is not stored in the history.
++                if len(new_msg_history) >= 2 and new_msg_history[-1].get('role') == 'assistant':
++                    new_msg_history = new_msg_history[:-1]
++                break
++
++            # Remove the empty assistant turn and the user message before it; resend that user
++            # message merged with the nudge so roles keep alternating.
++            base_history = new_msg_history
++            prev_text = ''
++            if len(new_msg_history) >= 2 and new_msg_history[-1].get('role') == 'assistant' \
++                    and new_msg_history[-2].get('role') == 'user':
++                base_history = new_msg_history[:-2]
++                prev = new_msg_history[-2].get('content')
++                if isinstance(prev, str):
++                    prev_text = prev
++                elif isinstance(prev, list):
++                    prev_text = '\n'.join(b.get('text', '') for b in prev if isinstance(b, dict) and b.get('text'))
++            resend = f"{prev_text}\n\n{EMPTY_NUDGES[attempt]}" if prev_text else EMPTY_NUDGES[attempt]
+             response, new_msg_history = get_response_from_llm(
+-                msg=tool_msg,
++                msg=resend,
+                 client=client,
+                 model=client_model,
+                 system_message=system_message,
+                 print_debug=False,
+-                msg_history=new_msg_history,
++                msg_history=base_history,
+             )
+             logging(f"Output: {response}")
+ 
+-            # Check for next tool use
+-            tool_use = check_for_tool_use(response, model=client_model)
+-
+     except Exception:
+         pass
+ 
+     return new_msg_history
+ 
++EMPTY_NUDGES = [
++    "Continue: call the editor tool now to implement the solution.",
++    (
++        "Continue: call the editor tool now to implement the solution. Use exactly this format:\n"
++        "<tool_use>\n{'tool_name': 'editor', 'tool_input': {'command': 'create', "
++        "'path': '<path of the target source file>', 'file_text': '<complete file contents>'}}\n</tool_use>"
++    ),
++]
++
++
++def _is_empty_response(response, model=''):
++    """
++    True when the response has no non-whitespace text and no tool call.
++    """
++    if isinstance(response, str):
++        has_text = bool(response.strip())
++    elif 'claude' in model:
++        has_text = any(
++            getattr(block, 'type', None) == 'text' and (getattr(block, 'text', '') or '').strip()
++            for block in (getattr(response, 'content', None) or [])
++        )
++    else:
++        has_text = bool((getattr(response, 'output_text', '') or '').strip())
++    has_tool = check_for_tool_use(response, model=model) is not None
++    return (not has_text) and (not has_tool)
++
++
++def _append_nudge(msg_history, text):
++    """
++    Add a nudge without stacking consecutive user messages: merge it into the last
++    message if that is a user message (tool_result or text), otherwise append a new user message.
++    """
++    if msg_history and msg_history[-1].get("role") == "user":
++        last = msg_history[-1]
++        content = last.get("content")
++        if isinstance(content, str):
++            last["content"] = content + "\n\n" + text
++        elif isinstance(content, list):
++            content.append({"type": "text", "text": text})
++        else:
++            last["content"] = [{"type": "text", "text": text}]
++    else:
++        msg_history.append({"role": "user", "content": [{"type": "text", "text": text}]})
++    return msg_history
++
++
+ def chat_with_agent_claude(
+         msg,
+         model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+@@ -385,9 +466,9 @@ def chat_with_agent_claude(
+         )
+ 
+         final_response = None
+-        nudged = False
+-        # Bounded: at most one nudge for an empty response (no text and no tool call).
+-        for _pass in range(2):
++        gave_up = False
++        # Bounded: up to 3 attempts to recover from empty responses (no text and no tool call).
++        for attempt in range(3):
+             # Check for tool use
+             tool_use = check_for_tool_use(response, model=client_model)
+             while tool_use:
+@@ -422,23 +503,17 @@ def chat_with_agent_claude(
+ 
+             # Get final response
+             final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
+-            if final_response or nudged:
++            if not _is_empty_response(response, model=client_model):
+                 break
+ 
+-            # Empty text and no tool call: nudge the model once to act.
+-            nudged = True
+-            logging("Empty assistant response without tool call; nudging the model once.")
+-            if response.content:
+-                new_msg_history.append({"role": "assistant", "content": response.content})
+-            new_msg_history.append({
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": "You must call a tool or finish with a summary of the changes you made.",
+-                    }
+-                ],
+-            })
++            # Empty turn: drop it (never stored in history) and nudge with an escalating message.
++            logging(f"Dropping empty assistant turn (attempt {attempt + 1}/3); nudging the model.")
++            final_response = None
++            if attempt >= len(EMPTY_NUDGES):
++                logging("Empty turn persisted after all nudges; giving up so the caller can restart.")
++                gave_up = True
++                break
++            _append_nudge(new_msg_history, EMPTY_NUDGES[attempt])
+             response = get_response_withtools(
+                 client=client,
+                 model=client_model,
+@@ -447,15 +522,16 @@ def chat_with_agent_claude(
+                 tools=tools,
+                 logging=logging,
+             )
+-        new_msg_history.append({
+-            "role": "assistant",
+-            "content": [
+-                {
+-                    "type": "text",
+-                    "text": final_response,
+-                }
+-            ],
+-        })
++        if final_response is not None and not gave_up:
++            new_msg_history.append({
++                "role": "assistant",
++                "content": [
++                    {
++                        "type": "text",
++                        "text": final_response,
++                    }
++                ],
++            })
+ 
+     except Exception:
+         pass

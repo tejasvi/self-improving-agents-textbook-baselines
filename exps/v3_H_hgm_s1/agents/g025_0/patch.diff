@@ -1,0 +1,327 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3938de2..bd57e35 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,6 +8,9 @@ import threading
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, list_non_test_tracked_files, read_starter_files, resolve_primary_source_file, write_fallback_solution
+ from utils.common_utils import extract_code_block
++from tools.run_examples import tool_function as run_examples_tool
++import json
++import re
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -142,13 +145,17 @@ def _last_assistant_text(msg_history):
+     return ''
+ 
+ 
+-def _build_retry_prompt(git_tempdir, primary_path, patch):
++def _build_retry_prompt(git_tempdir, primary_path, patch, problem_statement=''):
+     """Compact retry prompt for a fresh context. The problem statement is already in the repo README/problem description, so it is not repeated here."""
+     patch_display = patch.strip() if patch.strip() else "EMPTY (no changes at all)"
+     starter = read_starter_files(git_tempdir, primary_path=primary_path)
+     starter_text = "\n\n".join(f"### {path}\n```\n{text}\n```" for path, text in starter) or "(no files)"
+     primary_text = primary_path if primary_path else "(no non-test file found; create the appropriate source file)"
+-    return f"""I have uploaded a code repository in the directory {git_tempdir}. It contains a programming problem description (see the README or problem file) that you must solve.
++    return f"""I have uploaded a code repository in the directory {git_tempdir}. Help solve the following problem.
++
++<problem_description>
++{problem_statement}
++</problem_description>
+ 
+ No source edits were detected so far. The current diff against the base commit is:
+ {patch_display}
+@@ -158,7 +165,7 @@ The solution file to edit is: {primary_text}
+ Current contents of the non-test, non-doc files (primary file first):
+ {starter_text}
+ 
+-Your first action must be an editor tool call with command=edit on {primary_text} containing the full solution (or command=create if the file does not exist); do not explore further and do not reply with an empty message. The solution must replace the starter stub and keep the required signature, adding any missing imports. After editing, reply with a short summary of the change."""
++Your first action must be an editor tool call with command=edit on {primary_text} containing the full solution (or command=create if the file does not exist); do not reply with an empty message. The solution must replace the starter stub and keep the required signature, adding any missing imports. After editing, reply with a short summary of the change."""
+ 
+ 
+ def _build_fallback_prompt(problem_statement, primary_path, git_tempdir):
+@@ -169,23 +176,62 @@ def _build_fallback_prompt(problem_statement, primary_path, git_tempdir):
+ Output the complete contents of {primary_path} (inside {git_tempdir}, the solution file) that solves the problem, in one ```python fenced block, and nothing else. Keep the required signature and any imports needed. If the file is not Python, use the fence language matching its extension."""
+ 
+ 
+-def _build_verification_prompts(git_tempdir, primary_path):
+-    """Bounded, fixed sequence of verification prompts (no open-ended loops)."""
+-    solution = primary_path if primary_path else "the primary source file"
+-    sample_check = f"""Verification step 1 (sample exact-match check):
+-a) Extract every sample input and expected output from the problem statement.
+-b) Save each sample as /tmp/samples/N.in (input) and /tmp/samples/N.out (expected output), for N = 1, 2, ...
+-c) Run the solution on each sample, e.g. `python3 {git_tempdir}/{solution} < /tmp/samples/N.in > /tmp/samples/N.actual`, and diff it exactly against /tmp/samples/N.out (`diff /tmp/samples/N.actual /tmp/samples/N.out`). You may also use the `sample_check` tool with the samples as {{input, expected}} objects.
+-d) Also run a brute-force comparison on small random inputs and fix any errors or edge cases in the source file with the editor tool.
+-Report for each sample whether the output matches exactly."""
+-    reconcile = """Verification step 2 (exact-match reconciliation):
+-If ANY sample's output differs from the expected output, do NOT assume the answer is acceptable just because it is valid (your own checker passing is not enough; hidden graders may compare exactly). Instead:
+-1. Enumerate canonical construction variants of your algorithm, such as: iteration order (ascending vs. descending), bit-assignment order, which free variable gets which bit, pivot choice, reduced row echelon form vs. not, and the order of output elements.
+-2. Write a small script (e.g. /tmp/variants.py) that implements these variants as combinations and tries them until all samples match exactly against /tmp/samples/N.out.
+-3. Once a combination matches every sample exactly, update the source file accordingly, keeping its validity checker passing, and re-run the samples and random tests.
+-4. If no variant reproduces all sample outputs, keep the valid solution and state explicitly in your final message that the sample outputs could not be matched exactly.
+-Finally, make sure the final source file is complete and imports are correct."""
+-    return [sample_check, reconcile]
++def _build_extract_examples_prompt(problem_statement):
++    return f"""Problem statement:
++{problem_statement}
++
++Extract every example (sample input and expected output) from the problem statement above.
++Reply with JSON only, no prose, in this exact shape:
++{{"mode": "stdin" or "method", "class_name": "Solution", "method_name": "<method name or empty string>", "examples": [{{"input": "...", "expected": "..."}}]}}
++Use mode "stdin" if the program reads standard input; use mode "method" if the task is a method of a Solution class, in which case "input" is the call arguments in 'name = value' form separated by commas or newlines, and "expected" is the Python literal of the return value. Copy the values exactly."""
++
++
++def _parse_examples_fallback(problem_statement):
++    """Regex fallback: pull 'Input:' / 'Output:' pairs from the statement (stdin mode)."""
++    pattern = re.compile(r'Input:\s*(.*?)\s*Output:\s*(.*?)(?=\n\s*(?:Input:|Explanation:|Constraints:)|\Z)', re.DOTALL)
++    examples = []
++    for m in pattern.finditer(problem_statement or ''):
++        inp, out = m.group(1).strip(), m.group(2).strip()
++        if inp and out:
++            examples.append({"input": inp, "expected": out})
++    return {"mode": "stdin", "class_name": "Solution", "method_name": "", "examples": examples}
++
++
++def _extract_examples(problem_statement, model):
++    """Ask the model for examples as JSON; fall back to regexes if parsing fails."""
++    try:
++        history = chat_with_agent(_build_extract_examples_prompt(problem_statement), model=model, msg_history=[], logging=safe_log)
++        text = _last_assistant_text(history)
++        match = re.search(r'\{.*\}', text, re.DOTALL)
++        data = json.loads(match.group(0)) if match else None
++        if isinstance(data, dict) and isinstance(data.get('examples'), list) and data['examples']:
++            return data
++        safe_log("[forward] Example extraction returned no usable examples; using regex fallback.")
++    except Exception as e:
++        safe_log(f"[forward] Example extraction failed ({e}); using regex fallback.")
++    return _parse_examples_fallback(problem_statement)
++
++
++def _build_repair_prompt(problem_statement, solution_text, report):
++    return f"""Problem statement:
++{problem_statement}
++
++The current solution file is:
++```
++{solution_text}
++```
++
++Running the examples from the problem statement produced this report:
++{report}
++
++Re-read the problem requirements carefully, work out why the failing examples differ, and edit the solution file with the editor tool to fix it. You MUST edit the file; do not reply with only an explanation. Afterwards, reply with a short summary of the change."""
++
++
++def _build_must_edit_prompt(problem_statement, primary_text):
++    return f"""Your previous reply was empty. Problem statement:
++{problem_statement}
++
++You must edit the file {primary_text} now with the editor tool so that it solves the problem, then reply with a short summary."""
+ 
+ 
+ class AgenticSystem:
+@@ -276,7 +322,7 @@ Rules:
+             if has_source_edits(patch):
+                 break
+             safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Retrying with fresh context.")
+-            retry_msg = _build_retry_prompt(self.git_tempdir, primary_path, patch)
++            retry_msg = _build_retry_prompt(self.git_tempdir, primary_path, patch, self.problem_statement)
+             msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             if _is_empty_reply(msg_history):
+                 safe_log(f"[forward] Stall detected on retry attempt {attempt + 1}/3 (empty reply).")
+@@ -310,14 +356,32 @@ Rules:
+             patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+ 
+         has_edit = has_source_edits(patch)
+-        if has_edit:
+-            # Verification pass once a source edit exists
+-            safe_log("[forward] Running verification pass.")
+-            verify_prompts = _build_verification_prompts(self.git_tempdir, primary_path)
+-            for round_idx, verify_msg in enumerate(verify_prompts, start=1):
+-                safe_log(f"[forward] Verification round {round_idx}/{len(verify_prompts)}.")
+-                msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        else:
++        if has_edit and primary_path is not None:
++            safe_log("[forward] Running example verification loop.")
++            spec = _extract_examples(self.problem_statement, self.code_model)
++            solution_file = os.path.join(self.git_tempdir, primary_path)
++            mode = spec.get('mode') if spec.get('mode') in ('stdin', 'method') else 'stdin'
++            method_name = spec.get('method_name') or None
++            class_name = spec.get('class_name') or 'Solution'
++            examples = [e for e in spec['examples'] if isinstance(e, dict)]
++            for round_idx in range(1, 5):
++                if mode == 'method' and not method_name:
++                    report = "Error: no method_name extracted for method mode."
++                else:
++                    report = run_examples_tool(solution_file, mode, examples,
++                                               class_name=class_name, method_name=method_name)
++                safe_log(f"[forward] Verification round {round_idx}/4:\n{report}")
++                if report.startswith(f"{len(examples)}/{len(examples)} examples passed"):
++                    break
++                solution_text = open(solution_file, encoding='utf-8').read() if os.path.exists(solution_file) else ''
++                repair = _build_repair_prompt(self.problem_statement, solution_text, report)
++                msg_history = chat_with_agent(repair, model=self.code_model, msg_history=[], logging=safe_log)
++                if _is_empty_reply(msg_history):
++                    safe_log("[forward] Empty reply during repair; re-prompting once to edit the file.")
++                    _log_raw_empty_reply(msg_history)
++                    msg_history = chat_with_agent(_build_must_edit_prompt(self.problem_statement, primary_path),
++                                                  model=self.code_model, msg_history=[], logging=safe_log)
++        elif not has_edit:
+             safe_log("[forward] Warning: agent finished without a non-test source edit.")
+         safe_log(f"[forward] Final status: source edit exists = {has_edit}.")
+ 
+diff --git a/tools/run_examples.py b/tools/run_examples.py
+new file mode 100644
+index 0000000..a31b5e7
+--- /dev/null
++++ b/tools/run_examples.py
+@@ -0,0 +1,148 @@
++import ast
++import os
++import subprocess
++import sys
++
++DEFAULT_TIMEOUT = 10  # seconds per example
++
++# Runs inside a subprocess: imports the solution, parses the call arguments
++# from an "a = 1, b = [2]" style input, calls Solution.method and prints the
++# repr of the result as a literal.
++_METHOD_RUNNER = r'''
++import ast, importlib.util, sys
++path, class_name, method_name, call_src = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
++spec = importlib.util.spec_from_file_location("solution_mod", path)
++mod = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(mod)
++call = ast.parse("_f(" + call_src + ")", mode="eval").body
++args = [ast.literal_eval(a) for a in call.args]
++kwargs = {k.arg: ast.literal_eval(k.value) for k in call.keywords}
++obj = getattr(mod, class_name)()
++result = getattr(obj, method_name)(*args, **kwargs)
++print(repr(result))
++'''
++
++
++def tool_info():
++    return {
++        "name": "run_examples",
++        "description": """Run examples against a solution and report PASS/FAIL per example.\\n
++* mode 'method': imports the file, instantiates class_name (default 'Solution'), and calls method_name (required) with arguments parsed from each example input in 'name = value' form (ast.literal_eval). The result is compared against the expected value parsed with ast.literal_eval (compared by equality).\\n
++* mode 'stdin': runs the file with python3, piping the example input to stdin; output is compared after stripping trailing whitespace.\\n
++* Reports actual output, expected output, tracebacks, and timeouts for each failing example.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the Python solution file to run."
++                },
++                "mode": {
++                    "type": "string",
++                    "enum": ["method", "stdin"],
++                    "description": "'method' to call a Solution method, or 'stdin' to run the script with input on stdin."
++                },
++                "class_name": {
++                    "type": "string",
++                    "description": "Class to instantiate in 'method' mode. Defaults to 'Solution'."
++                },
++                "method_name": {
++                    "type": "string",
++                    "description": "Method to call in 'method' mode."
++                },
++                "examples": {
++                    "type": "array",
++                    "description": "Examples to run.",
++                    "items": {
++                        "type": "object",
++                        "properties": {
++                            "input": {
++                                "type": "string",
++                                "description": "Example input text."
++                            },
++                            "expected": {
++                                "type": "string",
++                                "description": "Expected output (stdin mode) or expected return value literal (method mode)."
++                            }
++                        },
++                        "required": ["input", "expected"]
++                    }
++                }
++            },
++            "required": ["solution_path", "mode", "examples"]
++        }
++    }
++
++
++def _run_stdin(solution_path, example_input, timeout):
++    try:
++        proc = subprocess.run(
++            [sys.executable, solution_path],
++            input=example_input, capture_output=True, text=True, timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return None, f"Timed out after {timeout}s"
++    if proc.returncode != 0:
++        return proc.stdout, proc.stderr.strip()
++    return proc.stdout, ""
++
++
++def _run_method(solution_path, class_name, method_name, example_input, timeout):
++    try:
++        proc = subprocess.run(
++            [sys.executable, "-c", _METHOD_RUNNER, solution_path, class_name, method_name, example_input],
++            capture_output=True, text=True, timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return None, f"Timed out after {timeout}s"
++    if proc.returncode != 0:
++        return proc.stdout, proc.stderr.strip()
++    return proc.stdout, ""
++
++
++def _compare_method(actual_text, expected_text):
++    try:
++        expected = ast.literal_eval(expected_text.strip())
++        actual = ast.literal_eval(actual_text.strip())
++    except Exception:
++        return actual_text.strip() == expected_text.strip()
++    return actual == expected
++
++
++def tool_function(solution_path, mode, examples, class_name=None, method_name=None):
++    timeout = DEFAULT_TIMEOUT
++    if not isinstance(examples, list) or not examples:
++        return "Error: 'examples' must be a non-empty array of {input, expected} objects."
++    if mode not in ("method", "stdin"):
++        return "Error: 'mode' must be 'method' or 'stdin'."
++    if mode == "method" and not method_name:
++        return "Error: 'method_name' is required in 'method' mode."
++    if not os.path.exists(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    class_name = class_name or "Solution"
++
++    lines = []
++    passed = 0
++    for i, ex in enumerate(examples, start=1):
++        if not isinstance(ex, dict) or "input" not in ex or "expected" not in ex:
++            lines.append(f"Example {i}: FAIL (malformed example; needs 'input' and 'expected')")
++            continue
++        ex_input, expected = str(ex["input"]), str(ex["expected"])
++        if mode == "stdin":
++            actual, err = _run_stdin(solution_path, ex_input, timeout)
++            ok = actual is not None and not err and actual.rstrip() == expected.rstrip()
++        else:
++            actual, err = _run_method(solution_path, class_name, method_name, ex_input, timeout)
++            ok = actual is not None and not err and _compare_method(actual, expected)
++        if ok:
++            passed += 1
++            lines.append(f"Example {i}: PASS")
++            continue
++        lines.append(f"Example {i}: FAIL")
++        lines.append(f"  input: {ex_input!r}")
++        lines.append(f"  expected: {expected!r}")
++        lines.append(f"  actual: {(actual or '')!r}")
++        if err:
++            lines.append(f"  error/traceback:\n{err}")
++    lines.insert(0, f"{passed}/{len(examples)} examples passed.")
++    return "\n".join(lines)

@@ -1,0 +1,300 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a31eabc..6a59748 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,6 +8,11 @@ import threading
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++# Number of independent attempts; the attempt whose solution passes the problem's examples is kept.
++MAX_ATTEMPTS = 3
++PASS_MARKER = 'EXAMPLES: PASS'
++FAIL_MARKER = 'EXAMPLES: FAIL'
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -93,6 +98,32 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def last_assistant_text(msg_history):
++    """
++    Return the text of the last assistant message in a message history ('' if none).
++    Handles both plain-string content and lists of content blocks.
++    """
++    for msg in reversed(msg_history or []):
++        if msg.get('role') != 'assistant':
++            continue
++        content = msg.get('content')
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            texts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
++            return '\n'.join(t for t in texts if t)
++        return ''
++    return ''
++
++def parse_verdict(text):
++    """
++    Return True if the last PASS/FAIL marker in `text` is PASS, False otherwise.
++    A missing marker counts as a failure.
++    """
++    pass_idx = text.rfind(PASS_MARKER)
++    fail_idx = text.rfind(FAIL_MARKER)
++    return pass_idx > fail_idx
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -137,11 +168,8 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    def _build_task(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -150,6 +178,14 @@ class AgenticSystem:
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+ 
++    def _run_attempt(self, attempt_idx):
++        """
++        Run one full attempt (analysis, implementation, verification) starting from the base commit.
++        Returns (patch, passed).
++        """
++        task = self._build_task()
++        safe_log(f"===== Attempt {attempt_idx + 1}/{MAX_ATTEMPTS} =====")
++
+         # Phase 1: analysis call that produces a plan (no edits yet).
+         analysis_instruction = (
+             f"{task}\n\n"
+@@ -191,10 +227,64 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             "Make sure the final code reads input and writes output exactly as the problem requires (or implements the "
+             "requested Solution method)."
+         )
+-        init_edit = chat_with_agent(
++        impl_history = chat_with_agent(
+             implementation_instruction, model=self.code_model, msg_history=analysis_history, logging=safe_log
+         )
+ 
++        # Verification: run the examples from the problem statement against the final code.
++        verify_instruction = (
++            "Verification step. Do NOT write new tests or brute-force files and do NOT edit the solution now. "
++            "Using the bash tool, run the solution against each example given in the problem statement "
++            "(compare its output with the expected output in the statement). "
++            "Then reply with the actual vs expected output for each example, and on the very last line write exactly "
++            f"`{PASS_MARKER}` if every example matches, or exactly `{FAIL_MARKER}` otherwise."
++        )
++        verify_history = chat_with_agent(
++            verify_instruction, model=self.code_model, msg_history=impl_history, logging=safe_log
++        )
++        passed = parse_verdict(last_assistant_text(verify_history))
++        safe_log(f"Attempt {attempt_idx + 1} verdict: {'PASS' if passed else 'FAIL'}")
++
++        patch = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        return patch, passed
++
++    def forward(self):
++        """
++        The forward function for the AgenticSystem.
++        Runs up to MAX_ATTEMPTS independent attempts from the base commit, stops at the first attempt whose
++        solution passes the problem's examples, and leaves that attempt's patch in the repository.
++        Returns a dict with the chosen attempt index, whether it passed, and its patch.
++        """
++        attempts = []  # list of (patch, passed)
++        for attempt_idx in range(MAX_ATTEMPTS):
++            reset_to_commit(self.git_tempdir, self.base_commit)
++            try:
++                patch, passed = self._run_attempt(attempt_idx)
++            except Exception as e:
++                safe_log(f"Attempt {attempt_idx + 1} raised an error: {e}")
++                attempts.append(('', False))
++                continue
++            attempts.append((patch, passed))
++            if passed:
++                break
++
++        # Choose the first passing attempt; otherwise the last attempt that produced edits.
++        chosen_idx = next((i for i, (_, ok) in enumerate(attempts) if ok), None)
++        if chosen_idx is None:
++            non_empty = [i for i, (p, _) in enumerate(attempts) if p.strip()]
++            chosen_idx = non_empty[-1] if non_empty else len(attempts) - 1
++        chosen_patch, chosen_passed = attempts[chosen_idx]
++        safe_log(f"Selected attempt {chosen_idx + 1} (passed={chosen_passed})")
++
++        # Restore the chosen attempt's state in the repository.
++        current_patch = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        if current_patch.strip() != chosen_patch.strip():
++            reset_to_commit(self.git_tempdir, self.base_commit)
++            if chosen_patch.strip():
++                apply_patch(self.git_tempdir, chosen_patch)
++
++        return {'attempt': chosen_idx + 1, 'passed': chosen_passed, 'patch': chosen_patch}
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tests/test_coding_agent.py b/tests/test_coding_agent.py
+new file mode 100644
+index 0000000..1da5a2e
+--- /dev/null
++++ b/tests/test_coding_agent.py
+@@ -0,0 +1,150 @@
++import os
++import subprocess
++
++import pytest
++
++import coding_agent
++from coding_agent import AgenticSystem, parse_verdict, last_assistant_text, MAX_ATTEMPTS
++
++
++def test_parse_verdict_pass_fail_missing():
++    assert parse_verdict("ok\nEXAMPLES: PASS") is True
++    assert parse_verdict("ok\nEXAMPLES: FAIL") is False
++    assert parse_verdict("no marker here") is False
++    # Last marker wins
++    assert parse_verdict("EXAMPLES: PASS\nactually\nEXAMPLES: FAIL") is False
++
++
++def test_last_assistant_text_handles_blocks_and_strings():
++    hist = [
++        {"role": "user", "content": [{"type": "text", "text": "q"}]},
++        {"role": "assistant", "content": [{"type": "text", "text": "first"}]},
++        {"role": "user", "content": "more"},
++        {"role": "assistant", "content": [{"type": "text", "text": "EXAMPLES: PASS"}]},
++    ]
++    assert last_assistant_text(hist) == "EXAMPLES: PASS"
++    assert last_assistant_text([]) == ""
++    assert last_assistant_text([{"role": "assistant", "content": "plain"}]) == "plain"
++
++
++@pytest.fixture
++def system(tmp_path, monkeypatch):
++    monkeypatch.setattr(coding_agent, "safe_log", lambda *a, **k: None)
++    s = AgenticSystem("problem", str(tmp_path), "base", chat_history_file=str(tmp_path / "h.md"))
++    return s
++
++
++def _fake_run(outcomes, calls, patches):
++    """outcomes: list of bool verdicts per attempt; patches: patch text per attempt."""
++    def fake(self, attempt_idx):
++        calls.append(attempt_idx)
++        return patches[attempt_idx], outcomes[attempt_idx]
++    return fake
++
++
++def test_stops_at_first_passing_attempt(system, monkeypatch):
++    calls, resets, applied = [], [], []
++    monkeypatch.setattr(AgenticSystem, "_run_attempt", _fake_run([False, True, False], calls, ["p1", "p2", "p3"]))
++    monkeypatch.setattr(coding_agent, "reset_to_commit", lambda d, c: resets.append(d))
++    monkeypatch.setattr(coding_agent, "apply_patch", lambda d, p: applied.append(p))
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda d, c: "other")
++    res = system.forward()
++    assert calls == [0, 1]
++    assert res == {'attempt': 2, 'passed': True, 'patch': 'p2'}
++    assert len(resets) >= 2  # reset before each attempt
++    assert applied == ['p2']
++
++
++def test_all_fail_picks_last_nonempty(system, monkeypatch):
++    calls = []
++    monkeypatch.setattr(AgenticSystem, "_run_attempt", _fake_run([False] * 3, calls, ["a", "", "c"]))
++    monkeypatch.setattr(coding_agent, "reset_to_commit", lambda d, c: None)
++    monkeypatch.setattr(coding_agent, "apply_patch", lambda d, p: None)
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda d, c: "c")
++    res = system.forward()
++    assert calls == [0, 1, 2]
++    assert len(calls) == MAX_ATTEMPTS
++    assert res['passed'] is False and res['patch'] == 'c' and res['attempt'] == 3
++
++
++def test_exception_in_attempt_is_isolated(system, monkeypatch):
++    def fake(self, idx):
++        if idx == 0:
++            raise RuntimeError("boom")
++        return "ok-patch", True
++    monkeypatch.setattr(AgenticSystem, "_run_attempt", fake)
++    monkeypatch.setattr(coding_agent, "reset_to_commit", lambda d, c: None)
++    monkeypatch.setattr(coding_agent, "apply_patch", lambda d, p: None)
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda d, c: "")
++    res = system.forward()
++    assert res == {'attempt': 2, 'passed': True, 'patch': 'ok-patch'}
++
++
++def test_all_empty_failures_return_last_attempt(system, monkeypatch):
++    monkeypatch.setattr(AgenticSystem, "_run_attempt", _fake_run([False] * 3, [], ["", "", ""]))
++    monkeypatch.setattr(coding_agent, "reset_to_commit", lambda d, c: None)
++    monkeypatch.setattr(coding_agent, "apply_patch", lambda d, p: None)
++    monkeypatch.setattr(coding_agent, "diff_versus_commit", lambda d, c: "")
++    res = system.forward()
++    assert res['attempt'] == 3 and res['passed'] is False and res['patch'] == ''
++
++
++# ---- Brute-force cross-check on a real git repo (scratch files only, not part of the patch) ----
++
++def _git(d, *args):
++    subprocess.run(["git", "-C", str(d), *args], check=True, capture_output=True)
++
++
++def test_end_to_end_real_git_keeps_passing_attempt(tmp_path, monkeypatch):
++    """Real git repo: attempt 1 writes a wrong solution, attempt 2 writes the right one.
++    The final working tree must contain the passing attempt's solution."""
++    monkeypatch.setattr(coding_agent, "safe_log", lambda *a, **k: None)
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    _git(repo, "init", "-q")
++    _git(repo, "config", "user.email", "t@t")
++    _git(repo, "config", "user.name", "t")
++    (repo / "sol.py").write_text("print(0)\n")
++    _git(repo, "add", ".")
++    _git(repo, "commit", "-qm", "base")
++    base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
++
++    wrong = "print(1)\n"
++    right = "a, b = map(int, input().split())\nprint(a + b)\n"
++    counter = {"n": 0}
++
++    def fake_chat(msg, model=None, msg_history=None, logging=print):
++        if "Verification step" in msg:
++            counter["n"] += 0  # verification handled below
++            text = "EXAMPLES: PASS" if open(repo / "sol.py").read() == right else "EXAMPLES: FAIL"
++            return (msg_history or []) + [{"role": "assistant", "content": [{"type": "text", "text": text}]}]
++        if "Phase 1 of 2" in msg:
++            return [{"role": "assistant", "content": [{"type": "text", "text": "plan"}]}]
++        # Phase 2: edit. Attempt 1 writes wrong code, attempt 2 right code.
++        counter["n"] += 1
++        content = wrong if counter["n"] == 1 else right
++        (repo / "sol.py").write_text(content)
++        return (msg_history or []) + [{"role": "assistant", "content": [{"type": "text", "text": "done"}]}]
++
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake_chat)
++    s = AgenticSystem("add two ints", str(repo), base, chat_history_file=str(tmp_path / "h.md"))
++    res = s.forward()
++    assert res['passed'] is True and res['attempt'] == 2
++    assert (repo / "sol.py").read_text() == right
++    assert "sol.py" in res['patch']
++
++
++def test_bruteforce_crosscheck_parse_verdict():
++    """Naive reference (scan all marker occurrences) vs. parse_verdict on seeded random texts."""
++    import random
++    rng = random.Random(2024)
++    pieces = ["EXAMPLES: PASS", "EXAMPLES: FAIL", "EXAMPLES:", " PASS", " FAIL", "\n", "x", "ok "]
++
++    def brute(text):
++        last_pass = max((i for i in range(len(text)) if text.startswith("EXAMPLES: PASS", i)), default=-1)
++        last_fail = max((i for i in range(len(text)) if text.startswith("EXAMPLES: FAIL", i)), default=-1)
++        return last_pass > last_fail
++
++    for _ in range(500):
++        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 12)))
++        assert parse_verdict(text) == brute(text), repr(text)

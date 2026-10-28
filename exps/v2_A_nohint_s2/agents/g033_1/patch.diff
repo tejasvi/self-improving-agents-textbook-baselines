@@ -1,0 +1,157 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a225287..ee48496 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -158,7 +158,7 @@ def _extract_samples(problem_statement):
+     samples = []
+     for m in SAMPLE_PATTERN.finditer(problem_statement or ''):
+         sample_in = m.group(2).strip('\n') + '\n'
+-        expected = m.group(3).strip()
++        expected = m.group(3).strip().split('\n\n')[0].strip()
+         samples.append((sample_in, expected))
+     return samples
+ 
+@@ -196,7 +196,7 @@ def _run_samples(target_path, samples, max_report_chars=3000):
+             failures.append(f"Sample {i}: could not execute ({repr(e)})")
+             continue
+         got = proc.stdout.strip()
+-        if proc.returncode == 0 and got == expected:
++        if proc.returncode == 0 and got.split() == expected.split():
+             continue
+         failures.append(f"Sample {i}: FAIL (exit code {proc.returncode})\nInput:\n{sample_in}"
+                         f"Expected output:\n{expected}\nStdout:\n{proc.stdout[:max_report_chars]}"
+@@ -251,14 +251,31 @@ class AgenticSystem:
+         return new_msg_history
+ 
+     def _run_agent(self, prompt, msg_history):
+-        """Run one agent call; on failure log the exception and return the old history."""
+-        try:
+-            new_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            safe_log(f"chat_with_agent returned history of length {len(new_history or [])}")
+-            return new_history
+-        except Exception as e:
+-            safe_log(f"chat_with_agent failed: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
+-            return msg_history
++        """Run one agent call. If the last assistant message is empty, retry with a changed strategy (bounded)."""
++        clean_prev = _clean_history(msg_history)
++        alt_model = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++        problem_only = (f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                        f"Save the solution file in {self.git_tempdir} using the editor tool. {STDLIB_NOTE}")
++        strategies = [
++            (self.code_model, prompt, msg_history),
++            (self.code_model, "Respond with a tool call or code, not an empty message.\n\n" + prompt, clean_prev),
++            (alt_model, prompt, clean_prev),
++            (self.code_model, problem_only, []),
++        ]
++        for attempt in range(4):
++            model, p, hist = strategies[attempt]
++            try:
++                new_history = chat_with_agent(p, model=model, msg_history=hist, logging=safe_log)
++                safe_log(f"chat_with_agent (attempt {attempt}, model {model}) returned history of length {len(new_history or [])}")
++            except Exception as e:
++                safe_log(f"chat_with_agent failed (attempt {attempt}): {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
++                continue
++            last_asst = next((m for m in reversed(new_history or []) if isinstance(m, dict) and m.get('role') == 'assistant'), None)
++            if last_asst is None or not _is_empty_assistant_msg(last_asst):
++                return new_history
++            safe_log(f"Empty assistant response (attempt {attempt}); raw content: {_msg_content(last_asst)!r}", level=logging.WARNING)
++        safe_log("All attempts returned empty responses; returning previous clean history.", level=logging.ERROR)
++        return clean_prev
+ 
+     def _target_file_path(self):
+         """Detect a target filename (e.g. `solution.py`) named in the problem statement."""
+@@ -267,43 +284,46 @@ class AgenticSystem:
+         return os.path.join(self.git_tempdir, name)
+ 
+     def _direct_code_fallback(self, target_path):
+-        """Last resort: ask the model directly for a ```python block, write it, and check it on the samples (max 2 re-asks)."""
++        """Last resort: ask the model directly for a ```python block, write it, and check it on the samples.
++        Tries self.code_model and then the alternate model; each gets up to 3 attempts."""
+         samples = _extract_samples(self.problem_statement)
++        alt_model = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
+         base_prompt = ("Reply ONLY with the complete Python program in a ```python block. "
+                        "It must read standard input and write standard output (or implement the required method). "
+                        "Use standard library only (no numpy); no third-party packages.\n\n"
+                        f"<problem_description>\n{self.problem_statement}\n</problem_description>")
+-        prompt = base_prompt
+         wrote = False
+-        for attempt in range(3):  # 1 initial try + at most 2 re-asks
+-            try:
+-                client, client_model = create_client(self.code_model)
+-                content, _ = get_response_from_llm(prompt, client, client_model,
+-                                                   system_message="You are an expert competitive programmer.",
+-                                                   msg_history=[], temperature=0.0)
+-            except Exception as e:
+-                safe_log(f"Direct code fallback failed: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
+-                return wrote
+-            match = re.search(r'```python\s*\n(.*?)```', content or '', re.DOTALL)
+-            if not match or not match.group(1).strip():
+-                safe_log("Direct code fallback: no ```python block found in reply", level=logging.ERROR)
+-                prompt = base_prompt + "\n\nYour reply had no ```python block. Reply ONLY with the complete program in a ```python block."
+-                continue
+-            try:
+-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+-                with open(target_path, 'w') as f:
+-                    f.write(match.group(1))
+-                wrote = True
+-                safe_log(f"Direct code fallback wrote {target_path}")
+-            except OSError as e:
+-                safe_log(f"Direct code fallback failed to write {target_path}: {repr(e)}", level=logging.ERROR)
+-                return False
+-            ok, report = _run_samples(target_path, samples)
+-            if ok:
+-                return True
+-            safe_log(f"Direct code fallback failed samples (attempt {attempt + 1}):\n{report}", level=logging.ERROR)
+-            prompt = (base_prompt + f"\n\nYour previous program failed the sample tests. Raw results:\n{report}\n"
+-                      "Reply ONLY with the corrected complete program in a ```python block.")
++        for model in [self.code_model, alt_model]:
++            prompt = base_prompt
++            for attempt in range(3):  # 1 initial try + at most 2 re-asks
++                try:
++                    client, client_model = create_client(model)
++                    content, _ = get_response_from_llm(prompt, client, client_model,
++                                                       system_message="You are an expert competitive programmer.",
++                                                       msg_history=[], temperature=0.0)
++                except Exception as e:
++                    safe_log(f"Direct code fallback ({model}) call failed: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
++                    break  # try the alternate model
++                try:
++                    match = re.search(r'```python\s*\n(.*?)```', content or '', re.DOTALL)
++                    if not match or not match.group(1).strip():
++                        safe_log(f"Direct code fallback ({model}): no ```python block found in reply", level=logging.ERROR)
++                        prompt = base_prompt + "\n\nYour reply had no ```python block. Reply ONLY with the complete program in a ```python block."
++                        continue
++                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
++                    with open(target_path, 'w') as f:
++                        f.write(match.group(1))
++                    wrote = True
++                    safe_log(f"Direct code fallback ({model}) wrote {target_path}")
++                    ok, report = _run_samples(target_path, samples)
++                except Exception as e:
++                    safe_log(f"Direct code fallback ({model}) parse/write error: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
++                    continue
++                if ok:
++                    return True
++                safe_log(f"Direct code fallback ({model}) failed samples (attempt {attempt + 1}):\n{report}", level=logging.ERROR)
++                prompt = (base_prompt + f"\n\nYour previous program failed the sample tests. Raw results:\n{report}\n"
++                          "Reply ONLY with the corrected complete program in a ```python block.")
+         return wrote
+ 
+     def _file_is_stub_or_empty(self, target_path, stub_content):
+diff --git a/llm.py b/llm.py
+index d6b4da1..0cbe4b1 100644
+--- a/llm.py
++++ b/llm.py
+@@ -200,7 +200,11 @@ def get_response_from_llm(
+             system=system_message,
+             messages=new_msg_history,
+         )
+-        content = response.content[0].text
++        blocks = response.content or []
++        content = ''.join(getattr(b, 'text', '') or '' for b in blocks if getattr(b, 'type', None) == 'text')
++        print(f"[llm] claude stop_reason={getattr(response, 'stop_reason', None)} n_blocks={len(blocks)} text_len={len(content)}")
++        if not content.strip():
++            raise ValueError(f"Empty content from Claude model {model}; stop_reason={getattr(response, 'stop_reason', None)}, raw_content={blocks!r}")
+         new_msg_history = new_msg_history + [
+             {
+                 "role": "assistant",

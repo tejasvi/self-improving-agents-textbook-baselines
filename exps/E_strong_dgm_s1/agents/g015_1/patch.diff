@@ -1,0 +1,388 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 9a54c1c..5a5abb6 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,9 +4,24 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import shutil
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.run_suite import run_suite_raw
++from tools import robust_check as robust_check_tool
++
++WORK_REPO = '/work/repo'
++TESTS_DIR = '/work/tests'
++CANDIDATES_DIR = '/work/candidates'
++NUM_ATTEMPTS = 3
++ROUNDS_PER_ATTEMPT = 3
++SUITE_TIMEOUT = 600
++
++def _tail(s, n=3000):
++    s = s or ''
++    return s if len(s) <= n else f'<{len(s) - n} earlier chars>...' + s[-n:]
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -102,7 +117,8 @@ class AgenticSystem:
+             chat_history_file='./chat_history.md',
+             test_description=None,
+             self_improve=False,
+-            language='python'
++            language='python',
++            num_attempts=NUM_ATTEMPTS,
+         ):
+         self.problem_statement = problem_statement
+         self.git_tempdir = git_tempdir
+@@ -111,6 +127,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.num_attempts = num_attempts
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -137,30 +154,226 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    # ------------------------------------------------------------------
++    # Test-driven, multi-attempt pipeline
++    # ------------------------------------------------------------------
++    def _log(self, message):
++        safe_log(message)
++
++    def _task_header(self):
++        return f"""I have uploaded a code repository in the directory {WORK_REPO}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+ 
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
++
++    def _prepare_dirs(self):
++        for d in (WORK_REPO, TESTS_DIR, CANDIDATES_DIR):
++            os.makedirs(d, exist_ok=True)
++
++    def _design_tests(self):
++        """Phase 1: an agent that has NOT seen any solution builds an independent test suite."""
++        interactive = 'interactive' in self.problem_statement.lower()
++        if interactive:
++            interactive_guidance = """This is an INTERACTIVE problem. In addition to the files above you MUST create /work/tests/judge.py, a judge harness that runs a candidate solution as a subprocess and plays the interactor:
++* The judge reads the solution's output with line-based reads (readline), never read() to EOF.
++* Every print the judge sends to the solution must be followed by a flush.
++* Handle a -1 response from the judge (the solution asked for an illegal query or gave a wrong answer): the judge must stop and report FAIL immediately.
++* Enforce a query-count limit. Derive the limit INDEPENDENTLY of any solution code: for small sizes use a brute-force computation of the minimum needed, for larger sizes use a different method than the one a typical solution would use. Do NOT import or copy the solution's planning function. Count every query and report FAIL if the solution exceeds the bound.
++* Every read from the solution must use a timeout (e.g. a reader thread with queue.get(timeout=...), or select on the pipe) so the judge can never hang. On timeout, kill the subprocess and report FAIL.
++* Never use an unbounded loop: use `for` loops bounded by the query limit plus a small slack.
++* run_tests.sh must invoke judge.py for each interactive case, passing the solution path.
++"""
++        else:
++            interactive_guidance = "This is NOT an interactive problem; do not create judge.py."
++
++        prompt = f"""{self._task_header()}You are the TEST DESIGNER. Your job is to build an independent test suite for this problem in /work/tests/. Do NOT write or look at any solution file in /work/repo; another agent will write the solution later and will be checked against your tests. Your tests must be derived from the statement alone.
++
++Create these files in /work/tests/:
++1. brute.py: a simple, obviously-correct brute-force reference that reads the same input format as the solution and prints the same output format. It may be slow but must be correct. For a `Solution` class method problem, brute.py should call the method on the arguments.
++2. gen.py: a random generator of small valid inputs (respecting every constraint in the statement) that takes a seed argument and prints one input to stdout. Vary sizes across the whole small range, not only tiny N.
++3. Edge-case inputs in /work/tests/cases/: minimum sizes, maximum sizes, boundary values, degenerate cases (all equal, sorted, empty-like where allowed), and every sample from the statement with its expected output.
++4. Max-size performance inputs in /work/tests/cases/ at the largest constraints allowed by the statement.
++5. run_tests.sh: a single entry point `bash run_tests.sh <solution_path>` that runs the solution on every case (edge cases, samples, max-size, and a stress loop of several hundred random gen.py cases compared with brute.py). For each case print exactly one line `PASS <case-name>` or `FAIL <case-name>`, and for failures print the expected vs actual output (truncated) below the FAIL line. Each solution run must have a timeout (e.g. 10 seconds) and stdin must be provided. At the end print a summary line `SUMMARY passed=<n> failed=<m>`. The script must exit non-zero if any case fails. Use only the standard library and bash/python3.
++   Use `python3 <solution_path>` for stdin programs; for a `Solution` class method, write a driver in /work/tests that imports the solution module by path and calls the method.
++6. Verify your own suite: run `bash /work/tests/run_tests.sh /work/tests/brute.py` (the brute force used as a candidate) and confirm every case passes. Fix the suite if it does not. Do not change the brute force to match anything other than the statement.
++
++{interactive_guidance}
++
++Keep every file small and deterministic (fixed seeds). Use bounded loops only; never use `while True`. Finish by stating which cases exist and the command to run the suite."""
++        self._log("=== PHASE 1: test design ===")
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _suite_score(self, solution_path, label):
++        """Run the suite on a candidate and return a dict of raw-output-derived facts."""
++        t0 = time.monotonic()
++        rc, out, err, timed_out = run_suite_raw(solution_path, TESTS_DIR, timeout=SUITE_TIMEOUT)
++        elapsed = time.monotonic() - t0
++        lines = out.splitlines()
++        passes = sum(1 for l in lines if l.strip().startswith('PASS'))
++        fails = sum(1 for l in lines if l.strip().startswith('FAIL'))
++        ok = rc == 0 and not timed_out and fails == 0 and passes > 0
++        raw = (out + ("\nSTDERR:\n" + err if err.strip() else "")).strip()
++        result = {
++            'label': label, 'path': solution_path, 'rc': rc, 'passes': passes,
++            'fails': fails, 'timed_out': timed_out, 'ok': ok, 'elapsed': elapsed,
++            'tail': _tail(raw, 3000),
++        }
++        self._log(f"[suite] {label}: rc={rc} PASS={passes} FAIL={fails} timed_out={timed_out} "
++                  f"ok={ok} time={elapsed:.1f}s")
++        return result
++
++    def _run_attempt(self, k, prior_failures):
++        """Phase 2 (one attempt): write solution.py, iterate a bounded number of rounds, snapshot it."""
++        self._log(f"=== PHASE 2: attempt {k} ===")
++        solution_file = os.path.join(WORK_REPO, 'solution.py')
++        if os.path.exists(solution_file):
++            os.remove(solution_file)
++
++        if prior_failures:
++            prior_text = "\n\n".join(
++                f"--- Attempt {p['label']} (PASS={p['passes']} FAIL={p['fails']}) raw suite output tail ---\n{p['tail']}"
++                for p in prior_failures
++            )
++            diversity = f"""Earlier attempts already failed the test suite. Their raw failing output is below. Do NOT reuse their approach: first identify the algorithmic idea they used, then choose a DIFFERENT algorithmic approach (for example a different decomposition, data structure, or characterization of the answer) that you verify against the brute force.
++
++{prior_text}
++"""
++        else:
++            diversity = "This is the first attempt. Choose the most reliable standard algorithm for the constraints.\n"
++
++        base = f"""{self._task_header()}You are SOLVER attempt {k}. The test suite is in /work/tests/ (entry point: run_tests.sh, brute force: brute.py, generator: gen.py). Do NOT edit files in /work/tests except to fix an obvious bug in the test harness itself; the tests are the ground truth for the statement.
++
++{diversity}
++Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass.
+-7. Before finishing, write all sample inputs to files and run the `robust_check` tool on solution.py (pass the sample input files as input_files). The grader may inject star-imports (e.g. `from math import *`, which makes `pow` the 2-argument math.pow) or use a different Python version. If any variant fails or differs from the baseline, fix the code, e.g. by using `import builtins` and `builtins.pow` for modular exponentiation (or hand-written modular inverses), and by avoiding names that star-imports can shadow (pow, sum, min, max, abs, etc.). Re-run robust_check until every variant passes with identical output.
+-8. Prefer simple, standard algorithms over exotic tricks unless the complexity requires them. The final answer must depend only on the Python standard library.
+-The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++2. Write the solution to {solution_file} with the editor tool. For a `Solution` class method write the class at the top of the file (add `from typing import *` and any imports you need at the top of solution.py).
++3. Run it on every sample in the statement and compare with the expected outputs exactly.
++4. Run the full suite with the run_suite tool (solution_path={solution_file}, tests_dir={TESTS_DIR}). Read the raw PASS/FAIL lines and the failing details yourself. Fix every FAIL by reasoning about the discrepancy with the brute force; do not special-case test inputs.
++5. Check that the maximum-size case finishes in well under 2 seconds.
++6. Keep iterating until the suite is fully passing or you have exhausted your ideas.
++Use only the Python standard library. Do NOT run robust_check in this step; that is done later on the selected candidate."""
++        msg = base
++        history = []
++        result = None
++        for rnd in range(ROUNDS_PER_ATTEMPT):
++            self._log(f"--- attempt {k} round {rnd + 1}/{ROUNDS_PER_ATTEMPT} ---")
++            history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
++            if not os.path.isfile(solution_file):
++                msg = f"{solution_file} does not exist. Write the solution there now, then run the suite."
++                continue
++            result = self._suite_score(solution_file, f"attempt{k}.round{rnd + 1}")
++            if result['ok']:
++                break
++            msg = (f"The suite still fails (PASS={result['passes']} FAIL={result['fails']}, "
++                   f"timed_out={result['timed_out']}). Raw output tail:\n{result['tail']}\n\n"
++                   f"Diagnose each failure against the brute force, fix {solution_file}, and re-run the suite.")
++        if result is None:
++            return None
++        snapshot = os.path.join(CANDIDATES_DIR, f'attempt{k}.py')
++        shutil.copyfile(solution_file, snapshot)
++        self._log(f"[snapshot] attempt {k} -> {snapshot}")
++        result['path'] = snapshot
++        result['label'] = f'attempt{k}'
++        return result
++
++    def _select_best(self, candidates):
++        """Phase 3: score every candidate, copy the best to /work/repo/solution.py, repair if none passes."""
++        self._log("=== PHASE 3: selection ===")
++        scored = []
++        for c in candidates:
++            if c is None:
++                continue
++            # Re-score the snapshot itself so the decision uses the exact file that is kept.
++            s = self._suite_score(c['path'], c['label'])
++            scored.append(s)
++        if scored:
++            best = min(scored, key=lambda s: (-s['passes'], s['fails'], s['elapsed']))
++            self._log(f"[select] best={best['label']} PASS={best['passes']} FAIL={best['fails']} "
++                      f"time={best['elapsed']:.1f}s ok={best['ok']}")
++            solution_file = os.path.join(WORK_REPO, 'solution.py')
++            if os.path.abspath(best['path']) != os.path.abspath(solution_file):
++                shutil.copyfile(best['path'], solution_file)
++        else:
++            best = None
++            self._log("[select] no candidate produced a solution.py")
++
++        if best is None or not best['ok']:
++            solution_file = os.path.join(WORK_REPO, 'solution.py')
++            failures = best['tail'] if best else "No solution.py was produced by any attempt."
++            self._log("[select] no fully passing candidate; running repair call")
++            repair = f"""{self._task_header()}A repair pass is needed. The best candidate from the solver attempts is at {solution_file} (it may be missing). The test suite is in /work/tests/ (entry point run_tests.sh; brute force brute.py).
++
++Raw failing output of the best candidate:
++{failures}
++
++Find the root cause of each failure by comparing with brute.py on the failing inputs, fix {solution_file}, then run the run_suite tool (solution_path={solution_file}, tests_dir={TESTS_DIR}) until every case passes. Use only the Python standard library."""
++            chat_with_agent(repair, model=self.code_model, msg_history=[], logging=safe_log)
++            if os.path.isfile(solution_file):
++                shutil.copyfile(solution_file, os.path.join(CANDIDATES_DIR, 'repair.py'))
++                repaired = self._suite_score(os.path.join(CANDIDATES_DIR, 'repair.py'), 'repair')
++                if best is None or (repaired['passes'], -repaired['fails']) > (best['passes'], -best['fails']):
++                    self._log(f"[select] repair candidate accepted (PASS={repaired['passes']} FAIL={repaired['fails']})")
++                    best = repaired
++                else:
++                    self._log("[select] repair candidate not better; keeping previous best")
++                    shutil.copyfile(best['path'], solution_file)
++        return best
++
++    def _falsify_and_check(self, best):
++        """Phase 4: adversarial review of unverified claims, then robust_check on the selected candidate."""
++        self._log("=== PHASE 4: falsification review ===")
++        solution_file = os.path.join(WORK_REPO, 'solution.py')
++        prompt = f"""{self._task_header()}You are the FALSIFICATION REVIEWER. The selected solution is {solution_file} and the test suite is in /work/tests/ (run_tests.sh, brute.py, gen.py).
++
++Step 1: Write a list of every claim the current solution relies on that has NOT been independently verified by the suite (for example: correctness on sizes above the brute-force range, the complexity at maximum size, the handling of boundary values, the query bound for interactive problems, and the output format).
++Step 2: For each claim, write extra tests in /work/tests/extra/ (new cases, larger random cases with brute.py where feasible, adversarial inputs) that try to BREAK the claim. Add them to the run so run_tests.sh covers them, or run them directly.
++Step 3: Run the run_suite tool (solution_path={solution_file}, tests_dir={TESTS_DIR}). If anything fails, find the root cause and fix {solution_file}, then re-run until everything passes.
++Step 4: Falsify your own claims: state explicitly which claims you could NOT break and which remain unverified, and say so honestly in your final message. Do not claim something is verified unless a test in the suite checked it.
++
++Finally, write all sample inputs from the statement to files in /work/tests/samples/ (one file per sample, named sample1.txt, sample2.txt, ...) and run the `robust_check` tool on {solution_file} with those sample input files as input_files. If any variant fails or differs from the baseline, fix the code (for example use `import builtins` and `builtins.pow` for modular exponentiation and avoid names star-imports can shadow such as pow, sum, min, max, abs), re-run the suite, and re-run robust_check until every variant passes with identical output. Use only the Python standard library."""
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        if not os.path.isfile(solution_file):
++            self._log("[final] no solution.py present after falsification review")
++            return
++        final = self._suite_score(solution_file, 'final')
++        self._log(f"[final] PASS={final['passes']} FAIL={final['fails']} ok={final['ok']}")
++        # Deterministic robust_check on the selected candidate only (sample inputs written by the agent).
++        samples_dir = os.path.join(TESTS_DIR, 'samples')
++        sample_files = sorted(os.path.join(samples_dir, f) for f in os.listdir(samples_dir)) if os.path.isdir(samples_dir) else []
++        rc_out = robust_check_tool.tool_function(solution_file, input_files=sample_files)
++        self._log(f"[robust_check] {rc_out}")
++
++    def _sync_to_git_repo(self):
++        """Make the selected solution visible to the git diff of the task repository."""
++        src = os.path.join(WORK_REPO, 'solution.py')
++        dst = os.path.join(self.git_tempdir, 'solution.py')
++        if os.path.isfile(src) and os.path.abspath(src) != os.path.abspath(dst):
++            os.makedirs(self.git_tempdir, exist_ok=True)
++            shutil.copyfile(src, dst)
++            self._log(f"[sync] copied {src} -> {dst}")
++
++    def forward(self):
++        """
++        The forward function for the AgenticSystem:
++        test design -> K independent attempts -> selection -> falsification + robust_check.
++        """
++        self._prepare_dirs()
++        self._design_tests()
++
++        candidates = []
++        prior_failures = []
++        for k in range(1, self.num_attempts + 1):
++            result = self._run_attempt(k, prior_failures)
++            candidates.append(result)
++            if result is not None:
++                prior_failures.append(result)
++
++        best = self._select_best(candidates)
++        self._falsify_and_check(best)
++        self._sync_to_git_repo()
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/run_suite.py b/tools/run_suite.py
+new file mode 100644
+index 0000000..429f5b0
+--- /dev/null
++++ b/tools/run_suite.py
+@@ -0,0 +1,91 @@
++import os
++import signal
++import subprocess
++
++TAIL_CHARS = 4000
++
++
++def tool_info():
++    return {
++        "name": "run_suite",
++        "description": """Run the test suite in a tests directory against a candidate solution and report the raw output.
++
++* Executes `bash run_tests.sh <solution_path>` with the tests directory as working directory, under a hard time limit (the whole process group is killed on timeout).
++* Returns the tail of stdout and stderr and the exit code. Output is NOT parsed: read the raw PASS/FAIL lines and failing-case details yourself.
++* Exit code 0 normally means all cases passed, but trust the printed PASS/FAIL lines.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the candidate solution file to test (e.g. /work/repo/solution.py).",
++                },
++                "tests_dir": {
++                    "type": "string",
++                    "description": "Directory containing run_tests.sh (e.g. /work/tests).",
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Hard time limit in seconds for the whole suite (default 300, max 900).",
++                },
++            },
++            "required": ["solution_path", "tests_dir"],
++        },
++    }
++
++
++def _tail(s, n=TAIL_CHARS):
++    s = s or ""
++    if len(s) <= n:
++        return s
++    return f"<{len(s) - n} earlier chars clipped>...\n" + s[-n:]
++
++
++def run_suite_raw(solution_path, tests_dir, timeout=300):
++    """Run run_tests.sh and return (returncode, full_stdout, full_stderr, timed_out).
++
++    Used by the orchestrator for scoring; the agent-facing tool wraps this without parsing.
++    """
++    try:
++        timeout = max(1, min(int(timeout or 300), 900))
++    except (TypeError, ValueError):
++        timeout = 300
++    script = os.path.join(tests_dir, "run_tests.sh")
++    if not os.path.isfile(script):
++        return 127, "", f"run_tests.sh not found in {tests_dir}", False
++    p = subprocess.Popen(
++        ["bash", script, os.path.abspath(solution_path)],
++        cwd=tests_dir,
++        stdin=subprocess.DEVNULL,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++        errors="replace",
++        start_new_session=True,
++    )
++    try:
++        out, err = p.communicate(timeout=timeout)
++        return p.returncode, out or "", err or "", False
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(p.pid, signal.SIGKILL)
++        except OSError:
++            pass
++        out, err = p.communicate()
++        return (p.returncode if p.returncode is not None else -9), out or "", err or "", True
++
++
++def tool_function(solution_path, tests_dir, timeout=300):
++    if not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    if not os.path.isdir(tests_dir):
++        return f"Error: tests directory not found: {tests_dir}"
++    rc, out, err, timed_out = run_suite_raw(solution_path, tests_dir, timeout)
++    lines = [f"exit code: {rc}"]
++    if timed_out:
++        lines.append(f"Error: suite timed out after {timeout} seconds and was killed.")
++    lines.append("STDOUT (tail):")
++    lines.append(_tail(out.rstrip()) or "(empty)")
++    lines.append("STDERR (tail):")
++    lines.append(_tail(err.rstrip()) or "(empty)")
++    return "\n".join(lines)

@@ -1,0 +1,411 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 591ff7c..697a2bc 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,7 @@
+ import argparse
+ import ast
++import hashlib
++import tempfile
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -51,6 +53,18 @@ SAMPLE_TIMEOUT_SECONDS = 5
+ SAMPLE_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+ DERIVE_MAX_ROUNDS = 4
+ 
++# Multi-attempt search: bounded number of independent attempts, each with a fresh conversation.
++MAX_ATTEMPTS = 3
++# Scratch directories the agent is told to use; candidates are harvested from here.
++SCRATCH_DIRS = ['/tmp/work', '/tmp/s', '/tmp/stress']
++# Differential test and timing limits used when scoring candidates.
++DIFF_TEST_CASES = 200
++DIFF_TEST_BUDGET_SECONDS = 120
++DIFF_TIMEOUT_SECONDS = 5
++MAX_INPUT_TIMEOUT_SECONDS = 10
++FAST_ENOUGH_SECONDS = 1.0
++NOT_RUN_RUNTIME = 1e9  # sentinel runtime for candidates that could not be timed
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -105,6 +119,154 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++
++def _source_is_stub(text):
++    """True if the source has no real logic: unparseable/empty, or every function body is pass/NotImplementedError."""
++    if not text or not text.strip():
++        return True
++    try:
++        tree = ast.parse(text)
++    except SyntaxError:
++        return True
++    funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
++    if not funcs:
++        return False
++    def stub(fn):
++        body = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(getattr(s, 'value', None), ast.Constant)
++                                           and isinstance(s.value.value, str))]
++        if not body:
++            return True
++        return len(body) == 1 and (isinstance(body[0], ast.Pass) or (
++            isinstance(body[0], ast.Raise) and body[0].exc is not None and
++            (getattr(body[0].exc, 'func', body[0].exc).id == 'NotImplementedError'
++             if isinstance(getattr(body[0].exc, 'func', body[0].exc), ast.Name) else False)))
++    return all(stub(f) for f in funcs)
++
++
++class CandidateTracker:
++    """
++    Harvests candidate solutions written by the agent (the target file and *.py files in the
++    scratch dirs), scores each one, and restores the best one into the target file.
++    Ranking tuple (higher is better): (all samples pass, differential test passes, non-stub, -runtime).
++    Candidates are copied into an internal store and deduplicated by content hash.
++    """
++    def __init__(self, system, store_dir=None):
++        self.system = system
++        self.store_dir = store_dir or tempfile.mkdtemp(prefix='candidates_')
++        os.makedirs(self.store_dir, exist_ok=True)
++        self.candidates = []   # dicts: path (original), stored (copy), hash, mtime, score, details
++        self._seen_hashes = set()
++
++    def _target_path(self):
++        return os.path.join(self.system.git_tempdir, self.system._target_file())
++
++    def _scratch_files(self):
++        files = []
++        for d in SCRATCH_DIRS:
++            if not os.path.isdir(d):
++                continue
++            for root, dirs, names in os.walk(d):
++                dirs[:] = [x for x in dirs if x != '__pycache__'][:50]
++                for n in names[:200]:
++                    if n.endswith('.py'):
++                        files.append(os.path.join(root, n))
++        return files
++
++    def snapshot_candidates(self):
++        """Copy the target file and scratch *.py files into the store; skip content already seen."""
++        paths = [self._target_path()] + self._scratch_files()
++        added = []
++        for path in paths:
++            if not os.path.isfile(path):
++                continue
++            try:
++                with open(path, 'rb') as fh:
++                    data = fh.read()
++            except OSError:
++                continue
++            digest = hashlib.sha256(data).hexdigest()
++            if digest in self._seen_hashes:
++                continue
++            self._seen_hashes.add(digest)
++            stored = os.path.join(self.store_dir, f"cand_{len(self.candidates)}.py")
++            with open(stored, 'wb') as fh:
++                fh.write(data)
++            cand = {'path': path, 'stored': stored, 'hash': digest,
++                    'mtime': os.path.getmtime(path), 'score': None, 'details': {}}
++            self.candidates.append(cand)
++            added.append(cand)
++        return added
++
++    def _run_diff_test(self, stored):
++        """Differential test against /tmp/work/brute.py and gen.py, reusing the stress_test tool logic."""
++        brute, gen = os.path.join(SCRATCH_DIRS[0], 'brute.py'), os.path.join(SCRATCH_DIRS[0], 'gen.py')
++        if not (os.path.isfile(brute) and os.path.isfile(gen)):
++            return None, 'no brute.py/gen.py'
++        from tools.stress_test import tool_function as stress
++        out = stress(f"{sys.executable} {stored}", f"{sys.executable} {brute}",
++                     f"{sys.executable} {gen}", DIFF_TEST_CASES, timeout=DIFF_TIMEOUT_SECONDS)
++        return out.startswith('ALL TESTS PASSED'), out[:1000]
++
++    def _run_timing(self, stored):
++        """Runtime on the max-size input, if /tmp/work/max_input.txt exists. None if absent or failed."""
++        max_input = os.path.join(SCRATCH_DIRS[0], 'max_input.txt')
++        if not os.path.isfile(max_input):
++            return None
++        with open(max_input, 'r') as fh:
++            data = fh.read()
++        start = time.time()
++        try:
++            proc = subprocess.run([sys.executable, stored], input=data, capture_output=True, text=True,
++                                  timeout=MAX_INPUT_TIMEOUT_SECONDS)
++        except subprocess.TimeoutExpired:
++            return None
++        if proc.returncode != 0:
++            return None
++        return time.time() - start
++
++    def score_candidate(self, cand):
++        """Score one candidate; returns the tuple (samples_ok, diff_ok, nonstub, -runtime)."""
++        with open(cand['stored'], 'r', errors='replace') as fh:
++            text = fh.read()
++        results = self.system._run_samples(cand['stored'])
++        samples_ok = bool(results) and all(r['ok'] for r in results)
++        diff_ok, diff_msg = self._run_diff_test(cand['stored']) if samples_ok else (False, 'skipped: samples fail')
++        runtime = self._run_timing(cand['stored']) if samples_ok else None
++        runtime = NOT_RUN_RUNTIME if runtime is None else runtime
++        nonstub = not _source_is_stub(text)
++        score = (int(samples_ok), int(bool(diff_ok)), int(nonstub), -runtime)
++        cand['score'] = score
++        cand['details'] = {
++            'failing': [f"sample {r['index']}: {r['reason']}" for r in results if not r['ok']],
++            'diff': diff_msg, 'runtime': runtime,
++        }
++        return score
++
++    def score_all(self):
++        for cand in self.candidates:
++            if cand['score'] is None:
++                self.score_candidate(cand)
++
++    def best(self):
++        scored = [c for c in self.candidates if c['score'] is not None]
++        return max(scored, key=lambda c: c['score']) if scored else None
++
++    def restore_best(self):
++        """Write the best candidate into the target file if it beats the current target."""
++        best = self.best()
++        if best is None:
++            return False
++        target = self._target_path()
++        current = next((c for c in self.candidates if c['path'] == target and c['score'] is not None), None)
++        if current is not None and best['score'] <= current['score']:
++            return False
++        if best['path'] == target:
++            return False
++        with open(best['stored'], 'rb') as src, open(target, 'wb') as dst:
++            dst.write(src.read())
++        safe_log(f"Restored best candidate {best['path']} (score {best['score']}) into {target}.")
++        return True
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -259,13 +421,15 @@ class AgenticSystem:
+                 samples.append((idx, parts['input'].strip() + '\n', parts['output'].strip()))
+         return samples
+ 
+-    def _run_samples(self):
++    def _run_samples(self, target_path=None):
+         """
+         Run the target file with python3 on every parsed sample (wall-clock timeout and address
+         space limit). Returns a list of dicts with keys: index, ok, reason, stdout, stderr,
+         runtime. Errors are returned raw; nothing is parsed out of them.
++        target_path defaults to the repo target file; the candidate tracker passes other paths.
+         """
+-        target_path = os.path.join(self.git_tempdir, self._target_file())
++        if target_path is None:
++            target_path = os.path.join(self.git_tempdir, self._target_file())
+         results = []
+ 
+         def limit_memory():
+@@ -460,66 +624,68 @@ class AgenticSystem:
+ 
+         return f"Repository files (git ls-files):\n{listing_text}\n\n" + "\n\n".join(contents)
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        workflow = """
+-Follow this workflow step by step:
+-1. Explore the repository: list the files and read the relevant code, tests, and any README or specification.
+-2. Identify the primary source file that must be changed. If the task names a file (e.g. solution.py) and it does not exist, create it.
+-3. Implement the solution by actually calling the editor tool (command=create or command=edit) on the source file. Do not only describe the code in text.
+-4. Test it: run the program via bash with the sample inputs from the problem statement and with your own edge cases. For interactive problems, write a small local judge/simulator and run your solution against it.
+-5. Finally verify with `git status` and `git diff` that the source file has actually changed. Fix any problems you find.
+-
+-IMPORTANT RULES:
+-- You MUST make changes using the editor tool. Do not just answer in text.
+-- If the task names an output file such as solution.py, create it.
+-- Responding with text only and no file edits counts as failure.
+-- Modifying only test files does not solve the task; the primary source file must be changed.
+-"""
+-        target = self._target_file()
+-        snapshot = self._snapshot_repo()
+-        instruction = (
+-            f"{task}\n{workflow}\n"
+-            f"Current repository contents:\n{snapshot}\n\n"
+-            f"Your first action must be an editor create/edit on {os.path.join(self.git_tempdir, target)} "
+-            f"(the primary source file) that implements the solution."
++    def _attempt_prompt(self, attempt, previous_summaries):
++        """Prompt for one independent attempt: baseline-first workflow, prior attempts table, strategy hint."""
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        strategies = [
++            "Strategy: brute force / DP baseline first, then optimise the algorithm.",
++            "Strategy: derive a formula from small-case brute-force tables (print results for n=1..10, look for a pattern, verify).",
++            "Strategy: think in terms of known techniques (inclusion-exclusion, combinatorics, prefix sums, DP with bitmasks) and check each against brute force.",
++        ]
++        hint = strategies[attempt % len(strategies)]
++        table = "No previous attempts." if not previous_summaries else (
++            "Previous attempts (score = samples ok, diff test ok, non-stub, -runtime):\n" +
++            "\n".join(previous_summaries))
++        return (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"This is attempt {attempt + 1} of {MAX_ATTEMPTS}. {hint}\n\n"
++            f"{table}\n\n"
++            "Follow these steps in order:\n"
++            f"Step 1: within your first 3 tool calls, write the simplest correct solution (brute force or a polynomial DP) "
++            f"to {target_path} (use editor `edit` if the file exists, `create` otherwise), then verify it on the samples.\n"
++            "Step 2: save brute.py (exhaustive, literal reading of the rules) and gen.py (takes a seed as sys.argv[-1], "
++            "prints one small valid input) in /tmp/work.\n"
++            "Step 3: only then optimise. After every improvement, write the file immediately. "
++            "Never keep more than ~15 lines of reasoning without a tool call.\n"
++            "Also write a max-size input to /tmp/work/max_input.txt and time the solution on it (target: under 1 second).\n"
++            "Use the stress_test tool to compare against /tmp/work/brute.py over many random cases.\n"
++            "Do not write scratch files inside the repository. Keep the final reply short."
+         )
+-        msg_history = []
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
+ 
+-        if self._solution_ok():
+-            safe_log("Source patch passes the sample gate after initial attempt; skipping retries.")
+-        else:
+-            # Do not reuse a history that may end with an empty assistant turn: escalate with a
+-            # compact prompt, first on the primary model then on the alternate model/API path.
+-            safe_log("Source patch missing or failing samples after initial attempt; escalating with a compact prompt.")
+-            msg_history = self._attempt_with_models(self._compact_prompt(), msg_history)
+-
+-        if self._extract_samples() and not self._is_feasible():
+-            safe_log("Samples still failing; starting bounded derive-and-fit phase.")
+-            msg_history = self._derive_and_fit(msg_history)
+-
+-        if self._is_feasible() or not self._extract_samples():
+-            msg_history = self._run_verification(msg_history)
+-        else:
+-            safe_log("Verification skipped: samples fail, so the solution is not feasible yet.")
++    def forward(self):
++        """
++        Bounded multi-attempt search. Each attempt uses a fresh conversation; after each attempt the
++        candidates are harvested and scored, and the best one is restored into the target file.
++        """
++        tracker = CandidateTracker(self)
++        summaries = []
++        for attempt in range(MAX_ATTEMPTS):
++            prompt = self._attempt_prompt(attempt, summaries)
++            safe_log(f"Attempt {attempt + 1}/{MAX_ATTEMPTS} starting.")
++            try:
++                chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"Attempt {attempt + 1} raised: {e}\n{traceback.format_exc()}")
++            tracker.snapshot_candidates()
++            tracker.score_all()
++            best = tracker.best()
++            tracker.restore_best()
++            if best is None:
++                summaries.append(f"- attempt {attempt + 1}: no candidate files found")
++            else:
++                d = best['details']
++                summaries.append(
++                    f"- attempt {attempt + 1}: score={best['score']}, runtime={d.get('runtime')}, "
++                    f"failing={d.get('failing')}, diff={str(d.get('diff'))[:200]}, best_path={best['path']}")
++                if best['score'][0] == 1 and best['score'][1] == 1 and best['score'][3] >= -FAST_ENOUGH_SECONDS:
++                    safe_log(f"Attempt {attempt + 1}: candidate passes samples, diff test and time limit; stopping early.")
++                    break
+ 
+         if not self._has_source_patch():
+-            safe_log("Last-resort attempt: requesting the complete solution as a code block (no tools).")
++            safe_log("No source patch after all attempts; last-resort write.")
+             self._last_resort_write()
+-            safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
+-                     f"source patch: {self._has_source_patch()}")
++        safe_log(f"Finished. Changed files: {self._get_changed_files()}")
+ 
+     def _alternate_model(self):
+         """
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 6b5d0ba..3851caa 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -47,22 +47,15 @@ def get_response_withtools(
+         logging = print
+     try:
+         if 'claude' in model:
+-            # Bounded retries (no unbounded loop): if the model hit max_tokens and produced no content
+-            # blocks, re-issue the request with a doubled max_tokens (capped at the model limit).
+-            response = None
+-            for attempt in range(3):
+-                max_tokens = min(MAX_TOKENS_LIMIT, 4096 * (2 ** attempt))
+-                logging(f"Claude request attempt {attempt + 1}/3: max_tokens={max_tokens}, thinking=disabled")
+-                response = client.messages.create(
+-                    model=model,
+-                    messages=messages,
+-                    max_tokens=max_tokens,
+-                    tool_choice=tool_choice,
+-                    tools=tools,
+-                )
+-                if response.content or getattr(response, 'stop_reason', None) != 'max_tokens':
+-                    break
+-                logging(f"Empty response with stop_reason=max_tokens at max_tokens={max_tokens}; retrying with a larger limit.")
++            # Single request. An empty max_tokens turn is NOT retried with a larger limit here;
++            # the caller restarts the turn from a compact context instead (see chat_with_agent_claude).
++            response = client.messages.create(
++                model=model,
++                messages=messages,
++                max_tokens=MAX_TOKENS_LIMIT,
++                tool_choice=tool_choice,
++                tools=tools,
++            )
+         elif model.startswith('o3-'):
+             response = client.responses.create(
+                 model=model,
+@@ -398,6 +391,16 @@ MAX_TOKENS_NUDGE = (
+     "(for example /tmp/work/hypothesis.md or /tmp/work/notes.md). Keep your next step small."
+ )
+ 
++def compact_restart_text(original_msg, max_chars=6000):
++    """Compact restart prompt used after a max_tokens empty turn: original task (truncated) plus instructions."""
++    task = original_msg if len(original_msg) <= max_chars else original_msg[:max_chars] + "\n...(truncated)"
++    return (
++        f"{task}\n\n"
++        "You ran out of tokens thinking. Write the best verified code you have to the file now, "
++        "in under 200 words of text."
++    )
++
++
+ EMPTY_NUDGES = [
+     "Continue: call the editor tool now to implement the solution.",
+     (
+@@ -569,7 +572,12 @@ def chat_with_agent_claude(
+                 gave_up = True
+                 break
+             if getattr(response, 'stop_reason', None) == 'max_tokens':
+-                _append_nudge(new_msg_history, MAX_TOKENS_NUDGE)
++                # Restart the turn from a compact context instead of re-sending the bloated one.
++                logging("Empty turn at max_tokens: restarting the turn with a compact prompt.")
++                new_msg_history = [{
++                    "role": "user",
++                    "content": [{"type": "text", "text": compact_restart_text(msg)}],
++                }]
+             else:
+                 _append_nudge(new_msg_history, EMPTY_NUDGES[attempt])
+             response = get_response_withtools(
+diff --git a/tools/edit.py b/tools/edit.py
+index e56cbca..4327182 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -68,7 +68,10 @@ def validate_path(path: str, command: str) -> Path:
+             raise ValueError(f"The path {path} does not exist.")
+     elif command == "create":
+         if path_obj.exists():
+-            raise ValueError(f"Error: {path} already exists. Use the `edit` command to overwrite it.")
++            raise ValueError(
++                f"Error: {path} already exists. Call the `edit` command with the same path and the full "
++                f"`file_text` to overwrite it (or use `str_replace` for a targeted change)."
++            )
+     elif command in ("edit", "str_replace"):
+         # Path must exist and must be a file
+         if not path_obj.exists():

@@ -1,0 +1,261 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 153cbdc..6833912 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ import re
+ import shutil
++import tempfile
+ import time
+ import uuid
+ from logging.handlers import RotatingFileHandler
+@@ -91,6 +92,34 @@ Create these three files in {d}:
+ Then check brute.py by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Finish by making sure all three files exist."""
+ 
+ 
++MULTI_ANSWER_RE = re.compile(
++    r"any of them (will be|is|are) accepted"
++    r"|any (valid |correct )?(answer|solution)s? (will be|is|are) accepted"
++    r"|if (there are )?multiple (solutions|answers)"
++    r"|\bprint any\b|\boutput any\b|\byou may (print|output) any"
++    r"|other acceptable (solutions|answers)",
++    re.I)
++
++CHECKER_TEMPLATE = """Additionally, this problem accepts ANY valid answer (several outputs can be correct), so the harness needs a checker.
++Create /checker.py in {d}, written from the statement ONLY (never read or import solution.py or brute.py).
++
++<problem_description>
++{statement}
++</problem_description>
++
++Requirements for checker.py:
++- Usage: `python3 checker.py input.txt output.txt`. The first argument is a file with the exact input, the second is a file with the program's output.
++- Exit code 0 means the output is a VALID answer for that input: correct format and token count, values within the constraints, and the answer satisfies every condition of the statement (recompute the conditions from the input yourself).
++- On rejection, print ONE short line describing the reason to stdout and exit with a non-zero code. Never crash with a traceback on a malformed output; catch the parse errors and report them as a rejection.
++- If the output is a verdict such as Yes/No or -1 with no witness, verify the verdict independently (e.g. exhaustive search) when the input is small enough to make that cheap; a verdict that cannot be verified may be accepted.
++- Make the checker efficient enough for inputs of a few thousand elements.
++
++Then sanity-test the checker:
++1. Produce a valid answer for a sample input from the statement (by hand or with brute.py) and check that `python3 checker.py` accepts it (exit 0).
++2. Corrupt that valid output (e.g. change one value, drop a token, or print a witness that violates a condition) and check that the checker rejects it (non-zero exit, one-line reason).
++Fix checker.py until both tests behave correctly. Do not make the checker accept everything, and do not make it reject valid answers just because they differ from the sample text.
++"""
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -258,6 +287,58 @@ class AgenticSystem:
+     def _is_class_task(self):
+         return re.search(r"\bclass\s+Solution\b", self.problem_statement or '') is not None
+ 
++    def _is_multi_answer(self):
++        """True if the statement accepts any valid answer (e.g. 'print any', 'if multiple solutions exist')."""
++        return MULTI_ANSWER_RE.search(self.problem_statement or '') is not None
++
++    def _checker_path(self):
++        p = os.path.join(self.git_tempdir, 'checker.py')
++        return p if os.path.isfile(p) else None
++
++    def _run_checker(self, inp, out):
++        """Run checker.py on (input, output) using temp files outside the repo. Returns (accepted, reason)."""
++        if self._checker_path() is None:
++            return False, "checker.py does not exist."
++        tmpdir = tempfile.mkdtemp(prefix='checker_')
++        try:
++            in_p = os.path.join(tmpdir, 'input.txt')
++            out_p = os.path.join(tmpdir, 'output.txt')
++            with open(in_p, 'w') as f:
++                f.write(inp)
++            with open(out_p, 'w') as f:
++                f.write(out)
++            p = subprocess.run(['python3', 'checker.py', in_p, out_p], cwd=self.git_tempdir,
++                               capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++        except subprocess.TimeoutExpired:
++            return False, f"checker.py timed out after {RUN_TIMEOUT_S}s."
++        except OSError as e:
++            return False, f"checker.py could not be run: {e!r}"
++        finally:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++        if p.returncode == 0:
++            return True, ''
++        lines = [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
++        lines += [ln.strip() for ln in (p.stderr or '').splitlines() if ln.strip()]
++        reason = lines[-1] if lines else f"exit code {p.returncode}"
++        return False, reason[:REPORT_CLIP]
++
++    def _checker_usable(self):
++        """
++        (usable, note). The checker is trusted only if it accepts every official sample output.
++        If it rejects one, it is a CHECKER BUG and exact comparison is used instead.
++        """
++        if self._checker_path() is None:
++            return False, "checker.py is missing."
++        samples = self._parse_samples()
++        if not samples:
++            return True, "checker.py could not be validated: no samples were parsed."
++        for idx, _inp, exp in samples:
++            ok, reason = self._run_checker(_inp, exp + '\n')
++            if not ok:
++                return False, (f"CHECKER BUG: checker.py rejects the official Sample Output {idx} ({reason}). "
++                               "The checker is ignored and exact comparison is used.")
++        return True, f"checker.py accepts all {len(samples)} official sample outputs."
++
+     @staticmethod
+     def _clean_block(text):
+         lines = [ln for ln in text.splitlines() if not ln.strip().startswith('```')]
+@@ -291,7 +372,13 @@ class AgenticSystem:
+         samples = self._parse_samples()
+         if not samples:
+             return 0, 0, False, "No 'Sample Input N' / 'Sample Output N' blocks were found in the statement."
++        # Multi-answer problems: a different valid answer is accepted when checker.py accepts it.
++        use_checker, checker_note = False, ''
++        if self._is_multi_answer() and self._checker_path() is not None:
++            use_checker, checker_note = self._checker_usable()
+         passed, timed_out, parts = 0, False, []
++        if checker_note:
++            parts.append(checker_note)
+         for idx, inp, exp in samples:
+             try:
+                 p = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=inp,
+@@ -305,9 +392,17 @@ class AgenticSystem:
+             actual = p.stdout
+             if actual.split() == exp.split():
+                 passed += 1
++            elif use_checker and p.returncode == 0 and self._run_checker(inp, actual)[0]:
++                passed += 1
++                parts.append(f"Sample {idx}: valid alternative answer (tokens differ from the sample output, "
++                             "but checker.py accepts it).")
+             else:
++                checker_reason = ''
++                if use_checker:
++                    checker_reason = f"checker.py verdict: {self._run_checker(inp, actual)[1]}\n"
+                 parts.append(f"Sample {idx}: FAILED\ninput:\n{inp[:REPORT_CLIP]}"
+                              f"expected:\n{exp[:REPORT_CLIP]}\nactual:\n{actual[:REPORT_CLIP]}"
++                             f"{checker_reason}"
+                              f"stderr:\n{(p.stderr or '')[-REPORT_CLIP:]}\n(exit code {p.returncode})")
+         report = f"Samples passed: {passed}/{len(samples)}."
+         if parts:
+@@ -323,6 +418,12 @@ class AgenticSystem:
+         brute = os.path.join(self.git_tempdir, 'brute.py')
+         if not (os.path.isfile(gen) and os.path.isfile(brute)):
+             return False, 0, "Stress skipped: gen.py and/or brute.py missing."
++        # Multi-answer problems: compare verdicts, and validate witnesses with checker.py.
++        multi = False
++        if self._is_multi_answer() and self._checker_path() is not None:
++            multi, note = self._checker_usable()
++            if not multi:
++                safe_log(note)
+         start = time.monotonic()
+         ran = 0
+         for seed in range(1, STRESS_SEEDS + 1):
+@@ -357,7 +458,30 @@ class AgenticSystem:
+                 return False, ran, (f"helper script failed: brute.py crashed on seed {seed} "
+                                     f"(not counted against solution.py; fix brute.py).\n"
+                                     f"input:\n{inp[:REPORT_CLIP]}\nbrute stderr:\n{b_err[-REPORT_CLIP:]}")
+-            if s_out.split() != b_out.split():
++            if multi:
++                s_first = s_out.split()[:1]
++                b_first = b_out.split()[:1]
++                verdict_tokens = ('YES', 'NO')
++                if ((s_first and s_first[0].upper() in verdict_tokens) or (b_first and b_first[0].upper() in verdict_tokens)) \
++                        and s_first != b_first:
++                    return True, ran, (f"MISMATCH on seed {seed} (verdict differs).\ninput:\n{inp[:REPORT_CLIP]}"
++                                       f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
++                                       f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
++                                       f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}\n"
++                                       f"Note: brute.py itself may be wrong; verify it against the statement.")
++                if not (b_first and b_first[0].upper() == 'NO'):
++                    ok_s, why_s = self._run_checker(inp, s_out)
++                    if not ok_s:
++                        return True, ran, (f"MISMATCH on seed {seed}: checker.py rejects solution.py's output "
++                                           f"({why_s}).\ninput:\n{inp[:REPORT_CLIP]}"
++                                           f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
++                                           f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}")
++                    ok_b, why_b = self._run_checker(inp, b_out)
++                    if not ok_b:
++                        return False, ran, (f"helper script failed: checker.py rejects brute.py's output on seed {seed} "
++                                            f"({why_b}); not counted against solution.py; fix brute.py or checker.py.\n"
++                                            f"input:\n{inp[:REPORT_CLIP]}")
++            elif s_out.split() != b_out.split():
+                 return True, ran, (f"MISMATCH on seed {seed}.\ninput:\n{inp[:REPORT_CLIP]}"
+                                    f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
+                                    f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
+@@ -471,7 +595,7 @@ Harness report:
+ Diagnose the root cause first. If your algorithm is fundamentally wrong, derive a different one; do not just patch special cases.
+ If the previous solution failed stress or relied on heavy case analysis (modular wrap-around enumeration, sign tracking), re-derive a simpler formulation: start from brute.py's state definition and use a DP over the single free coordinate with O(Q*N) transitions, so that it matches the brute force by construction.
+ {HYPOTHESIS_LINE}
+-{self._timeout_hint(feedback)}{self._interactive_hint()}Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
++{self._timeout_hint(feedback)}{self._interactive_hint()}{self._multi_hint()}Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
+ """
+ 
+     TIMEOUT_HINT = ("solution.py is still exponential; derive an O(1) or O(log) per-case method, starting from the "
+@@ -507,7 +631,23 @@ If the previous solution failed stress or relied on heavy case analysis (modular
+                 "Keep reasoning brief and write the file with the editor tool.")
+ 
+     def _oracle_prompt(self):
+-        return ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement)
++        prompt = ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement)
++        if self._is_multi_answer():
++            prompt += "\n\n" + self._checker_prompt()
++        return prompt
++
++    def _checker_prompt(self):
++        return CHECKER_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement)
++
++    def _multi_hint(self):
++        """Extra instructions for multi-answer statements (empty otherwise)."""
++        if not self._is_multi_answer():
++            return ""
++        return ("MULTI-ANSWER PROBLEM: any valid answer is accepted. The harness validates outputs with checker.py. "
++                "Differences from the sample's expected output in the specific witness (which values or configuration "
++                "are printed) are acceptable and are NOT a failure. Do NOT modify solution.py to reproduce the sample's "
++                "exact numbers or text; only fix real errors (wrong verdict, invalid witness, wrong format, timeouts), "
++                "and confirm with checker.py rather than by matching the sample text.\n")
+ 
+     @staticmethod
+     def _last_reply_text(history):
+@@ -625,7 +765,7 @@ If the previous solution failed stress or relied on heavy case analysis (modular
+         for k in range(MAX_ATTEMPTS):
+             before = self._read_solution() if k > 0 else self._base_solution()
+             if k == 0:
+-                prompt = self._task_text() + "\n" + self._method_text() + "\n\n" + FIRST_DRAFT_LINE
++                prompt = self._task_text() + "\n" + self._method_text() + "\n\n" + self._multi_hint() + FIRST_DRAFT_LINE
+             else:
+                 prompt = self._retry_prompt(feedback, prev_code)
+             changed = self._ask_until_changed(prompt, before)
+@@ -664,6 +804,8 @@ If the previous solution failed stress or relied on heavy case analysis (modular
+                 if not all(os.path.isfile(os.path.join(self.git_tempdir, f))
+                            for f in ('brute.py', 'gen.py', 'gen_big.py')):
+                     self._ask(self._oracle_prompt())
++                elif self._is_multi_answer() and self._checker_path() is None:
++                    self._ask(self._checker_prompt())
+                 stress_mismatch, _, stress_report = self._run_stress()
+                 report_parts.append(stress_report)
+                 if not stress_mismatch:
+diff --git a/solution.py b/solution.py
+index 5ede178..9f55bcf 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1 +1,20 @@
+-# Placeholder solution file. The actual changes are applied to the coding agent repo in /dgm.
++# Matches the contract in brute.py by construction:
++#   stdin : "N L R" followed by N integers (tokens may be split across lines).
++#   stdout: "! S" where S = sum of array elements v with L <= v <= R.
++# Single pass over the values; O(N) time, O(1) extra memory.
++import sys
++
++
++def main():
++    data = sys.stdin.buffer.read().split()
++    n, lo, hi = int(data[0]), int(data[1]), int(data[2])
++    total = 0
++    for i in range(3, 3 + n):
++        v = int(data[i])
++        if lo <= v <= hi:
++            total += v
++    sys.stdout.write(f"! {total}\n")
++
++
++if __name__ == "__main__":
++    main()

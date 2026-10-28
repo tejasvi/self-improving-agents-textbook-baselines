@@ -1,0 +1,253 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 8f5cb92..bd98fd1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,8 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
++import sys
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -129,11 +131,89 @@ def _last_assistant_text(msg_history):
+     return ''
+ 
+ 
+-def _primary_source_file(git_tempdir):
+-    """Return the primary non-test tracked file (first by sorted git ls-files, skipping dotfiles), or None."""
+-    candidates = [p for p in list_non_test_tracked_files(git_tempdir)
+-                  if not os.path.basename(p).startswith('.')]
+-    return candidates[0] if candidates else None
++STUB_MARKER_RE = re.compile(r'\bpass\b|TODO|unimplemented!|todo!\(\)')
++FILENAME_RE = re.compile(r'`?([\w./-]+\.(?:py|js|cpp|go|rs|java))`?')
++DOC_SUFFIXES = ('.md', '.txt', '.rst')
++
++
++def _is_candidate_source(path):
++    """Non-doc, non-test, non-dotfile tracked file."""
++    base = os.path.basename(path)
++    if base.startswith('.') or path.lower().endswith(DOC_SUFFIXES):
++        return False
++    return True
++
++
++def _primary_source_file(git_tempdir, problem_statement=None):
++    """
++    Pick the primary source file:
++      1. A filename mentioned in the problem statement that exists as a tracked, non-test, non-doc file.
++      2. Otherwise, the first tracked file whose content contains a stub marker (pass/TODO/unimplemented!/todo!()).
++    Returns a path relative to git_tempdir, or None.
++    """
++    candidates = [p for p in list_non_test_tracked_files(git_tempdir) if _is_candidate_source(p)]
++    if not candidates:
++        return None
++    by_name = {}
++    for p in candidates:
++        by_name.setdefault(os.path.basename(p), p)
++        by_name.setdefault(p, p)
++    if problem_statement:
++        for m in FILENAME_RE.finditer(problem_statement):
++            name = m.group(1)
++            if name in by_name:
++                return by_name[name]
++            base = os.path.basename(name)
++            if base in by_name:
++                return by_name[base]
++    for p in candidates:
++        try:
++            with open(os.path.join(git_tempdir, p), encoding='utf-8', errors='replace') as f:
++                if STUB_MARKER_RE.search(f.read()):
++                    return p
++        except OSError:
++            continue
++    return None
++
++
++def _diff_touches_file(patch, path):
++    """True if the unified diff contains a change to `path`."""
++    if not path:
++        return False
++    return any(line.startswith('diff --git') and (f' a/{path}' in line or line.endswith(f' b/{path}'))
++               for line in patch.splitlines())
++
++
++def _run_stress_test(git_tempdir, timeout=120):
++    """
++    Run ../stress_test.py (outside the repo diff) if it exists.
++    Returns (exists, passed, output_tail).
++    """
++    script = os.path.abspath(os.path.join(git_tempdir, '..', 'stress_test.py'))
++    if not os.path.isfile(script):
++        return False, False, ''
++    try:
++        proc = subprocess.run([sys.executable, script], cwd=git_tempdir,
++                              capture_output=True, text=True, timeout=timeout)
++        out = (proc.stdout or '') + (proc.stderr or '')
++        passed = proc.returncode == 0 and 'ALL OK' in (proc.stdout or '')
++        return True, passed, out[-2000:]
++    except subprocess.TimeoutExpired as e:
++        out = ((e.stdout or b'').decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or ''))
++        return True, False, (out + f"\n[stress_test.py timed out after {timeout}s]")[-2000:]
++
++
++def _build_debug_prompt(stress_output, primary_path):
++    return f"""The stress test ../stress_test.py FAILED. Output (last 2000 chars):
++{stress_output}
++
++Debug protocol (do this before editing):
++1. Minimize the counterexample: find the smallest input that still shows the mismatch.
++2. Hand-compute the true expected answer for that input step by step.
++3. Identify the specific flawed assumption in the current algorithm that produces the wrong answer.
++4. Re-derive the correct logic, or redesign the algorithm if needed (a different approach is allowed).
++5. Only then edit {primary_path} with the editor tool (use str_replace for small changes), and re-run `python ../stress_test.py` until it prints ALL OK.
++Do not modify README or other docs to make tests pass; fix the solution in {primary_path}."""
+ 
+ 
+ def _build_retry_prompt(problem_statement, git_tempdir, primary_path, patch):
+@@ -265,8 +345,8 @@ Follow these steps in order:
+ 1. Inspect the repository: read the starter file(s) (e.g. with bash `cat`, `ls`, `find`) to learn the required function/class signature and any existing tests.
+ 2. Design the algorithm: reason carefully about the problem's constraints and the most efficient correct approach.
+ 3. IMMEDIATELY implement it by editing the starter source file with the editor tool. The starter stub (`pass`) must be replaced with a full implementation. Keep the required signature. If the stub uses names such as `List`, add the missing imports (e.g. `from typing import List`).
+-4. Test: run the problem's examples and a brute-force comparison on small random inputs via bash, and fix any mismatches or errors in the source file.
+-5. Final check: confirm via `git diff` (or equivalent) that the diff contains changes to the primary source file.
++4. Test: write a brute-force reference and a random stress test comparing it against your solution on small inputs. Save the stress test to the fixed path `../stress_test.py` (relative to {self.git_tempdir}, i.e. OUTSIDE the repo so it does not appear in the diff). It must print 'ALL OK' and exit 0 only if every comparison passes, and exit non-zero on any mismatch. Also run the problem's examples. Fix any mismatches or errors in the source file.
++5. Final check: confirm via `git diff` (or equivalent) that the diff contains changes to the primary source file, and that `python ../stress_test.py` prints ALL OK.
+ 
+ Rules:
+ - You MUST modify the source file using the editor tool; never finish your turn with an empty reply or only a plan.
+@@ -279,17 +359,17 @@ Rules:
+             safe_log("[forward] Stall detected: last assistant message is empty after initial pass.")
+ 
+         patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-        primary_path = _primary_source_file(self.git_tempdir)
++        primary_path = _primary_source_file(self.git_tempdir, self.problem_statement)
+ 
+         # Fresh-context retries (bounded loop, never reuses the stalled history).
+         # Stall detection is independent of has_source_edits: an empty final reply
+         # or failing samples also trigger a continuation.
+         samples = extract_samples(self.problem_statement)
+         for attempt in range(3):
+-            if has_source_edits(patch) and not _is_empty_reply(msg_history) \
++            if _diff_touches_file(patch, primary_path) and not _is_empty_reply(msg_history) \
+                     and not (samples and primary_path and run_samples(self.git_tempdir, primary_path, samples)):
+                 break
+-            safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Retrying with fresh context.")
++            safe_log(f"[forward] No primary-file edits detected (attempt {attempt + 1}/3). Retrying with fresh context.")
+             retry_msg = _build_retry_prompt(self.problem_statement, self.git_tempdir, primary_path, patch)
+             msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             if _is_empty_reply(msg_history):
+@@ -297,7 +377,7 @@ Rules:
+             patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+ 
+         # Tool-free fallback: ask for the full primary file as a single code block
+-        if not has_source_edits(patch):
++        if not _diff_touches_file(patch, primary_path):
+             safe_log("[forward] Still no source edits after retries. Trying tool-free fallback.")
+             if primary_path is None:
+                 safe_log("[forward] Fallback skipped: no non-test tracked files found.")
+@@ -338,7 +418,20 @@ Rules:
+                 if run_samples(self.git_tempdir, primary_path, samples):
+                     safe_log("[forward] Sample rounds exhausted; samples still failing.")
+ 
+-        has_edit = has_source_edits(patch)
++        # Stress-test gate: run ../stress_test.py after each pass; on failure continue the SAME history.
++        for debug_round in range(4):
++            exists, passed, out = _run_stress_test(self.git_tempdir)
++            if not exists or passed:
++                break
++            safe_log(f"[forward] Stress test failed (debug round {debug_round + 1}/4).")
++            debug_msg = _build_debug_prompt(out, primary_path)
++            if _is_empty_reply(msg_history):
++                debug_msg = "Continue: fix the failing counterexample below using the editor tool.\n\n" + debug_msg
++            msg_history = chat_with_agent(debug_msg, model=self.code_model,
++                                          msg_history=msg_history, logging=safe_log)
++            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++
++        has_edit = _diff_touches_file(patch, primary_path)
+         if has_edit:
+             # Verification pass once a source edit exists
+             verify_msg = """Verify your solution once more: run the problem's examples and a brute-force comparison on small random inputs via bash. If there are any mismatches, errors, or edge-case issues, fix them in the source file with the editor tool. Make sure the final source file is complete and imports are correct."""
+diff --git a/tools/edit.py b/tools/edit.py
+index 72a62c0..ca3a66e 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -10,14 +10,15 @@ def tool_info():
+ * The `create` command cannot be used if the specified `path` already exists as a file.\n
+ * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+ * The `edit` command overwrites the entire file with the provided `file_text`.\n
++* The `str_replace` command replaces the unique occurrence of `old_str` with `new_str` in the file. `old_str` must match exactly once (include enough surrounding context); prefer it over `edit` for small changes.\n
+ * No partial/line-range edits or partial viewing are supported.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "command": {
+                     "type": "string",
+-                    "enum": ["view", "create", "edit"],
+-                    "description": "The command to run: `view`, `create`, or `edit`."
++                    "enum": ["view", "create", "edit", "str_replace"],
++                    "description": "The command to run: `view`, `create`, `edit`, or `str_replace`."
+                 },
+                 "path": {
+                     "description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.",
+@@ -26,6 +27,14 @@ def tool_info():
+                 "file_text": {
+                     "description": "Required parameter of `create` or `edit` command, containing the content for the entire file.",
+                     "type": "string"
++                },
++                "old_str": {
++                    "description": "Required parameter of `str_replace` command: the exact text to replace. Must match exactly one location in the file.",
++                    "type": "string"
++                },
++                "new_str": {
++                    "description": "Required parameter of `str_replace` command: the replacement text (may be empty to delete old_str).",
++                    "type": "string"
+                 }
+             },
+             "required": ["command", "path"]
+@@ -61,7 +70,7 @@ def validate_path(path: str, command: str) -> Path:
+         # Path must not exist
+         if path_obj.exists():
+             raise ValueError(f"Cannot create new file; {path} already exists. To overwrite an existing file, use the 'edit' command instead.")
+-    elif command == "edit":
++    elif command in ("edit", "str_replace"):
+         # Path must exist and must be a file
+         if not path_obj.exists():
+             raise ValueError(f"The file {path} does not exist.")
+@@ -119,12 +128,13 @@ def view_path(path_obj: Path) -> str:
+     content = read_file(path_obj)
+     return format_output(content, str(path_obj))
+ 
+-def tool_function(command: str, path: str, file_text: str = None) -> str:
++def tool_function(command: str, path: str, file_text: str = None, old_str: str = None, new_str: str = None) -> str:
+     """
+     Main tool function that handles:
+       - 'view'  : View the entire file or directory listing
+       - 'create': Create a new file with the given file_text
+       - 'edit'  : Overwrite an existing file with file_text
++      - 'str_replace': Replace the unique occurrence of old_str with new_str
+     """
+     try:
+         path_obj = validate_path(path, command)
+@@ -144,6 +154,20 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
+             write_file(path_obj, file_text)
+             return f"File at {path} has been overwritten with new content."
+ 
++        elif command == "str_replace":
++            if old_str is None or old_str == "":
++                raise ValueError("Missing required non-empty `old_str` for 'str_replace' command.")
++            if new_str is None:
++                raise ValueError("Missing required `new_str` for 'str_replace' command.")
++            content = read_file(path_obj)
++            count = content.count(old_str)
++            if count == 0:
++                raise ValueError(f"`old_str` was not found in {path}. No changes made.")
++            if count > 1:
++                raise ValueError(f"`old_str` matches {count} locations in {path}; include more context so it is unique. No changes made.")
++            write_file(path_obj, content.replace(old_str, new_str, 1))
++            return f"The file {path} has been edited successfully (str_replace)."
++
+         else:
+             raise ValueError(f"Unknown command: {command}")
+ 

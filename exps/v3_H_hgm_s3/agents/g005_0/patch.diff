@@ -1,0 +1,229 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d0d0024..9953c6d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -106,13 +106,54 @@ def _changed_files(diff):
+             files.append(match.group(2))
+     return files
+ 
++_TEST_DIR_RE = re.compile(r'^(tests?|spec|__tests__)$', re.IGNORECASE)
++_TEST_FILE_RE = re.compile(r'^(test_.*|.*_test|.*\.spec|conftest)\.\w+$', re.IGNORECASE)
++
+ def _is_test_file(path):
+     """
+-    Case-insensitive check whether any path component looks like a test file/dir.
++    Check whether a path looks like a test file: any directory component named
++    tests/test/spec/__tests__, or a filename like test_*.py, *_test.py, *.spec.*, conftest.py.
++    """
++    parts = [p for p in re.split(r'[\\/]', path) if p]
++    if not parts:
++        return False
++    *dirs, filename = parts
++    if any(_TEST_DIR_RE.match(d) for d in dirs):
++        return True
++    return bool(_TEST_FILE_RE.match(filename))
++
++def _block_type(block):
++    if isinstance(block, dict):
++        return block.get('type')
++    return getattr(block, 'type', None)
++
++def _block_text(block):
++    if isinstance(block, dict):
++        return block.get('text')
++    return getattr(block, 'text', None)
++
++def _strip_empty_assistant_turns(msg_history):
++    """
++    Remove assistant messages whose text is empty/whitespace-only and which contain
++    no tool_use blocks. Such turns cause the model to repeat empty replies.
+     """
+-    lowered = path.lower()
+-    parts = re.split(r'[\\/]', lowered)
+-    return any(keyword in part for part in parts for keyword in ('test', 'spec', 'conftest'))
++    cleaned = []
++    for msg in msg_history:
++        role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++        content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++        if role == 'assistant':
++            if isinstance(content, str):
++                blocks = [{'type': 'text', 'text': content}]
++            elif isinstance(content, list):
++                blocks = content
++            else:
++                blocks = []
++            has_tool_use = any(_block_type(b) == 'tool_use' for b in blocks)
++            has_text = any((_block_text(b) or '').strip() for b in blocks)
++            if not has_tool_use and not has_text:
++                continue
++        cleaned.append(msg)
++    return cleaned
+ 
+ class AgenticSystem:
+     def __init__(
+@@ -170,6 +211,114 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _target_file(self):
++        """
++        Pick the file the agent should write: solution.py if the task mentions it,
++        otherwise the first tracked file in the repo (or None).
++        """
++        if 'solution.py' in (self.problem_statement or '') or os.path.exists(os.path.join(self.git_tempdir, 'solution.py')):
++            return 'solution.py'
++        try:
++            result = subprocess.run(
++                ['git', '-C', self.git_tempdir, 'ls-files'],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True,
++            )
++            files = [f for f in result.stdout.splitlines() if f.strip() and not _is_test_file(f)]
++            return files[0] if files else None
++        except Exception:
++            return None
++
++    def _repo_snapshot(self):
++        """
++        Return a text snapshot of the repo: `git status --short` plus a file listing.
++        """
++        try:
++            status = subprocess.run(
++                ['git', '-C', self.git_tempdir, 'status', '--short'],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True,
++            ).stdout.strip()
++        except Exception as e:
++            status = f'(git status failed: {e})'
++        try:
++            listing = subprocess.run(
++                ['ls', '-la', self.git_tempdir],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True,
++            ).stdout.strip()
++        except Exception as e:
++            listing = f'(ls failed: {e})'
++        return f"# Repo snapshot\n## git status --short\n{status or '(clean)'}\n## ls\n{listing}\n"
++
++    def _changed_test_files(self):
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        return _changed_files(diff)
++
++    def _build_retry_feedback(self, attempt, reason, task):
++        """
++        Escalating retry prompts, indexed by attempt (0-based).
++        """
++        target = self._target_file()
++        target_desc = os.path.join(self.git_tempdir, target) if target else 'the main solution file'
++        if reason == 'tests_only':
++            changed = self._changed_test_files()
++            listed = '\n'.join(f'- {f}' for f in changed) or '(none listed)'
++            body = (
++                'You only modified test files:\n'
++                f'{listed}\n\n'
++                f'Implement the change in the primary source file ({target_desc}) using the editor tool. '
++                'Do not modify the test files to make them pass.'
++            )
++        elif attempt == 0:
++            body = (
++                f'{task}\n\n'
++                'Your previous response had no tool calls and no edits. '
++                'Immediately call the editor tool to create/edit the solution file. Do not write prose first.'
++            )
++        else:
++            body = (
++                f'Target file: {target_desc}\n'
++                'Make exactly one editor `create` or `edit` call that writes a complete first-draft solution '
++                'to this file. No prose, no analysis first. After that single write, you may test and refine.'
++            )
++        return f'{self._repo_snapshot()}\n{body}'
++
++    def _fallback_write(self, task):
++        """
++        Last resort: ask for the complete code in a fenced python block with a fresh
++        history, then write it to the target file. Returns True if a file was written.
++        """
++        target = 'solution.py'
++        if 'solution.py' not in (self.problem_statement or ''):
++            return False
++        prompt = (
++            f'{self.problem_statement}\n\n'
++            'Reply with ONLY the complete final Python code in a single ```python fenced block. '
++            'No other text.'
++        )
++        history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        code = None
++        for msg in reversed(history):
++            role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++            if role != 'assistant':
++                continue
++            content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++            blocks = [{'type': 'text', 'text': content}] if isinstance(content, str) else (content or [])
++            for block in blocks:
++                text = _block_text(block) or ''
++                match = re.search(r'```python\s*\n(.*?)```', text, re.DOTALL)
++                if match:
++                    code = match.group(1)
++                    break
++            if code is not None:
++                break
++        if not code or not code.strip():
++            safe_log('Fallback: no python code block found.')
++            return False
++        path = os.path.join(self.git_tempdir, target)
++        with open(path, 'w') as f:
++            f.write(code)
++        safe_log(f'Fallback: wrote {path}.')
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -185,29 +334,37 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         instruction = f"""{task}
+ 
+ Please follow these steps:
+-1. Inspect the repository: use the editor `view` command and bash to look at the directory layout and any existing files relevant to the task.
+-2. Identify or create the target source file named in the task (for example, solution.py for a standalone stdin/stdout program, or the file containing the Solution class).
+-3. WRITE the implementation to disk with the editor tool. The task is not complete until files are actually edited on disk. A text-only reply, or an empty reply with no file edits, is a failure.
+-4. Run the program on the sample inputs provided in the problem using bash, compare against the expected outputs, and fix any mismatches.
+-5. Consider edge cases and the time/memory limits of the problem, and make the solution efficient enough to handle the largest inputs.
++1. Write a complete draft solution to disk right away as your very first action, using the editor tool. Create the solution file (for example, solution.py for a standalone stdin/stdout program, or the file containing the Solution class). Do not do extended analysis before this first write.
++2. Inspect the repository as needed with the editor `view` command and bash to confirm the layout and any existing files relevant to the task.
++3. Test the draft: run the program on the sample inputs provided in the problem using bash, compare against the expected outputs, and fix any mismatches by editing the file.
++4. Consider edge cases and the time/memory limits of the problem, and make the solution efficient enough to handle the largest inputs. Refine the file accordingly.
+ 
++The task is not complete until files are actually edited on disk. A text-only reply, or an empty reply with no file edits, is a failure.
+ Do not stop until the solution file has been written and verified."""
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        for attempt in range(3):
++        max_retries = 3
++        for attempt in range(max_retries):
+             ok, reason = self._patch_is_acceptable()
+             if ok:
+                 safe_log(f"Patch accepted after {attempt} retries.")
+                 break
+-            if reason == 'empty':
+-                feedback = ('No files were modified. You must now actually create/edit the solution file '
+-                            'using the editor tool. Do not reply with text only.')
+-            else:
+-                feedback = ('You only modified test files. Implement the fix in the main source/solution file.')
+-            safe_log(f"Patch not acceptable ({reason}); retry attempt {attempt + 1}/3.")
++            safe_log(f"Patch not acceptable ({reason}); retry attempt {attempt + 1}/{max_retries}.")
++            feedback = self._build_retry_feedback(attempt, reason, task)
++            msg_history = _strip_empty_assistant_turns(msg_history)
+             msg_history = chat_with_agent(feedback, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         else:
+-            safe_log("Patch still not acceptable after retries.")
++            ok, reason = self._patch_is_acceptable()
++            if ok:
++                safe_log("Patch accepted after final retry.")
++            else:
++                safe_log(f"Patch still not acceptable ({reason}) after retries; trying fallback.")
++
++        ok, reason = self._patch_is_acceptable()
++        if not ok and reason == 'empty':
++            self._fallback_write(task)
++            ok, reason = self._patch_is_acceptable()
++            safe_log(f"Fallback result: {'accepted' if ok else reason}.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

@@ -1,0 +1,728 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 25db227..9e3002d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,8 @@
+ import argparse
++import json
++import shutil
+ import subprocess
++import tempfile
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -173,10 +176,109 @@ class AgenticSystem:
+             return "\n".join(parts)
+         return ""
+ 
++    # ------------------------------------------------------------------
++    # Helpers for the phased workflow
++    # ------------------------------------------------------------------
++    REAL_VALUED_PATTERNS = ['absolute or relative error', 'relative error', 'absolute error',
++                            'decimal', 'real number', 'floating']
++
++    def _is_real_valued(self):
++        text = (self.problem_statement or '').lower()
++        return any(p in text for p in self.REAL_VALUED_PATTERNS)
++
++    @staticmethod
++    def _iter_strings(obj, depth=0):
++        """Yield every string nested anywhere in a message history structure."""
++        if depth > 12 or obj is None:
++            return
++        if isinstance(obj, str):
++            yield obj
++        elif isinstance(obj, dict):
++            for v in obj.values():
++                yield from AgenticSystem._iter_strings(v, depth + 1)
++        elif isinstance(obj, (list, tuple)):
++            for v in obj:
++                yield from AgenticSystem._iter_strings(v, depth + 1)
++        elif hasattr(obj, '__dict__'):
++            for v in vars(obj).values():
++                yield from AgenticSystem._iter_strings(v, depth + 1)
++
++    @staticmethod
++    def _parse_judge_summary(text):
++        """Parse the JUDGE_SUMMARY_JSON line of a judge_candidates result. Returns dict or None."""
++        marker = 'JUDGE_SUMMARY_JSON: '
++        idx = text.rfind(marker)
++        if idx < 0:
++            return None
++        try:
++            obj, _ = json.JSONDecoder().raw_decode(text[idx + len(marker):])
++            return obj if isinstance(obj, dict) and 'candidates' in obj else None
++        except ValueError:
++            return None
++
++    @staticmethod
++    def _latest_judge_result(msg_history):
++        """Return (full_judge_text, summary_dict) of the most recent judge_candidates result in history."""
++        for s in reversed(list(AgenticSystem._iter_strings(msg_history))):
++            if 'JUDGE_SUMMARY_JSON: ' in s:
++                summary = AgenticSystem._parse_judge_summary(s)
++                if summary is not None:
++                    return s, summary
++        return None, None
++
++    @staticmethod
++    def _clip_text(s, n=3000):
++        s = s or ''
++        if len(s) <= n:
++            return s
++        return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++    @staticmethod
++    def _score(cand):
++        """Lower is better: failures + timeouts + crashes; zero passes is ranked last."""
++        bad = cand.get('fail', 0) + cand.get('timeouts', 0) + cand.get('crashes', 0)
++        if cand.get('pass', 0) == 0:
++            bad += 10 ** 6
++        return bad
++
++    def _judge_direct(self, cand_paths, gen_path, checker_path, extra_inputs=None, num_tests=300):
++        """Programmatic fallback: run the judge tool directly and return (text, summary)."""
++        from tools import judge_candidates
++        text = judge_candidates.tool_function(
++            candidate_paths=cand_paths,
++            generator_path=gen_path,
++            checker_path=checker_path if checker_path and os.path.isfile(checker_path) else None,
++            num_tests=num_tests,
++            timeout=10,
++            extra_inputs=extra_inputs or [],
++        )
++        return text, self._parse_judge_summary(text)
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Phased workflow:
++          A. tests first (generator, checker, optional brute force) written from the statement alone
++          B. K independent candidate solutions, each from a fresh history with a different hint
++          C. judge_candidates over all candidates with many seeds
++          D. select the best candidate by judge results; up to 2 reflection rounds on it
++          E. copy the winner to solution.py and run the final checks
+         """
++        real_valued = self._is_real_valued()
++        tests_dir = tempfile.mkdtemp(prefix='agent_tests_')
++        gen_path = os.path.join(tests_dir, 'gen.py')
++        brute_path = os.path.join(tests_dir, 'brute.py')
++        check_path = os.path.join(tests_dir, 'check.py')
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        NUM_CANDIDATES = 3
++        NUM_SEEDS = 300
++        MAX_REFLECTIONS = 2
++        hints = [
++            "Use a direct approach: the most natural greedy/constructive or simulation idea that fits the constraints.",
++            "Use a dynamic-programming or prefix/data-structure approach that is different from the obvious one.",
++            "Reformulate the problem mathematically (e.g. invariant, sorting, counting, or meet-in-the-middle) and use an algorithm unlike the other candidates.",
++        ]
++        cand_paths = [os.path.join(tests_dir, f'cand_{k}.py') for k in range(NUM_CANDIDATES)]
++
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -185,48 +287,183 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator (a script taking a seed argument and printing one input), then run the stress_compare tool with a few hundred seeds comparing solution.py with the brute force. Fix every mismatch. If the answer is real-valued, write the brute force with exact or high-precision arithmetic (fractions.Fraction or decimal), not floats. Treat any max relative error above about 1e-11 reported by stress_compare as a defect to investigate and fix, even if it is within the statement's tolerance (the hidden tests may use a stricter check). Recompute the final reported value with the direct canonical formula once the optimization step has found the optimal choice, instead of accumulating it through the DP's floating-point path. Avoid truncation or approximation unless its measured error is at floating-point noise level. Print real results with enough digits (e.g. '%.15f' or repr-level precision, never fewer digits than the statement asks for). Compare sample outputs against the expected outputs character by character, not just approximately.
+-4b. For real-valued answers, run this mandatory exact re-evaluation workflow (a 1e-9 comparison is NOT an acceptance criterion):
+-   (a) Make the DP/greedy record the optimal choice (e.g. best k plus parent pointers / the chosen subset).
+-   (b) Recompute the reported value from the chosen set with the canonical formula using math.fsum, Fraction or Decimal, and print that value.
+-   (c) Write a high-precision reference (Fraction/Decimal) of the SAME algorithm, for use as the reference_path of precision_audit.
+-   (d) Run precision_audit on at least: all samples, a max-size random input, an all-max-value input, an all-min-value input, an alternating max/min input, an input with extreme values at both ends, and near-tie inputs (values that are equal or differ by 1 so several choices tie).
+-   (e) Every case must be at most 4 ULP (max_ulp=4). If any case exceeds it, or has fewer than 15 significant digits, fix the numerics (e.g. reconstruct the subset and evaluate it exactly) and re-run the audit. Do not merely note a limitation in the final message; fix it.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass.
+-7. Before finishing, run the final solution through the run_clean tool on all samples and a max-size input (run_clean runs it in a clean isolated subprocess like the grader does). Read all stderr carefully and fix any crash or traceback it shows.
+-8. Avoid environment-fragile constructs: do not use 3-argument pow (e.g. pow(a, MOD-2, MOD)); write a small hand-written modular power helper `def mpow(b, e, m)` with a loop instead. Avoid threading and recursion-limit tricks; prefer iterative code.
+-9. Do a last re-read of solution.py for edge cases such as N=1, empty input, and the smallest/largest constraints.
+-The final solution.py is what gets graded; helper files are ignored.
+-Within your first few tool calls, write a first-draft solution.py (even brute force), before any extended exploration. Never end your turn without real code in solution.py. Never send an empty reply. Keep tool calls and heredocs short to avoid output truncation; split long scripts into multiple files. If the exact formula is not found after some exploration, submit the best-known approach and keep improving it."""
+-        instruction = f"{task}\n\n{method}"
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not msg_history:
+-            msg_history = []
+-
+-        # Bounded single follow-up: if the agent admits an unperformed check or gap, make it close it.
+-        final_text = self._last_assistant_text(msg_history)
+-        gap_phrases = ['not done', 'did not', "didn't", 'sanity check', 'not performed', 'not run', 'not verified']
+-        if final_text and any(p in final_text.lower() for p in gap_phrases):
+-            safe_log("[forward] Final message admits an unresolved gap; re-invoking once.")
+-            gap_msg = (
+-                "Your final message says some check was not done, did not run, or was only a sanity check. "
+-                "Resolve that gap now: perform the missing check(s) (e.g. run precision_audit / stress_compare "
+-                "on the required inputs), fix any failures in solution.py, and then state the final results. "
+-                "Do not leave any check unperformed."
++
++        # ---------------- Phase A: tests first ----------------
++        phase_a = f"""{task}
++Phase A (tests first). Before any solution work, write the test infrastructure FROM THE STATEMENT ALONE (do not read any solution yet):
++1. {gen_path}: a generator run as `python3 gen.py SEED` that prints one valid input for the problem to stdout. Use tiers chosen by the seed: tiny inputs (exhaustive-like, all small cases), edge/structured cases (N=1, minimal and maximal values, empty-like or complete/star/path shapes where relevant), random medium inputs, and max-size inputs that satisfy the constraints exactly.
++2. {brute_path} (only if feasible): an obviously correct brute force for small inputs, independent of your intended fast algorithm.
++3. {check_path}: a validator run as `python3 check.py INPUT_FILE OUTPUT_FILE`. It must read the input and the program output files and verify the output format, every range, and EVERY condition of the problem. Exit 0 if accepted; on rejection print the reason to stderr and exit 1. For problems with several valid answers, check validity (not equality). For 'No'/impossible answers, verify the claim independently (brute force on small inputs), and do not accept a 'No' whose impossibility you cannot confirm.
++Test the generator and checker quickly (e.g. run the generator for a few seeds and check that the inputs are valid). Keep these files in {tests_dir}; do not put them in the repository and do not edit solution.py in this phase.
++"""
++        msg_a = chat_with_agent(phase_a, model=self.code_model, msg_history=[], logging=safe_log) or []
++        if not os.path.isfile(gen_path):
++            msg_a = chat_with_agent(
++                f"The generator {gen_path} does not exist yet. Write it now (seed -> one valid input) and test it.",
++                model=self.code_model, msg_history=msg_a, logging=safe_log) or msg_a
++        have_checker = os.path.isfile(check_path)
++        have_gen = os.path.isfile(gen_path)
++        safe_log(f"[forward] Phase A done: gen={have_gen} checker={have_checker} brute={os.path.isfile(brute_path)}")
++
++        # ---------------- Phase B: independent candidates ----------------
++        candidate_notes = []  # short summary of earlier candidates with their quick results
++        cand_histories = {}
++        if real_valued:
++            precision_block = (
++                "- The answer is real-valued: use exact or high-precision arithmetic (fractions.Fraction or decimal) for the brute force; "
++                "the stress test's max relative error must stay below about 1e-11. Record the optimal choice, recompute the reported value "
++                "from the chosen set with math.fsum, Fraction or Decimal, and print with enough digits (e.g. '%.15f' or repr-level). "
++                "Run precision_audit (max_ulp=4) on the samples, a max-size input, an all-max-value input, an all-min-value input, an alternating max/min input, "
++                "extreme values at both ends, and near-tie inputs, and fix any case that fails."
+             )
+-            msg_history = chat_with_agent(
+-                gap_msg,
+-                model=self.code_model,
+-                msg_history=msg_history,
+-                logging=safe_log,
+-            ) or msg_history
++        else:
++            precision_block = (
++                "- Multi-answer or exact-output problems: judge validity with the checker ({check_path}), not by equality with a single expected output.".replace('{check_path}', check_path)
++            )
++        for k in range(NUM_CANDIDATES):
++            prev = "\n".join(candidate_notes) if candidate_notes else "(none yet)"
++            phase_b = f"""{task}
++Phase B, candidate {k + 1} of {NUM_CANDIDATES}. Write an independent full solution to the problem in {cand_paths[k]}.
++Algorithm hint for this candidate: {hints[k % len(hints)]}
++Earlier candidates (summaries and their results on a quick judge run; do NOT copy their approach, aim for a different algorithm):
++{prev}
++
++Test resources written in Phase A (use them, do not rewrite them unless they are wrong):
++- generator: {gen_path}
++- checker (if it exists): {check_path}
++- brute force (if it exists): {brute_path}
++
++Requirements:
++- {cand_paths[k]} must be a complete program reading stdin and writing stdout (or, if the task asks for a Solution class method, a file defining class Solution plus a `if __name__ == '__main__':` driver that parses the sample input format and prints the result).
++- Choose an algorithm whose complexity fits the constraints (Python does roughly 10^7 simple operations per second).
++- Run it on every sample from the statement and compare exactly, character by character.
++- Test it against the brute force / checker on small generated inputs with the generator, and fix every mismatch.
++- Time it on a max-size input from the generator: it must finish well under 2 seconds. This timing run is mandatory before you reply.
++- Avoid 3-argument pow (write a loop-based modular power helper), avoid recursion-limit tricks and threading.
++- Re-read the code for N=1, empty-like and extreme-value edge cases.
++{precision_block}
++- Write the code yourself; do not write to solution.py in this phase.
++When finished, reply with a 2-4 line summary of the algorithm and its complexity.
++"""
++            msg_b = chat_with_agent(phase_b, model=self.code_model, msg_history=[], logging=safe_log) or []
++            cand_histories[k] = msg_b
++            if os.path.isfile(cand_paths[k]) and have_gen:
++                quick_text, quick = self._judge_direct([cand_paths[k]], gen_path,
++                                                       check_path if have_checker else None,
++                                                       num_tests=60)
++                result_line = (f"pass={quick['candidates'][0]['pass']} fail={quick['candidates'][0]['fail']}"
++                               if quick and quick.get('candidates') else "not judged")
++            else:
++                result_line = "file missing" if not os.path.isfile(cand_paths[k]) else "not judged"
++            approach = self._last_assistant_text(msg_b)[:600]
++            candidate_notes.append(f"- cand_{k}.py (hint: {hints[k % len(hints)][:60]}...): {result_line}; approach: {approach}")
++
++        # ---------------- Phase C: judge all candidates ----------------
++        sample_hint = ("Include the samples from the statement as extra inputs (write them to files under "
++                       f"{tests_dir} and pass the paths in extra_inputs), and a max-size input from {gen_path} "
++                       "(e.g. the largest tier) written to a file.")
++        judge_request = f"""Phase C (judge). Call the judge_candidates tool now with:
++- candidate_paths: {json.dumps(cand_paths)}
++- generator_path: {gen_path}
++- checker_path: {check_path if have_checker else '(omit: no checker)'}
++- num_tests: {NUM_SEEDS} (at least {NUM_SEEDS} seeds)
++- timeout: 10
++- extra_inputs: {sample_hint}
++Then reply with the verdict table: pass/fail/timeouts/crashes per candidate and the max elapsed time. Do not edit any file in this message.
++"""
++        judge_msg = msg_a
++        judge_text, summary = None, None
++        for attempt in range(2):
++            judge_msg = chat_with_agent(judge_request, model=self.code_model, msg_history=judge_msg,
++                                        logging=safe_log) or judge_msg
++            judge_text, summary = self._latest_judge_result(judge_msg)
++            if summary is not None:
++                break
++            judge_request = ("You did not call judge_candidates (or its result is missing). Call judge_candidates "
++                             f"now on {json.dumps(cand_paths)} with generator {gen_path}, "
++                             f"checker {check_path if have_checker else 'none'}, num_tests {NUM_SEEDS}.")
++        if summary is None and have_gen:
++            judge_text, summary = self._judge_direct(cand_paths, gen_path,
++                                                     check_path if have_checker else None,
++                                                     num_tests=NUM_SEEDS)
++            safe_log("[forward] judge fallback: ran judge_candidates programmatically.")
++
++        # ---------------- Phase D: select and reflect ----------------
++        history_table = []
+ 
+-        # Bounded retry: ensure solution.py contains real code
++        def pick(summary):
++            if not summary:
++                return None
++            by_name = {os.path.basename(p): (i, p) for i, p in enumerate(cand_paths)}
++            scored = []
++            for c in summary.get('candidates', []):
++                if c.get('name') in by_name:
++                    i, p = by_name[c['name']]
++                    scored.append((self._score(c), i, p, c))
++            if not scored:
++                return None
++            scored.sort(key=lambda t: (t[0], t[1]))
++            return scored[0]
++
++        best = pick(summary)
++        if best is None:
++            best_path = cand_paths[0]
++            best_idx = 0
++        else:
++            best_path, best_idx = best[2], best[1]
++        if summary:
++            for c in summary.get('candidates', []):
++                history_table.append(f"{c.get('name')}: pass={c.get('pass')} fail={c.get('fail')} "
++                                     f"timeouts={c.get('timeouts')} crashes={c.get('crashes')}")
++        best_all_pass = bool(best and best[3].get('all_pass') and best[3].get('timeouts', 0) == 0
++                             and best[3].get('crashes', 0) == 0)
++        safe_log(f"[forward] Phase D initial pick: cand_{best_idx}.py all_pass={best_all_pass}")
++
++        reflect_hist = cand_histories.get(best_idx, [])
++        for rnd in range(MAX_REFLECTIONS):
++            if best_all_pass:
++                break
++            failing_text = self._clip_text(judge_text or 'no judge result available', 6000)
++            table = "\n".join(history_table) or "(none)"
++            reflect_msg = f"""Reflection round {rnd + 1} of {MAX_REFLECTIONS} on your candidate {best_path}.
++It did not pass all judge tests yet. Below is the judge output (failing inputs, your candidate output, checker messages, and the seeds where candidates disagree):
++{failing_text}
++
++History of attempts and their judge results so far:
++{table}
++
++Do this: diagnose the failure from the failing input and the checker message (re-derive by hand or with brute force on that input if needed), fix {best_path} (edit the file in place; keep it a stdin program), re-run the samples, then call judge_candidates on [{json.dumps(best_path)}] with generator {gen_path}, checker {check_path if have_checker else 'none'}, num_tests {NUM_SEEDS}, and the samples plus max-size input as extra_inputs. Reply with the judge verdict line.
++"""
++            reflect_hist = chat_with_agent(reflect_msg, model=self.code_model, msg_history=reflect_hist,
++                                           logging=safe_log) or reflect_hist
++            new_text, new_summary = self._latest_judge_result(reflect_hist)
++            if new_summary is None and have_gen:
++                new_text, new_summary = self._judge_direct([best_path], gen_path,
++                                                           check_path if have_checker else None,
++                                                           num_tests=NUM_SEEDS)
++            if new_summary:
++                c = new_summary.get('candidates', [{}])[0]
++                history_table.append(f"reflection {rnd + 1}: pass={c.get('pass')} fail={c.get('fail')} "
++                                     f"timeouts={c.get('timeouts')} crashes={c.get('crashes')}")
++                best_all_pass = bool(c.get('all_pass') and c.get('timeouts', 0) == 0 and c.get('crashes', 0) == 0)
++                judge_text = new_text
++            else:
++                history_table.append(f"reflection {rnd + 1}: judge result missing")
++
++        # ---------------- Phase E: finalize ----------------
++        if os.path.isfile(best_path):
++            shutil.copyfile(best_path, sol_path)
++            safe_log(f"[forward] Copied {best_path} to {sol_path}")
++        final_msg = f"""Phase E (final). The selected candidate ({best_path}) has been copied to {sol_path}.
++Final checks, in order:
++1. Run run_clean on {sol_path} with all samples from the statement and one max-size input. Read stderr and fix any crash or traceback in {sol_path}.
++2. Time the max-size input once more; it must finish well under 2 seconds.
++3. If the statement has several valid answers, confirm the output is accepted by the checker {check_path if have_checker else '(none)'}.
++Then state the final status briefly. Only edit {sol_path} if a fix is needed.
++Judge history: {'; '.join(history_table) or 'none'}
++"""
++        msg_hist = chat_with_agent(final_msg, model=self.code_model, msg_history=[], logging=safe_log) or []
++        # Real-edit check and bounded retry: ensure solution.py contains real code
+         reminder_text = (
+             "No solution code has been written to solution.py yet, so the task is not done. "
+             f"You must call the editor tool right now to create {self.git_tempdir}/solution.py "
+@@ -238,12 +475,15 @@ Within your first few tool calls, write a first-draft solution.py (even brute fo
+             if self._has_real_edit():
+                 break
+             safe_log(f"[forward] No real edit in solution.py; retry {attempt + 1}/3")
+-            msg_history = chat_with_agent(
++            msg_hist = chat_with_agent(
+                 reminder_text,
+                 model=self.code_model,
+-                msg_history=msg_history,
++                msg_history=msg_hist,
+                 logging=safe_log,
+-            ) or msg_history
++            ) or msg_hist
++        if not self._has_real_edit() and os.path.isfile(best_path):
++            shutil.copyfile(best_path, sol_path)
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/solution.py b/solution.py
+index 46cb87b..840dfb8 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,86 +1,14 @@
+ import sys
+-from decimal import Decimal, getcontext
+-
+-# Assumed problem: given N contest performances P_1..P_N (in time order), choose a
+-# non-empty subset of size k (keeping time order). The rating is
+-#   sum_{j} 0.9^{k-j} Q_j / sum_{j} 0.9^{k-j} - 1200 / sqrt(k)
+-# where Q_1..Q_k are the chosen performances in order. Output the maximum.
+-#
+-# DP from the end: dp[t] = max numerator using t chosen items from the suffix,
+-# where the item chosen as the (t+1)-th from the end has weight 0.9^t.
+-# Each dp[k] gives the best numerator for exactly k items, so the best value is
+-# max_k dp[k]/den_k - 1200/sqrt(k). The optimal subsets are reconstructed and the
+-# final value is recomputed exactly with Decimal.
+-
+-getcontext().prec = 60
+-
+-
+-def solve(p):
+-    n = len(p)
+-    NEG = float('-inf')
+-    w = [1.0] * (n + 1)
+-    for t in range(1, n + 1):
+-        w[t] = w[t - 1] * 0.9
+-    dp = [NEG] * (n + 1)
+-    dp[0] = 0.0
+-    take = [None] * n  # take[i][t]: item i taken when count after step i is t
+-    for idx in range(n - 1, -1, -1):
+-        pv = p[idx]
+-        tk = [False] * (n + 1)
+-        new = dp[:]
+-        for t in range(n - 1, -1, -1):
+-            if dp[t] == NEG:
+-                continue
+-            c = dp[t] + w[t] * pv
+-            if c > new[t + 1]:
+-                new[t + 1] = c
+-                tk[t + 1] = True
+-        dp = new
+-        take[idx] = tk
+-
+-    # Candidate k values by float score
+-    scores = []
+-    for k in range(1, n + 1):
+-        if dp[k] == NEG:
+-            continue
+-        den = sum(w[:k])
+-        scores.append((dp[k] / den - 1200.0 / (k ** 0.5), k))
+-    if not scores:
+-        return None
+-    best = max(s for s, _ in scores)
+-    cands = [k for s, k in scores if s >= best - 1e-6]
+-
+-    getcontext().prec = 60
+-    best_val = None
+-    for k in cands:
+-        # reconstruct chosen indices
+-        c = k
+-        chosen = []
+-        for i in range(n):
+-            if c > 0 and take[i][c]:
+-                chosen.append(i)
+-                c -= 1
+-        chosen.sort()
+-        # exact evaluation with Decimal
+-        num = Decimal(0)
+-        den = Decimal(0)
+-        kk = len(chosen)
+-        for j, i in enumerate(chosen):
+-            wt = Decimal('0.9') ** (kk - 1 - j)
+-            num += wt * Decimal(p[i])
+-            den += wt
+-        val = num / den - Decimal(1200) / Decimal(kk).sqrt()
+-        if best_val is None or val > best_val:
+-            best_val = val
+-    return best_val
+ 
+ 
+ def main():
+     data = sys.stdin.read().split()
++    if not data:
++        print(0)
++        return
+     n = int(data[0])
+-    p = [int(x) for x in data[1:1 + n]]
+-    val = solve(p)
+-    print(format(val, '.15f'))
++    values = [int(x) for x in data[1:1 + n]]
++    print(sum(values))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tools/judge_candidates.py b/tools/judge_candidates.py
+new file mode 100644
+index 0000000..8d97b23
+--- /dev/null
++++ b/tools/judge_candidates.py
+@@ -0,0 +1,259 @@
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from collections import Counter
++
++from tools.stress_compare import _run, _clip, _compare
++
++
++def tool_info():
++    return {
++        "name": "judge_candidates",
++        "description": """Judge several candidate solutions on the same generated inputs and report raw results.\n
++* `generator_path` is run as `python3 generator.py SEED` for SEED = 1..num_tests and prints one input.
++* `extra_inputs` are extra test inputs; each entry is either the literal input text or a path to a file holding the input (e.g. samples, max-size input).
++* Each candidate is run with `python3 -I` on each input with a timeout.
++* Verdict per candidate and input: if `checker_path` is given, it is run as `python3 checker.py input_file output_file`; exit code 0 means accepted and stderr holds the reason. Otherwise, if `reference_path` is given, the output is compared token by token with the reference output (numeric tokens with tolerance 1e-9). Otherwise, a candidate passes when its output equals the most common output among the successful candidates.
++* Returns raw data: per candidate pass/fail/timeout/crash counts, max elapsed time, the first failing input with the candidate's output and the checker message, the first crash stderr, and the seeds where candidates disagree. The last line is a JSON summary (prefixed with JUDGE_SUMMARY_JSON:).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "candidate_paths": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Paths to the candidate Python solution files to judge."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to the generator script; run as `python3 generator.py SEED`, prints one input."
++                },
++                "checker_path": {
++                    "type": "string",
++                    "description": "Optional path to a validator script run as `python3 checker.py input_file output_file`. Exit 0 = accepted; stderr gives the reason."
++                },
++                "reference_path": {
++                    "type": "string",
++                    "description": "Optional path to a reference program used for token diff when no checker is given."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of seeds to test, seeds 1..num_tests (default 300, at least 300 recommended)."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-run time limit in seconds for each candidate, checker and reference (default 10)."
++                },
++                "extra_inputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Extra inputs run in addition to the generated ones: each entry is input text or a path to an input file (samples, max-size input)."
++                }
++            },
++            "required": ["candidate_paths", "generator_path"]
++        }
++    }
++
++
++def _norm(s):
++    return " ".join((s or "").split())
++
++
++def _read_extra(entries):
++    inputs = []
++    for i, e in enumerate(entries or []):
++        if not isinstance(e, str):
++            continue
++        is_file = False
++        if len(e) < 1024 and '\n' not in e:
++            try:
++                is_file = os.path.isfile(e)
++            except (ValueError, OSError):
++                is_file = False
++        if is_file:
++            with open(e, errors='replace') as f:
++                inputs.append((f"extra[{i}]:{e}", f.read()))
++        else:
++            inputs.append((f"extra[{i}]", e))
++    return inputs
++
++
++def _run_checker(checker_path, in_text, out_text, timeout, tmpdir):
++    inp = os.path.join(tmpdir, 'check_in.txt')
++    outp = os.path.join(tmpdir, 'check_out.txt')
++    with open(inp, 'w') as f:
++        f.write(in_text)
++    with open(outp, 'w') as f:
++        f.write(out_text)
++    try:
++        p = subprocess.run([sys.executable, '-I', checker_path, inp, outp], capture_output=True,
++                           text=True, timeout=timeout, errors='replace')
++        msg = (p.stderr or p.stdout or '').strip()
++        return p.returncode == 0, msg
++    except subprocess.TimeoutExpired:
++        return False, f"checker timed out after {timeout}s"
++
++
++def _timed_run(path, data, timeout):
++    t0 = time.time()
++    r = _run(path, data, timeout)
++    r['elapsed'] = time.time() - t0
++    return r
++
++
++def tool_function(candidate_paths, generator_path, checker_path=None, reference_path=None,
++                  num_tests=300, timeout=10, extra_inputs=None):
++    try:
++        num_tests = max(1, min(int(num_tests or 300), 2000))
++    except (TypeError, ValueError):
++        num_tests = 300
++    try:
++        timeout = max(1, min(int(timeout or 10), 120))
++    except (TypeError, ValueError):
++        timeout = 10
++    if isinstance(candidate_paths, str):
++        candidate_paths = [candidate_paths]
++    candidate_paths = list(candidate_paths or [])
++    if not candidate_paths:
++        return "Error: no candidate_paths given"
++    for p in candidate_paths + [generator_path]:
++        if not os.path.isfile(p):
++            return f"Error: file not found: {p}"
++    if checker_path and not os.path.isfile(checker_path):
++        return f"Error: file not found: {checker_path}"
++    if reference_path and not os.path.isfile(reference_path):
++        return f"Error: file not found: {reference_path}"
++
++    names = [os.path.basename(p) for p in candidate_paths]
++    stats = {n: {'pass': 0, 'fail': 0, 'timeouts': 0, 'crashes': 0, 'max_elapsed': 0.0,
++                 'first_fail': None, 'first_crash': None} for n in names}
++    disagree_seeds = []
++    ref_failures = 0
++    checker_failures_only = 0
++    total = 0
++
++    tmpdir = tempfile.mkdtemp(prefix='judge_')
++
++    tests = []  # (label, seed or None, input_text)
++    for seed in range(1, num_tests + 1):
++        gen = subprocess.run([sys.executable, '-I', generator_path, str(seed)], capture_output=True,
++                             text=True, timeout=60, errors='replace')
++        if gen.returncode != 0:
++            return (f"Generator failed at seed {seed} (exit {gen.returncode}).\n"
++                    f"stderr:\n{_clip(gen.stderr)}")
++        tests.append((f"seed {seed}", seed, gen.stdout))
++    for label, text in _read_extra(extra_inputs):
++        tests.append((label, None, text))
++
++    for label, seed, data in tests:
++        total += 1
++        outs = {n: _timed_run(p, data, timeout) for n, p in zip(names, candidate_paths)}
++        ref = _run(reference_path, data, timeout) if reference_path else None
++        if ref is not None and not ref['ok']:
++            ref_failures += 1
++            ref = None
++
++        # Verdicts: True / False for each successful candidate, None for crashed/timed out
++        verdict = {}
++        reason = {}
++        for n in names:
++            r = outs[n]
++            st = stats[n]
++            st['max_elapsed'] = max(st['max_elapsed'], r['elapsed'])
++            if not r['ok']:
++                verdict[n] = False
++                reason[n] = 'timeout' if r['code'] == 'TIMEOUT' else f"exit {r['code']}"
++                if r['code'] == 'TIMEOUT':
++                    st['timeouts'] += 1
++                else:
++                    st['crashes'] += 1
++                if st['first_crash'] is None:
++                    st['first_crash'] = {'test': label, 'exit': str(r['code']),
++                                         'stderr': _clip(r['stderr'], 1500)}
++                continue
++            if checker_path:
++                ok, msg = _run_checker(checker_path, data, r['stdout'], timeout, tmpdir)
++                verdict[n] = ok
++                reason[n] = msg
++            elif ref is not None:
++                _, ok, _, _ = _compare(r['stdout'], ref['stdout'], 1e-9)
++                verdict[n] = ok
++                reason[n] = 'output differs from reference' if not ok else ''
++            else:
++                verdict[n] = None  # decided below by consensus
++                reason[n] = ''
++
++        if not checker_path and ref is None:
++            ok_outs = [_norm(outs[n]['stdout']) for n in names if outs[n]['ok']]
++            if ok_outs:
++                majority = Counter(ok_outs).most_common(1)[0][0]
++                for n in names:
++                    if outs[n]['ok']:
++                        verdict[n] = _norm(outs[n]['stdout']) == majority
++                        if not verdict[n]:
++                            reason[n] = 'output differs from the majority of candidates'
++            if len(set(ok_outs)) > 1 or len(ok_outs) < len(names):
++                disagree_seeds.append(label)
++        elif checker_path:
++            vals = set(verdict.values())
++            if len(vals) > 1:
++                disagree_seeds.append(label)
++        else:
++            ok_outs = set(_norm(outs[n]['stdout']) for n in names if outs[n]['ok'])
++            if len(ok_outs) > 1 or len(ok_outs) < len(names):
++                disagree_seeds.append(label)
++
++        for n in names:
++            st = stats[n]
++            if verdict[n]:
++                st['pass'] += 1
++            else:
++                st['fail'] += 1
++                if st['first_fail'] is None:
++                    st['first_fail'] = {
++                        'test': label,
++                        'input': _clip(data, 2000),
++                        'output': _clip(outs[n]['stdout'], 1500),
++                        'reason': _clip(reason[n] or outs[n]['stderr'], 1500),
++                    }
++
++    summary_cands = []
++    for n in names:
++        st = stats[n]
++        summary_cands.append({'name': n, 'pass': st['pass'], 'fail': st['fail'],
++                              'timeouts': st['timeouts'], 'crashes': st['crashes'],
++                              'all_pass': st['fail'] == 0 and st['pass'] > 0})
++    lines = [
++        f"tests run: {total} (generated seeds {num_tests}, extra inputs {total - num_tests})",
++        f"judge mode: {'checker' if checker_path else ('reference' if reference_path else 'agreement only')}",
++    ]
++    if reference_path and ref_failures:
++        lines.append(f"reference failed (crashed/timed out) on {ref_failures} inputs; those used agreement only")
++    lines.append(f"seeds where candidates disagree: {len(disagree_seeds)} {disagree_seeds[:50]}")
++    for n in names:
++        st = stats[n]
++        lines += [
++            f"=== candidate {n} ===",
++            f"pass={st['pass']} fail={st['fail']} timeouts={st['timeouts']} crashes={st['crashes']} "
++            f"max_elapsed={st['max_elapsed']:.3f}s",
++        ]
++        if st['first_fail']:
++            ff = st['first_fail']
++            lines += [f"first failing test: {ff['test']}",
++                      f"input:\n{ff['input']}",
++                      f"candidate output:\n{ff['output']}",
++                      f"checker/judge message:\n{ff['reason']}"]
++        if st['first_crash']:
++            fc = st['first_crash']
++            lines += [f"first crash/timeout: {fc['test']} exit={fc['exit']}",
++                      f"stderr:\n{fc['stderr']}"]
++    shutil.rmtree(tmpdir, ignore_errors=True)
++    lines.append("JUDGE_SUMMARY_JSON: " + json.dumps({
++        'tests': total,
++        'disagree_seeds': len(disagree_seeds),
++        'candidates': summary_cands,
++    }))
++    return "\n".join(lines)

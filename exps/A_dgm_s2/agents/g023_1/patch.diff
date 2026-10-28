@@ -1,0 +1,422 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5d3cfd0..3a24702 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,407 +1,13 @@
+-import argparse
+-import subprocess
+-import logging
+-from logging.handlers import RotatingFileHandler
++"""Coding agent with sanitized, bounded recovery for empty or malformed first attempts."""
++
+ import os
+ import re
+-import threading
+-
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+-
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+-
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
+-
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
+-
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
+-
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+-
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
+-
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    # Matches "diff --git a/<path> b/<path>" headers in a git diff
+-    _DIFF_HEADER_RE = re.compile(r'^diff --git a/(.+?) b/', re.MULTILINE)
+-
+-    def _changed_files(self, diff):
+-        """
+-        Extract the list of changed file paths from a git diff string.
+-        """
+-        return self._DIFF_HEADER_RE.findall(diff or '')
+-
+-    def _is_test_file(self, path):
+-        """
+-        Generic heuristic for whether a path refers to a test file.
+-        """
+-        normalized = path.replace('\\', '/')
+-        parts = [p for p in normalized.split('/') if p]
+-        if not parts:
+-            return False
+-        basename = parts[-1]
+-        if (basename.startswith('test_') and basename.endswith('.py')) \
+-                or basename.endswith('_test.py') \
+-                or basename.endswith('_test.go') \
+-                or basename.endswith('.test.js') \
+-                or basename.endswith('.spec.js'):
+-            return True
+-        # Any directory component named tests/test/spec
+-        return any(p in ('tests', 'test', 'spec') for p in parts[:-1])
+-
+-    def _has_source_edits(self):
+-        """
+-        Returns True if at least one changed file is not a test file.
+-        """
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        return any(not self._is_test_file(f) for f in self._changed_files(diff))
+-
+-    def _current_changed_files_str(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        files = self._changed_files(diff)
+-        return ', '.join(files) if files else 'none'
+-
+-    # Markers that suggest a file is a stub / unfinished implementation
+-    _STUB_RE = re.compile(r'^\s*pass\s*$|NotImplementedError|TODO', re.MULTILINE)
+-    # Non-code files that should never be chosen as edit targets
+-    _NON_CODE_NAMES = {'readme', 'license', 'licence', 'changelog', 'contributing', 'copying', 'notice', 'authors'}
+-    _NON_CODE_EXTS = {'.md', '.rst', '.txt', '.lock', '.toml', '.cfg', '.ini', '.yaml', '.yml', '.json', '.csv', '.svg', '.png', '.jpg', '.gif', '.pdf'}
+-    _LOCKFILE_NAMES = {'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock', 'cargo.lock', 'go.sum', 'gemfile.lock', 'composer.lock'}
+-
+-    def _find_candidate_files(self, max_candidates=3, max_chars=4000):
+-        """
+-        Discover likely edit targets in the repo (non-test, non-doc source files),
+-        ranked by: basename mentioned in the problem statement, stub markers, small size.
+-        Returns a list of (relative_path, truncated_content).
+-        """
+-        try:
+-            result = subprocess.run(
+-                ["git", "-C", self.git_tempdir, "ls-files"],
+-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-            )
+-            tracked = result.stdout.decode(errors='replace').splitlines()
+-        except Exception:
+-            return []
+-
+-        problem = self.problem_statement or ''
+-        scored = []
+-        for rel in tracked:
+-            if not rel or self._is_test_file(rel):
+-                continue
+-            basename = os.path.basename(rel)
+-            lower = basename.lower()
+-            stem, ext = os.path.splitext(lower)
+-            if lower in self._LOCKFILE_NAMES or stem in self._NON_CODE_NAMES or ext in self._NON_CODE_EXTS:
+-                continue
+-            full = os.path.join(self.git_tempdir, rel)
+-            if not os.path.isfile(full):
+-                continue
+-            try:
+-                with open(full, 'r', encoding='utf-8') as f:
+-                    content = f.read()
+-            except (OSError, UnicodeDecodeError):
+-                continue
+-            size = len(content)
+-            mentioned = bool(basename) and basename in problem
+-            has_stub = bool(self._STUB_RE.search(content))
+-            # Higher is better; size is a tie-breaker favouring small files
+-            score = (int(mentioned) * 4) + (int(has_stub) * 2) - (size / 100000.0)
+-            scored.append((score, rel, content))
+-
+-        scored.sort(key=lambda x: x[0], reverse=True)
+-        top = scored[:max_candidates]
+-        return [(rel, content[:max_chars] + ('\n<truncated>' if len(content) > max_chars else '')) for _, rel, content in top]
+-
+-    def _format_candidates(self, candidates):
+-        if not candidates:
+-            return "(no candidate source files were identified automatically; locate the right file yourself)"
+-        blocks = []
+-        for rel, content in candidates:
+-            blocks.append(f"### {rel}\n```\n{content}\n```")
+-        return "\n\n".join(blocks)
+-
+-    def _last_assistant_text(self, msg_history):
+-        """Extract the text of the last assistant message from a message history (best effort)."""
+-        for msg in reversed(msg_history or []):
+-            if msg.get('role') != 'assistant':
+-                continue
+-            content = msg.get('content')
+-            if isinstance(content, str):
+-                return content
+-            parts = []
+-            for block in content or []:
+-                if isinstance(block, dict):
+-                    text = block.get('text')
+-                else:
+-                    text = getattr(block, 'text', None)
+-                if text:
+-                    parts.append(text)
+-            return "\n".join(parts)
+-        return ''
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        candidates = self._find_candidate_files()
+-        candidates_str = self._format_candidates(candidates)
+-        top_path = candidates[0][0] if candidates else None
+-
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        instruction = f"""{task}
+-
+-<candidate_files>
+-Likely target files (auto-detected; verify they are the right ones):
+-{candidates_str}
+-</candidate_files>
+-
+-Follow these steps in order:
+-1. Inspect the repository and the starter/source file(s) that need to be implemented or fixed. The candidate files above are the most likely targets.
+-2. IMMEDIATELY implement the solution. Your FIRST action must be an editor `edit` call on the correct non-test source file, overwriting it with a complete implementation (not a partial stub, not a description).
+-3. Then test the implementation with bash: write and run tests, or a brute-force comparison against your solution, using the provided tests if any.
+-4. Fix any bugs found by the tests or comparison, editing the source file again as needed.
+-
+-WARNING: Responding with only a plan, or describing the solution without editing files, is a failure. The task is not complete until the non-test source file has been modified. Do not end your turn before the source file edits are in place.
+-"""
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # Post-run validation with escalating recovery (bounded loop, no while True)
+-        max_retries = 3
+-        if not self._has_source_edits():
+-            for attempt in range(1, max_retries + 1):
+-                changed = self._current_changed_files_str()
+-                safe_log(f"Patch validation failed (changed files: {changed}). Retry {attempt}/{max_retries}.")
+-
+-                if attempt == 1:
+-                    # Stage 1: continue the conversation, name the exact file and its current content
+-                    current = ''
+-                    if top_path:
+-                        try:
+-                            with open(os.path.join(self.git_tempdir, top_path), 'r', encoding='utf-8') as f:
+-                                current = f.read()
+-                        except (OSError, UnicodeDecodeError):
+-                            current = ''
+-                    nudge = (
+-                        "Your previous reply contained no tool call or was empty, and no non-test source file was changed "
+-                        f"(changed files: {changed}). The target file is `{top_path}`. Its current content is:\n"
+-                        f"```\n{current}\n```\n"
+-                        f"Use the editor tool now with command `edit` on `{top_path}` (absolute path under {self.git_tempdir}) "
+-                        "and provide the complete working implementation. Then run tests with bash."
+-                    ) if top_path else (
+-                        "Your previous reply contained no tool call or was empty, and no non-test source file was changed "
+-                        f"(changed files: {changed}). Use the editor tool now to implement the solution in the correct "
+-                        "non-test source file, then run tests with bash."
+-                    )
+-                    msg_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-                    stage = "stage1-continue"
+-
+-                elif attempt == 2:
+-                    # Stage 2: fresh conversation with a minimal directive prompt
+-                    fresh = (
+-                        f"Problem:\n{self.problem_statement}\n\n"
+-                        f"Candidate file contents:\n{candidates_str}\n\n"
+-                        + (f"Overwrite `{top_path}` (absolute path under {self.git_tempdir}) with a full working implementation "
+-                           "using the editor tool (`edit` command)." if top_path else
+-                           "Overwrite the correct non-test source file with a full working implementation using the editor tool (`edit` command).")
+-                    )
+-                    msg_history = chat_with_agent(fresh, model=self.code_model, msg_history=[], logging=safe_log)
+-                    stage = "stage2-fresh"
+-
+-                else:
+-                    # Stage 3: last resort - ask for the full file in a fenced code block and write it directly
+-                    stage = "stage3-direct-write"
+-                    if top_path:
+-                        direct = (
+-                            f"Problem:\n{self.problem_statement}\n\n"
+-                            f"Return the complete contents of `{top_path}` as a single ```python fenced code block, "
+-                            "with a full working implementation. Do not call any tools."
+-                        )
+-                        msg_history = chat_with_agent(direct, model=self.code_model, msg_history=[], logging=safe_log)
+-                        reply = self._last_assistant_text(msg_history)
+-                        match = re.search(r'```(?:python)?\s*\n(.*?)```', reply, re.DOTALL)
+-                        if match:
+-                            code = match.group(1)
+-                            try:
+-                                with open(os.path.join(self.git_tempdir, top_path), 'w', encoding='utf-8') as f:
+-                                    f.write(code)
+-                                safe_log(f"Stage 3 wrote code block to {top_path}.")
+-                            except OSError as e:
+-                                safe_log(f"Stage 3 failed to write {top_path}: {e}")
+-                        else:
+-                            safe_log("Stage 3: no fenced code block found in reply.")
+-
+-                if self._has_source_edits():
+-                    safe_log(f"Recovery succeeded at {stage}.")
+-                    break
+-            else:
+-                safe_log(f"Recovery exhausted after {max_retries} retries; no non-test source edits.")
+-
+-        if self._has_source_edits():
+-            # Optional short verification pass, once source edits exist
+-            verify_msg = (
+-                "Now run your tests once more and confirm the final contents of the source file you edited. "
+-                "Fix anything that fails, then stop."
+-            )
+-            safe_log("Source edits present. Running one verification pass.")
+-            msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        else:
+-            safe_log("Warning: no non-test source edits after retries.")
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
++import subprocess
++from typing import Callable, List, Optional, Tuple
+ 
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
++# chat_fn(prompt, msg_history, use_tools) -> (response_text, new_msg_history)
++ChatFn = Callable[[str, list, bool], Tuple[str, list]]
+ 
+-if __name__ == "__main__":
+-    main()
++MAX_RECOVERY_ATTEMPTS = 2  # attempts 1 and 2 are directive re-prompts; attempt 3 is direct-write
++TOOL_CALL_NOTE = "[previous malformed tool-call text omitted]"
++CODE_BLOCK_RE = re.compile(r"
+\ No newline at end of file

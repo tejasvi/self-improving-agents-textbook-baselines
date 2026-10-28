@@ -1,0 +1,430 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 8ead127..df0b1bf 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -94,11 +94,34 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _block_type(b):
++    if isinstance(b, dict):
++        return b.get('type')
++    return getattr(b, 'type', None)
++
++def _block_text(b):
++    if isinstance(b, dict):
++        return b.get('text', '') or ''
++    return getattr(b, 'text', '') or ''
++
+ def _message_blocks(msg):
+     content = msg.get('content', [])
+     if isinstance(content, str):
+         return [{'type': 'text', 'text': content}]
+-    return [b if isinstance(b, dict) else {'type': 'text', 'text': str(b)} for b in content]
++    out = []
++    for b in content:
++        t = _block_type(b)
++        if t == 'text':
++            out.append({'type': 'text', 'text': _block_text(b)})
++        elif t == 'tool_use':
++            out.append({'type': 'tool_use'})
++        elif t == 'tool_result':
++            out.append({'type': 'tool_result', 'content': b.get('content', '') if isinstance(b, dict) else ''})
++        elif isinstance(b, dict):
++            out.append(b)
++        else:
++            out.append({'type': 'other'})
++    return out
+ 
+ def _last_assistant_text(msg_history):
+     """Return the concatenated text of the final assistant message ('' if none)."""
+@@ -117,6 +140,37 @@ def _last_assistant_empty(msg_history):
+             return all(not b.get('text', '').strip() for b in blocks if b.get('type') == 'text')
+     return True
+ 
++def _round_tool_calls(new_msgs):
++    """Number of tool_use blocks issued by the assistant in the given messages."""
++    n = 0
++    for msg in new_msgs:
++        if msg.get('role') == 'assistant':
++            n += sum(1 for b in _message_blocks(msg) if b.get('type') == 'tool_use')
++    return n
++
++_BENCH_RE = re.compile(r"STATUS: (OK|TIMEOUT|ERROR)")
++
++def _last_benchmark_status(msg_history):
++    """Status ('OK'|'TIMEOUT'|'ERROR') of the most recent run_timed result in the history, or None."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') != 'user':
++            continue
++        for b in _message_blocks(msg):
++            # Native tool results arrive as tool_result blocks; text-mode tool results arrive as
++            # "Tool Result: ..." text in user messages. Accept both.
++            if b.get('type') == 'tool_result':
++                content = b.get('content', '')
++            elif b.get('type') == 'text':
++                content = b.get('text', '')
++            else:
++                continue
++            if isinstance(content, list):
++                content = "\n".join(str(c.get('text', '')) if isinstance(c, dict) else str(c) for c in content)
++            m = _BENCH_RE.search(str(content))
++            if m:
++                return m.group(1)
++    return None
++
+ def _extract_python_code(text):
+     """Extract the longest ```python fenced block from text ('' if none)."""
+     matches = re.findall(r"```(?:python|py|Python)?[ \t]*\n(.*?)```", text or '', re.DOTALL)
+@@ -192,7 +246,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ Please follow this workflow carefully:
+ 
+ 1. Inspect the repository layout (e.g. `ls -la {self.git_tempdir}`) and identify the required deliverable file. If the task names a file (e.g. `solution.py`), use that; otherwise default to `solution.py` in the repository root. The task is either a complete program that reads standard input and writes standard output, or a method of a given `Solution` class; match whichever form the problem requires.
+-2. Write a first complete implementation to the deliverable file (solution.py or the file the task specifies) EARLY, before any further analysis. A working file on disk is more important than a perfect one. Do not leave the deliverable file empty or as a stub.
++2. Before writing code, compute the worst-case operation count from the constraints (e.g. n up to 15000 means O(n^2) ~ 2.25e8 is too slow in Python) and choose an algorithm that fits within about 5e7 basic Python operations; avoid per-check O(n^2) loops. Write the efficient version first, to the deliverable file (solution.py or the file the task specifies), EARLY. A working file on disk is more important than a perfect one. Do not leave the deliverable file empty or as a stub.
+ 3. Extract the sample inputs and expected outputs from the problem statement. Save each sample input into its own file (e.g. `sample1.in`, `sample2.in`, ...) and the expected outputs into matching files (e.g. `sample1.out`). Run the solution on every sample via bash, e.g. `python solution.py < sample1.in`, and compare with the expected output. Fix any failures and repeat until all samples pass.
+ 4. Write a brute-force reference implementation in `brute.py` that is obviously correct but slow. Then write a random-test comparison script (e.g. `stress.py`) that generates many small random inputs that respect the problem constraints, runs both `solution.py` and `brute.py` on each input, and reports any mismatch. Run it, and if there is any mismatch, determine whether the solution or the brute force is wrong, fix the bug, and re-run until there are no mismatches. Include edge cases (minimum sizes, equal values, duplicates, etc.) in the random generator.
+ 5. Benchmark the solution on a maximum-constraint input (generate it with a script and time it with `time python solution.py < big.in`). Verify that it runs well within the time limit: use fast input reading (e.g. `sys.stdin.buffer.read` / `sys.stdin.readline`), avoid deep recursion (use iteration or raise the recursion limit with care), and use an appropriate algorithmic complexity. Optimize if it is too slow.
+@@ -201,22 +255,26 @@ Please follow this workflow carefully:
+         instruction = f"{task}{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Robustness: ensure a deliverable exists. Retry up to 3 times with a FRESH history
+-        # and a directive prompt if the deliverable is missing or the last turn was empty.
++        # Robustness: ensure a deliverable exists. Retry up to 3 times, keeping a summary of the
++        # previous failure in the prompt (instead of discarding all context).
++        last_failure = "no deliverable file was produced"
+         for attempt in range(3):
+             if self._deliverable_exists():
+                 break
+-            safe_log(f"[forward] Attempt {attempt + 1}: deliverable missing or empty, re-prompting agent with fresh history.")
++            safe_log(f"[forward] Attempt {attempt + 1}: deliverable missing or empty, re-prompting agent.")
+             retry_msg = (
+                 f"The repository is at {self.git_tempdir}. Solve the following problem.\n\n"
+                 f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                "Think briefly about the algorithm, then immediately create solution.py with the editor tool "
++                f"Previous attempt summary: {last_failure}.\n"
++                "Think briefly about the algorithm (estimate the worst-case operation count from the constraints first), "
++                "then immediately create solution.py with the editor tool "
+                 "(a complete program reading stdin and writing stdout, or the required Solution class if the task "
+                 "specifies one). Then test it on the sample inputs with bash and fix any failures."
+             )
+             msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[forward] Attempt {attempt + 1} finished: deliverable_exists={self._deliverable_exists()}, "
+-                     f"last_assistant_empty={_last_assistant_empty(msg_history)}")
++            last_failure = (f"deliverable_exists={self._deliverable_exists()}, "
++                            f"last_assistant_empty={_last_assistant_empty(msg_history)}")
++            safe_log(f"[forward] Attempt {attempt + 1} finished: {last_failure}")
+ 
+         # Final fallback: ask for only the code and write it to solution.py from the harness.
+         if not self._deliverable_exists():
+@@ -235,15 +293,31 @@ Please follow this workflow carefully:
+             else:
+                 safe_log("[forward] Fallback produced no parsable python code block.")
+ 
+-        # Bounded verification round (single pass), only if the deliverable exists.
++        # Bounded verification loop (max 3 rounds, no while True). History is reused across rounds.
+         if self._deliverable_exists():
+             verify_msg = (
+-                "Verification pass: re-run the solution on all sample inputs and compare with the expected outputs. "
+-                "Then re-run the random stress test against brute.py (create them if they do not exist) and the "
+-                "maximum-size timing test. If you find any discrepancy, wrong output, or timeout, fix the solution "
+-                "and re-verify. Make sure the final solution is saved in the deliverable file."
++                "Verification round: (a) write a generator for worst-case max-size inputs from the problem constraints, "
++                "including adversarial structure (e.g. sorted, all-equal, alternating, extreme values). "
++                "(b) Use the run_timed tool with a 10s timeout to time the solution on them. "
++                "(c) Compare against brute force on small random cases (brute.py / stress.py). "
++                "If any run is TIMEOUT or too slow, state the complexity of the current approach and rewrite it with a faster "
++                "algorithm, then re-measure with run_timed. Fix any wrong output. Make sure the final solution is saved in the deliverable file."
+             )
+-            msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            nudges = 0
++            for round_idx in range(3):
++                safe_log(f"[forward] Verification round {round_idx + 1}/3")
++                msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                if not self._deliverable_exists():
++                    break
++                # Announce-then-stop detection: the last assistant turn made no tool call (or was empty)
++                # while the most recent benchmark was TIMEOUT/ERROR -> nudge to apply the fix (bounded).
++                last_msg = msg_history[-1] if msg_history else {}
++                ended_without_tool = (last_msg.get('role') == 'assistant') and _round_tool_calls([last_msg]) == 0
++                if ended_without_tool and _last_benchmark_status(msg_history) in ('TIMEOUT', 'ERROR') and nudges < 2:
++                    nudges += 1
++                    safe_log(f"[forward] Announce-then-stop detected; sending continuation nudge {nudges}.")
++                    nudge = ("Continue: apply the fix now by editing solution.py and re-run the benchmark with run_timed.")
++                    msg_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+ 
+ def main():
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..1373e9d
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,175 @@
++import argparse
++import subprocess
++import logging
++from logging.handlers import RotatingFileHandler
++import os
++import re
++import threading
++
++from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++
++# reset_to_commit(git_dname, commit)
++# apply_patch(git_dname, patch_str)
++
++# TEST COMMANDS for different languages
++# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
++NPM_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
++    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
++    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
++    ["npm", "run", "test"]
++]
++
++CPP_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
++    ["sh", "-c", "cd build"],
++    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
++    ["make"],
++    ["sh", "-c", "cd ../"]
++]
++
++TEST_COMMANDS = {
++    "python": [["pytest", "-rA", "--tb=long"]],
++    "rust": [["cargo", "test", "--", "--include-ignored"]],
++    "go": [["go", "test", "./..."]],
++    "javascript": NPM_TEST_COMMANDS,
++    "cpp": CPP_TEST_COMMANDS,
++    "java": [["./gradlew", "test"]],
++}
++
++# Thread-local storage for logger instances
++thread_local = threading.local()
++
++def get_thread_logger():
++    """
++    Get the logger instance specific to the current thread.
++    Returns None if no logger has been set for this thread.
++    """
++    return getattr(thread_local, 'logger', None)
++
++def set_thread_logger(logger):
++    """
++    Set the logger instance for the current thread.
++    """
++    thread_local.logger = logger
++
++def setup_logger(log_file='./chat_history.md', level=logging.INFO):
++    """
++    Set up a logger with both file and console handlers.
++    """
++    # Create logger with a unique name based on thread ID
++    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
++    logger.setLevel(level)
++    
++    # Remove existing handlers to avoid duplicates
++    logger.handlers = []
++    
++    # Create formatters
++    file_formatter = logging.Formatter('%(message)s')
++    
++    # Create and set up file handler
++    os.makedirs(os.path.dirname(log_file), exist_ok=True)
++    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
++    file_handler.setLevel(level)
++    file_handler.setFormatter(file_formatter)
++    
++    # Add handlers to logger
++    logger.addHandler(file_handler)
++    
++    # Store logger in thread-local storage
++    set_thread_logger(logger)
++    
++    return logger
++
++def safe_log(message, level=logging.INFO):
++    """
++    Thread-safe logging function that ensures messages go to the correct logger.
++    """
++    logger = get_thread_logger()
++    if logger:
++        logger.log(level, message)
++    else:
++        print(f"Warning: No logger found for thread {threading.get_ident()}")
++
++def _block_type(b):
++    if isinstance(b, dict):
++        return b.get('type')
++    return getattr(b, 'type', None)
++
++def _block_text(b):
++    if isinstance(b, dict):
++        return b.get('text', '') or ''
++    return getattr(b, 'text', '') or ''
++
++def _message_blocks(msg):
++    content = msg.get('content', [])
++    if isinstance(content, str):
++        return [{'type': 'text', 'text': content}]
++    out = []
++    for b in content:
++        t = _block_type(b)
++        if t == 'text':
++            out.append({'type': 'text', 'text': _block_text(b)})
++        elif t == 'tool_use':
++            out.append({'type': 'tool_use'})
++        elif t == 'tool_result':
++            out.append({'type': 'tool_result', 'content': b.get('content', '') if isinstance(b, dict) else ''})
++        elif isinstance(b, dict):
++            out.append(b)
++        else:
++            out.append({'type': 'other'})
++    return out
++
++def _last_assistant_text(msg_history):
++    """Return the concatenated text of the final assistant message ('' if none)."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') == 'assistant':
++            return "\n".join(b.get('text', '') for b in _message_blocks(msg) if b.get('type') == 'text')
++    return ''
++
++def _last_assistant_empty(msg_history):
++    """True if the final assistant message has only empty text and no tool_use blocks."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') == 'assistant':
++            blocks = _message_blocks(msg)
++            if any(b.get('type') == 'tool_use' for b in blocks):
++                return False
++            return all(not b.get('text', '').strip() for b in blocks if b.get('type') == 'text')
++    return True
++
++def _round_tool_calls(new_msgs):
++    """Number of tool_use blocks issued by the assistant in the given messages."""
++    n = 0
++    for msg in new_msgs:
++        if msg.get('role') == 'assistant':
++            n += sum(1 for b in _message_blocks(msg) if b.get('type') == 'tool_use')
++    return n
++
++_BENCH_RE = re.compile(r"STATUS: (OK|TIMEOUT|ERROR)")
++
++def _last_benchmark_status(msg_history):
++    """Status ('OK'|'TIMEOUT'|'ERROR') of the most recent run_timed result in the history, or None."""
++    for msg in reversed(msg_history or []):
++        if msg.get('role') != 'user':
++            continue
++        for b in _message_blocks(msg):
++            # Native tool results arrive as tool_result blocks; text-mode tool results arrive as
++            # "Tool Result: ..." text in user messages. Accept both.
++            if b.get('type') == 'tool_result':
++                content = b.get('content', '')
++            elif b.get('type') == 'text':
++                content = b.get('text', '')
++            else:
++                continue
++            if isinstance(content, list):
++                content = "\n".join(str(c.get('text', '')) if isinstance(c, dict) else str(c) for c in content)
++            m = _BENCH_RE.search(str(content))
++            if m:
++                return m.group(1)
++    return None
++
++def _extract_python_code(text):
++    """Extract the longest
+diff --git a/tools/run_timed.py b/tools/run_timed.py
+new file mode 100644
+index 0000000..be83fc7
+--- /dev/null
++++ b/tools/run_timed.py
+@@ -0,0 +1,85 @@
++import os
++import signal
++import subprocess
++import time
++
++MAX_OUTPUT_CHARS = 4000
++
++
++def tool_info():
++    return {
++        "name": "run_timed",
++        "description": """Run a shell command with a wall-clock time limit and report the result.\n
++* Use this to benchmark a solution (e.g. `python solution.py < big.in`) and to detect timeouts.\n
++* The command runs in its own process group; on timeout the whole group is killed.\n
++* Returns a status line 'STATUS: OK|TIMEOUT|ERROR, ELAPSED: x.xs' followed by the (truncated) STDOUT and STDERR.\n
++* Use plain `bash` for ordinary commands; use this tool when you need timing or a hard time limit.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "command": {
++                    "type": "string",
++                    "description": "The shell command to run, e.g. 'python solution.py < big.in'."
++                },
++                "timeout_seconds": {
++                    "type": "number",
++                    "description": "Wall-clock time limit in seconds (default 15)."
++                }
++            },
++            "required": ["command"]
++        }
++    }
++
++
++def _truncate(text):
++    if len(text) <= MAX_OUTPUT_CHARS:
++        return text
++    half = MAX_OUTPUT_CHARS // 2
++    return text[:half] + f"\n...[truncated {len(text) - MAX_OUTPUT_CHARS} chars]...\n" + text[-half:]
++
++
++def tool_function(command, timeout_seconds=15):
++    try:
++        timeout = float(timeout_seconds) if timeout_seconds is not None else 15.0
++    except (TypeError, ValueError):
++        timeout = 15.0
++    timeout = max(0.1, min(timeout, 600.0))
++
++    start = time.monotonic()
++    try:
++        proc = subprocess.Popen(
++            ['bash', '-c', command],
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            start_new_session=True,
++        )
++    except Exception as e:
++        return f"STATUS: ERROR, ELAPSED: 0.0s\nSTDOUT:\n\nSTDERR:\nFailed to start command: {e}"
++
++    status = 'OK'
++    try:
++        stdout, stderr = proc.communicate(timeout=timeout)
++    except subprocess.TimeoutExpired:
++        status = 'TIMEOUT'
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except (ProcessLookupError, PermissionError):
++            pass
++        try:
++            stdout, stderr = proc.communicate(timeout=5)
++        except subprocess.TimeoutExpired:
++            # Pipes still held by a stubborn grandchild; give up on collecting output.
++            stdout, stderr = '', ''
++    elapsed = time.monotonic() - start
++
++    if status == 'OK' and proc.returncode != 0:
++        status = 'ERROR'
++    if status == 'TIMEOUT':
++        stderr = (stderr or '') + f"\n[killed after {timeout:g}s timeout]"
++
++    return (
++        f"STATUS: {status}, ELAPSED: {elapsed:.1f}s, EXIT_CODE: {proc.returncode}\n"
++        f"STDOUT:\n{_truncate(stdout or '')}\n"
++        f"STDERR:\n{_truncate(stderr or '')}"
++    )

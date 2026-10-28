@@ -1,0 +1,167 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5e33ef1..9543532 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -93,6 +94,105 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++FAILURE_MARKER_RE = re.compile(
++    r"MISMATCH|Traceback|AssertionError|FAIL|wrong answer|Error:", re.IGNORECASE
++)
++RECENT_MESSAGE_WINDOW = 6
++
++def _message_role(msg):
++    if isinstance(msg, dict):
++        return msg.get('role', '') or ''
++    return getattr(msg, 'role', '') or ''
++
++def _message_texts(msg):
++    """
++    Extract raw text pieces from a message of any supported shape
++    (Claude-style dict with content blocks, OpenAI dict/object items, plain strings).
++    """
++    texts = []
++    if isinstance(msg, str):
++        return [msg]
++    if isinstance(msg, dict):
++        content = msg.get('content', None)
++        if content is None:
++            content = msg.get('output', None)
++    else:
++        content = getattr(msg, 'content', None)
++        if content is None:
++            content = getattr(msg, 'output_text', None)
++    if isinstance(content, str):
++        texts.append(content)
++    elif isinstance(content, list):
++        for block in content:
++            if isinstance(block, str):
++                texts.append(block)
++            elif isinstance(block, dict):
++                if isinstance(block.get('text'), str):
++                    texts.append(block['text'])
++                if isinstance(block.get('content'), str):
++                    texts.append(block['content'])
++            else:
++                if isinstance(getattr(block, 'text', None), str):
++                    texts.append(block.text)
++    elif content is None and isinstance(msg, dict) and isinstance(msg.get('output'), str):
++        texts.append(msg['output'])
++    return texts
++
++def _tool_result_texts(msg):
++    """
++    Raw tool-result texts from a message (Claude tool_result blocks or OpenAI function_call_output items).
++    Injected user prompts are deliberately excluded.
++    """
++    texts = []
++    if isinstance(msg, dict):
++        if msg.get('type') == 'function_call_output' and isinstance(msg.get('output'), str):
++            texts.append(msg['output'])
++        content = msg.get('content')
++        if isinstance(content, list):
++            for block in content:
++                if isinstance(block, dict) and block.get('type') == 'tool_result':
++                    c = block.get('content')
++                    if isinstance(c, str):
++                        texts.append(c)
++                    elif isinstance(c, list):
++                        for sub in c:
++                            if isinstance(sub, dict) and isinstance(sub.get('text'), str):
++                                texts.append(sub['text'])
++    return texts
++
++def _last_run_failed(msg_history, window=RECENT_MESSAGE_WINDOW):
++    """
++    Scan the last few messages (tool results and assistant text) for generic failure
++    markers. Returns the raw text around the first match, or None. No error parsing.
++    """
++    if not msg_history:
++        return None
++    for msg in reversed(msg_history[-window:]):
++        role = _message_role(msg)
++        if role == 'assistant':
++            candidates = _message_texts(msg)
++        else:
++            candidates = _tool_result_texts(msg)
++        for text in candidates:
++            m = FAILURE_MARKER_RE.search(text)
++            if m:
++                ctx_start = max(0, m.start() - 300)
++                ctx_end = min(len(text), m.end() + 300)
++                return text[ctx_start:ctx_end].strip()
++    return None
++
++def _last_message_empty(msg_history):
++    """
++    True if the most recent assistant message has no non-whitespace text.
++    """
++    if not msg_history:
++        return True
++    for msg in reversed(msg_history):
++        if _message_role(msg) == 'assistant':
++            texts = _message_texts(msg)
++            return not any(t.strip() for t in texts)
++    return True
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -211,9 +311,11 @@ Please follow this workflow:
+ 2. Think through the algorithm and its time/space complexity against the input constraints.
+ 3. Write the complete implementation to disk with the editor tool.
+ 4. Run the program on every sample input and compare the output with the expected output.
+-5. Write a brute-force checker and stress-test the solution on small random inputs.
++5. Save the solution, a brute-force checker, and a stress-test script in separate files. The stress test generates many small random inputs, compares the solution against the brute force, and prints only the first counterexample (input, expected, got) or 'ALL OK'.
+ 6. Test the largest inputs for speed.
+ 7. Fix any issues you find, and re-run the checks.
++If the stress test ever prints a mismatch, you must NOT finish: derive why the algorithm is wrong from the smallest counterexample, rewrite the solution with a corrected algorithm, and re-run the stress test until it prints 'ALL OK'.
++Never end your turn with an empty message.
+ 
+ The task is only complete once the solution source file has been written to disk. Ending your turn with no tool calls or an empty message is a failure. Do not just describe the solution; you must save it with the editor tool.
+ """
+@@ -241,6 +343,35 @@ The task is only complete once the solution source file has been written to disk
+                 fresh_instruction = f"{instruction}\n\n{corrective}"
+                 msg_history = chat_with_agent(fresh_instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
++        # Bounded verification-and-repair loop (max 3 rounds)
++        for round_idx in range(1, 4):
++            failure = _last_run_failed(msg_history)
++            empty = _last_message_empty(msg_history)
++            if not failure and not empty:
++                break
++            safe_log(f"Repair round {round_idx}/3: failure_detected={bool(failure)} empty_last_message={empty}")
++            if failure:
++                failure_block = f"The raw output from your last test run was:\n```\n{failure}\n```\n"
++            else:
++                failure_block = "Your last message was empty, which is not acceptable.\n"
++            repair = (
++                "Your own test showed a failure, so do not finish yet.\n"
++                f"{failure_block}"
++                "Analyze the smallest counterexample from this output, and identify the specific flaw in your reasoning. "
++                "Do not just patch the code: consider a different algorithm (for example, binary search on the answer with a feasibility check, or dynamic programming), "
++                "rewrite solution.py, and re-run the stress test until it reports no mismatch (it must print 'ALL OK'). "
++                "Do not end your turn with an empty message; finish with a short summary of the final state."
++            )
++            msg_history = chat_with_agent(repair, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        # Final mandatory verification round
++        verify = (
++            "Final check: if you have not yet run a brute-force comparison on at least a few hundred small random inputs, do so now "
++            "and report the result (the number of inputs checked and whether there were any mismatches). "
++            "If a mismatch appears, fix the solution and re-run until it is clean. Do not end with an empty message."
++        )
++        msg_history = chat_with_agent(verify, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

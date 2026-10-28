@@ -1,0 +1,534 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 57efd74..0e3a6ad 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -123,6 +123,38 @@ ADVERSARIAL_PROMPT = """Final adversarial review. All samples pass now. Your job
+ 4. Fix any mismatch or slowness you find in solution.py. Keep all samples passing (they are in samples/*.in and samples/*.out under the repo directory).
+ """
+ 
++NOTES_FILE = "NOTES.md"
++MAX_SUMMARY_CHARS = 1500
++BRUTE_STRESS_CASES = 60
++BRUTE_STRESS_TIMEOUT = 5
++
++def summarize_attempt(final_message, files, attempt_no, mode):
++    """LLM-free summarizer: keeps the last MAX_SUMMARY_CHARS of the agent's final message plus file names."""
++    text = (final_message or "").strip()
++    if len(text) > MAX_SUMMARY_CHARS:
++        text = "..." + text[-MAX_SUMMARY_CHARS:]
++    file_list = ", ".join(sorted(files)) if files else "(none)"
++    return f"Attempt {attempt_no} ({mode}) files: {file_list}\nFinal message tail: {text}"
++
++def last_assistant_text(msg_history):
++    """Return the text of the last assistant message in a chat history (supports str or block content)."""
++    for m in reversed(msg_history or []):
++        if not isinstance(m, dict) or m.get("role") != "assistant":
++            continue
++        c = m.get("content")
++        if isinstance(c, str):
++            return c
++        if isinstance(c, list):
++            parts = []
++            for b in c:
++                if isinstance(b, dict) and isinstance(b.get("text"), str):
++                    parts.append(b["text"])
++                elif isinstance(b, str):
++                    parts.append(b)
++            if parts:
++                return "\n".join(parts)
++    return ""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -145,6 +177,8 @@ class AgenticSystem:
+         self.sample_names = []
+         self.lessons = []
+         self.last_report = None
++        self.notes_text = ""
++        self.last_summary = ""
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -291,6 +325,26 @@ class AgenticSystem:
+         lines.append(f"{passed}/{len(results)} samples passed")
+         return results, "\n".join(lines)
+ 
++    def _update_notes_and_summary(self, hist, attempt_no, mode):
++        """After an attempt: read NOTES.md (if written), and build a summary of the final message."""
++        notes_path = os.path.join(self.git_tempdir, NOTES_FILE)
++        if os.path.exists(notes_path):
++            try:
++                with open(notes_path) as f:
++                    self.notes_text = f.read()[-4000:]
++            except Exception as e:
++                safe_log(f"notes read failed: {e}", level=logging.WARNING)
++        files = []
++        try:
++            diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            files = [m.group(2) for m in re.finditer(r'^diff --git a/(\S+) b/(\S+)', diff, flags=re.MULTILINE)]
++        except Exception:
++            pass
++        if os.path.isdir(self.git_tempdir):
++            files = sorted(set(files) | {f for f in os.listdir(self.git_tempdir)
++                                         if f.endswith('.py') or f == NOTES_FILE})
++        self.last_summary = summarize_attempt(last_assistant_text(hist), files, attempt_no, mode)
++
+     def _restore_snapshot(self, path):
+         shutil.copyfile(path, os.path.join(self.git_tempdir, 'solution.py'))
+ 
+@@ -310,6 +364,10 @@ class AgenticSystem:
+                     except OSError:
+                         pass
+         shutil.rmtree(self.samples_dir, ignore_errors=True)
++        try:
++            os.remove(os.path.join(self.git_tempdir, NOTES_FILE))
++        except OSError:
++            pass
+ 
+     def _write_fallback_solution(self):
+         """
+@@ -351,7 +409,63 @@ class AgenticSystem:
+         results, report = self._run_samples()
+         passed = sum(1 for r in results if r['ok'])
+         max_rt = max((r['seconds'] for r in results), default=0.0)
+-        return (passed, -max_rt), report, passed == len(results)
++        agree, stress_report = self._stress_against_brute()
++        report = report + "\n" + stress_report
++        # score = (sample passes, agreement with brute on random small inputs, -max runtime)
++        return (passed, agree, -max_rt), report, passed == len(results)
++
++    def _stress_against_brute(self):
++        """
++        Run solution.py and brute.py on small random inputs produced by a generator (gen.py or
++        generator.py in the repo, exposing gen(rng, size)). Returns (agreement_fraction, report).
++        agreement is 0.0 when brute.py or the generator is missing, so it never helps by default.
++        """
++        import random as _random
++        root = self.git_tempdir
++        brute = os.path.join(root, 'brute.py')
++        gen_path = next((os.path.join(root, g) for g in ('gen.py', 'generator.py')
++                         if os.path.exists(os.path.join(root, g))), None)
++        if not os.path.exists(brute) or gen_path is None:
++            return 0.0, "stress vs brute: skipped (need brute.py and gen.py)"
++        try:
++            import importlib.util as _ilu
++            spec = _ilu.spec_from_file_location("_agent_gen", gen_path)
++            gmod = _ilu.module_from_spec(spec)
++            spec.loader.exec_module(gmod)
++            rng = _random.Random(7)
++            inputs = []
++            if hasattr(gmod, 'enumerate_all'):
++                for i, x in enumerate(gmod.enumerate_all()):
++                    if i >= BRUTE_STRESS_CASES:
++                        break
++                    inputs.append(x)
++            size = 1
++            while len(inputs) < BRUTE_STRESS_CASES:
++                inputs.append(gmod.gen(rng, size))
++                size = min(size + 1, 12)
++        except Exception as e:
++            return 0.0, f"stress vs brute: generator error: {e}"
++        same = 0
++        total = 0
++        first_bad = None
++        for x in inputs:
++            # Generators may return a str or a tuple of args; both are passed as stdin text.
++            text = x if isinstance(x, str) else "\n".join(str(v) for v in x) if isinstance(x, (list, tuple)) else str(x)
++            try:
++                a = subprocess.run(["python3", os.path.join(root, 'solution.py')], input=text,
++                                   capture_output=True, text=True, timeout=BRUTE_STRESS_TIMEOUT, cwd=root)
++                b = subprocess.run(["python3", brute], input=text, capture_output=True, text=True,
++                                   timeout=BRUTE_STRESS_TIMEOUT, cwd=root)
++                ok = a.returncode == 0 and b.returncode == 0 and a.stdout.split() == b.stdout.split()
++            except subprocess.TimeoutExpired:
++                ok = False
++            total += 1
++            same += int(ok)
++            if not ok and first_bad is None:
++                first_bad = text[:200]
++        frac = same / total if total else 0.0
++        rep = f"stress vs brute: {same}/{total} agree" + (f"; first mismatch input: {first_bad!r}" if first_bad else "")
++        return frac, rep
+ 
+     def forward(self):
+         """
+@@ -378,9 +492,16 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+    - Your generator must NOT discard or skip degenerate inputs (minimum length, all equal values, max values, sorted and reverse-sorted input, special values). Do not add filters that exclude cases your solution handles specially.
+    - Exhaustively enumerate all inputs of tiny size and value range where feasible (use `enumerate_all()`).
+ 7. Audit every early return and special-case branch and confirm it is correct for every input that can reach it.
+-8. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-9. Keep messages short and avoid long reasoning without tool calls; very long outputs get cut off. If you have used more than ~15 tool calls without a solution.py that passes the samples, write the best correct-but-slow version now.
+-10. Before finishing, remove scratch files you created besides brute.py, the generator and the sample files if they are not needed, and make sure no __pycache__ directories or .pyc files remain. The final solution.py is what gets graded; helper files are ignored."""
++8. Brute-force-as-oracle protocol. If the brute force cannot handle the maximum constraints, do NOT iterate on the brute force. Treat it as an oracle, and follow:
++   (a) separate coarse and fine parameters (coarse = huge coordinates/values, fine = small residues, moduli, counts);
++   (b) call the `fit_formula` tool (oracle_path = a Python file in the repo defining f(*args) that wraps the brute force; list the parameter specs with name, min, max, kind 'linear' or 'periodic' plus modulus) to find the dependency structure and a closed formula per residue class;
++   (c) if no closed form fits, compress the structure into a small abstract graph (boundary states per block, edge weights from the oracle) and run Dijkstra or a matrix-style DP over it, then check it against the oracle on held-out small inputs;
++   (d) never print tables longer than ~20 lines; keep tool outputs compact.
++9. Notes. Keep a file NOTES.md in the repo root listing every hypothesis you tried, with the result (confirmed / refuted and the counterexample). Update it as you go.
++   In attempts 2 and later, the previous NOTES.md is provided below. Do NOT repeat refuted hypotheses, and use a method different from the previous attempt's method.
++11. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
++12. Keep messages short and avoid long reasoning without tool calls; very long outputs get cut off. If you have used more than ~15 tool calls without a solution.py that passes the samples, write the best correct-but-slow version now.
++13. Before finishing, remove scratch files you created besides brute.py, the generator and the sample files if they are not needed, and make sure no __pycache__ directories or .pyc files remain. The final solution.py is what gets graded; helper files are ignored."""
+ 
+         first_line = ("Your first action must be a tool call that writes a complete draft solution.py; "
+                       "avoid long analysis before writing the file.\n\n")
+@@ -410,11 +531,21 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                     best_src = f.read()
+             last_report = self.last_report or "(no verifier report yet; no attempt has produced a valid solution.py)"
+             lessons_text = "\n".join(f"- {x}" for x in self.lessons) or "(none yet)"
++            notes_block = ""
++            if attempt > 0:
++                notes_block = (
++                    f"Notes from earlier attempts ({NOTES_FILE}):\n"
++                    f"{self.notes_text or '(no NOTES.md was written)'}\n\n"
++                    "Rule: do not repeat refuted hypotheses listed above; start from the previous analysis "
++                    "and use a different method.\n\n"
++                    f"Summary of the previous attempt:\n{self.last_summary or '(none)'}\n\n"
++                )
+ 
+             instr = (
+                 f"{instruction_base}\n\n"
+                 f"=== Attempt {attempt + 1} of {MAX_ATTEMPTS} ({mode}) ===\n"
+                 f"{extra}\n\n"
++                f"{notes_block}"
+                 f"Lessons from earlier attempts:\n{lessons_text}\n\n"
+                 f"Best solution.py so far (score {best['score'] if best else 'none'}):\n"
+                 f"```python\n{best_src or '(none)'}\n```\n\n"
+@@ -422,12 +553,13 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             )
+             safe_log(f"forward: attempt {attempt + 1}/{MAX_ATTEMPTS} mode={mode}")
+             try:
+-                chat_with_agent(instr, model=self.code_model, msg_history=[], logging=safe_log)
++                hist = chat_with_agent(instr, model=self.code_model, msg_history=[], logging=safe_log)
+             except Exception as e:
+                 safe_log(f"forward: attempt {attempt + 1} raised {e}", level=logging.ERROR)
+                 self.lessons.append(f"Attempt {attempt + 1} crashed: {e}")
+                 continue
+             safe_log(f"forward: attempt {attempt + 1} finished")
++            self._update_notes_and_summary(hist, attempt + 1, mode)
+ 
+             score, report, all_pass = self._evaluate_candidate()
+             self.last_report = report
+@@ -436,6 +568,8 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                 self.lessons.append(f"Attempt {attempt + 1}: {report}")
+                 continue
+             self.lessons.append(f"Attempt {attempt + 1} ({mode}): score={score}; {report.splitlines()[-1]}")
++            if self.last_summary:
++                self.lessons.append(self.last_summary.split("\n")[0])
+ 
+             snap = os.path.join(cand_dir, f"attempt_{attempt + 1}.py")
+             shutil.copyfile(solution_path, snap)
+diff --git a/tools/fit_formula.py b/tools/fit_formula.py
+new file mode 100644
+index 0000000..58eaba4
+--- /dev/null
++++ b/tools/fit_formula.py
+@@ -0,0 +1,307 @@
++import importlib.util
++import itertools
++import random
++import traceback
++from fractions import Fraction
++
++OUT_CAP = 2900
++
++
++def tool_info():
++    return {
++        "name": "fit_formula",
++        "description": """Study a slow brute-force oracle at large parameter values and fit closed forms.\n
++* oracle_path: a Python file defining `f(*args)` (the brute force). Arguments are passed in the order of `params`.\n
++* params: list of parameter specs. kind 'linear' = large coordinate-like value, sampled in [min,max]; kind 'periodic' = value whose residue mod `modulus` defines a group (the oracle is studied per residue class).\n
++* The tool samples the oracle, groups points by periodic residues, and per group tests exact affine fits in the linear params and affine fits in simple features (|xi-xj|, max, min of pairs). It reports the best rule per group, match fraction, and up to 5 counterexamples.\n
++* It also reports which parameters change the output (dependency test).\n
++* Output is compact by design. Use small ranges (e.g. max up to 60) for quick scale studies, and larger ranges to validate a candidate formula.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "oracle_path": {
++                    "type": "string",
++                    "description": "Absolute path to a Python file exposing f(*args) that returns the brute-force answer."
++                },
++                "params": {
++                    "type": "array",
++                    "description": "Ordered list of parameter specs; each item describes one argument of f.",
++                    "items": {
++                        "type": "object",
++                        "properties": {
++                            "name": {"type": "string", "description": "Parameter name, used in reports."},
++                            "min": {"type": "integer", "description": "Minimum sampled value (inclusive)."},
++                            "max": {"type": "integer", "description": "Maximum sampled value (inclusive)."},
++                            "kind": {"type": "string", "enum": ["linear", "periodic"],
++                                     "description": "'linear' for fit in affine forms; 'periodic' to group by residue mod modulus."},
++                            "modulus": {"type": "integer", "description": "Modulus for kind 'periodic' (ignored for linear)."}
++                        },
++                        "required": ["name", "min", "max", "kind"]
++                    }
++                },
++                "num_samples": {
++                    "type": "integer",
++                    "description": "Approximate total number of oracle samples (default 300)."
++                }
++            },
++            "required": ["oracle_path", "params"]
++        }
++    }
++
++
++def _load_oracle(path):
++    spec = importlib.util.spec_from_file_location("_fit_oracle_mod", path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod.f
++
++
++def _solve_ls(rows, ys):
++    """Exact least squares via normal equations over Fractions; free variables set to 0."""
++    n = len(rows[0])
++    M = [[Fraction(0)] * (n + 1) for _ in range(n)]
++    for r, y in zip(rows, ys):
++        for i in range(n):
++            ri = r[i]
++            if ri == 0:
++                continue
++            for j in range(n):
++                M[i][j] += ri * r[j]
++            M[i][n] += ri * y
++    piv_cols = []
++    row = 0
++    for col in range(n):
++        if row >= n:
++            break
++        p = next((k for k in range(row, n) if M[k][col] != 0), None)
++        if p is None:
++            continue
++        M[row], M[p] = M[p], M[row]
++        inv = M[row][col]
++        M[row] = [v / inv for v in M[row]]
++        for k in range(n):
++            if k != row and M[k][col] != 0:
++                fct = M[k][col]
++                M[k] = [a - fct * b for a, b in zip(M[k], M[row])]
++        piv_cols.append(col)
++        row += 1
++    c = [Fraction(0)] * n
++    for i, col in enumerate(piv_cols):
++        c[col] = M[i][n]
++    return c
++
++
++def _feature_names(lin_names, mode):
++    names = ["1"] + list(lin_names)
++    if mode == "abs":
++        for i, j in itertools.combinations(range(len(lin_names)), 2):
++            a, b = lin_names[i], lin_names[j]
++            names += [f"|{a}-{b}|", f"max({a},{b})", f"min({a},{b})"]
++    return names
++
++
++def _features(lin_vals, mode):
++    feats = [Fraction(1)] + [Fraction(v) for v in lin_vals]
++    if mode == "abs":
++        for i, j in itertools.combinations(range(len(lin_vals)), 2):
++            a, b = lin_vals[i], lin_vals[j]
++            feats += [Fraction(abs(a - b)), Fraction(max(a, b)), Fraction(min(a, b))]
++    return feats
++
++
++def _fit_group(points, lin_names, mode):
++    """points: list of (lin_vals tuple, f value). Returns (rule_str, matched, total, coeffs, mismatches)."""
++    rows = [_features(x, mode) for x, _ in points]
++    ys = [Fraction(y) for _, y in points]
++    c = _solve_ls(rows, ys)
++    names = _feature_names(lin_names, mode)
++    matched = 0
++    mism = []
++    for (x, y), r in zip(points, rows):
++        pred = sum(ci * ri for ci, ri in zip(c, r))
++        if pred == y:
++            matched += 1
++        else:
++            mism.append((x, y, pred))
++    terms = [f"{c[k]}*{names[k]}" for k in range(len(c)) if c[k] != 0]
++    rule = " + ".join(terms) if terms else "0"
++    return rule, matched, len(points), mism
++
++
++def _fmt_args(args):
++    return "(" + ",".join(str(a) for a in args) + ")"
++
++
++def tool_function(oracle_path, params, num_samples=300):
++    try:
++        f = _load_oracle(oracle_path)
++    except Exception as e:
++        return f"Error loading oracle: {type(e).__name__}: {e}"
++    try:
++        num_samples = int(num_samples or 300)
++        specs = []
++        for p in params:
++            kind = p.get("kind", "linear")
++            if kind not in ("linear", "periodic"):
++                return f"Error: unknown kind {kind!r} for {p.get('name')}"
++            lo, hi = int(p["min"]), int(p["max"])
++            if hi < lo:
++                return f"Error: max < min for {p.get('name')}"
++            mod = int(p.get("modulus") or 1) if kind == "periodic" else 1
++            if kind == "periodic" and mod < 1:
++                return f"Error: modulus must be >= 1 for {p.get('name')}"
++            specs.append({"name": p["name"], "lo": lo, "hi": hi, "kind": kind, "mod": mod})
++        rng = random.Random(12345)
++        per_idx = [i for i, s in enumerate(specs) if s["kind"] == "periodic"]
++        lin_idx = [i for i, s in enumerate(specs) if s["kind"] == "linear"]
++        lin_names = [specs[i]["name"] for i in lin_idx]
++
++        def sample_value(s, residue=None):
++            lo, hi, m = s["lo"], s["hi"], s["mod"]
++            if residue is None:
++                if rng.random() < 0.2:
++                    return rng.choice([lo, hi])
++                return rng.randint(lo, hi)
++            first = lo + ((residue - lo) % m)
++            if first > hi:
++                return None
++            cnt = (hi - first) // m + 1
++            k = rng.choice([0, cnt - 1]) if rng.random() < 0.2 else rng.randint(0, cnt - 1)
++            return first + k * m
++
++        # Residue groups for periodic params.
++        groups = []
++        if per_idx:
++            full = 1
++            for i in per_idx:
++                full *= specs[i]["mod"]
++            if full <= 40:
++                combos = itertools.product(*[range(specs[i]["mod"]) for i in per_idx])
++                cand = list(combos)
++            else:
++                cand = []
++                for _ in range(40):
++                    cand.append(tuple(specs[i]["lo"] + rng.randrange(max(1, specs[i]["hi"] - specs[i]["lo"] + 1))
++                                      for i in per_idx))
++                cand = [tuple(v % specs[i]["mod"] for v, i in zip(c, per_idx)) for c in cand]
++            seen = set()
++            for c in cand:
++                if c in seen:
++                    continue
++                seen.add(c)
++                ok = all(sample_value(specs[i], r) is not None for r, i in zip(c, per_idx))
++                if ok:
++                    groups.append(c)
++            groups = groups[:40]
++        else:
++            groups = [()]
++        if not groups:
++            return "Error: no valid residue groups in the given ranges."
++
++        per_group = max(12, num_samples // len(groups))
++        n_calls = 0
++        errors = 0
++        group_results = []
++        for g in groups:
++            pts = []
++            for _ in range(per_group):
++                vals = [None] * len(specs)
++                for r, i in zip(g, per_idx):
++                    vals[i] = sample_value(specs[i], r)
++                for i in lin_idx:
++                    vals[i] = sample_value(specs[i])
++                try:
++                    y = f(*vals)
++                    n_calls += 1
++                except Exception:
++                    errors += 1
++                    continue
++                if isinstance(y, bool):
++                    y = int(y)
++                try:
++                    y = int(y)
++                except Exception:
++                    return f"Error: oracle returned non-integer {y!r} at args {_fmt_args(vals)}"
++                pts.append((tuple(vals[i] for i in lin_idx), y, tuple(vals)))
++            if len(pts) < 3:
++                continue
++            best = None
++            for mode in ("affine", "abs"):
++                rule, matched, total, mism = _fit_group([(x, y) for x, y, _ in pts], lin_names, mode)
++                score = matched / total
++                if best is None or score > best[0] + 1e-12:
++                    best = (score, mode, rule, matched, total, mism)
++                if matched == total:
++                    break
++            group_results.append((g, best))
++
++        # Dependency test: which parameters change the output.
++        dep_lines = []
++        for i, s in enumerate(specs):
++            changed = 0
++            trials = 0
++            for _ in range(6):
++                base = [None] * len(specs)
++                for j, t in enumerate(specs):
++                    base[j] = sample_value(t, rng.randrange(t["mod"]) if t["kind"] == "periodic" else None)
++                    if base[j] is None:
++                        base[j] = t["lo"]
++                if specs[i]["kind"] == "periodic":
++                    vals_alt = [sample_value(s, rng.randrange(s["mod"])) for _ in range(3)]
++                else:
++                    vals_alt = [s["lo"], s["hi"], rng.randint(s["lo"], s["hi"])]
++                outs = []
++                for v in vals_alt:
++                    if v is None:
++                        continue
++                    a = list(base)
++                    a[i] = v
++                    try:
++                        outs.append(f(*a))
++                        n_calls += 1
++                    except Exception:
++                        errors += 1
++                if len(outs) >= 2:
++                    trials += 1
++                    if any(o != outs[0] for o in outs[1:]):
++                        changed += 1
++            pct = (100 * changed // trials) if trials else -1
++            dep_lines.append(f"  {s['name']}: changes output in {pct}% of trials" if trials else
++                             f"  {s['name']}: not tested")
++
++        lines = [f"oracle calls={n_calls} errors={errors} groups={len(group_results)} "
++                 f"per_group={per_group}"]
++        lines.append("dependency (parameter changes output alone):")
++        lines += dep_lines[:12]
++        full_ok = sum(1 for _, b in group_results if b and b[3] == b[4])
++        lines.append(f"groups fully matched: {full_ok}/{len(group_results)}")
++        shown = 0
++        for g, b in group_results:
++            if shown >= 12:
++                lines.append("  ...more groups omitted")
++                break
++            score, mode, rule, matched, total, _ = b
++            gname = ",".join(f"{specs[i]['name']}%{specs[i]['mod']}={r}" for r, i in zip(g, per_idx)) or "all"
++            rule_s = rule if len(rule) <= 160 else rule[:157] + "..."
++            lines.append(f"[{gname}] {mode}: {rule_s} match={matched}/{total}")
++            shown += 1
++        cex = []
++        for g, b in group_results:
++            if b and b[5]:
++                for x, y, pred in b[5]:
++                    if len(cex) >= 5:
++                        break
++                    cex.append(f"  args{_fmt_args(x)} f={y} rule_pred={pred}")
++            if len(cex) >= 5:
++                break
++        if cex:
++            lines.append("counterexamples (linear args only):")
++            lines += cex
++        else:
++            lines.append("no counterexamples to the best fits")
++        out = "\n".join(lines)
++        if len(out) > OUT_CAP:
++            out = out[:OUT_CAP - 30] + "\n...<output clipped>"
++        return out
++    except Exception as e:
++        return f"Error during fit: {type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}"

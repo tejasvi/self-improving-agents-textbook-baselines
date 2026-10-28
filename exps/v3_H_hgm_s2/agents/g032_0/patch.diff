@@ -1,0 +1,498 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a50f826..2f1d3fb 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ import os
+ import threading
+ import json
+ import re
++import tempfile
+ import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, simple_chat
+@@ -136,6 +137,23 @@ result = getattr(mod.Solution(), method)(*args)
+ out = result if isinstance(result, str) else repr(result)
+ sys.stdout.write("__METHOD_RESULT__" + json.dumps(out) + "\n")
+ '''
++# Variant of _METHOD_RUNNER that reads the args literal from a file (argv has a size limit,
++# and max-size adversarial inputs can exceed it).
++_METHOD_RUNNER_FILE = r'''
++import sys, json, ast, importlib.util
++path, method = sys.argv[1], sys.argv[2]
++with open(sys.argv[3]) as _f:
++    args_src = _f.read()
++spec = importlib.util.spec_from_file_location("candidate_solution", path)
++mod = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(mod)
++args = ast.literal_eval(args_src)
++if not isinstance(args, tuple):
++    args = (args,)
++result = getattr(mod.Solution(), method)(*args)
++out = result if isinstance(result, str) else repr(result)
++sys.stdout.write("__METHOD_RESULT__" + json.dumps(out) + "\n")
++'''
+ 
+ class AgenticSystem:
+     def __init__(
+@@ -320,14 +338,14 @@ Return ONLY a JSON array (no prose) of objects with string keys:
+                     samples.append(sample)
+         return samples
+ 
+-    def _run_method_sample(self, solution_path, sample):
++    def _run_method_sample(self, solution_path, sample, timeout=10):
+         """
+         Run one class-method sample: import the solution module, call Solution().method(*args)
+         in a subprocess, and return (actual_text, stderr, returncode). Raises TimeoutExpired on timeout.
+         """
+         proc = subprocess.run(
+             ["python3", "-c", _METHOD_RUNNER, solution_path, str(sample["method"]), str(sample["args"])],
+-            capture_output=True, text=True, timeout=10, cwd=self.git_tempdir,
++            capture_output=True, text=True, timeout=timeout, cwd=self.git_tempdir,
+         )
+         actual = ""
+         for line in proc.stdout.splitlines():
+@@ -442,6 +460,153 @@ Return ONLY a JSON array (no prose) of objects with string keys:
+                 return os.path.join(self.git_tempdir, f)
+         return os.path.join(self.git_tempdir, candidates[0])
+ 
++    def _perf_check(self, task, method_note, samples):
++        """
++        Worst-case performance phase. The LLM proposes the max constraints and 6-10 structured
++        adversarial max-size inputs (JSON); the harness times each one in a subprocess with a 5s
++        timeout and reports the raw times. If any input is slow (> 2s) or times out, a repair chat
++        redesigns the algorithm and the benchmark is re-run. Bounded: at most 2 repair rounds.
++        """
++        solution_path = self._solution_path()
++        if not solution_path:
++            safe_log("[perf] no solution file found; skipping performance check.")
++            return
++        method_task = self._is_method_task()
++        method_names = [s.get("method") for s in samples if s.get("method")]
++        method_name = method_names[0] if method_names else ""
++
++        if method_task:
++            input_desc = ('"input": a Python literal tuple of the positional arguments of the method, '
++                          'e.g. "(\\"aaaa\\", 3)" (use a trailing comma for one argument)')
++            method_desc = f'"method": the method name of class Solution (use "{method_name}" if known)'
++        else:
++            input_desc = '"input": the exact stdin text of the program'
++            method_desc = '"method": ""'
++        prompt = f"""Below is a competitive programming problem. Determine its maximum input constraints and propose adversarial worst-case inputs at the maximum size.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++Return ONLY a JSON array (no prose) of 6 to 10 objects with string keys:
++{{"label": "<short description of the structure, e.g. 'single repeated char, n=max'>", {method_desc}, {input_desc}}}
++
++Requirements:
++- Use the maximum allowed sizes from the constraints (the largest n allowed), not small sizes.
++- Cover different structures that stress different algorithms: constant or nearly constant values, two values with unequal counts, sorted and reverse-sorted inputs, periodic patterns, many distinct values, extreme values of the allowed range, and random inputs.
++- Each input must be valid under the statement's constraints.
++- Write every input as a plain literal (for method tasks, a Python literal tuple; for stdin tasks, the exact text). Do NOT use expressions such as "a" * 10000.
++"""
++        cases = None
++        for _attempt in range(2):
++            text = simple_chat(prompt, model=self.code_model, max_tokens=8192, logging=safe_log)
++            cases = self._parse_json_array(text or "")
++            if cases is not None:
++                break
++            safe_log(f"[perf] case proposal attempt {_attempt} produced no JSON array.")
++        if not cases:
++            safe_log("[perf] no adversarial cases proposed; skipping performance check.")
++            return
++        norm_cases = []
++        for item in cases:
++            if not isinstance(item, dict):
++                continue
++            payload = item.get("input", "")
++            if isinstance(payload, (list, tuple)):
++                payload = repr(tuple(payload))
++            payload = str(payload)
++            method = str(item.get("method") or method_name)
++            if method_task and not (method and payload):
++                continue
++            norm_cases.append({"label": str(item.get("label", "")), "method": method, "input": payload})
++        if not norm_cases:
++            safe_log("[perf] proposed cases were not usable; skipping performance check.")
++            return
++        norm_cases = norm_cases[:10]
++
++        for round_idx in range(3):
++            solution_path = self._solution_path()
++            if not solution_path:
++                break
++            report, slow = self._run_perf_cases(solution_path, norm_cases, method_task)
++            safe_log(f"[perf round {round_idx}] solution: {solution_path}\n{report}")
++            if not slow:
++                safe_log(f"[perf round {round_idx}] all cases within limits; stopping.")
++                break
++            if round_idx == 2:
++                safe_log("[perf] repair rounds exhausted; stopping.")
++                break
++            current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            repair_msg = f"""{task}
++
++The solution was timed on adversarial max-size inputs (wall time includes Python startup; 2 seconds is the target ceiling). Raw timing report:
++
++{report}
++
++Current diff:
++{current_diff if current_diff.strip() else '(empty)'}
++
++Instructions:
++- Some inputs are slow (over 2 seconds) or timed out. Determine the complexity of the current algorithm as ops = f(n) at max n, and identify the operation that dominates on the slow inputs.
++- Redesign the algorithm with a provably faster approach (for example, remove a heuristic, pruning rule, or repeated scan, and replace it with an algorithm whose worst case has a proven bound). Do NOT just add caps or pruning that is not proven.
++{method_note}
++- Fix the solution file with the editor tool (`edit` or `create`, which overwrites).
++- Re-check correctness: compare the new solution against the previous one or a brute force on many small random inputs by exact output comparison.
++- Re-run the adversarial max-size inputs with the `benchmark` tool and confirm the times are within limits.
++- Re-run all samples with bash and confirm they still pass.
++- Do not reply with text only; finish only after the fixes are written to disk and verified.
++"""
++            chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"[perf round {round_idx}] repair chat finished.")
++
++    def _run_perf_cases(self, solution_path, cases, method_task, time_limit=5.0, slow_threshold=2.0):
++        """
++        Time each case in a subprocess with a time limit. Returns (raw_report, any_slow).
++        """
++        lines = [f"{'idx':>4} | {'label':<40} | {'wall_s':>8} | {'TIMEOUT':<7} | exit | stderr (tail)"]
++        any_slow = False
++        for idx, case in enumerate(cases):
++            start = time.time()
++            timed_out = False
++            stderr_text = ""
++            rc_text = "-"
++            try:
++                if method_task:
++                    # Pass the args literal via a file: large inputs exceed the argv size limit.
++                    with tempfile.NamedTemporaryFile("w", suffix=".args", delete=False) as tf:
++                        tf.write(case["input"])
++                        args_path = tf.name
++                    try:
++                        proc = subprocess.run(
++                            ["python3", "-c", _METHOD_RUNNER_FILE, solution_path, case["method"], args_path],
++                            capture_output=True, text=True, timeout=time_limit, cwd=self.git_tempdir,
++                        )
++                    finally:
++                        os.unlink(args_path)
++                    rc_text = str(proc.returncode)
++                    stderr_text = proc.stderr
++                else:
++                    stdin_text = case["input"] if case["input"].endswith("\n") or not case["input"] else case["input"] + "\n"
++                    proc = subprocess.run(
++                        ["python3", solution_path], input=stdin_text, capture_output=True, text=True,
++                        timeout=time_limit, cwd=self.git_tempdir,
++                    )
++                    rc_text = str(proc.returncode)
++                    stderr_text = proc.stderr
++            except subprocess.TimeoutExpired as e:
++                timed_out = True
++                stderr_text = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
++            elapsed = time.time() - start
++            if timed_out or elapsed > slow_threshold:
++                any_slow = True
++            tail = stderr_text[-300:].strip().replace("\n", " | ")
++            lines.append(
++                f"{idx:>4} | {case['label'][:40]:<40} | {elapsed:>8.3f} | {'YES' if timed_out else 'no':<7} | "
++                f"{'-' if timed_out else rc_text:>4} | {tail}"
++            )
++        header = f"Adversarial max-size timing (limit {time_limit}s per case, slow threshold {slow_threshold}s):"
++        return header + "\n" + "\n".join(lines), any_slow
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -460,6 +625,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ Follow this step-by-step workflow:
+ 1) Inspect the repository: use bash (e.g. `ls -la`, `cat`) and the editor tool to view existing files, and determine which file the solution must be written to (use the file named in the problem statement; if none is named, use the existing solution/entry file in the repo).
+ 2) Reason about the algorithm and the complexity needed for the input constraints before writing code. Do not ship heuristics (caps, restricted ranges, pruning) validated only on tiny inputs; validate them on medium/large inputs against an exact version, or prove them.
++   Before finishing, state the worst-case complexity as a number of operations at max constraints (e.g. "ops = n^2 * 26 = 1.4e10, too slow"), then benchmark adversarial max-size inputs with the `benchmark` tool (use mode "generate" to write structured presets such as constant, two-value, sorted, periodic, and extreme values, then mode "method" or "stdin" to time them). Do not rely on pruning heuristics unless they are proven or compared against an unpruned version at medium and large sizes.
+    If the statement allows multiple valid outputs (e.g. "if there are multiple solutions, print any"), do NOT assume any valid output is accepted. Assume the grader compares against the reference output, and choose the lexicographically smallest / first-in-natural-enumeration-order answer as the canonical answer. Design the algorithm so that this canonical answer is produced efficiently at max constraints, controlling tie-breaking explicitly. If the answer is a single number or otherwise unique, no tie-breaking is needed.
+ 3) Write the implementation to the required file using the editor tool's `create` or `edit` command. The file MUST be written to disk.
+ 4) Run the program on every sample input in the problem statement with bash and compare its output with the expected output. Fix any mismatch and re-run until all samples pass. If the statement allows multiple valid outputs, verify that every sample expected output equals your canonical answer; if it does not, your choice of canonical order is wrong, so revise it.
+@@ -522,6 +688,9 @@ Instructions:
+             chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[verify round {round_idx}] repair chat finished.")
+ 
++        # Worst-case performance phase: adversarial max-size inputs proposed by the LLM, timed by the harness.
++        self._perf_check(task, method_note, samples)
++
+         # Assumption audit + multi-scale differential testing phase: runs even when samples
+         # pass, because samples are tiny and cannot expose heuristics that only fail on large inputs.
+         for audit_idx in range(2):
+@@ -544,7 +713,8 @@ Small brute-force comparisons cannot reveal heuristics that only fail on large i
+ (c) Write generators in /tmp for at least three size tiers: tiny (n about 1-9), medium (about 50-500), and large (as big as the exact reference can still handle in reasonable time). Include adversarial distributions: skewed values, many distinct values, all-equal values, extremes of the value range, and sizes at the boundaries of the constraints.
+ (d) Run differential tests between solution.py and /tmp/exact.py: hundreds of cases per tier, each run with a timeout (e.g. `timeout 10`), comparing stdout EXACTLY. Use a Python driver or a shell loop. Keep generated files in /tmp.
+ (e) If ANY mismatch occurs, fix solution.py with the editor tool so it matches the exact reference. Never weaken or change /tmp/exact.py to match the solution. Remove any heuristic you cannot prove, or validate it against the exact version on medium and large inputs.
+-(f) Time solution.py on a max-size input allowed by the constraints, and confirm it is within the time limit.
++(f) Time solution.py on a max-size input allowed by the constraints, and confirm it is within the time limit. State the complexity as `ops = f(n)` at max n (a number, e.g. ops = 2e8) and check that it is achievable within the limit; if it is not, redesign with a provably faster algorithm.
++(f2) Create test scripts (generators, brute force, stress drivers) with the editor tool and redirect their outputs to files (e.g. `python3 /tmp/gen.py > /tmp/in.txt`), instead of pasting long heredocs into bash, which produces garbled echo output.
+ (g) Re-run the solution on all sample inputs and confirm they still pass.
+ - Do not reply with text only; finish only after the checks have been run and any fixes are written to disk.
+ """
+diff --git a/tools/benchmark.py b/tools/benchmark.py
+new file mode 100644
+index 0000000..4c81cb3
+--- /dev/null
++++ b/tools/benchmark.py
+@@ -0,0 +1,257 @@
++import json
++import os
++import random
++import subprocess
++import tempfile
++
++# Runs one class-method case: argv = [solution_path, method_name, args_file].
++# The args literal is read from a file (not argv) so large inputs do not hit the OS argument limit.
++_METHOD_RUNNER = r'''
++import sys, json, ast, importlib.util
++path, method = sys.argv[1], sys.argv[2]
++with open(sys.argv[3]) as _f:
++    args_src = _f.read()
++spec = importlib.util.spec_from_file_location("candidate_solution", path)
++mod = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(mod)
++args = ast.literal_eval(args_src)
++if not isinstance(args, tuple):
++    args = (args,)
++result = getattr(mod.Solution(), method)(*args)
++out = result if isinstance(result, str) else repr(result)
++sys.stdout.write("__METHOD_RESULT__" + json.dumps(out) + "\n")
++'''
++
++MAX_CASES = 40
++MAX_REPEAT = 5
++MAX_TIME_LIMIT = 60.0
++STDERR_TAIL = 400
++
++
++def tool_info():
++    return {
++        "name": "benchmark",
++        "description": """Time a solution on a file of test cases, each run in its own subprocess with a timeout. Returns a raw plain-text table (case index, label, wall time, TIMEOUT flag, exit code, stderr tail). Wall time includes Python startup and module import.\n
++Modes:
++* "method": class-method task. inputs_file is a JSON list; each element is a Python literal tuple of positional args (e.g. "(\\"aaaa\\", 3)") or an object {"label": "...", "args": "<literal tuple>"}. Calls Solution().<method_name>(*args).
++* "stdin": program task. inputs_file is a JSON list; each element is the stdin text (string) or an object {"label": "...", "input": "<stdin text>"}. Runs `python3 solution_path`.
++* "generate": writes structured adversarial max-size cases to inputs_file (a JSON list of {"label", "args"} objects, usable with mode "method"). Set generate_kind to "string" (constant char, two letters with unequal counts, k-block runs, sorted, periodic, random 2-letter, random 26-letter) or "int_array" (all equal, ascending, descending, random, all max, all min, alternating extremes, random); set n to the max size and optionally max_value for int arrays and alphabet_size for strings. Generated strings use letters starting at 'a'. solution_path is still required but is not used in generate mode.\n
++Results are raw: wall time (max over repeats), TIMEOUT flag, exit code, and the tail of stderr. Interpret them yourself.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Absolute path to the solution file (e.g. /repo/solution.py). Not used in generate mode."
++                },
++                "mode": {
++                    "type": "string",
++                    "enum": ["method", "stdin", "generate"],
++                    "description": "'method' for class-method tasks, 'stdin' for stdin/stdout programs, 'generate' to write structured adversarial inputs to inputs_file."
++                },
++                "inputs_file": {
++                    "type": "string",
++                    "description": "Path to a JSON list of cases (input file for 'method'/'stdin'; output file for 'generate')."
++                },
++                "method_name": {
++                    "type": "string",
++                    "description": "Name of the method of class Solution to call (required for mode 'method')."
++                },
++                "time_limit_seconds": {
++                    "type": "number",
++                    "description": "Timeout per run in seconds (default 5, max 60)."
++                },
++                "repeat": {
++                    "type": "integer",
++                    "description": "Number of runs per case; the reported time is the maximum (default 1, max 5)."
++                },
++                "generate_kind": {
++                    "type": "string",
++                    "enum": ["string", "int_array"],
++                    "description": "Kind of structured inputs to generate (mode 'generate' only)."
++                },
++                "n": {
++                    "type": "integer",
++                    "description": "Max size of generated inputs (mode 'generate' only, e.g. the max constraint)."
++                },
++                "max_value": {
++                    "type": "integer",
++                    "description": "Largest absolute value for generated int arrays (mode 'generate', default 1000000000)."
++                },
++                "alphabet_size": {
++                    "type": "integer",
++                    "description": "Number of letters used for generated strings (mode 'generate', default 26, max 26)."
++                }
++            },
++            "required": ["solution_path", "mode", "inputs_file"]
++        }
++    }
++
++
++def _string_presets(n, alphabet_size, rng):
++    letters = [chr(ord('a') + i) for i in range(alphabet_size)]
++    presets = []
++    presets.append(("constant", letters[0] * n))
++    if alphabet_size >= 2:
++        presets.append(("two letters, unequal counts", letters[0] * (n - 1) + letters[1]))
++        presets.append(("two letters, unequal counts (front-loaded)", letters[1] + letters[0] * (n - 1)))
++        presets.append(("two letters, random 50/50", "".join(rng.choice(letters[:2]) for _ in range(n))))
++    for k in (2, 3, 26):
++        if k > alphabet_size:
++            continue
++        # blocks of runs: each run length ~ n/k, cycling letters
++        run = max(1, n // k)
++        parts = [letters[i % k] * run for i in range(n // run + 1)]
++        presets.append((f"{k} blocks of equal runs", "".join(parts)[:n]))
++    presets.append(("sorted (cyclic letters, sorted)", "".join(sorted(letters[i % alphabet_size] for i in range(n)))))
++    for p in (2, 3, 7):
++        if p <= alphabet_size:
++            unit = letters[:p]
++            presets.append((f"periodic period {p}", (unit * (n // p + 1))[:n]))
++    presets.append(("random letters", "".join(rng.choice(letters) for _ in range(n))))
++    return presets
++
++
++def _int_presets(n, max_value, rng):
++    presets = []
++    presets.append(("all equal to max_value", [max_value] * n))
++    presets.append(("all equal to 1", [1] * n))
++    presets.append(("all equal to 0", [0] * n))
++    presets.append(("ascending", [(max_value * i) // n for i in range(1, n + 1)]))
++    presets.append(("descending", [max_value - (max_value * i) // n for i in range(n)]))
++    presets.append(("all max_value", [max_value] * n))
++    presets.append(("all -max_value", [-max_value] * n))
++    presets.append(("alternating extremes", [max_value if i % 2 == 0 else -max_value for i in range(n)]))
++    presets.append(("random", [rng.randint(-max_value, max_value) for _ in range(n)]))
++    presets.append(("random small (0..3)", [rng.randint(0, 3) for _ in range(n)]))
++    return presets
++
++
++def _generate(inputs_file, kind, n, max_value, alphabet_size):
++    if kind not in ("string", "int_array"):
++        return "error: generate_kind must be 'string' or 'int_array'."
++    if not n or n < 1:
++        return "error: n (a positive integer) is required for generate mode."
++    rng = random.Random(12345)
++    if kind == "string":
++        alphabet_size = max(1, min(26, alphabet_size or 26))
++        presets = _string_presets(n, alphabet_size, rng)
++    else:
++        max_value = max(1, max_value or 1000000000)
++        presets = _int_presets(n, max_value, rng)
++    cases = [{"label": f"{label} (n={n})", "args": repr((value,))} for label, value in presets]
++    with open(inputs_file, "w") as f:
++        json.dump(cases, f, indent=1)
++    return f"wrote {len(cases)} cases to {inputs_file}:\n" + "\n".join(
++        f"  [{i}] {c['label']}" for i, c in enumerate(cases))
++
++
++def _load_cases(inputs_file):
++    with open(inputs_file) as f:
++        data = json.load(f)
++    if not isinstance(data, list):
++        raise ValueError("inputs_file must contain a JSON list")
++    cases = []
++    for item in data:
++        if isinstance(item, dict):
++            payload = item.get("args", item.get("input", ""))
++            label = str(item.get("label", ""))
++        else:
++            payload, label = item, ""
++        if not isinstance(payload, str):
++            payload = repr(tuple(payload)) if isinstance(payload, list) else str(payload)
++        cases.append((label, payload))
++    return cases
++
++
++def _run_once(mode, solution_abs, method_name, payload, time_limit, cwd):
++    """Returns (wall_seconds, timed_out, returncode, stderr_text)."""
++    import time
++    start = time.time()
++    try:
++        if mode == "method":
++            with tempfile.NamedTemporaryFile("w", suffix=".args", delete=False) as tf:
++                tf.write(payload)
++                args_path = tf.name
++            try:
++                proc = subprocess.run(
++                    ["python3", "-c", _METHOD_RUNNER, solution_abs, method_name, args_path],
++                    capture_output=True, text=True, timeout=time_limit, cwd=cwd,
++                )
++            finally:
++                os.unlink(args_path)
++        else:
++            stdin_text = payload if (not payload or payload.endswith("\n")) else payload + "\n"
++            proc = subprocess.run(
++                ["python3", solution_abs],
++                input=stdin_text, capture_output=True, text=True, timeout=time_limit, cwd=cwd,
++            )
++        return time.time() - start, False, proc.returncode, proc.stderr or ""
++    except subprocess.TimeoutExpired as e:
++        stderr = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
++        return time.time() - start, True, None, stderr
++    except OSError as e:
++        return time.time() - start, False, -1, f"OSError: {e}"
++
++
++def tool_function(solution_path=None, mode=None, inputs_file=None, method_name=None,
++                  time_limit_seconds=None, repeat=None, generate_kind=None, n=None,
++                  max_value=None, alphabet_size=None):
++    if not inputs_file:
++        return "error: inputs_file is required."
++    if mode == "generate":
++        try:
++            return _generate(inputs_file, generate_kind, n, max_value, alphabet_size)
++        except Exception as e:
++            return f"generate failed: {type(e).__name__}: {e}"
++
++    if mode not in ("method", "stdin"):
++        return "error: mode must be 'method', 'stdin', or 'generate'."
++    if not solution_path or not os.path.exists(solution_path):
++        return f"Solution file not found: {solution_path}"
++    if mode == "method" and not method_name:
++        return "error: method_name is required for mode 'method'."
++
++    time_limit = float(time_limit_seconds) if time_limit_seconds else 5.0
++    time_limit = max(0.1, min(time_limit, MAX_TIME_LIMIT))
++    repeat = max(1, min(int(repeat) if repeat else 1, MAX_REPEAT))
++
++    try:
++        cases = _load_cases(inputs_file)
++    except Exception as e:
++        return f"could not read inputs_file {inputs_file}: {type(e).__name__}: {e}"
++    if not cases:
++        return "inputs_file contains no cases."
++    skipped = max(0, len(cases) - MAX_CASES)
++    cases = cases[:MAX_CASES]
++
++    solution_abs = os.path.abspath(solution_path)
++    cwd = os.path.dirname(solution_abs)
++    lines = [
++        f"mode={mode} solution={solution_abs} time_limit={time_limit}s repeat={repeat} cases={len(cases)}"
++        + (f" (skipped {skipped} beyond the {MAX_CASES}-case cap)" if skipped else ""),
++        f"{'idx':>4} | {'label':<40} | {'wall_s':>8} | {'TIMEOUT':<7} | {'exit':>4} | stderr (tail)",
++    ]
++    for idx, (label, payload) in enumerate(cases):
++        worst = 0.0
++        timed_out = False
++        codes = []
++        stderr_text = ""
++        for _ in range(repeat):
++            wall, to, rc, err = _run_once(mode, solution_abs, method_name, payload, time_limit, cwd)
++            worst = max(worst, wall)
++            if to:
++                timed_out = True
++                codes.append("-")
++            else:
++                codes.append(str(rc))
++            if (to or rc != 0) and not stderr_text:
++                stderr_text = err
++            if timed_out:
++                break  # no point repeating a case that already exceeded the limit
++        tail = stderr_text[-STDERR_TAIL:].strip().replace("\n", " | ")
++        exit_str = ",".join(codes) if len(set(codes)) > 1 else codes[0]
++        lines.append(
++            f"{idx:>4} | {label[:40]:<40} | {worst:>8.3f} | {'YES' if timed_out else 'no':<7} | {exit_str:>4} | {tail}"
++        )
++    return "\n".join(lines)

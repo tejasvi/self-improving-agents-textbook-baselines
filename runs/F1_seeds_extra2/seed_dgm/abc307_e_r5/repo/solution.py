@@ -1,0 +1,14 @@
+import sys
+
+def main():
+    data = sys.stdin.read().split()
+    n, m = int(data[0]), int(data[1])
+    MOD = 998244353
+    t = pow(m - 1, n, MOD)
+    if n % 2 == 0:
+        ans = (t + (m - 1)) % MOD
+    else:
+        ans = (t - (m - 1)) % MOD
+    print(ans)
+
+main()

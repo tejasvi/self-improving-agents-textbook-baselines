@@ -1,0 +1,232 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 308b024..15e750f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -167,6 +167,36 @@ def _has_verified_ok(msg_history):
+     text = _last_assistant_text(msg_history)
+     return VERIFIED_TOKEN in text and NOT_VERIFIED_TOKEN not in text
+ 
++def _is_empty_content(content):
++    """True if a message content (str or list of blocks) carries no non-whitespace text or tool use."""
++    if isinstance(content, str):
++        return not content.strip()
++    blocks = content or []
++    for block in blocks:
++        if _block_type(block) in ("tool_use", "tool_result"):
++            return False
++        if _block_text(block).strip():
++            return False
++    return True
++
++def _clean_history(msg_history):
++    """Return a copy of msg_history with trailing assistant messages that are empty/whitespace-only removed."""
++    cleaned = list(msg_history or [])
++    n_drop = 0
++    for msg in reversed(cleaned):
++        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
++        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
++        if role == "assistant" and _is_empty_content(content) and not _msg_has_tool_calls(msg):
++            n_drop += 1
++        else:
++            break
++    return cleaned[:len(cleaned) - n_drop]
++
++def _msg_has_tool_calls(msg):
++    if isinstance(msg, dict):
++        return bool(msg.get("tool_calls"))
++    return bool(getattr(msg, "tool_calls", None))
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -289,6 +319,51 @@ class AgenticSystem:
+                 return m
+         return None
+ 
++    def _ensure_source_edit(self, task, solution_file, msg_history):
++        """
++        Bounded (max 3 attempts) recovery when no source edit exists after a chat turn.
++        Returns (msg_history, failure_class, retries_used).
++        """
++        max_attempts = 3
++        failure_class = None
++        retries_used = 0
++        file_hint = solution_file or DEFAULT_SOLUTION_FILES.get(self.language, "solution.py")
++        for attempt in range(max_attempts):
++            if self._has_source_edit():
++                failure_class = None
++                break
++            failure_class = self._classify_failure(msg_history)
++            retries_used += 1
++            safe_log(f"[ensure] attempt={attempt} failure_class={failure_class} retry={retries_used}")
++            if failure_class == "empty_reply":
++                # Poisoned history: restart clean with a compact prompt; shorten further on each retry.
++                if attempt == 0:
++                    prompt = (
++                        f"{task}\nFirst action: run `ls -la {self.git_tempdir}` with bash, then create "
++                        f"{file_hint} with the editor tool containing the full solution."
++                    )
++                else:
++                    prompt = (
++                        f"Run `ls -la {self.git_tempdir}` with bash, then create {file_hint} "
++                        f"with the editor tool containing the full solution. Problem:\n{self.problem_statement}"
++                    )
++                msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            else:
++                corrective = (
++                    f"Your previous reply made no source edits. Call the editor tool now: command=create, "
++                    f"path={self.git_tempdir}/{file_hint}, file_text=<complete solution>. "
++                    f"Then run the samples with bash."
++                )
++                msg_history = chat_with_agent(
++                    corrective, model=self.code_model, msg_history=_clean_history(msg_history), logging=safe_log
++                )
++        else:
++            # Loop finished without break: check the final state.
++            if self._has_source_edit():
++                failure_class = None
++        safe_log(f"[ensure] done has_source_edit={self._has_source_edit()} failure_class={failure_class} retries={retries_used}")
++        return msg_history, failure_class, retries_used
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -324,95 +399,57 @@ IMPORTANT RULES:
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.\n{workflow}"
+ 
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"[forward] first turn has_source_edit={self._has_source_edit()}")
+ 
+-        # Bounded verify-and-repair loop: never finish with a known-failing solution.
+-        verify_prompt = (
+-            "Audit your work. Re-read the solution file with the editor view command. "
+-            "Run all samples from the problem statement. "
+-            "If you have not run a randomized brute-force comparison, write one now (a brute-force or "
+-            "reference solution plus a random small-case generator) and run it. "
+-            "If ANY output mismatches, or if your previous message described a fix you have not yet applied, "
+-            "apply the fix with the editor tool now and re-run. "
+-            "Finish your reply with exactly one line: VERIFIED_OK if all samples and the brute-force "
+-            "comparison pass with zero mismatches, otherwise NOT_VERIFIED."
+-        )
+-        stronger_hint = (
+-            "\nYour previous check did not verify the solution and you made no change to the solution file. "
+-            "Rethink the algorithm from first principles: test small cases by hand, examine the smallest "
+-            "counterexample from your brute-force comparison, and derive the correct logic before editing."
+-        )
+-        last_verdict_unchanged = False
+-        for verify_round in range(4):
+-            before_hash = self._solution_hash(solution_file)
+-            round_prompt = verify_prompt
+-            if verify_round > 0 and last_verdict_unchanged:
+-                round_prompt = verify_prompt + stronger_hint
+-            msg_history = chat_with_agent(
+-                round_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log
+-            )
+-            after_hash = self._solution_hash(solution_file)
+-            verified = _has_verified_ok(msg_history)
+-            last_verdict_unchanged = (before_hash == after_hash) and not verified
+-            safe_log(
+-                f"[verify-loop] round={verify_round} verified={verified} "
+-                f"solution_changed={before_hash != after_hash}"
+-            )
+-            if verified:
+-                break
+-
+-        max_retries = 3
+-        failure_class = None
+-        retries_used = 0
+-        for attempt in range(max_retries):
+-            has_edit = self._has_source_edit()
+-            changed = self._changed_files()
+-            safe_log(f"[verify] attempt={attempt} has_source_edit={has_edit} changed_files={changed}")
+-            if has_edit:
+-                failure_class = None
+-                break
+-
+-            failure_class = self._classify_failure(msg_history)
+-            safe_log(f"[verify] attempt={attempt} failure_class={failure_class}")
+-            is_last = attempt == max_retries - 1
+-            file_hint = solution_file or DEFAULT_SOLUTION_FILES.get(self.language, "solution.py")
+-            nudge = (
+-                f"Call the editor tool now: command=create, path={self.git_tempdir}/{file_hint}, "
+-                f"file_text=<complete solution>. Then run the samples with bash."
+-            )
+-            if attempt == 0:
+-                corrective = (
+-                    f"Your previous reply was {'empty' if failure_class == 'empty_reply' else 'incomplete'} "
+-                    f"and made no source edits. " + nudge
+-                )
+-            else:
+-                corrective = (
+-                    f"Still no non-test source change. Currently changed files: "
+-                    f"{changed if changed else '(none)'}.\n" + nudge
+-                )
+-            if is_last:
+-                corrective += (
+-                    "\nFinal attempt: write your best effort now, even if unsure. "
+-                    "An imperfect patch is better than none."
+-                )
+-
+-            retries_used += 1
+-            safe_log(f"[retry] attempt={attempt} class={failure_class} retry={retries_used}")
+-            if failure_class == "empty_reply":
+-                # Broken history: start fresh with the task text plus the nudge.
+-                msg_history = chat_with_agent(
+-                    f"{task}\n{corrective}", model=self.code_model, msg_history=[], logging=safe_log
+-                )
+-            else:
+-                msg_history = chat_with_agent(
+-                    corrective, model=self.code_model, msg_history=msg_history, logging=safe_log
+-                )
++        # Recover from a no-edit first turn BEFORE any verification (bounded retries).
++        msg_history, failure_class, retries_used = self._ensure_source_edit(task, solution_file, msg_history)
+ 
++        # Tool-free last resort if there is still no source file.
+         fallback_used = False
+         if not self._has_source_edit():
+             fallback_used = True
+             safe_log(f"[fallback] no source edit after {retries_used} retries; class={failure_class}")
+             self._write_fallback_solution(solution_file)
+ 
++        # Verify-and-repair only when a real source edit exists.
++        if self._has_source_edit():
++            # Bounded verify-and-repair loop: never finish with a known-failing solution.
++            verify_prompt = (
++                "Audit your work. Re-read the solution file with the editor view command. "
++                "Run all samples from the problem statement. "
++                "If you have not run a randomized brute-force comparison, write one now (a brute-force or "
++                "reference solution plus a random small-case generator) and run it. "
++                "If ANY output mismatches, or if your previous message described a fix you have not yet applied, "
++                "apply the fix with the editor tool now and re-run. "
++                "Finish your reply with exactly one line: VERIFIED_OK if all samples and the brute-force "
++                "comparison pass with zero mismatches, otherwise NOT_VERIFIED."
++            )
++            stronger_hint = (
++                "\nYour previous check did not verify the solution and you made no change to the solution file. "
++                "Rethink the algorithm from first principles: test small cases by hand, examine the smallest "
++                "counterexample from your brute-force comparison, and derive the correct logic before editing."
++            )
++            last_verdict_unchanged = False
++            for verify_round in range(4):
++                before_hash = self._solution_hash(solution_file)
++                round_prompt = verify_prompt
++                if verify_round > 0 and last_verdict_unchanged:
++                    round_prompt = verify_prompt + stronger_hint
++                msg_history = chat_with_agent(
++                    round_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log
++                )
++                after_hash = self._solution_hash(solution_file)
++                verified = _has_verified_ok(msg_history)
++                last_verdict_unchanged = (before_hash == after_hash) and not verified
++                safe_log(
++                    f"[verify-loop] round={verify_round} verified={verified} "
++                    f"solution_changed={before_hash != after_hash}"
++                )
++                if verified:
++                    break
++        else:
++            safe_log("[verify] skipped: no source edit to verify")
++
+         final_has_edit = self._has_source_edit()
+         safe_log(
+             f"[verify] final has_source_edit={final_has_edit} fallback_used={fallback_used} "

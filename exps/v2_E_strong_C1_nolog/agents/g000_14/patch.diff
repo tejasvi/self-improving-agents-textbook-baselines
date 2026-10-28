@@ -1,0 +1,317 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..c7e137c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -137,11 +138,11 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    # ------------------------------------------------------------------
++    # Helpers for the solve / review / final-check phases
++    # ------------------------------------------------------------------
++    def _task_header(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -149,15 +150,197 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
++
++    def _solution_path(self):
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _samples_dir(self):
++        return os.path.join(self.git_tempdir, 'samples')
++
++    def _needs_solution_class(self):
++        return re.search(r'\bSolution\b', self.problem_statement or '') is not None
++
++    def _read_solution(self):
++        path = self._solution_path()
++        if not os.path.isfile(path):
++            return None
++        with open(path, 'r', errors='replace') as f:
++            return f.read()
++
++    def _write_solution(self, content):
++        if content is None:
++            return
++        with open(self._solution_path(), 'w') as f:
++            f.write(content)
++
++    def _samples_pass(self):
++        """
++        Re-run solution.py on the saved samples (samples/sample_<i>_input.txt and
++        samples/sample_<i>_output.txt). For `class Solution` problems there is no
++        generic stdin entry point, so this returns True and the check is left to the agent.
++        """
++        if self._needs_solution_class():
++            return True
++        sdir = self._samples_dir()
++        if not os.path.isfile(self._solution_path()):
++            return False
++        inputs = []
++        if os.path.isdir(sdir):
++            inputs = sorted(f for f in os.listdir(sdir) if re.fullmatch(r'sample_\d+_input\.txt', f))
++        if not inputs:
++            # No saved samples to judge against: cannot decide, so do not revert or flag.
++            safe_log("No saved samples found in " + sdir + "; skipping sample check.")
++            return True
++        for inp in inputs:
++            out_path = os.path.join(sdir, inp.replace('_input.txt', '_output.txt'))
++            if not os.path.isfile(out_path):
++                safe_log(f"Missing expected output file {out_path}; cannot judge.")
++                return True
++            with open(os.path.join(sdir, inp)) as f:
++                stdin_text = f.read()
++            with open(out_path) as f:
++                expected = f.read()
++            try:
++                r = subprocess.run(['python3', self._solution_path()], input=stdin_text,
++                                   capture_output=True, text=True, timeout=10,
++                                   cwd=self.git_tempdir, errors='replace')
++            except subprocess.TimeoutExpired:
++                return False
++            if r.returncode != 0 or r.stdout.split() != expected.split():
++                return False
++        return True
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            parts = []
++            for block in content or []:
++                if isinstance(block, dict) and block.get('type') == 'text' and block.get('text'):
++                    parts.append(block['text'])
++                elif getattr(block, 'type', None) == 'text' and getattr(block, 'text', None):
++                    parts.append(block.text)
++            return '\n'.join(parts)
++        return ''
++
++    # ------------------------------------------------------------------
++    # Phases
++    # ------------------------------------------------------------------
++    def _solve(self):
++        task = self._task_header()
++        method = f"""Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
++2. Write the solution in {self._solution_path()} with the editor tool.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++4. Save every sample input and its expected output to files so they can be re-run later: `{self._samples_dir()}/sample_<i>_input.txt` and `{self._samples_dir()}/sample_<i>_output.txt` (i = 1, 2, ...). Do this for ALL samples in the statement.
++5. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
++6. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
++7. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        return chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _review_prompt(self):
++        return f"""You are a skeptical adversarial reviewer of a competitive programming solution. The repository is in the directory {self.git_tempdir}. The solution is in {self._solution_path()}. Another engineer wrote it; it may be wrong even if it passes the samples.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Step 1. Read {self._solution_path()} carefully. Do not trust it.
++Step 2. Estimate the worst-case time complexity of its algorithm against the constraints in the statement, and note any risk of exceeding the time limit in Python.
++Step 3. List at least 10 problem-specific edge cases (for example: minimum sizes such as n=1, empty or degenerate input, all-equal or duplicate values, extreme values at the limits, off-by-one boundaries, tie-breaking, and any I/O format details).
++Step 4. Write your OWN brute-force implementation from scratch in {self.git_tempdir}/brute.py. Derive the expected behavior directly from the problem statement. Do NOT copy or look at the algorithm in solution.py while writing it, so that you do not share its misunderstanding.
++Step 5. Write a random generator {self.git_tempdir}/gen.py that takes an integer seed as its only argument (`python3 gen.py <seed>`), calls random.seed(seed), prints one valid input to stdout, and is biased toward edge cases (small sizes, duplicates, extreme values, boundary values) while respecting the input format exactly.
++Step 6. Stress test with at least 300 cases using the stress_test tool: solution_path={self._solution_path()}, brute_path={self.git_tempdir}/brute.py, generator_path={self.git_tempdir}/gen.py, num_tests=300, timeout=5. If the tool is unavailable, write an equivalent stress loop that runs 300+ seeds with a timeout per run and prints the first mismatch. Inspect the first mismatch carefully: decide whether solution.py or brute.py is wrong by re-reading the statement.
++Step 7. Timing: generate a maximum-size valid input (at the constraint limits) and time `python3 solution.py < big.txt`. It must finish well under 2 seconds.
++Step 8. Re-run the saved samples in {self._samples_dir()} against solution.py and confirm they still pass exactly.
++Step 9. If anything fails (a wrong answer, a crash, bad output format, or a timeout), fix {self._solution_path()} and re-run the failing checks. Keep helper files (brute.py, gen.py, etc.) separate from solution.py. Never use an infinite loop in any script.
++
++When you are finished, end your final message with exactly one of these lines on its own:
++REVIEW_RESULT: CHANGED   (you modified solution.py in this review)
++REVIEW_RESULT: CLEAN     (you found no problems and made no changes to solution.py)"""
++
++    def _review(self, round_idx):
++        before = self._read_solution()
++        prompt = f"[Review round {round_idx + 1}]\n" + self._review_prompt()
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        text = self._last_assistant_text(msg_history)
++        clean = 'REVIEW_RESULT: CLEAN' in text
++
++        # Restore the pre-review version if the reviewed one no longer passes the samples.
++        after = self._read_solution()
++        if before is not None and after != before and not self._samples_pass():
++            safe_log(f"Review round {round_idx + 1} broke the samples; restoring previous solution.py")
++            self._write_solution(before)
++        return msg_history, clean
++
++    def _final_check(self):
++        """Programmatic sanity gate: py_compile, class presence, and saved samples."""
++        path = self._solution_path()
++        needs_class = self._needs_solution_class()
++        ok, output = True, ''
++
++        if not os.path.isfile(path):
++            ok, output = False, f"{path} does not exist."
++        else:
++            # py_compile + class check run in a subprocess, so a broken file cannot affect this process.
++            check_code = (
++                "import py_compile, re, sys\n"
++                "path, needs_class = sys.argv[1], sys.argv[2] == '1'\n"
++                "try:\n"
++                "    py_compile.compile(path, doraise=True)\n"
++                "except py_compile.PyCompileError as e:\n"
++                "    print('COMPILE ERROR:\\n' + str(e)); sys.exit(1)\n"
++                "if needs_class:\n"
++                "    src = open(path, errors='replace').read()\n"
++                "    if not re.search(r'^class\\s+Solution\\b', src, re.M):\n"
++                "        print('ERROR: the problem requires `class Solution`, but solution.py does not define it.'); sys.exit(1)\n"
++                "print('OK')\n"
++            )
++            try:
++                r = subprocess.run(['python3', '-c', check_code, path, '1' if needs_class else '0'],
++                                   capture_output=True, text=True, timeout=60)
++                ok = r.returncode == 0
++                output = (r.stdout + r.stderr).strip()
++            except subprocess.TimeoutExpired:
++                ok, output = False, 'Final compile/class check timed out.'
++
++        if ok and not self._samples_pass():
++            ok = False
++            output = f"solution.py does not reproduce the saved samples in {self._samples_dir()}."
++
++        if ok:
++            return None
++        safe_log(f"Final check failed:\n{output}")
++        fix_prompt = f"""The final sanity check of {path} failed with this output:
++
++{output}
++
++Fix {path} so that it compiles, defines `class Solution` if the problem requires it, and produces the exact expected output on every sample. Re-run the samples to confirm, then stop.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>"""
++        return chat_with_agent(fix_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def forward(self):
++        """
++        The forward function for the AgenticSystem:
++        solve -> up to 3 adversarial review rounds (stop early on CLEAN) -> final check.
++        """
++        self._solve()
++
++        for round_idx in range(3):
++            _, clean = self._review(round_idx)
++            if clean:
++                break
++
++        self._final_check()
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..62b24a8
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,78 @@
++import os
++import subprocess
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Run a randomized stress test comparing a solution program against a brute-force reference.\n
++* For each test i in 1..num_tests, runs `python3 generator_path <seed>` (seed = i) to produce an input on stdin-compatible text, then runs both solution_path and brute_path on that input with a per-run timeout.\n
++* Outputs are compared token-wise (whitespace-insensitive).\n
++* Returns the first failing input with both outputs, or 'all N passed'. Crashes (non-zero exit) and timeouts are reported as failures.\n
++* Paths must be absolute or relative to the current directory; all three programs are Python 3 scripts that read stdin and write stdout.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the solution Python script (reads stdin, writes stdout)."},
++                "brute_path": {"type": "string", "description": "Path to the brute-force reference Python script (reads stdin, writes stdout)."},
++                "generator_path": {"type": "string", "description": "Path to the random input generator script; it is called as `python3 generator_path <seed>` and prints one test input to stdout."},
++                "num_tests": {"type": "integer", "description": "Number of random tests to run (default 300)."},
++                "timeout": {"type": "integer", "description": "Per-run timeout in seconds for each program (default 5)."}
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++def _run(script, stdin_text, timeout):
++    return subprocess.run(
++        ['python3', script], input=stdin_text, capture_output=True, text=True,
++        timeout=timeout, errors='replace',
++    )
++
++def _clip(s, n=3000):
++    return s if len(s) <= n else s[:n] + f"\n... <{len(s) - n} characters clipped>"
++
++def tool_function(solution_path, brute_path, generator_path, num_tests=300, timeout=5):
++    try:
++        num_tests = max(1, min(int(num_tests or 300), 5000))
++    except (TypeError, ValueError):
++        num_tests = 300
++    try:
++        timeout = max(1, min(int(timeout or 5), 60))
++    except (TypeError, ValueError):
++        timeout = 5
++    solution_path = os.path.abspath(solution_path)
++    brute_path = os.path.abspath(brute_path)
++    generator_path = os.path.abspath(generator_path)
++    for p in (solution_path, brute_path, generator_path):
++        if not os.path.isfile(p):
++            return f"Error: file not found: {p}"
++
++    gen_dir = os.path.dirname(generator_path)
++    for seed in range(1, num_tests + 1):
++        try:
++            g = subprocess.run(['python3', generator_path, str(seed)], capture_output=True,
++                               text=True, timeout=timeout, cwd=gen_dir, errors='replace')
++        except subprocess.TimeoutExpired:
++            return f"Generator timed out on seed {seed}."
++        if g.returncode != 0:
++            return f"Generator crashed on seed {seed} (exit {g.returncode}):\n{_clip(g.stderr)}"
++        test_input = g.stdout
++
++        results = {}
++        for name, path in (('solution', solution_path), ('brute', brute_path)):
++            try:
++                r = _run(path, test_input, timeout)
++            except subprocess.TimeoutExpired:
++                return (f"FAIL (seed {seed}): {name} timed out after {timeout}s.\n"
++                        f"Input:\n{_clip(test_input)}")
++            if r.returncode != 0:
++                return (f"FAIL (seed {seed}): {name} crashed (exit {r.returncode}).\n"
++                        f"Input:\n{_clip(test_input)}\nSTDERR:\n{_clip(r.stderr)}")
++            results[name] = r.stdout
++
++        if results['solution'].split() != results['brute'].split():
++            return (f"FAIL (seed {seed}): output mismatch.\n"
++                    f"Input:\n{_clip(test_input)}\n"
++                    f"solution output:\n{_clip(results['solution'])}\n"
++                    f"brute output:\n{_clip(results['brute'])}")
++    return f"all {num_tests} passed"

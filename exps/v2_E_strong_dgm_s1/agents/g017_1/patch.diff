@@ -1,0 +1,313 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index b8a1aa1..74b214c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,9 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
++
++from tools import stress_test, bash
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -202,57 +205,254 @@ class AgenticSystem:
+                     return False
+         return True
+ 
++    # ------------------------------------------------------------------
++    # Staged, short prompts. Each stage starts from a fresh history.
++    # ------------------------------------------------------------------
++    def _task_header(self):
++        return (f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++                f"Help solve the following problem.\n\n<problem_description>\n{self.problem_statement}\n"
++                "</problem_description>\n\n"
++                f"Your task is to make changes to the files in the {self.git_tempdir} directory to address "
++                "the <problem_description>. I have already taken care of the required dependencies.\n")
++
++    def _draft_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 1 (DRAFT): Immediately use the editor tool to write a complete, working solution to "
++            f"{self.git_tempdir}/solution.py (a Python program reading stdin, writing stdout, or the requested "
++            "method if the statement asks for a class). Do not analyze at length first. Do not reply without a tool call."
++        )
++
++    def _oracle_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 2 (ORACLE): solution.py exists now. Write {self.git_tempdir}/brute.py, an obviously correct "
++            "brute-force solution (same I/O format, reads stdin), and "
++            f"{self.git_tempdir}/gen.py, invoked as `python3 gen.py SEED SCALE`, printing one valid input. "
++            "SCALE 1-3 gives tiny inputs, SCALE 5-100 gives medium inputs (n 50-300) with small and large values, "
++            "duplicate-heavy and edge-value cases. Keep inputs within the constraints. Do not fix solution.py in this step. "
++            "Do not reply without a tool call."
++        )
++
++    def _repair_prompt(self, failures, prev_diff):
++        return self._task_header() + (
++            f"\nSTEP 3 (REPAIR): The harness ran solution.py against the samples and against brute.py. "
++            f"Raw results (unprocessed):\n<failures>\n{failures}\n</failures>\n\n"
++            f"Previous edit diff (may be empty):\n<prev_diff>\n{prev_diff}\n</prev_diff>\n\n"
++            f"Fix {self.git_tempdir}/solution.py using the editor tool so that it matches the expected outputs on "
++            "these inputs. Reason from the failing input and the expected output. Re-run the failing input after editing. "
++            "Do not reply without a tool call."
++        )
++
++    def _alt_prompt(self, approach_hint):
++        return self._task_header() + (
++            f"\nSTEP 4 (ALTERNATIVE): Write an independent second solution to {self.git_tempdir}/solution_alt.py "
++            "using a different algorithm. Do not modify solution.py. "
++            f"Approach hint: {approach_hint}. "
++            "Use the editor tool to write it now. Do not reply without a tool call."
++        )
++
++    def _short_prompt(self, target):
++        return (f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Call the editor tool now to write the full Python solution into {target}.")
++
++    def _run_stage(self, prompt, attempts=3, target="solution.py"):
++        """Run one stage. Retries in a fresh context with shorter prompts; success = file changed."""
++        target_path = os.path.join(self.git_tempdir, target)
++        before = self._file_snapshot(target_path)
++        for attempt in range(attempts):
++            # First try the full stage prompt; later attempts use a shorter prompt, always in a fresh context.
++            p = prompt if attempt == 0 else self._short_prompt(target_path)
++            history = chat_with_agent(p, model=self.code_model, msg_history=[], logging=safe_log)
++            changed = self._file_snapshot(target_path) != before
++            if target == "solution.py":
++                changed = changed or self._has_source_edit()
++            safe_log(f"[stage] attempt {attempt + 1}/{attempts} done; tool_use_blocks={self._count_tool_uses(history)}; "
++                     f"file changed={changed}")
++            if changed:
++                return True
++        return False
++
++    def _file_snapshot(self, path):
++        try:
++            with open(path) as f:
++                return f.read()
++        except OSError:
++            return None
++
++    @staticmethod
++    def _count_tool_uses(history):
++        n = 0
++        for m in history or []:
++            content = m.get("content") if isinstance(m, dict) else None
++            if isinstance(content, list):
++                n += sum(1 for b in content if isinstance(b, dict) and b.get("type") in ("tool_use", "function_call"))
++        return n
++
++    def _parse_samples(self):
++        """Extract (input, expected output) pairs from the statement, e.g. 'Sample Input 1' / 'Sample Output 1'."""
++        text = self.problem_statement
++        pattern = re.compile(
++            r"(?:Sample|Example)\s*Input\s*(\d*)\s*:?\s*\n(.*?)\n\s*(?:Sample|Example)\s*Output\s*\1\s*:?\s*\n(.*?)(?=\n\s*(?:Sample|Example)\s*Input|\Z)",
++            re.S | re.I,
++        )
++        samples = []
++        for m in pattern.finditer(text):
++            inp = "\n".join(l.rstrip() for l in m.group(2).strip().splitlines()) + "\n"
++            out = m.group(3).strip()
++            samples.append((inp, out))
++        return samples
++
++    def _run_samples(self):
++        """Run solution.py on each parsed sample; return raw mismatch text ('' when all pass)."""
++        samples = self._parse_samples()
++        if not samples:
++            return ""
++        sol = os.path.join(self.git_tempdir, "solution.py")
++        report = []
++        for i, (inp, expected) in enumerate(samples, 1):
++            try:
++                p = subprocess.run(["python3", sol], input=inp, capture_output=True, text=True,
++                                   timeout=10, cwd=self.git_tempdir)
++                got = p.stdout
++                err = p.stderr
++            except subprocess.TimeoutExpired:
++                got, err = "", "timed out after 10 seconds"
++            if got.split() != expected.split():
++                report.append(f"Sample {i} FAILED\n--- input ---\n{inp}--- expected ---\n{expected}\n"
++                              f"--- actual ---\n{got}--- stderr ---\n{err[-1500:]}")
++        if report:
++            return "\n\n".join(report)
++        return ""
++
++    def _stress(self):
++        """Run the stress test (solution vs brute.py with gen.py) and return the raw output."""
++        common = dict(solution_cmd="python3 solution.py", generator_cmd="python3 gen.py",
++                      reference_cmd="python3 brute.py", timeout=5, seeds_per_scale=25,
++                      scales=[1, 2, 3, 5, 8, 20, 50])
++        old_cwd = bash._STATE.get('cwd')
++        try:
++            bash._STATE['cwd'] = self.git_tempdir
++            return stress_test.tool_function(**common)
++        except Exception as e:
++            return f"Error: stress test raised {type(e).__name__}: {e}"
++        finally:
++            bash._STATE['cwd'] = old_cwd
++
++    def _run_candidate_on(self, path, inp):
++        try:
++            p = subprocess.run(["python3", path], input=inp, capture_output=True, text=True,
++                               timeout=5, cwd=self.git_tempdir)
++            return p.stdout if p.returncode == 0 else None
++        except subprocess.TimeoutExpired:
++            return None
++
++    def _compare_candidates(self, candidates, brute_path):
++        """Score each candidate file on samples + generator inputs against brute.py; copy the best to solution.py."""
++        inputs = [inp for inp, _ in self._parse_samples()]
++        gen_path = os.path.join(self.git_tempdir, "gen.py")
++        if os.path.exists(gen_path) and os.path.exists(brute_path):
++            for seed in range(30):
++                scale = [1, 3, 8, 20][seed % 4]
++                try:
++                    p = subprocess.run(["python3", gen_path, str(seed), str(scale)], capture_output=True,
++                                       text=True, timeout=5, cwd=self.git_tempdir)
++                    if p.returncode == 0 and p.stdout.strip():
++                        inputs.append(p.stdout)
++                except subprocess.TimeoutExpired:
++                    pass
++        if not inputs or not os.path.exists(brute_path):
++            return None
++        scores = {}
++        for path in candidates:
++            if not os.path.exists(path):
++                continue
++            score = 0
++            for inp in inputs:
++                ref = None
++                try:
++                    p = subprocess.run(["python3", brute_path], input=inp, capture_output=True, text=True,
++                                       timeout=5, cwd=self.git_tempdir)
++                    ref = p.stdout if p.returncode == 0 else None
++                except subprocess.TimeoutExpired:
++                    ref = None
++                got = self._run_candidate_on(path, inp)
++                if ref is not None and got is not None and got.split() == ref.split():
++                    score += 1
++            scores[path] = score
++            safe_log(f"[compare] {os.path.basename(path)} score={score}/{len(inputs)}")
++        if not scores:
++            return None
++        best = max(scores, key=lambda k: scores[k])
++        with open(best) as f:
++            text = f.read()
++        with open(os.path.join(self.git_tempdir, "solution.py"), "w") as f:
++            f.write(text)
++        safe_log(f"[compare] selected {os.path.basename(best)} with score {scores[best]}")
++        return best
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Staged workflow: draft -> oracle -> sample/stress repair rounds -> alternative candidate -> selection.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer:
+-1. FIRST ACTION: before any long analysis, use the editor tool to write a complete working first draft into solution.py (even if unoptimized). Keep replies concise; never end a reply without a tool call until solution.py is implemented and tested. Never stop without having edited the primary source file (solution.py). Then read the statement and constraints and choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Refine solution.py with the editor tool (replace the draft with the efficient version if needed).
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. MANDATORY: write a brute-force reference (brute.py) that is obviously correct, even if slow (e.g. enumerate all pairs/subsets/permutations directly, counting multiplicities exactly as the statement says).
+-5. Write a generator (gen.py) invoked as `python3 gen.py SEED SCALE` that prints one valid input to stdout. The SCALE parameter must control size and cover: tiny inputs (e.g. n<=8, small values), medium inputs (n around 50-300, with both small and large value ranges), large inputs close to the real constraints, and duplicate-heavy cases (many equal values, all-equal, sorted, reversed, values drawn from only a few distinct numbers, and target/X values near the edge of the value range). Make sure the generator only produces inputs that satisfy the constraints.
+-6. If the problem has several valid answers (e.g. "print any valid pair/triple/permutation"), write a validator (checker.py) invoked as `python3 checker.py input_file output_file` that checks every constraint of the output (indices in range, distinctness, the required sum/property, format) and exits with code 0 only if valid. A checker alone is NOT enough for a '-1' / 'impossible' answer: when the checker accepts -1, it must itself perform a full brute-force existence check (feasible on the medium-size inputs) so that a wrong -1 is caught. Do not compare such outputs with the brute force directly.
+-7. Run the stress_test tool with solution_cmd='python3 solution.py', generator_cmd='python3 gen.py', reference_cmd='python3 brute.py' and checker_cmd='python3 checker.py' when there are many valid answers. The brute-force comparison at MEDIUM scale (n 50-300, scales such as [1,2,3,5,8,20,50,100]) is mandatory in every case, even if you also have a checker. Use a few hundred seeds in total and a timeout of a few seconds. The stress_test tool also tests mutated variants of each input (values compressed, few distinct values, sorted, reversed); keep mutations enabled. Read its output: if it warns that outputs are one-sided (e.g. almost always -1) or that medium inputs were not exercised, extend gen.py until the warnings disappear. Fix every failure, then rerun until everything passes. Then run stress_test again with coverage_source='solution.py' (or run coverage_report on the sample and stress-test inputs). For every uncovered line or branch in solution.py, construct a small input that reaches it (add the generator mode if needed), run it, and verify the output with the brute force/checker. Also, always confirm that the output format has the exact number of tokens required by the statement. Do not finish while any reachable branch remains unexecuted. Make the checker verify the exact output format too (e.g. the count of printed numbers and that printed indices are distinct).
+-8. Run the validator (or compare with the reference) on max-size inputs too, not only on small ones, and time the max-size runs: solution.py must finish well under 2 seconds. A fast output that is invalid is still wrong.
+-9. Once all tests pass, re-read solution.py and look for untested branches (edge cases such as n=1, empty results, all-equal values, boundary values, negative numbers, answers that must be -1). Add tests that exercise them. Prefer a simpler, verifiable algorithm over an unverifiable clever one: if a clever algorithm (e.g. FFT/convolution tricks) cannot be validated at medium scale against the brute force or the checker, replace it with a simpler approach that fits the time limit.
+-10. Before declaring done, re-run the stress test on the dangerous scenario categories again: dense values with the target X near the value range, and many duplicates / repeated small values. Both must pass at medium scale.
+-11. Before finishing, write a second independent simple solution (e.g. a hash-based O(n^2) or direct enumeration solution, written separately from solution.py, not copied from it) and diff-test it against solution.py on random inputs with n<=2000 (and on the medium-size generator outputs). Any disagreement means one of them is wrong: find out which one with the brute force and fix it.
+-12. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log(f"[verify] initial run finished; source edit detected: {self._has_source_edit()}")
+-
+-        retry_note = (
+-            "No change to the primary source file (solution.py) was detected; it is still the starter stub. "
+-            "Do not explore further. Call the editor tool now to write your full solution into "
+-            f"{self.git_tempdir}/solution.py, then run the samples and the stress test."
+-        )
+-        msg_history = init_edit
+-        for attempt in range(3):
+-            if self._has_source_edit():
++        sol_path = os.path.join(self.git_tempdir, "solution.py")
++        brute_path = os.path.join(self.git_tempdir, "brute.py")
++        K = 3
++
++        # Stage 1: draft
++        ok = self._run_stage(self._draft_prompt(), attempts=3)
++        safe_log(f"[stage] draft: {'ok' if ok else 'FAILED'}")
++
++        # Stage 2: oracle
++        ok = self._run_stage(self._oracle_prompt(), attempts=2, target="brute.py")
++        safe_log(f"[stage] oracle: {'ok' if ok else 'FAILED'}")
++
++        # Stage 3: samples + stress, repair up to K rounds
++        prev_diff = ""
++        for rnd in range(K):
++            failures = self._run_samples()
++            if not failures and os.path.exists(brute_path):
++                failures = self._stress()
++                if "ALL PASSED" in failures:
++                    failures = ""
++            safe_log(f"[repair] round {rnd + 1}/{K}: {'all passed' if not failures else 'failures'}")
++            if not failures:
+                 break
+-            safe_log(f"[verify] retry {attempt + 1}/3: no source edit detected")
+-            msg_history = chat_with_agent(retry_note, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            safe_log(f"[verify] retry {attempt + 1}/3 finished; source edit detected: {self._has_source_edit()}")
++            before = self._file_snapshot(sol_path)
++            self._run_stage(self._repair_prompt(failures, prev_diff), attempts=2)
++            after = self._file_snapshot(sol_path)
++            prev_diff = "" if before is None or after is None else (
++                f"--- before\n{before}\n+++ after\n{after}" if before != after else "(no change)")
+ 
++        # Stage 4: alternative candidate, then select best by harness score
++        cand1 = os.path.join(self.git_tempdir, "cand1.py")
++        cand2 = os.path.join(self.git_tempdir, "solution_alt.py")
++        cur = self._file_snapshot(sol_path)
++        if cur is not None:
++            with open(cand1, "w") as f:
++                f.write(cur)
++        ok = self._run_stage(self._alt_prompt("an approach different from the one in solution.py "
++                                              "(e.g. a different data structure, a different decomposition, or a direct simulation)"),
++                             attempts=2, target="solution_alt.py")
++        safe_log(f"[stage] alternative: {'ok' if ok else 'FAILED'}")
++        if os.path.exists(cand2) and os.path.exists(cand1):
++            best = self._compare_candidates([cand1, cand2], brute_path)
++            safe_log(f"[compare] best candidate: {best}")
++
++        # Last resort: the solution must not remain the starter stub.
+         if not self._has_source_edit():
+             safe_log("[verify] fallback: minimal prompt to write solution.py")
+-            fallback = (
+-                f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                f"Working directory: {self.git_tempdir}\n"
+-                "Write the final solution to solution.py with the editor tool; nothing else."
+-            )
+-            chat_with_agent(fallback, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[verify] fallback finished; source edit detected: {self._has_source_edit()}")
++            ok = self._run_stage(self._draft_prompt(), attempts=2)
++            safe_log(f"[stage] fallback: {'ok' if ok else 'FAILED'}")
++        if not self._has_source_edit():
++            # Still a stub: use the brute-force reference if the agent wrote one, so the solution is non-stub.
++            if os.path.exists(brute_path):
++                with open(brute_path) as f:
++                    text = f.read()
++                with open(sol_path, "w") as f:
++                    f.write(text)
++                safe_log("[verify] fallback: copied brute.py into solution.py (non-stub)")
++            else:
++                safe_log("[verify] WARNING: solution.py still looks like the stub")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

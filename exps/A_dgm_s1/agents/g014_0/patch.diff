@@ -1,0 +1,156 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index fefb3ec..031af8f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -130,6 +130,75 @@ def _has_source_edit(diff):
+     """
+     return any(not _is_test_path(p) for p in _changed_files(diff))
+ 
++def _is_empty_assistant_message(msg):
++    """
++    Return True if an assistant message carries no content: empty/whitespace text only, no tool_use blocks.
++    """
++    content = msg.get('content')
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return content.strip() == ''
++    if isinstance(content, list):
++        for block in content:
++            if isinstance(block, dict):
++                btype = block.get('type')
++                text = block.get('text')
++            else:
++                btype = getattr(block, 'type', None)
++                text = getattr(block, 'text', None)
++            if btype == 'tool_use':
++                return False
++            if btype != 'text':
++                return False
++            if isinstance(text, str) and text.strip() != '':
++                return False
++        return True
++    return False
++
++def _sanitize_history(msg_history):
++    """
++    Return a copy of the message history with trailing empty assistant messages removed.
++    Never returns None; an empty input yields an empty list.
++    """
++    history = list(msg_history or [])
++    for _ in range(len(history)):
++        if not history:
++            break
++        last = history[-1]
++        if isinstance(last, dict) and last.get('role') == 'assistant' and _is_empty_assistant_message(last):
++            history.pop()
++        else:
++            break
++    return history
++
++def _find_target_file(git_tempdir, problem_statement):
++    """
++    Determine the main source file to edit, returned as an absolute path under git_tempdir.
++    1. A filename mentioned in backticks in the problem statement that exists in the repo.
++    2. Otherwise the only non-test tracked source file.
++    3. Otherwise solution.py in the repo root.
++    """
++    default = os.path.abspath(os.path.join(git_tempdir, 'solution.py'))
++    for name in re.findall(r'`(\w+\.(?:py|go|rs|js|cpp|java))`', problem_statement or ''):
++        if os.path.isfile(os.path.join(git_tempdir, name)):
++            return os.path.abspath(os.path.join(git_tempdir, name))
++    try:
++        result = subprocess.run(
++            ["git", "-C", git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
++        )
++        tracked = result.stdout.decode(errors='replace').splitlines()
++    except Exception:
++        tracked = []
++    candidates = [
++        p for p in tracked
++        if not _is_test_path(p) and re.search(r'\.(py|go|rs|js|cpp|java)$', p)
++    ]
++    if len(candidates) == 1:
++        return os.path.abspath(os.path.join(git_tempdir, candidates[0]))
++    return default
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -199,22 +268,61 @@ The task is not complete until the source files are actually modified. Do not en
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Validate that a non-test source file was actually edited; retry a bounded number of times.
+-        for attempt in range(3):
+-            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if _has_source_edit(diff):
+-                break
+-            safe_log(f"Attempt {attempt + 1}: no source edits detected, retrying.")
+-            corrective = (
+-                "No changes to the main source code were detected "
+-                f"(current diff: {diff.strip() or '<empty>'}). "
+-                "Use the editor tool now to implement the solution in the source file. "
+-                "Do not only describe it. Replace the stub, then run it against the examples."
+-            )
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        # Validate that a non-test source file was actually edited; escalate through bounded recovery stages.
++        target = _find_target_file(self.git_tempdir, self.problem_statement)
++
++        def edit_landed():
++            return _has_source_edit(diff_versus_commit(self.git_tempdir, self.base_commit))
++
++        if not edit_landed():
++            # Stage 1: sanitized history plus a directive message.
++            safe_log(f"Escalation 1: no source edits detected, retrying with sanitized history (target {target}).")
++            try:
++                corrective = (
++                    f"You have not edited any file. Call the editor tool now to write the complete solution to {target}. "
++                    "Do not reply with text only."
++                )
++                msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=_sanitize_history(msg_history), logging=safe_log)
++            except Exception as e:
++                safe_log(f"Escalation 1 failed with exception: {e}")
++
++        if not edit_landed():
++            # Stage 2: fresh conversation with the original task and an explicit first-action instruction.
++            safe_log(f"Escalation 2: still no source edits, restarting with fresh history (target {target}).")
++            try:
++                fresh_task = (
++                    f"{task}\nYour first action must be an editor tool call that creates or overwrites {target} "
++                    "with the complete solution."
++                )
++                msg_history = chat_with_agent(fresh_task, model=self.code_model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"Escalation 2 failed with exception: {e}")
++
++        if not edit_landed():
++            # Stage 3: tool-free fallback; extract a fenced python block and write it directly.
++            safe_log(f"Escalation 3: still no source edits, requesting a code block fallback (target {target}).")
++            try:
++                fallback_prompt = (
++                    f"{task}\nDo not use any tools. Reply with the complete program as a single ```python fenced code block "
++                    "and nothing else. The program must read standard input and write standard output."
++                )
++                reply_history = chat_with_agent(fallback_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++                reply = _last_assistant_text(reply_history)
++                blocks = re.findall(r'```(?:python|py)?[ \t]*\n(.*?)```', reply or '', re.DOTALL)
++                if blocks:
++                    code = max(blocks, key=len)
++                    os.makedirs(os.path.dirname(target), exist_ok=True)
++                    with open(target, 'w') as f:
++                        f.write(code)
++                    safe_log(f"Escalation 3 wrote {len(code)} characters to {target}.")
++                else:
++                    safe_log("Escalation 3: no python code block found in reply.")
++                msg_history = reply_history
++            except Exception as e:
++                safe_log(f"Escalation 3 failed with exception: {e}")
+ 
+         # Verification checklist turn once a source edit exists; re-prompt a bounded number of times.
+-        if _has_source_edit(diff_versus_commit(self.git_tempdir, self.base_commit)):
++        if edit_landed():
+             final_check = (
+                 "Verification checklist. Before finishing, complete each item and report its status:\n"
+                 "1. Exact sample match: re-run the `run_samples` tool on ALL statement samples. Every case must have exact_match true (character-for-character agreement, including decimal digit count and integer formatting). State the result.\n"

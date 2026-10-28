@@ -1,0 +1,223 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 89af0c8..d3f63c5 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ import re
++import tempfile
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -86,6 +87,29 @@ def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+     
+     return logger
+ 
++def _describe_turn(response_or_msg):
++    """Return a short description of stop_reason and content block types/lengths for logging."""
++    stop_reason = getattr(response_or_msg, 'stop_reason', None)
++    content = getattr(response_or_msg, 'content', None)
++    if content is None and isinstance(response_or_msg, dict):
++        stop_reason = response_or_msg.get('stop_reason', stop_reason)
++        content = response_or_msg.get('content')
++    parts = []
++    if isinstance(content, str):
++        parts.append(f"str({len(content)})")
++    elif isinstance(content, list):
++        for block in content:
++            if isinstance(block, dict):
++                btype = block.get('type')
++                text = block.get('text')
++            else:
++                btype = getattr(block, 'type', None)
++                text = getattr(block, 'text', None)
++            length = len(text) if isinstance(text, str) else 0
++            parts.append(f"{btype}({length})")
++    return f"stop_reason={stop_reason} blocks=[{', '.join(parts)}]"
++
++
+ def safe_log(message, level=logging.INFO):
+     """
+     Thread-safe logging function that ensures messages go to the correct logger.
+@@ -125,6 +149,8 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
++        self._write_statement_file()
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -200,6 +226,36 @@ class AgenticSystem:
+         return "test-only"
+ 
+     MAX_TARGET_CHARS = 8000
++    MAX_STATEMENT_CHARS = 4000
++
++    def _problem_for_retry(self, statement):
++        """Truncate long statements to the first chunk plus Sample 1/2 blocks."""
++        statement = statement or ''
++        if len(statement) <= self.MAX_STATEMENT_CHARS:
++            return statement
++        head = statement[:self.MAX_STATEMENT_CHARS]
++        samples = []
++        for m in re.finditer(r'Sample (?:Input|Output)\s*\d*\s*:?[ \t]*\n.*?(?=\n\s*Sample (?:Input|Output)|\Z)',
++                             statement, re.DOTALL | re.IGNORECASE):
++            if len(samples) >= 4:
++                break
++            samples.append(m.group(0).strip())
++        note = ("\n... [statement truncated; the full statement is in "
++                f"{self._statement_file_path()} (read it with the bash tool if needed)]")
++        tail = ("\n\n" + "\n\n".join(samples[:4])) if samples else ""
++        return head + note + tail
++
++    def _statement_file_path(self):
++        if not getattr(self, '_statement_dir', None):
++            self._statement_dir = tempfile.mkdtemp(prefix='coding_agent_')
++        return os.path.join(self._statement_dir, 'problem.md')
++
++    def _write_statement_file(self):
++        try:
++            with open(self._statement_file_path(), 'w', encoding='utf-8') as f:
++                f.write(self.problem_statement or '')
++        except OSError:
++            pass
+ 
+     @staticmethod
+     def _block_field(block, key):
+@@ -227,6 +283,17 @@ class AgenticSystem:
+                     return True
+         return False
+ 
++    @classmethod
++    def _is_empty_turn(cls, msg_history):
++        """
++        True if the last message is an assistant turn with no tool_use block and no non-whitespace text.
++        """
++        if not isinstance(msg_history, list) or not msg_history:
++            return False
++        last = msg_history[-1]
++        role = last.get('role') if isinstance(last, dict) else getattr(last, 'role', None)
++        return role == 'assistant' and not cls._message_has_content(last)
++
+     @classmethod
+     def _sanitize_history(cls, msg_history):
+         """
+@@ -259,6 +326,18 @@ class AgenticSystem:
+                 return f"len={len(text)} preview={text[:200]!r}"
+         return "no assistant message"
+ 
++    @staticmethod
++    def _log_last_turn(history, label):
++        """Log stop_reason and content block types/lengths of the last assistant turn."""
++        if not isinstance(history, list):
++            return
++        for msg in reversed(history):
++            role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++            if role == 'assistant':
++                safe_log(f"{label}: {_describe_turn(msg)}")
++                return
++        safe_log(f"{label}: no assistant message")
++
+     def _safe_chat(self, prompt, history):
+         """
+         Call chat_with_agent without letting exceptions abort the run.
+@@ -267,6 +346,20 @@ class AgenticSystem:
+         previous = self._sanitize_history(history)
+         try:
+             result = chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
++            self._log_last_turn(result, 'turn')
++            for _ in range(2):
++                if not self._is_empty_turn(result):
++                    break
++                safe_log("Empty assistant turn detected; asking the model again in the same conversation.",
++                         level=logging.WARNING)
++                base = result[:-1]
++                result = chat_with_agent(
++                    'Your last reply was empty. Call the editor tool now to write the full solution to the target file.',
++                    model=self.code_model,
++                    msg_history=base,
++                    logging=safe_log,
++                )
++                self._log_last_turn(result, 'empty-recovery turn')
+             return self._sanitize_history(result)
+         except Exception:
+             import traceback
+@@ -281,6 +374,41 @@ class AgenticSystem:
+             )
+             return previous
+ 
++    def _direct_codegen_fallback(self, model, target_path, target_content):
++        """
++        No-tools single completion asking for the full program in one ```python block.
++        Writes the last python block to target_path (or solution.py in the repo). Returns True if written.
++        """
++        from llm import create_client, get_response_from_llm
++        prompt = (
++            "Return ONLY the complete Python 3 program in one ```python block.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Target file: {target_path or os.path.join(self.git_tempdir, 'solution.py')}\n"
++            f"Starter content:\n```python\n{target_content or ''}\n```\n"
++        )
++        try:
++            client, client_model = create_client(model)
++            text, _ = get_response_from_llm(
++                prompt, client=client, model=client_model,
++                system_message="You are an expert competitive programmer.",
++                msg_history=[], temperature=0.0,
++            )
++        except Exception:
++            import traceback
++            safe_log("Direct codegen fallback raised:\n" + traceback.format_exc(), level=logging.ERROR)
++            return False
++        if not isinstance(text, str):
++            return False
++        blocks = re.findall(r'```(?:python)?\n(.*?)```', text, re.S)
++        if not blocks or not blocks[-1].strip():
++            safe_log(f"Direct codegen fallback ({model}): no usable python block.", level=logging.WARNING)
++            return False
++        out_path = target_path or os.path.join(self.git_tempdir, 'solution.py')
++        with open(out_path, 'w', encoding='utf-8') as f:
++            f.write(blocks[-1])
++        safe_log(f"Direct codegen fallback ({model}): wrote {out_path}")
++        return True
++
+     SAMPLE_INPUT_RE = re.compile(
+         r'Sample Input\s*\d*\s*:?[ \t]*\n(.*?)(?=\n\s*Sample Output|\n\s*Output\b|\Z)',
+         re.DOTALL | re.IGNORECASE,
+@@ -475,7 +603,7 @@ Steps:
+             else:
+                 extra = "Write the simplest correct solution, even if brute force. Do not analyze further; write it now."
+             prompt = (
+-                f"Solve this programming problem.\n\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Solve this programming problem.\n\n<problem_description>\n{self._problem_for_retry(self.problem_statement)}\n</problem_description>\n\n"
+                 f"{target_hint}\n"
+                 f"Call the editor tool now to write the full solution into this file; do not reply with text only. "
+                 f"{extra}"
+@@ -483,6 +611,25 @@ Steps:
+             msg_history = self._safe_chat(prompt, [])
+             safe_log(f"Retry {attempt} outcome: {self._patch_outcome()}")
+ 
++        if not self._has_valid_patch():
++            safe_log("No valid patch after retries; trying direct no-tools codegen fallback.", level=logging.WARNING)
++            fallback_models = [self.code_model]
++            alternate_model = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++            if alternate_model != self.code_model:
++                fallback_models.append(alternate_model)
++            for model in fallback_models:
++                self._direct_codegen_fallback(model, target_path, target_content)
++                if self._has_valid_patch():
++                    break
++            if self._has_valid_patch():
++                fallback_target = target_path or os.path.join(self.git_tempdir, 'solution.py')
++                verify_prompt = (
++                    f"A draft is in the file {fallback_target}. Run it on all samples and fix it. "
++                    "Use the editor tool to fix any bugs; the file must contain the final implementation."
++                )
++                msg_history = self._safe_chat(verify_prompt, [])
++                safe_log(f"Fallback verification turn outcome: {self._patch_outcome()}")
++
+         smoke_ok = None
+         for smoke_attempt in range(3):
+             smoke_ok, smoke_report = self._smoke_check()

@@ -1,0 +1,320 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 128b70c..133c5b6 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -2,6 +2,9 @@ import argparse
+ import re
+ import subprocess
+ import logging
++import traceback
++import anthropic
++import openai
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+@@ -205,16 +208,51 @@ class AgenticSystem:
+             return True
+         return False
+ 
+-    def _infer_target_filename(self):
++    def _detect_target_file(self):
+         """
+-        Infer the target file name from the problem statement.
+-        Uses a backticked *.py name if present; defaults to solution.py.
++        Detect the file the solution should be written to.
++        Order: (1) backticked filenames (any extension) in the problem statement, preferring ones that
++        exist in the repo; (2) repo files containing `class Solution` (preferring pass-only stubs);
++        (3) default 'solution.py'.
+         """
+-        m = re.search(r'`([\w\-./]+\.py)`', self.problem_statement)
+-        if m:
+-            return m.group(1)
++        names = re.findall(r'`([\w\-./]+\.\w+)`', self.problem_statement or '')
++        for name in names:
++            if os.path.isfile(os.path.join(self.git_tempdir, name)):
++                return name
++        if names:
++            return names[0]
++
++        candidates = []
++        for root, dirs, files in os.walk(self.git_tempdir):
++            dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', 'node_modules')]
++            for fname in files:
++                if not fname.endswith('.py'):
++                    continue
++                full = os.path.join(root, fname)
++                rel = os.path.relpath(full, self.git_tempdir)
++                if self._is_test_path(rel):
++                    continue
++                try:
++                    with open(full, 'r', encoding='utf-8', errors='ignore') as f:
++                        code = f.read()
++                except Exception:
++                    continue
++                if not re.search(r'^\s*class\s+Solution\b', code, flags=re.MULTILINE):
++                    continue
++                body = code.split('class Solution', 1)[1]
++                is_stub = bool(re.search(r'^\s+pass\s*$', body, flags=re.MULTILINE))
++                candidates.append((0 if is_stub else 1, rel))
++        if candidates:
++            candidates.sort()
++            return candidates[0][1]
+         return 'solution.py'
+ 
++    def _infer_target_filename(self):
++        """
++        Infer the target file name from the problem statement (see _detect_target_file).
++        """
++        return self._detect_target_file()
++
+     def _extract_samples(self):
+         """
+         Parse (input, expected_output) pairs from self.problem_statement.
+@@ -296,44 +334,171 @@ class AgenticSystem:
+                 )
+         return failures
+ 
+-    def _fallback_write_solution(self):
++    def _normalize_response_text(self, response):
+         """
+-        Last-resort: make a tool-free LLM call asking for the full solution file contents,
+-        extract the code block and write it to the git_tempdir.
++        Turn an LLM response (str, list of content blocks, or object with .content[0].text)
++        into plain text. Returns '' when no text is present. Never indexes without a length check.
++        """
++        if response is None:
++            return ''
++        if isinstance(response, str):
++            return response
++        if isinstance(response, (list, tuple)):
++            parts = []
++            for block in response:
++                if isinstance(block, str):
++                    parts.append(block)
++                elif isinstance(block, dict):
++                    parts.append(str(block.get('text') or ''))
++                else:
++                    parts.append(str(getattr(block, 'text', '') or ''))
++            return '\n'.join(p for p in parts if p)
++        content = getattr(response, 'content', None)
++        if content is not None:
++            if isinstance(content, str):
++                return content
++            if isinstance(content, (list, tuple)):
++                if len(content) == 0:
++                    return ''
++                return self._normalize_response_text(list(content))
++        choices = getattr(response, 'choices', None)
++        if choices is not None and len(choices) > 0:
++            message = getattr(choices[0], 'message', None)
++            text = getattr(message, 'content', None)
++            return text or ''
++        return str(getattr(response, 'text', '') or '')
++
++    def _single_shot_llm(self, prompt, system_message="You are an expert competitive programmer. Respond only with the requested code."):
++        """
++        One tool-free completion. Tries llm.get_response_from_llm first; on any exception,
++        logs the full traceback and calls the provider SDK directly. Returns text ('' on failure).
+         """
+-        filename = self._infer_target_filename()
+-        safe_log(f"[forward] Fallback: requesting full contents of {filename} (tool-free).")
+-        prompt = (
+-            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-            f"Output ONLY the full contents of {filename} in a single ```python block. "
+-            "The file must be a complete, runnable Python program or implementation that solves the problem above. "
+-            "Do not include any other text."
+-        )
+         try:
+             client, client_model = create_client(self.code_model)
+             response, _ = get_response_from_llm(
+                 msg=prompt,
+                 client=client,
+                 model=client_model,
+-                system_message="You are an expert competitive programmer. Respond only with the requested code.",
++                system_message=system_message,
+                 print_debug=False,
+                 msg_history=[],
+             )
++            text = self._normalize_response_text(response)
++            if text.strip():
++                return text
++            safe_log("[forward] _single_shot_llm: get_response_from_llm returned empty text; trying SDK directly.")
++        except Exception:
++            safe_log(f"[forward] _single_shot_llm: get_response_from_llm failed:\n{traceback.format_exc()}")
++
++        try:
++            model = self.code_model
++            if model.startswith('claude-') or 'claude' in model:
++                client = anthropic.Anthropic()
++                client_model = model.split('/')[-1] if model.startswith('bedrock') or model.startswith('vertex_ai') else model
++                resp = client.messages.create(
++                    model=client_model,
++                    max_tokens=4096,
++                    system=system_message,
++                    messages=[{"role": "user", "content": prompt}],
++                )
++                return self._normalize_response_text(resp)
++            client = openai.OpenAI()
++            resp = client.chat.completions.create(
++                model=model,
++                messages=[
++                    {"role": "system", "content": system_message},
++                    {"role": "user", "content": prompt},
++                ],
++            )
++            return self._normalize_response_text(resp)
++        except Exception:
++            safe_log(f"[forward] _single_shot_llm: direct SDK call failed:\n{traceback.format_exc()}")
++            return ''
++
++    def _extract_code_block(self, text):
++        """
++        Extract the first code block from text. Tolerates ```python, ```py, and bare fences.
++        Returns None when no fenced block is found.
++        """
++        if not text:
++            return None
++        m = re.search(r'```(?:python3|python|py)?[ \t]*\r?\n(.*?)```', text, flags=re.DOTALL)
++        if m:
++            return m.group(1)
++        return None
++
++    def _compile_error(self, code):
++        """
++        Return None if code compiles, else the compile error text. Uses py_compile on a temp copy.
++        """
++        import tempfile
++        import py_compile
++        fd, tmp_path = tempfile.mkstemp(suffix='.py', prefix='cand_')
++        try:
++            with os.fdopen(fd, 'w') as f:
++                f.write(code)
++            py_compile.compile(tmp_path, doraise=True, cfile=tmp_path + 'c')
++            return None
++        except py_compile.PyCompileError as e:
++            return str(e)
+         except Exception as e:
+-            safe_log(f"[forward] Fallback LLM call failed: {e}")
+-            return False
++            return f"{type(e).__name__}: {e}"
++        finally:
++            for p in (tmp_path, tmp_path + 'c'):
++                try:
++                    os.remove(p)
++                except OSError:
++                    pass
+ 
+-        match = re.search(r'```(?:python|py)?[ \t]*\n(.*?)```', response or '', flags=re.DOTALL)
+-        if not match:
+-            safe_log(f"[forward] Fallback: no ```python code block found in response.")
+-            return False
+-        code = match.group(1)
++    def _fallback_write_solution(self):
++        """
++        Last-resort: tool-free LLM call with the current stub contents, asking for the complete
++        updated file in one code block. The code is compile-checked before writing; retried once
++        with the compile error. Returns True if a file was written.
++        """
++        filename = self._infer_target_filename()
+         target = os.path.join(self.git_tempdir, filename)
+-        os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+-        with open(target, 'w') as f:
+-            f.write(code)
+-        safe_log(f"[forward] Fallback: wrote {len(code)} chars to {target}")
+-        return True
++        current = ''
++        if os.path.isfile(target):
++            try:
++                with open(target, 'r', encoding='utf-8', errors='ignore') as f:
++                    current = f.read()
++            except Exception:
++                safe_log(f"[forward] Fallback: could not read {target}:\n{traceback.format_exc()}")
++        safe_log(f"[forward] Fallback: requesting full contents of {filename} (tool-free, single-shot).")
++        base_prompt = (
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Here is the current file {filename}:\n```python\n{current}\n```\n\n"
++            f"Return the complete updated file {filename} in one code block. "
++            "The file must be a complete, runnable Python implementation that solves the problem above "
++            "(keep any given class/function signatures; read input from stdin and print output if the problem is a stdin program). "
++            "Do not include any other text outside the single code block."
++        )
++        prompt = base_prompt
++        last_error = None
++        for try_idx in range(2):
++            if try_idx == 1:
++                prompt = (
++                    base_prompt
++                    + f"\n\nYour previous answer failed to compile with this error:\n{last_error}\n"
++                    "Return the corrected complete file in one code block."
++                )
++            response_text = self._single_shot_llm(prompt)
++            code = self._extract_code_block(response_text)
++            if code is None:
++                last_error = "no fenced code block found in the response"
++                safe_log(f"[forward] Fallback try {try_idx}: {last_error}.")
++                continue
++            last_error = self._compile_error(code)
++            if last_error is None:
++                os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
++                with open(target, 'w') as f:
++                    f.write(code)
++                safe_log(f"[forward] Fallback: wrote {len(code)} chars to {target}")
++                return True
++            safe_log(f"[forward] Fallback try {try_idx}: compile error: {last_error}")
++        safe_log("[forward] Fallback: giving up without writing a file.")
++        return False
+ 
+     def forward(self):
+         """
+@@ -383,17 +548,45 @@ Please analyze the problem description carefully. Then make edits to the code fi
+                 reason = (f"Your patch only modifies test files ({', '.join(changed_files)}). "
+                           "Tests do not count as the solution.")
+             degenerate = (not changed_files) or last_empty
+-            strategy = "fresh-restart" if degenerate else "corrective-message"
++            if not degenerate:
++                strategy = "corrective-message"
++            elif attempt == 0 and msg_history:
++                strategy = "continue-nudge"
++            else:
++                strategy = "fresh-restart-with-stub"
+             safe_log(f"[forward] Attempt {attempt}: failure={failure}, last_assistant_empty={last_empty}, "
+                      f"changed_files={changed_files}, strategy={strategy}")
+ 
+-            if degenerate:
++            target_name = self._infer_target_filename()
++            if strategy == "continue-nudge":
++                nudge = (
++                    "Your last reply was empty and no source file was changed. "
++                    f"Call the editor tool now and write the full implementation into {target_name}. "
++                    "Do not reply with text only; the next action must be a tool call."
++                )
++                msg_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            elif strategy == "fresh-restart-with-stub":
++                target_path = os.path.join(self.git_tempdir, target_name)
++                stub_text = ''
++                if os.path.isfile(target_path):
++                    try:
++                        with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
++                            stub_text = f.read()
++                    except Exception:
++                        safe_log(f"[forward] Could not read stub {target_path}:\n{traceback.format_exc()}")
++                if attempt == 1:
++                    action = (f"Edit {target_name} immediately with the editor tool: replace its contents with a complete, "
++                              "working implementation of the problem above. Your first action must be that tool call. "
++                              "Then test it on the sample inputs with bash.")
++                else:
++                    action = (f"Your previous attempts produced no edit. This time, go straight to work: call the editor tool "
++                              f"on {target_name} with the full final code (a simple correct approach is fine for now), "
++                              "then refine it. Do not write any explanation before the tool call.")
+                 restart = (
+                     f"{task}\n"
+-                    "Your first action must be a tool call that creates or edits the solution file with a complete implementation. "
+-                    "If the target file (e.g. solution.py) does not exist, create it with the editor tool right away, "
+-                    "then refine it and test it.\n"
+-                    "Do not end a turn without a tool call before the file has been written."
++                    f"The target file is {target_name}. Its current contents are:\n"
++                    f"```\n{stub_text}\n```\n"
++                    f"{action}"
+                 )
+                 msg_history = chat_with_agent(restart, model=self.code_model, msg_history=[], logging=safe_log)
+             else:

@@ -1,0 +1,366 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ad74aca..75126cb 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -213,6 +213,19 @@ def _parse_samples(text):
+     return result
+ 
+ 
++_INTERACTIVE_RE = re.compile(
++    r'interactive problem|interacts? with the judge|"\?\s[^"\n]*"', re.I)
++
++INTERACTIVE_BLOCK = """
++Interactive-problem workflow (the statement is an interactive problem). Assume nothing about the I/O until you have checked it:
++A. State the protocol explicitly in a comment at the top of solution.py: what is printed (queries/answers, flush rules), what is read, and when the program must stop.
++B. Write interactor.py (in {repo}): a judge that takes a seed as sys.argv[1], builds a hidden instance from it (vary N and the hidden values across seeds, include edge sizes such as N=1 and N at the constraint maximum), answers the solution's queries exactly as the statement specifies, enforces the query limit, validates every answer line, and exits 0 only if the solution gave a correct final answer. Print the rejection reason to stderr.
++C. Run the interactive_test tool (solution_cmd='python3 solution.py', interactor_cmd='python3 interactor.py', seeds=200 or more, timeout a few seconds). Also run it with several seeds that force extreme cases. Fix every WRONG, CRASH and TIMEOUT.
++D. Check query counts against an independent first-principles oracle: compute the minimum or expected number of queries from the statement's rules (e.g. log2 bound for binary search, or the required structure) in the interactor or in a separate script, and confirm the solution's count is within the limit for every seed and size.
++E. Robustness to grader variants: the hidden grader may feed the whole interaction as static stdin (the transcript of answers appended after your queries) instead of a live judge. Read stdin tolerantly: prefer line-by-line reads for live play, but never crash on unexpected extra tokens or lines; if the responses are not line-aligned, fall back to sys.stdin.read().split() and consume tokens in order. Never raise on EOF; exit cleanly. Check this by running the solution once with a static transcript file (interactive_test with mode='static_input' and transcript_file) and confirm it does not crash.
++F. Do not finish with only a self-written judge that shares your assumptions: the interactor must follow the statement's text, not your solution's reading of it.
++"""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -258,6 +271,17 @@ class AgenticSystem:
+         return new_msg_history
+ 
+ 
++    def _is_interactive(self):
++        """True when the statement describes an interactive problem (judge queries)."""
++        try:
++            return bool(_INTERACTIVE_RE.search(self.problem_statement or ''))
++        except Exception:
++            return False
++
++    def _has_agent_sample_files(self):
++        """True when sample*.in files exist in the repo (framework-extracted or agent-written)."""
++        return bool(glob.glob(os.path.join(self.git_tempdir, 'sample*.in')))
++
+     def _has_primary_edit(self):
+         """
+         True if the primary deliverable (solution.py, or if absent any non-helper source file)
+@@ -305,6 +329,8 @@ class AgenticSystem:
+             with open(os.path.join(self.git_tempdir, f"sample{num}.out"), 'w') as f:
+                 f.write(out)
+         safe_log(f"Extracted {len(found)} sample(s) from the problem statement.")
++        if not found:
++            safe_log("No samples were extracted from the statement; the agent must hand-derive at least one test.")
+         return len(found)
+ 
+     def _sample_failures(self):
+@@ -496,6 +522,9 @@ For `Solution` class-method tasks, use the method_stress_test tool instead of st
+ 10. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored.
+ 
+ Guidance: Keep replies concise; do not re-print the README; create files in a single editor call; avoid re-printing large files."""
++        if self._is_interactive():
++            method = method + INTERACTIVE_BLOCK.replace('{repo}', self.git_tempdir)
++            safe_log("Interactive problem detected; added the interactive workflow to the prompt.")
+         instruction = f"{task}\n\n{method}"
+         msg_history = []
+         try:
+@@ -511,6 +540,7 @@ Guidance: Keep replies concise; do not re-print the README; create files in a si
+             f"Write the simplest correct solution to {self.git_tempdir}/solution.py now with a single editor call. "
+             "Do not explore the repo. Do not write elaborate tests."
+         )
++        hand_test_requested = False
+         for attempt in range(4):
+             sample_failures = []
+             canon_report = None
+@@ -520,6 +550,24 @@ Guidance: Keep replies concise; do not re-print the README; create files in a si
+                 self._extract_samples()
+                 if self._has_primary_edit():
+                     sample_failures = self._sample_failures()
++                    if not sample_failures and not self._has_agent_sample_files() and not hand_test_requested:
++                        # No samples at all: the sample gate would pass vacuously. Ask once for a hand-derived test.
++                        hand_test_requested = True
++                        safe_log(f"No sample files exist before retry attempt {attempt + 1}; requesting hand-derived test cases.")
++                        retry_msg = (
++                            f"{task}\n\n"
++                            "solution.py exists, but there are NO sample test files, so nothing has been verified yet. "
++                            "Hand-derive at least one test from the statement: pick a small input, work out the expected output "
++                            "by reasoning from the problem rules (not from your solution), save it as "
++                            f"{self.git_tempdir}/sample1.in and {self.git_tempdir}/sample1.out, then run run_samples on "
++                            f"{self.git_tempdir} and make sure it passes. If the problem is interactive, also run interactive_test "
++                            "with your interactor. Do not finish until at least one verified test exists.\n"
++                        )
++                        try:
++                            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=self.get_current_edits(), logging=safe_log)
++                        except Exception as e:
++                            safe_log(f"Hand-test retry failed: {e}")
++                        continue
+                     if not sample_failures:
+                         canon_report = self._canonical_mismatch()
+                         if canon_report is None:
+diff --git a/tools/interactive_test.py b/tools/interactive_test.py
+new file mode 100644
+index 0000000..fe48601
+--- /dev/null
++++ b/tools/interactive_test.py
+@@ -0,0 +1,266 @@
++import os
++import signal
++import subprocess
++import threading
++import time
++
++MAX_STDERR_TAIL = 600
++MAX_MSG = 600
++MAX_SEEDS = 500
++
++
++def tool_info():
++    return {
++        "name": "interactive_test",
++        "description": """Test an interactive-problem solution against an interactor (judge) you wrote.\n
++* `interactor_cmd` is run as `<interactor_cmd> <seed>` for each seed. The interactor holds a hidden instance chosen from the seed, talks to the solution over pipes, and signals acceptance with exit code 0. Any non-zero exit means rejection; the interactor should print its reason to stderr (or stdout is treated as the message if stderr is empty).\n
++* Mode 'live' (default): the interactor's stdout is wired to the solution's stdin and the solution's stdout is wired to the interactor's stdin, so the two talk in real time. The number of lines the solution sends to the interactor is reported as the query count.\n
++* Mode 'static_input': the solution's stdin is a fixed transcript file (`transcript_file`) instead of a live judge. Use it to check that the solution does not crash when the grader supplies the whole interaction as static stdin. The interactor is not run in this mode; the solution's exit code and stderr are reported for each seed's transcript (the same transcript is used for every seed unless `seeds` is 1).\n
++* Each seed runs both processes with a timeout; a hang is reported as TIMEOUT. The result lists per-seed verdicts, query counts, and for the first failure the interactor message and the solution's stderr tail.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command that runs the solution reading from stdin and writing to stdout, e.g. 'python3 solution.py'."
++                },
++                "interactor_cmd": {
++                    "type": "string",
++                    "description": "Shell command for the interactor; it is run as '<interactor_cmd> <seed>'. e.g. 'python3 interactor.py'. Exit code 0 means the solution was accepted."
++                },
++                "seeds": {
++                    "type": "integer",
++                    "description": "Number of seeds to run, 0 .. seeds-1 (default 50). Use many seeds and different sizes encoded in the interactor."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Time limit in seconds per seed run (default 5)."
++                },
++                "mode": {
++                    "type": "string",
++                    "description": "'live' (default) for a cross-connected interactor, or 'static_input' to feed transcript_file to the solution as stdin."
++                },
++                "transcript_file": {
++                    "type": "string",
++                    "description": "Path to a pre-recorded transcript file used as the solution's stdin in 'static_input' mode."
++                }
++            },
++            "required": ["solution_cmd", "interactor_cmd"]
++        }
++    }
++
++
++def _kill(proc):
++    try:
++        os.killpg(proc.pid, signal.SIGKILL)
++    except OSError:
++        pass
++
++
++def _clip(s, n=MAX_MSG):
++    s = s or ''
++    return s if len(s) <= n else s[:n] + '...'
++
++
++def _run_live(solution_cmd, interactor_cmd, seed, cwd, timeout):
++    """Returns dict with verdict, message, queries, stderr."""
++    # Interactor and solution are both started in their own process group so both can be killed.
++    inter = subprocess.Popen(
++        f"{interactor_cmd} {seed}",
++        shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        cwd=cwd, start_new_session=True)
++    sol = subprocess.Popen(
++        solution_cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        cwd=cwd, start_new_session=True)
++
++    queries = [0]
++    box = {}
++
++    def pump_sol_to_inter():
++        # Solution's stdout -> interactor's stdin; counts lines (queries) sent by the solution.
++        try:
++            for line in iter(sol.stdout.readline, b''):
++                queries[0] += 1
++                try:
++                    inter.stdin.write(line)
++                    inter.stdin.flush()
++                except (BrokenPipeError, OSError, ValueError):
++                    break
++        except (OSError, ValueError):
++            pass
++        try:
++            inter.stdin.close()
++        except (OSError, ValueError):
++            pass
++
++    def pump_inter_to_sol():
++        # Interactor's stdout -> solution's stdin.
++        try:
++            for line in iter(inter.stdout.readline, b''):
++                try:
++                    sol.stdin.write(line)
++                    sol.stdin.flush()
++                except (BrokenPipeError, OSError, ValueError):
++                    break
++        except (OSError, ValueError):
++            pass
++        try:
++            sol.stdin.close()
++        except (OSError, ValueError):
++            pass
++
++    def drain_err(p, key):
++        try:
++            box[key] = p.stderr.read()
++        except (OSError, ValueError):
++            box[key] = b''
++
++    threads = [
++        threading.Thread(target=pump_sol_to_inter, daemon=True),
++        threading.Thread(target=pump_inter_to_sol, daemon=True),
++        threading.Thread(target=drain_err, args=(inter, 'inter_err'), daemon=True),
++        threading.Thread(target=drain_err, args=(sol, 'sol_err'), daemon=True),
++    ]
++    for t in threads:
++        t.start()
++
++    start = time.time()
++    deadline = start + timeout
++    timed_out = False
++    try:
++        inter_rc = inter.wait(timeout=max(0.01, deadline - time.time()))
++    except subprocess.TimeoutExpired:
++        timed_out = True
++    if not timed_out:
++        try:
++            sol_rc = sol.wait(timeout=max(0.01, deadline - time.time()))
++        except subprocess.TimeoutExpired:
++            timed_out = True
++    if timed_out:
++        _kill(inter)
++        _kill(sol)
++    for p in (inter, sol):
++        try:
++            p.wait(timeout=2)
++        except subprocess.TimeoutExpired:
++            _kill(p)
++    for t in threads:
++        t.join(timeout=2)
++
++    inter_err = (box.get('inter_err') or b'').decode('utf-8', errors='replace')
++    sol_err = (box.get('sol_err') or b'').decode('utf-8', errors='replace')
++    inter_rc = inter.returncode
++    sol_rc = sol.returncode
++    res = {'queries': queries[0], 'stderr': sol_err, 'inter_msg': inter_err}
++    if timed_out:
++        res['verdict'] = 'TIMEOUT'
++        res['message'] = f"exceeded {timeout}s (solution or interactor did not finish)"
++    elif inter_rc != 0:
++        res['verdict'] = 'WRONG'
++        res['message'] = inter_err.strip() or f"interactor exit code {inter_rc}"
++    elif sol_rc != 0:
++        res['verdict'] = 'CRASH'
++        res['message'] = f"solution exit code {sol_rc}"
++    else:
++        res['verdict'] = 'OK'
++        res['message'] = 'accepted'
++    return res
++
++
++def _run_static(solution_cmd, transcript_path, cwd, timeout):
++    start = time.time()
++    try:
++        with open(transcript_path, 'rb') as fin:
++            proc = subprocess.Popen(
++                solution_cmd, shell=True, stdin=fin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                cwd=cwd, start_new_session=True)
++            try:
++                out, err = proc.communicate(timeout=timeout)
++            except subprocess.TimeoutExpired:
++                _kill(proc)
++                proc.communicate()
++                return {'verdict': 'TIMEOUT', 'message': f'exceeded {timeout}s', 'queries': 0,
++                        'stderr': '', 'inter_msg': ''}
++    except OSError as e:
++        return {'verdict': 'CRASH', 'message': str(e), 'queries': 0, 'stderr': '', 'inter_msg': ''}
++    err_s = err.decode('utf-8', errors='replace')
++    res = {'queries': 0, 'stderr': err_s, 'inter_msg': '',
++           'out_tokens': len(out.split()), 'elapsed': round(time.time() - start, 3)}
++    if proc.returncode != 0:
++        res['verdict'] = 'CRASH'
++        res['message'] = f"solution exit code {proc.returncode} on static transcript"
++    else:
++        res['verdict'] = 'OK'
++        res['message'] = 'no crash on static transcript'
++    return res
++
++
++def tool_function(solution_cmd, interactor_cmd=None, seeds=50, timeout=5, mode='live', transcript_file=None):
++    if not solution_cmd:
++        return "Error: solution_cmd is required."
++    mode = (mode or 'live').strip().lower()
++    try:
++        seeds = int(seeds) if seeds is not None else 50
++    except (TypeError, ValueError):
++        seeds = 50
++    seeds = max(1, min(seeds, MAX_SEEDS))
++    try:
++        timeout = int(timeout) if timeout is not None else 5
++    except (TypeError, ValueError):
++        timeout = 5
++    timeout = max(1, min(timeout, 60))
++    cwd = os.getcwd()
++    try:
++        from tools import bash as _bash
++        cwd = _bash._STATE.get('cwd') or cwd
++        if not os.path.isdir(cwd):
++            cwd = os.getcwd()
++    except Exception:
++        pass
++
++    if mode == 'static_input':
++        if not transcript_file:
++            return "Error: transcript_file is required in static_input mode."
++        path = transcript_file if os.path.isabs(transcript_file) else os.path.join(cwd, transcript_file)
++        if not os.path.exists(path):
++            return f"Error: transcript_file {transcript_file!r} not found."
++        res = _run_static(solution_cmd, path, cwd, timeout)
++        lines = [f"static_input transcript={transcript_file}: {res['verdict']} - {res['message']}"]
++        if res['verdict'] != 'OK':
++            lines.append(f"solution stderr tail: {_clip(res['stderr'].strip()[-MAX_STDERR_TAIL:]) or '(none)'}")
++        else:
++            lines.append(f"solution produced {res.get('out_tokens', 0)} output tokens; stderr tail: "
++                         f"{_clip(res['stderr'].strip()[-200:]) or '(none)'}")
++        return "\n".join(lines)
++
++    if mode != 'live':
++        return f"Error: unknown mode {mode!r}; use 'live' or 'static_input'."
++    if not interactor_cmd:
++        return "Error: interactor_cmd is required in live mode."
++
++    counts = {'OK': 0, 'WRONG': 0, 'CRASH': 0, 'TIMEOUT': 0}
++    first_fail = None
++    per_seed = []
++    for seed in range(seeds):
++        res = _run_live(solution_cmd, interactor_cmd, seed, cwd, timeout)
++        counts[res['verdict']] = counts.get(res['verdict'], 0) + 1
++        per_seed.append(f"seed {seed}: {res['verdict']} queries={res['queries']}")
++        if res['verdict'] != 'OK' and first_fail is None:
++            first_fail = (seed, res)
++            # Stop early on the first failure to keep the report short.
++            break
++    head = (f"interactive_test: {sum(counts.values())} seed(s) run, OK={counts['OK']} WRONG={counts['WRONG']} "
++            f"CRASH={counts['CRASH']} TIMEOUT={counts['TIMEOUT']}")
++    lines = [head]
++    if first_fail is None:
++        lines.append("All seeds accepted. Per-seed query counts:")
++        lines.extend(per_seed[:20])
++        if len(per_seed) > 20:
++            lines.append(f"... ({len(per_seed) - 20} more)")
++    else:
++        seed, res = first_fail
++        lines.append(f"First failure at seed {seed}: {res['verdict']} queries={res['queries']}")
++        lines.append(f"interactor message: {_clip(res['inter_msg'].strip()) or '(none)'}")
++        lines.append(f"verdict detail: {res['message']}")
++        lines.append(f"solution stderr tail: {_clip(res['stderr'].strip()[-MAX_STDERR_TAIL:]) or '(none)'}")
++    return "\n".join(lines)

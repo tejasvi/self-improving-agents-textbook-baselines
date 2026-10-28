@@ -1,0 +1,980 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 30682ca..9f6ab3c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,966 +1,11 @@
+-import argparse
++from typing import *
++import os
+ import re
++import sys
++import json
++import time
+ import subprocess
+-import logging
+-from logging.handlers import RotatingFileHandler
+-import os
+-import threading
+-import ast
+-
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from llm import create_client
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+-
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+-
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
+-
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
+-
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
+-
+-# Scratch directory where the agent writes maximum-size performance inputs
+-_PERF_DIR = '/tmp/perf_inputs'
+-
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+-
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
+-
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    def _changed_files(self):
+-        """
+-        Return the list of paths changed versus self.base_commit in git_tempdir,
+-        including untracked files.
+-        """
+-        result = subprocess.run(
+-            ["git", "-C", self.git_tempdir, "status", "--porcelain", "--untracked-files=all"],
+-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-        )
+-        files = []
+-        for line in result.stdout.decode(errors='replace').splitlines():
+-            if len(line) < 4:
+-                continue
+-            path = line[3:]
+-            if ' -> ' in path:  # rename: keep the new path
+-                path = path.split(' -> ', 1)[1]
+-            path = path.strip().strip('"')
+-            if path:
+-                files.append(path)
+-        return files
+-
+-    def _is_test_file(self, path):
+-        """
+-        True if any directory or filename component of the path contains
+-        'test', 'spec' or 'conftest' (case-insensitive).
+-        """
+-        lowered = path.lower().replace('\\', '/')
+-        keywords = ('test', 'spec', 'conftest')
+-        return any(any(k in part for k in keywords) for part in lowered.split('/') if part)
+-
+-    def _patch_status(self):
+-        """
+-        Classify the current repo edits as 'empty', 'test_only', 'invalid' or 'ok'.
+-        'invalid' means the target solution file fails _validate_target().
+-        """
+-        files = self._changed_files()
+-        if not files:
+-            return 'empty'
+-        if all(self._is_test_file(f) for f in files):
+-            return 'test_only'
+-        ok, reason = self._validate_target()
+-        if not ok:
+-            safe_log(f"[validate] target invalid: {reason}", level=logging.WARNING)
+-            return 'invalid'
+-        return 'ok'
+-
+-    def _target_path(self):
+-        filename = self._output_filename()
+-        if not filename:
+-            return None
+-        return os.path.join(self.git_tempdir, filename)
+-
+-    def _starter_methods(self, filename):
+-        """
+-        Names of methods of class Solution in the starter (base commit) version of filename.
+-        Falls back to the current file when the base version is unavailable.
+-        """
+-        text = self._starter_text(filename)
+-        if 'class Solution' not in text:
+-            path = os.path.join(self.git_tempdir, filename)
+-            try:
+-                with open(path) as f:
+-                    text = f.read()
+-            except OSError:
+-                return []
+-        try:
+-            tree = ast.parse(text)
+-        except SyntaxError:
+-            return []
+-        for node in tree.body:
+-            if isinstance(node, ast.ClassDef) and node.name == 'Solution':
+-                return [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
+-        return []
+-
+-    @staticmethod
+-    def _is_trivial_body(fn):
+-        body = list(fn.body)
+-        if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], 'value', None), ast.Constant) \
+-                and isinstance(body[0].value.value, str):
+-            body = body[1:]
+-        if not body:
+-            return True
+-        return all(isinstance(s, ast.Pass) for s in body)
+-
+-    def _validate_target(self):
+-        """
+-        Check the target file. Returns (ok, reason).
+-        - The file must compile.
+-        - Method-style (file defines class Solution): the starter's method names must still exist
+-          in Solution, with non-trivial bodies.
+-        - Program-style: must print/write output and must not contain the stub marker.
+-        """
+-        filename = self._output_filename()
+-        path = self._target_path()
+-        if not filename or not path or not os.path.isfile(path):
+-            return True, 'no target file to validate'
+-        try:
+-            with open(path) as f:
+-                text = f.read()
+-        except OSError as e:
+-            return False, f'cannot read {filename}: {e}'
+-        try:
+-            compile(text, filename, 'exec')
+-        except SyntaxError as e:
+-            return False, f'{filename} does not compile: {e}'
+-        try:
+-            tree = ast.parse(text)
+-        except SyntaxError as e:
+-            return False, f'{filename} does not parse: {e}'
+-
+-        if self._is_method_task(filename):
+-            classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Solution']
+-            if not classes:
+-                return False, f'{filename} no longer defines class Solution'
+-            methods = {n.name: n for n in classes[0].body if isinstance(n, ast.FunctionDef)}
+-            for name in self._starter_methods(filename):
+-                if name not in methods:
+-                    return False, f'Solution.{name} is missing from {filename}'
+-                if self._is_trivial_body(methods[name]):
+-                    return False, f'Solution.{name} in {filename} has an empty body'
+-            if not self._starter_methods(filename) and all(self._is_trivial_body(m) for m in methods.values()):
+-                return False, f'Solution in {filename} has no implemented method'
+-            return True, 'method-style target looks valid'
+-
+-        if 'TODO: replace with a real solution' in text:
+-            return False, f'{filename} still contains the stub marker'
+-        if 'print(' not in text and 'sys.stdout' not in text:
+-            return False, f'{filename} never writes output (no print/sys.stdout)'
+-        return True, 'program-style target looks valid'
+-
+-    def _starter_text(self, filename):
+-        result = subprocess.run(
+-            ["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:{filename}"],
+-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-        )
+-        return result.stdout.decode(errors='replace') if result.returncode == 0 else ''
+-
+-    def _is_method_task(self, filename):
+-        """True if the starter file (base commit) or the current file defines class Solution."""
+-        if 'class Solution' in self._starter_text(filename):
+-            return True
+-        path = os.path.join(self.git_tempdir, filename)
+-        try:
+-            with open(path) as f:
+-                return 'class Solution' in f.read()
+-        except OSError:
+-            return False
+-
+-    def _ensure_typing_import(self, path):
+-        """Prepend 'from typing import *' to a method-style file only if it is missing."""
+-        with open(path) as f:
+-            text = f.read()
+-        if 'from typing import *' in text:
+-            return
+-        with open(path, 'w') as f:
+-            f.write('from typing import *\n' + text)
+-
+-    def _block_has_text(self, block):
+-        if isinstance(block, dict):
+-            btype, text = block.get('type'), block.get('text')
+-        else:
+-            btype, text = getattr(block, 'type', None), getattr(block, 'text', None)
+-        return btype == 'text' and isinstance(text, str) and text.strip() != ''
+-
+-    def _block_is_tool_use(self, block):
+-        if isinstance(block, dict):
+-            return block.get('type') == 'tool_use'
+-        return getattr(block, 'type', None) == 'tool_use'
+-
+-    def _is_degenerate_assistant(self, msg):
+-        """
+-        True for assistant turns that carry neither non-empty text nor tool_use blocks.
+-        """
+-        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+-            return False
+-        content = msg.get('content')
+-        if content is None:
+-            return True
+-        if isinstance(content, str):
+-            return content.strip() == ''
+-        if not isinstance(content, list):
+-            return False
+-        for block in content:
+-            if self._block_is_tool_use(block) or self._block_has_text(block):
+-                return False
+-        return True
+-
+-    def _sanitize_history(self, history):
+-        """
+-        Drop degenerate assistant turns (empty/whitespace-only text, no tool_use) and
+-        merge adjacent messages with the same role so the history remains valid.
+-        """
+-        if not history:
+-            return []
+-        cleaned = []
+-        dropped = 0
+-        for msg in history:
+-            if self._is_degenerate_assistant(msg):
+-                dropped += 1
+-                continue
+-            if cleaned and cleaned[-1].get('role') == msg.get('role'):
+-                prev = cleaned[-1]
+-                prev_content = prev.get('content')
+-                new_content = msg.get('content')
+-                if isinstance(prev_content, str):
+-                    prev_content = [{"type": "text", "text": prev_content}]
+-                if isinstance(new_content, str):
+-                    new_content = [{"type": "text", "text": new_content}]
+-                merged = dict(prev)
+-                merged['content'] = list(prev_content or []) + list(new_content or [])
+-                cleaned[-1] = merged
+-            else:
+-                cleaned.append(msg)
+-        if dropped:
+-            safe_log(f"[sanitize] dropped {dropped} degenerate assistant message(s)")
+-        return cleaned
+-
+-    def _safe_chat(self, msg, history):
+-        """
+-        Call chat_with_agent, never raising. On failure, log and return the sanitized input history.
+-        """
+-        try:
+-            new_history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+-            if new_history is None:
+-                raise ValueError("chat_with_agent returned None")
+-            if new_history and self._is_degenerate_assistant(new_history[-1]):
+-                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent; retrying once with a shortened prompt",
+-                         level=logging.WARNING)
+-                short_prompt = self._shortened_prompt(msg)
+-                retry_history = chat_with_agent(short_prompt, model=self.code_model,
+-                                                msg_history=self._sanitize_history(history),
+-                                                logging=safe_log)
+-                if retry_history and not self._is_degenerate_assistant(retry_history[-1]):
+-                    return retry_history
+-                safe_log("[safe_chat] shortened retry still degenerate", level=logging.WARNING)
+-                return retry_history or new_history
+-            elif len(new_history) <= len(history):
+-                safe_log("[safe_chat] chat_with_agent added no messages", level=logging.WARNING)
+-            return new_history
+-        except Exception as e:
+-            safe_log(f"[safe_chat] exception from chat_with_agent: {type(e).__name__}: {e}", level=logging.ERROR)
+-            return self._sanitize_history(history)
+-
+-    def _shortened_prompt(self, msg):
+-        """
+-        A minimal prompt for a retry: the problem excerpt plus the instruction only.
+-        """
+-        excerpt = (self.problem_statement or '')[:3000]
+-        return ("Instruction: continue the task by making the next tool call (edit the solution file, "
+-                "or run tests). Do not reply with an empty message.\n\n"
+-                f"Problem excerpt:\n{excerpt}\n\n"
+-                f"(Original message began: {(msg or '')[:200]!r})")
+-
+-    _SAMPLE_FAILURE_MARKERS = ('DIFFER', 'MISMATCH')
+-    _SAMPLE_PASS_MARKER = 'ALL SAMPLES EXACT MATCH'
+-    _MULTI_ANSWER_SUMMARY = 'MULTI-ANSWER: samples not exact; validate with a checker'
+-
+-    def _history_events(self, msg_history):
+-        """
+-        Flatten the message history into ('call', name, text) and ('result', name, text) events,
+-        supporting structured tool_use/tool_result blocks and text blocks with '<tool_use>' or
+-        'Tool Used:' / 'Tool Result:' markers.
+-        """
+-        events = []
+-        last_call = None
+-        for msg in msg_history or []:
+-            if not isinstance(msg, dict):
+-                continue
+-            content = msg.get('content')
+-            if isinstance(content, str):
+-                content = [{"type": "text", "text": content}]
+-            if not isinstance(content, list):
+-                continue
+-            for block in content:
+-                if isinstance(block, dict):
+-                    btype = block.get('type')
+-                    if btype == 'tool_use':
+-                        last_call = block.get('name')
+-                        events.append(('call', last_call, str(block.get('input', ''))))
+-                        continue
+-                    if btype == 'tool_result':
+-                        events.append(('result', last_call, str(block.get('content', ''))))
+-                        continue
+-                    text = block.get('text') if btype == 'text' else None
+-                else:
+-                    if getattr(block, 'type', None) == 'tool_use':
+-                        last_call = getattr(block, 'name', None)
+-                        events.append(('call', last_call, str(getattr(block, 'input', ''))))
+-                    continue
+-                if not isinstance(text, str):
+-                    continue
+-                if '<tool_use>' in text:
+-                    m = re.search(r"tool_name['\"]?\s*:\s*['\"]?(\w+)", text)
+-                    last_call = m.group(1) if m else None
+-                    events.append(('call', last_call, text))
+-                    continue
+-                used = re.search(r'Tool Used:\s*(\w+)', text)
+-                if used:
+-                    last_call = used.group(1)
+-                    before, _, after = text.partition('Tool Result:')
+-                    events.append(('call', last_call, before))
+-                    if 'Tool Result:' in text:
+-                        events.append(('result', last_call, after))
+-                    continue
+-                if 'Tool Result:' in text:
+-                    events.append(('result', last_call, text.split('Tool Result:', 1)[1]))
+-        return events
+-
+-    @classmethod
+-    def _sample_report_failed(cls, report):
+-        """
+-        Strict check: True only if a line is a 'Sample N: MISMATCH' line or the 'N SAMPLE(S) DIFFER'
+-        summary. The multi-answer 'DIFFERENT (...)' label and the MULTI-ANSWER summary are not failures
+-        here; they are handled by a validator prompt instead of sample-matching repair.
+-        """
+-        for line in report.splitlines():
+-            stripped = line.strip()
+-            if re.match(r'^Sample \d+: MISMATCH\b', stripped):
+-                return True
+-            if re.match(r'^\d+ SAMPLE\(S\) DIFFER$', stripped):
+-                return True
+-        return False
+-
+-    @classmethod
+-    def _sample_report_multi(cls, report):
+-        """True if a run_samples report flags a multi-answer problem (samples not exact by design)."""
+-        return cls._MULTI_ANSWER_SUMMARY in report
+-
+-    def _last_verification_failed(self, msg_history):
+-        """
+-        Inspect the history after the last file-writing editor call. Returns (failed, excerpt):
+-        - failed is True if the last run_samples result after that edit reports a mismatch
+-          (DIFFER / MISMATCH), or if no run_samples result follows the edit (unverified).
+-        - failed is False only when the last run_samples result reports ALL SAMPLES EXACT MATCH.
+-        Generic keyword matching on raw bash output is deliberately not used.
+-        """
+-        events = self._history_events(msg_history)
+-        last_edit = None
+-        for i, (kind, name, text) in enumerate(events):
+-            if kind == 'call' and name == 'editor' and re.search(
+-                    r"command['\"]?\s*:\s*['\"](create|edit)['\"]", text):
+-                last_edit = i
+-        if last_edit is None:
+-            return False, ''
+-
+-        later_results = [text for kind, name, text in events[last_edit + 1:]
+-                         if kind == 'result' and name == 'run_samples']
+-        if not later_results:
+-            return True, 'no run_samples verification run after last edit'
+-
+-        last_report = later_results[-1].strip()
+-        if self._sample_report_failed(last_report) or self._sample_report_multi(last_report):
+-            return True, last_report[-1500:]
+-        return False, ''
+-
+-    def _direct_sample_check(self):
+-        """
+-        Run the sample tests directly against the output file on disk.
+-        Returns (failed, report), or None if the output file or problem text is unavailable.
+-        """
+-        filename = self._output_filename()
+-        if not filename or not self.problem_statement:
+-            return None
+-        path = os.path.join(self.git_tempdir, filename)
+-        if not os.path.isfile(path):
+-            return None
+-        try:
+-            from tools.run_samples import tool_function as run_samples
+-            report = run_samples(path, self.problem_statement)
+-        except Exception as e:
+-            safe_log(f"[forward] direct sample check failed: {type(e).__name__}: {e}", level=logging.WARNING)
+-            return None
+-        return (self._sample_report_failed(report) or self._sample_report_multi(report)), report
+-
+-    def _direct_example_check(self):
+-        """
+-        For problems without 'Sample Input N' blocks: check the Solution method against the
+-        'Input:' / 'Output:' examples with tools/run_examples. Returns (failed, report) or None.
+-        """
+-        path = self._target_path()
+-        if not path or not self.problem_statement or not os.path.isfile(path):
+-            return None
+-        if not self._is_method_task(self._output_filename()):
+-            return None
+-        try:
+-            from tools.run_examples import tool_function as run_examples
+-            report = run_examples(path, self.problem_statement)
+-        except Exception as e:
+-            safe_log(f"[forward] direct example check failed: {type(e).__name__}: {e}", level=logging.WARNING)
+-            return None
+-        if 'No "Input:"' in report:
+-            return None
+-        failed = 'DIFFER' in report or 'MISMATCH' in report or 'ERROR' in report
+-        return failed, report
+-
+-    def _perf_input_files(self):
+-        """Sorted list of input files in _PERF_DIR (bounded: at most 50 entries)."""
+-        if not os.path.isdir(_PERF_DIR):
+-            return []
+-        names = sorted(os.listdir(_PERF_DIR))[:50]
+-        return [os.path.join(_PERF_DIR, n) for n in names if os.path.isfile(os.path.join(_PERF_DIR, n))]
+-
+-    def _direct_perf_check(self):
+-        """
+-        Run the performance check directly on the target program against the inputs in _PERF_DIR.
+-        Only for program-style targets. Returns (failed, report), or None if there are no inputs.
+-        """
+-        path = self._target_path()
+-        if not path or not os.path.isfile(path):
+-            return None
+-        if self._is_method_task(self._output_filename()):
+-            return None
+-        inputs = self._perf_input_files()
+-        if not inputs:
+-            return None
+-        try:
+-            from tools.perf_check import tool_function as perf_check
+-            report = perf_check(path, inputs, time_limit=3)
+-        except Exception as e:
+-            safe_log(f"[forward] direct perf check failed: {type(e).__name__}: {e}", level=logging.WARNING)
+-            return None
+-        failed = 'PERF FAIL' in report or 'TIMEOUT' in report or 'RUNTIME ERROR' in report
+-        return failed, report
+-
+-    def _current_verification(self, msg_history):
+-        """
+-        Authoritative state: the direct sample run on the file if possible, otherwise the
+-        run_samples result in the history. Returns (failed, excerpt).
+-        """
+-        direct = self._direct_sample_check()
+-        if direct is not None:
+-            failed, report = direct
+-            if failed:
+-                return failed, report[-1500:]
+-            perf = self._direct_perf_check()
+-            if perf is not None and perf[0]:
+-                return True, perf[1][-1500:]
+-            return failed, report[-1500:]
+-        ok, reason = self._validate_target()
+-        if not ok:
+-            return True, reason
+-        example = self._direct_example_check()
+-        if example is not None:
+-            failed, report = example
+-            return failed, report[-1500:]
+-        return self._last_verification_failed(msg_history)
+-
+-    def _output_filename(self):
+-        """
+-        The target file named in the problem statement (`file.py`). Falls back to the first
+-        .py file in the repo that defines class Solution.
+-        """
+-        match = re.search(r'`([\w./-]+\.py)`', self.problem_statement or '')
+-        if match:
+-            return match.group(1)
+-        for root, dirs, files in os.walk(self.git_tempdir):
+-            dirs[:] = [d for d in dirs if not d.startswith('.')]
+-            for name in sorted(files):
+-                if not name.endswith('.py'):
+-                    continue
+-                full = os.path.join(root, name)
+-                try:
+-                    with open(full, errors='replace') as f:
+-                        text = f.read()
+-                    tree = ast.parse(text)
+-                except (OSError, SyntaxError, ValueError):
+-                    continue
+-                if any(isinstance(n, ast.ClassDef) and n.name == 'Solution' for n in tree.body):
+-                    return os.path.relpath(full, self.git_tempdir)
+-        return None
+-
+-    def _plain_llm_text(self, client, model, system_message, prompt):
+-        """One tool-less completion. Returns the reply text."""
+-        if 'claude' in model:
+-            resp = client.messages.create(
+-                model=model,
+-                max_tokens=8192,
+-                system=system_message,
+-                messages=[{"role": "user", "content": prompt}],
+-            )
+-            return ''.join(getattr(b, 'text', '') or '' for b in resp.content)
+-        resp = client.chat.completions.create(
+-            model=model,
+-            messages=[
+-                {"role": "system", "content": system_message},
+-                {"role": "user", "content": prompt},
+-            ],
+-        )
+-        return resp.choices[0].message.content or ''
+-
+-    def _staged_fallback(self, task, attempts_per_stage=2):
+-        """
+-        Non-agentic staged fallback, run as soon as the agent returns a degenerate turn.
+-        Each stage is a tool-less LLM call that returns the complete target file in one ```python block.
+-        Stage 1 gives the full problem plus the current file; stage 2 gives a minimal prompt with the
+-        problem excerpt only (smaller requests seem to avoid empty replies). The block is written to the
+-        target path and re-validated; validation errors are fed back to the model. Bounded by
+-        attempts_per_stage per stage. Returns True if the target validates afterwards.
+-        """
+-        path = self._target_path()
+-        filename = self._output_filename()
+-        if not path or not filename:
+-            safe_log("[staged] no target filename; staged fallback skipped", level=logging.WARNING)
+-            return False
+-        try:
+-            client, client_model = create_client(self.code_model)
+-        except Exception as e:
+-            safe_log(f"[staged] cannot create client: {type(e).__name__}: {e}", level=logging.ERROR)
+-            return False
+-
+-        system_message = "You write complete, correct Python source files. Reply with the full file only."
+-        stages = ('full', 'minimal')
+-        for stage_idx, stage in enumerate(stages, start=1):
+-            error_feedback = ''
+-            for attempt in range(1, attempts_per_stage + 1):
+-                current = ''
+-                if os.path.isfile(path):
+-                    with open(path) as f:
+-                        current = f.read()
+-                if stage == 'full':
+-                    prompt = (
+-                        f"Problem statement:\n{self.problem_statement}\n\n"
+-                        f"Target file: {filename}\n"
+-                        f"Current file content:\n```python\n{current}\n```\n\n"
+-                        "Write the complete final content of the target file so that it solves the problem. "
+-                        "If the file defines class Solution, keep the class and the method signatures exactly as they are "
+-                        "and implement the method bodies. If the problem reads stdin and writes stdout, write a complete "
+-                        "program that does so. Put the complete file in a single ```python code block and nothing else."
+-                    )
+-                else:
+-                    excerpt = (self.problem_statement or '')[:3000]
+-                    prompt = (
+-                        f"Problem:\n{excerpt}\n\n"
+-                        f"Write the full {filename} as one ```python code block. Nothing else."
+-                    )
+-                if error_feedback:
+-                    prompt += f"\n\nYour previous attempt was rejected: {error_feedback}\nFix this and return the complete file."
+-                safe_log(f"[staged] stage {stage_idx} ({stage}) attempt {attempt}")
+-                try:
+-                    content = self._plain_llm_text(client, client_model, system_message, prompt)
+-                except Exception as e:
+-                    error_feedback = f'LLM call failed: {type(e).__name__}: {e}'
+-                    safe_log(f"[staged] stage {stage_idx} attempt {attempt}: {error_feedback}", level=logging.ERROR)
+-                    continue
+-                match = re.search(r"```python\s*\n(.*?)```", content or '', re.DOTALL)
+-                if not match:
+-                    error_feedback = 'the reply contained no ```python code block'
+-                    safe_log(f"[staged] stage {stage_idx} attempt {attempt}: {error_feedback}", level=logging.WARNING)
+-                    continue
+-                code = match.group(1)
+-                os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+-                with open(path, 'w') as f:
+-                    f.write(code)
+-                if self._is_method_task(filename):
+-                    self._ensure_typing_import(path)
+-                ok, reason = self._validate_target()
+-                safe_log(f"[staged] stage {stage_idx} attempt {attempt}: validation ok={ok}: {reason}")
+-                if ok:
+-                    return True
+-                error_feedback = reason
+-        return False
+-
+-    def _is_trivial_file_text(self, text):
+-        """
+-        True if the file has no meaningful code: empty, whitespace/comments only, or only
+-        pass statements and docstrings (imports alone do not count as a solution).
+-        """
+-        if text is None:
+-            return True
+-        try:
+-            tree = ast.parse(text)
+-        except SyntaxError:
+-            return text.strip() == ''
+-        for node in tree.body:
+-            if isinstance(node, (ast.Pass, ast.Import, ast.ImportFrom)):
+-                continue
+-            if isinstance(node, ast.Expr) and isinstance(getattr(node, 'value', None), ast.Constant) \
+-                    and isinstance(node.value.value, str):
+-                continue
+-            return False
+-        return True
+-
+-    def _write_placeholder(self):
+-        """
+-        If the target file exists but is trivial, replace it with a placeholder so the agent
+-        starts from a meaningful state:
+-        - the starter (base commit) version if it is non-trivial;
+-        - otherwise a stub that compiles but carries the stub marker, so _validate_target()
+-          rejects it until the agent writes a real solution.
+-        Returns True if the file was written.
+-        """
+-        filename = self._output_filename()
+-        path = self._target_path()
+-        if not filename or not path or not os.path.isfile(path):
+-            return False
+-        try:
+-            with open(path) as f:
+-                current = f.read()
+-        except OSError:
+-            return False
+-        if not self._is_trivial_file_text(current):
+-            return False
+-
+-        starter = self._starter_text(filename)
+-        if starter and not self._is_trivial_file_text(starter):
+-            content = starter
+-            reason = 'restored starter version'
+-        elif self._is_method_task(filename):
+-            content = ('from typing import *\n\n'
+-                       'class Solution:\n'
+-                       '    # TODO: replace with a real solution\n'
+-                       '    pass\n')
+-            reason = 'method-style stub'
+-        else:
+-            content = ('import sys\n\n'
+-                       '# TODO: replace with a real solution\n'
+-                       'def main():\n'
+-                       '    data = sys.stdin.read()\n\n'
+-                       'main()\n')
+-            reason = 'program-style stub'
+-        with open(path, 'w') as f:
+-            f.write(content)
+-        safe_log(f"[placeholder] {filename} was trivial; wrote {reason}")
+-        return True
+-
+-    def _verify_and_repair(self, msg_history, task, max_rounds=5):
+-        """
+-        Bounded verify-and-repair loop. While the last verification failed or is missing,
+-        resume the agent with the failure excerpt. Never loops unboundedly.
+-        """
+-        final_failed, final_excerpt = True, 'not checked'
+-        multi_prompted = False
+-        for rnd in range(1, max_rounds + 1):
+-            failed, excerpt = self._current_verification(msg_history)
+-            if not failed:
+-                final_failed, final_excerpt = False, ''
+-                break
+-            if self._sample_report_multi(excerpt) and not self._sample_report_failed(excerpt):
+-                # Multi-answer problem: exact sample bytes are not the goal. Ask for a validator and a
+-                # brute-force existence check once, then stop chasing sample bytes.
+-                if multi_prompted:
+-                    final_failed, final_excerpt = False, excerpt
+-                    break
+-                multi_prompted = True
+-                safe_log(f"[forward] verify round {rnd}: multi-answer problem; requesting validator")
+-                multi_prompt = (
+-                    "This problem accepts several different correct outputs, so an exact sample match is not the goal.\n"
+-                    "Write a validator and brute-force existence checker; stress-test n up to 10 including Yes-instances; "
+-                    "do not chase sample bytes.\n"
+-                    "Concretely: (1) write a checker that takes the input and your output and verifies the output's "
+-                    "validity against the statement's rules; (2) write a brute-force reference that decides existence "
+-                    "(Yes/No) for small n; (3) use the stress_test tool with a generator that produces both Yes and No "
+-                    "instances, and fix the solution until it reports ALL OK; (4) check that the solution's Yes/No "
+-                    "decision is never wrong, especially on inputs whose answer is Yes.\n\n"
+-                    f"Original task:\n{task}"
+-                )
+-                msg_history = self._safe_chat(multi_prompt, self._sanitize_history(msg_history))
+-                continue
+-            safe_log(f"[forward] verify round {rnd}: verification failed/missing: {excerpt[:200]!r}")
+-            if 'TIMEOUT' in excerpt or 'PERF FAIL' in excerpt:
+-                perf_prompt = (
+-                    "The solution gives correct sample outputs but is too slow at scale. perf_check on the "
+-                    "maximum-size inputs reported:\n"
+-                    f"<perf_report>\n{excerpt[:1500]}\n</perf_report>\n\n"
+-                    "The time limit is 3 seconds per input for a Python solution. Do the following:\n"
+-                    "(1) Count the basic operations of the current algorithm at the maximum constraints (write the "
+-                    "count as a formula in N and the other limits).\n"
+-                    "(2) State the target complexity that fits within about 3 seconds in Python.\n"
+-                    "(3) Pick a faster algorithm (better asymptotics, or vectorized/bulk built-in operations, avoiding "
+-                    "per-element Python loops over the full input) and rewrite the solution file with the editor tool.\n"
+-                    "(4) Re-check correctness with run_samples and the brute-force stress_test.\n"
+-                    "(5) Run perf_check again on the same maximum-size inputs and do not stop until every line says OK "
+-                    "and the summary says ALL PERF OK.\n"
+-                    "Always make the tool call rather than announcing a next step.\n\n"
+-                    f"Original task:\n{task}"
+-                )
+-                msg_history = self._safe_chat(perf_prompt, self._sanitize_history(msg_history))
+-                final_failed, final_excerpt = True, excerpt
+-                continue
+-            repair_prompt = (
+-                "The solution fails the sample tests or has not been verified against them.\n"
+-                f"Latest sample-test report (run_samples):\n<verification>\n{excerpt[:1500]}\n</verification>\n\n"
+-                "Each MISMATCH shows the expected and actual output. A mismatch is a failure even if your "
+-                "output is a different valid answer, because the grader may compare exactly. Find which "
+-                "choice (ordering, tie-breaking, free-variable/basis choice, bit order, scaling) makes your "
+-                "output differ, and change the construction so that every sample output is reproduced exactly. "
+-                "Rewrite the solution file with the editor tool (use `edit`, after viewing it). Then call "
+-                "run_samples again and the brute-force stress test (stress_test tool). Do not stop until the report says "
+-                "ALL SAMPLES EXACT MATCH. Always make the tool call rather than announcing a next step.\n\n"
+-                f"Original task:\n{task}"
+-            )
+-            msg_history = self._safe_chat(repair_prompt, self._sanitize_history(msg_history))
+-            final_failed, final_excerpt = True, excerpt
+-        else:
+-            final_failed, final_excerpt = self._current_verification(msg_history)
+-        state = 'FAILED' if final_failed else 'PASSED'
+-        safe_log(f"[forward] final verification state: {state} {final_excerpt[:200]!r}")
+-        return not final_failed
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        workflow = """
+-Follow this workflow:
+-1. Explore the repository: look at the relevant files, the existing tests and the sample inputs/outputs in the problem statement.
+-2. Work out a brute force (a simple, obviously-correct reference) and a correct algorithm with a short correctness argument. Then write a first implementation early with the editor tool, and refine it.
+-3. Run the implementation on ALL sample inputs with bash and compare with the expected outputs.
+-4. Write a stress test that compares your implementation against the brute force on many small random inputs. If they disagree, fix the solution.
+-5. Check performance on maximum-size inputs (time limits matter). Optimize if needed.
+-6. Fix any discrepancies and re-verify everything from steps 3-5.
+-7. After writing the solution, call run_samples with the problem statement (or run_examples if the problem has only Input/Output examples). Any sample mismatch on a problem with a unique answer is a failure. Use run_samples and stress_test to verify correctness.
+-8. Multi-answer problems (the statement says any valid answer, any of them, or multiple solutions are accepted): do not chase sample bytes. Instead require (a) a validator that checks any output against the statement's rules, (b) a brute-force *existence* answer (Yes/No) at moderate n (about 8-12), and (c) a generator that biases toward both outcomes (Yes and No instances, including many likely Yes cases). Run stress_test with the solution, brute force, generator, and checker_path=validator, and fix the solution until it reports ALL OK. run_samples will report a MULTI-ANSWER line for such problems; that is expected once the validator passes.
+-9. Use the stress_test tool (not ad hoc heredoc harnesses) for randomized comparison. It takes absolute paths and a timeout, and reports the first failing seed with input and outputs.
+-
+-10. Performance gate: before coding, count the basic operations at the maximum constraints and state the complexity. Then write at least 2 maximum-size inputs (for example a worst-case no-answer input and a many-distinct-values or many-duplicates input) to /tmp/perf_inputs/ and run perf_check on them; a Python solution must finish within 3s per input.
+-
+-Environment facts: python3 is available; numpy is NOT installed (check with `python3 -c 'import numpy'` before relying on it). Use only the standard library unless you verify otherwise.
+-
+-Keep the required output file complete: a program file must read stdin and write stdout, and a method-style file must keep the `Solution` class and its method signatures. Put your work in the non-test source file.
+-"""
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.\n{workflow}"
+-
+-        self._write_placeholder()
+-        msg_history = self._safe_chat(instruction, [])
+-        status = self._patch_status()
+-        safe_log(f"[forward] attempt 0 (initial) patch status: {status}")
+-        if not msg_history or self._is_degenerate_assistant(msg_history[-1]):
+-            safe_log("[forward] initial turn is degenerate; running the staged fallback now", level=logging.WARNING)
+-            if self._staged_fallback(task):
+-                safe_log("[forward] staged fallback produced a valid target")
+-                self._verify_and_repair(self._sanitize_history([]), task)
+-                return
+-
+-        max_retries = 3
+-        for attempt in range(1, max_retries + 1):
+-            if status == 'ok':
+-                break
+-            msg_history = self._sanitize_history(msg_history)
+-            if status == 'test_only':
+-                short = "You only changed test files. Edit the solution file itself with the editor tool."
+-            elif status == 'invalid':
+-                short = ("The solution file is no longer valid (it fails to compile, lost the Solution class or "
+-                         "method, or still contains a stub). Restore it with the editor tool so it is a complete, "
+-                         "working solution.")
+-            else:
+-                short = "No file has been edited yet. Use the editor tool to write your solution now."
+-            # Retries use a short, simple prompt: long prompts seem to correlate with empty replies.
+-            if attempt == 1:
+-                corrective = short
+-            else:
+-                corrective = f"{short}\n\nTask: {self.problem_statement}"
+-            safe_log(f"[forward] retry {attempt} due to status '{status}'")
+-            msg_history = self._safe_chat(corrective, msg_history)
+-            status = self._patch_status()
+-            safe_log(f"[forward] retry {attempt} patch status: {status}")
+-
+-        if status == 'ok':
+-            if not self._perf_input_files():
+-                safe_log("[forward] no perf inputs found; asking the agent to create them")
+-                perf_request = (
+-                    f"Before finishing, create at least 2 maximum-size inputs for the problem (a worst-case no-answer "
+-                    f"input and a many-distinct or many-duplicates input) and write them to {_PERF_DIR}/ "
+-                    "(create the directory first). Then run perf_check on them with the solution file "
+-                    f"{self._output_filename()}. A Python solution must finish within 3s per input. "
+-                    "If it does not, optimize it and re-run perf_check."
+-                )
+-                msg_history = self._safe_chat(perf_request, self._sanitize_history(msg_history))
+-            self._verify_and_repair(msg_history, task)
+-            return
+-
+-        safe_log(f"[forward] status '{status}' after retries; trying the staged fallback")
+-        if self._staged_fallback(task):
+-            safe_log("[forward] staged fallback produced a valid target")
+-            self._verify_and_repair(self._sanitize_history([]), task)
+-            return
+-
+-        safe_log(f"[forward] staged fallback failed; status '{self._patch_status()}'", level=logging.WARNING)
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
++import tempfile
++import concurrent.futures
+ 
+-if __name__ == "__main__":
+-    main()
++PYTHON_BLOCK_RE = re.compile(r"
+\ No newline at end of file

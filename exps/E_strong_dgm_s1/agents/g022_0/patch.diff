@@ -1,0 +1,681 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7c5f411..5fdc1e4 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -25,10 +25,14 @@ STRESS_MODES = ['small', 'edge']
+ GEN_MODES = ['small', 'edge', 'max']
+ MAX_MODE = 'max'
+ STRESS_BUDGET = 120.0     # seconds per candidate's stress run at most
++VERDICT_MAX_SHARE = 0.85  # max share of one first-token verdict in the small-generator distribution
++DIST_SEEDS = 30           # seeds used for the verdict-distribution check
++CROSS_SEEDS = 20          # seeds per mode for the cross-candidate differential check
++CROSS_MIN_SECONDS = 300   # minimum remaining budget before running an extra candidate after a perfect one
+ CANDIDATE_HINTS = [
+-    "first write an exact solution over the full state space used by the brute force (a polynomial DP or BFS, even if too slow for the maximum constraints), verify it against the brute force, then optimise while re-running the stress test",
+-    "optimal complexity: pick the best known algorithm for the constraints and make sure it is fast in Python",
+-    "re-derive from the constraints and edge cases: carefully reread the statement, enumerate edge cases, and choose an approach that handles them",
++    "first derive a correct algorithm from the statement, verify it against the brute force on small inputs, then optimise while re-running the stress test",
++    "use a DIFFERENT algorithm family from candidate 1 (for example, if a DP is natural, use a greedy, constructive, math or graph approach instead). brute.py is only a slow oracle: derive your own algorithm from the statement and do not copy brute.py's approach",
++    "use a DIFFERENT algorithm family from candidates 1 and 2 (for example, a constructive argument, an invariant, a reduction, or a search with pruning). brute.py is only a slow oracle: derive your own algorithm from the statement and do not copy brute.py's approach",
+ ]
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -116,6 +120,14 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _is_number(tok):
++    try:
++        float(tok)
++        return True
++    except ValueError:
++        return False
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -244,6 +256,7 @@ class AgenticSystem:
+         self.samples_path = os.path.join(self.git_tempdir, 'tests', 'samples.json')
+         self.cands_dir = os.path.join(self.git_tempdir, 'cands')
+         self.solution_path = os.path.join(self.git_tempdir, 'solution.py')
++        self.check_path = os.path.join(self.git_tempdir, 'tests', 'check.py')
+ 
+     def _time_left(self):
+         return self.deadline - time.monotonic()
+@@ -271,6 +284,62 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             pairs.append((str(item['input']), str(item['output'])))
+         return pairs
+ 
++    @staticmethod
++    def _mutate_output(text):
++        """Return a copy of a sample output with one token changed (always differs from the original)."""
++        m = re.search(r'-?\d+', text)
++        if m:
++            return text[:m.start()] + str(int(m.group()) + 1) + text[m.end():]
++        if 'Yes' in text:
++            return text.replace('Yes', 'No', 1)
++        if 'No' in text:
++            return text.replace('No', 'Yes', 1)
++        return 'x\n'
++
++    def _validate_checker(self, samples, problems):
++        """Checker (tests/check.py) must accept each sample output and reject a mutated one."""
++        check = self.check_path
++        for idx, (inp, out) in enumerate(samples):
++            ok, msg = solution_check.run_checker(check, inp, out, out)
++            if not ok:
++                problems.append(f"tests/check.py rejects the sample {idx} expected output (it must accept it):\n{msg}")
++                continue
++            mutated = self._mutate_output(out)
++            ok, msg = solution_check.run_checker(check, inp, mutated, out)
++            if ok:
++                problems.append(f"tests/check.py accepts a mutated output of sample {idx} "
++                                f"(changed to {mutated.strip()!r}); it must reject invalid outputs")
++
++    def _verdict_distribution(self, problems):
++        """Run brute on small generator outputs; reject if one first-token verdict dominates."""
++        inputs = []
++        for seed in range(DIST_SEEDS):
++            text, err = solution_check.generate_input(self.gen_path, seed, 'small', timeout=TIME_LIMIT)
++            if text is not None:
++                inputs.append(text)
++        if not inputs:
++            return
++        results = solution_check.run_capture(self.brute_path, inputs, timeout=TIME_LIMIT)
++        counts = {}
++        for ok, out in results:
++            if not ok:
++                continue
++            toks = out.split()
++            if not toks or _is_number(toks[0]):
++                continue  # numeric answers have no verdict to balance
++            key = toks[0]
++            counts[key] = counts.get(key, 0) + 1
++        total = sum(counts.values())
++        if total == 0:
++            return
++        top_key = max(counts, key=lambda k: counts[k])
++        if counts[top_key] / total > VERDICT_MAX_SHARE:
++            dist = ", ".join(f"{k!r}: {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
++            problems.append(f"tests/gen.py small mode is degenerate: first-token verdict {top_key!r} covers "
++                            f"{counts[top_key]}/{total} cases (> {int(VERDICT_MAX_SHARE * 100)}%). "
++                            f"Distribution over seeds 0..{DIST_SEEDS - 1}: {dist}. "
++                            f"Make gen.py produce a more balanced mix (planted answers, both outcomes, varied shapes).")
++
+     def _validate_tests(self):
+         """Harness-side check of the design-phase files. Returns (ok, report_text)."""
+         problems = []
+@@ -283,10 +352,23 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             samples = self._load_samples()
+         except (ValueError, OSError) as e:
+             return False, f"tests/samples.json is invalid: {e}"
+-        res = solution_check.run_plain(self.brute_path, [i for i, _ in samples],
+-                                       [o for _, o in samples], timeout=TIME_LIMIT)
+-        if res['passed'] != len(samples):
+-            problems.append("tests/brute.py does not reproduce the sample outputs:\n" + res['report'])
++        has_checker = os.path.isfile(self.check_path)
++        if has_checker:
++            self._validate_checker(samples, problems)
++            for idx, (inp, out) in enumerate(samples):
++                run_ok, bout = solution_check.run_capture(self.brute_path, [inp], timeout=TIME_LIMIT)[0]
++                if not run_ok:
++                    problems.append(f"tests/brute.py fails on sample {idx} (nonzero exit, timeout or stderr)")
++                    continue
++                ok, msg = solution_check.run_checker(self.check_path, inp, bout, out)
++                if not ok:
++                    problems.append(f"tests/brute.py output on sample {idx} is rejected by tests/check.py:\n"
++                                    f"brute output:\n{bout.rstrip()}\nexpected:\n{out.rstrip()}\n{msg}")
++        else:
++            res = solution_check.run_plain(self.brute_path, [i for i, _ in samples],
++                                           [o for _, o in samples], timeout=TIME_LIMIT)
++            if res['passed'] != len(samples):
++                problems.append("tests/brute.py does not reproduce the sample outputs:\n" + res['report'])
+         for mode in GEN_MODES:
+             text, err = solution_check.generate_input(self.gen_path, 0, mode, timeout=TIME_LIMIT)
+             if text is None or not text.strip():
+@@ -301,9 +383,12 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                 res = solution_check.run_plain(self.brute_path, inputs, None, timeout=TIME_LIMIT)
+                 if res['crashed']:
+                     problems.append(f"tests/brute.py fails or is too slow on small '{mode}' inputs:\n{res['report']}")
++        self._verdict_distribution(problems)
+         if problems:
+             return False, "\n\n".join(problems)
+-        return True, f"tests valid: {len(samples)} samples reproduced by brute; generator modes {GEN_MODES} run"
++        return True, (f"tests valid: {len(samples)} samples reproduced by brute"
++                      + (" (via tests/check.py)" if has_checker else "")
++                      + f"; generator modes {GEN_MODES} run; verdict distribution balanced")
+ 
+     def _design_tests(self, feedback=None):
+         """Separate session that sees only the statement and writes tests/brute.py, tests/gen.py, tests/samples.json."""
+@@ -313,17 +398,19 @@ You are preparing the TEST HARNESS only. Do not solve the problem in solution.py
+ Work from the problem statement alone. Create these files with the editor tool:
+ 
+ 1. {self.brute_path}
+-   A simple, obviously-correct brute-force reference program that reads stdin and writes stdout exactly like the real solution is expected to. Keep it simple; it may be slow, but must finish on small inputs.
++   The simplest possible obviously-correct reference program that reads stdin and writes stdout. Use the simplest method you can (for example exhaustive enumeration for tiny sizes), NOT a clever polynomial algorithm: it is an oracle and may be very slow, but must finish on small inputs.
+ 2. {self.gen_path}
+    A random input generator. It takes an integer seed as sys.argv[1] and an optional mode as sys.argv[2]:
+-   - no mode or 'small': small random valid inputs (small enough for the brute force).
++   - no mode or 'small': small valid inputs (small enough for the brute force). Mix structured cases with purely random ones: planted-answer instances (build a solution first, then derive the input), disconnected or degenerate shapes, repeated values, and boundary sizes. Make sure both kinds of answer occur (for decision problems, both Yes and No in roughly comparable amounts).
+    - 'edge': edge cases (minimal sizes, equal values, boundaries of the constraints), still small.
+    - 'max': a maximum-size valid input using the largest constraints from the statement.
+-   Use random.seed(int(sys.argv[1])). Print exactly one valid input to stdout.
++   Use random.seed(int(sys.argv[1])). Print exactly one valid input to stdout. Print nothing else to stdout.
+ 3. {self.samples_path}
+    A JSON list of objects {{"input": "<exact stdin text>", "output": "<exact expected stdout>"}} containing every sample input and expected output given in the problem statement. Copy them exactly.
++4. Special judge (ONLY if more than one output can be valid for some input, e.g. "print any valid assignment"): also write {self.check_path}.
++   It is run as `python3 check.py <input_file> <contestant_output_file> <reference_output_file>` (argv[1] = input, argv[2] = contestant output, argv[3] = reference output from brute.py). Exit code 0 iff the contestant output is valid for that input; otherwise print a short reason and exit non-zero. Verify the contestant output's validity from the statement (do not just compare with the reference), and for decision problems also require the verdict to match the reference. Do not force brute.py to reproduce the sample text in this case: it only needs to be accepted by the checker on the samples.
+ 
+-Check that the generator runs for seeds 0..4 in each mode, and that brute.py reproduces the samples (run `python3 {self.brute_path} < file`). Do not write anything else under tests/ except these files.
++Check that the generator runs for seeds 0..4 in each mode, and that brute.py reproduces the samples (run `python3 {self.brute_path} < file`), or, if check.py exists, that brute.py's output is accepted by check.py on each sample. Do not write anything else under tests/ except these files.
+ Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins.
+ """
+         if feedback:
+@@ -357,8 +444,9 @@ Fix the files so that every check passes.
+             report.append("LINT (grader-incompatible constructs; the grader rejects these):\n  " + "\n  ".join(lint))
+ 
+         # All execution checks run in strict mode (2-argument pow only, as in the grader).
++        checker = self.check_path if os.path.isfile(self.check_path) else None
+         sres = solution_check.run_plain(path, [i for i, _ in samples], [o for _, o in samples],
+-                                        timeout=TIME_LIMIT, strict=True)
++                                        timeout=TIME_LIMIT, strict=True, checker_path=checker)
+         if sres['report']:
+             report.append(sres['report'])
+         report.append(f"samples: {sres['passed']}/{n} passed")
+@@ -378,7 +466,7 @@ Fix the files so that every check passes.
+         stress_budget = min(STRESS_BUDGET, max(10.0, self._time_left() / 4))
+         st = solution_check.run_stress(path, self.brute_path, self.gen_path, range(STRESS_SEEDS),
+                                        modes=STRESS_MODES, timeout=TIME_LIMIT, budget=stress_budget,
+-                                       strict=True)
++                                       strict=True, checker_path=checker)
+         if st['first_failure']:
+             report.append(st['first_failure'])
+         report.append(f"stress: {st['passed']}/{st['total']} passed"
+@@ -390,6 +478,47 @@ Fix the files so that every check passes.
+         report.append("RESULT: OK" if perfect else "RESULT: FAILED")
+         return score, "\n\n".join(report)
+ 
++    def _cross_check(self, path_a, path_b):
++        """
++        Differential test of two candidates on generated inputs (small and edge modes).
++        With a checker: each output must be accepted with the other's output as reference.
++        Without: outputs must match whitespace-normalised. Returns (agree, report).
++        """
++        checker = self.check_path if os.path.isfile(self.check_path) else None
++        inputs = []
++        for mode in STRESS_MODES:
++            for seed in range(CROSS_SEEDS):
++                text, _ = solution_check.generate_input(self.gen_path, seed, mode, timeout=TIME_LIMIT)
++                if text is not None:
++                    inputs.append(text)
++        runs_a = solution_check.run_capture(path_a, inputs, timeout=TIME_LIMIT)
++        runs_b = solution_check.run_capture(path_b, inputs, timeout=TIME_LIMIT)
++        problems = []
++        for idx, inp in enumerate(inputs):
++            ok_a, out_a = runs_a[idx]
++            ok_b, out_b = runs_b[idx]
++            if not (ok_a and ok_b):
++                problems.append(f"[input {idx}] a candidate crashed or timed out "
++                                f"(a ok={ok_a}, b ok={ok_b})\ninput:\n{inp.rstrip()}")
++                continue
++            if checker:
++                acc_a, msg_a = solution_check.run_checker(checker, inp, out_a, out_b)
++                acc_b, msg_b = solution_check.run_checker(checker, inp, out_b, out_a)
++                if not (acc_a and acc_b):
++                    problems.append(f"[input {idx}] candidates disagree\ninput:\n{inp.rstrip()}\n"
++                                    f"output of {path_a}:\n{out_a.rstrip()}\n"
++                                    f"output of {path_b}:\n{out_b.rstrip()}\n"
++                                    f"checker (a vs b): {msg_a}\nchecker (b vs a): {msg_b}")
++            elif solution_check._normalise(out_a) != solution_check._normalise(out_b):
++                problems.append(f"[input {idx}] candidates disagree\ninput:\n{inp.rstrip()}\n"
++                                f"output of {path_a}:\n{out_a.rstrip()}\n"
++                                f"output of {path_b}:\n{out_b.rstrip()}")
++            if len(problems) >= 3:
++                break
++        if problems:
++            return False, "\n\n".join(problems)
++        return True, f"cross-check: {len(inputs)} inputs, candidates agree"
++
+     @staticmethod
+     def _pick_best(entries):
+         """entries: list of (score, path, report). Returns the entry with the highest score; ties keep the earliest."""
+@@ -551,10 +680,14 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+         history = []
+         self.scores = {}
+         feedback = None
++        perfect_path = None  # first perfect candidate; triggers one more candidate for a cross-check
+         for i in range(self.num_candidates):
+             if self._time_left() <= 0:
+                 safe_log("budget exhausted; stopping candidate generation")
+                 break
++            if perfect_path is not None and self._time_left() <= CROSS_MIN_SECONDS:
++                safe_log("not enough budget for a cross-candidate check; stopping")
++                break
+             hint = CANDIDATE_HINTS[i % len(CANDIDATE_HINTS)]
+             path, score, rep = self._solve_candidate(i + 1, hint, feedback=feedback)
+             if not os.path.isfile(path):
+@@ -564,7 +697,25 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+             entries.append((score, path, rep))
+             history.append(f"candidate {i + 1} ({hint}): score {score}")
+             safe_log(f"candidate {i + 1} score={score}")
++            if perfect_path is not None:
++                # Second independent candidate after a perfect one: differential test, then stop.
++                if self._is_perfect_report(rep):
++                    agree, xrep = self._cross_check(perfect_path, path)
++                    history.append(f"cross-check candidate 1 vs {i + 1}: {'agree' if agree else 'DISAGREE'}")
++                    safe_log(xrep)
++                    if not agree:
++                        # Mark the perfect entry as failed so reflection repairs it, and let the
++                        # adjudicator decide which side misreads the statement.
++                        self._adjudicate(perfect_path, xrep)
++                        entries = [(sc, p, (r + "\n" + xrep + "\nRESULT: FAILED") if p == perfect_path else r)
++                                   for sc, p, r in entries]
++                        entries = [((sc[0], sc[1], 0) if p == perfect_path else sc, p, r)
++                                   for sc, p, r in entries]
++                break
+             if self._is_perfect_report(rep):
++                perfect_path = path
++                if self._time_left() > CROSS_MIN_SECONDS and i + 1 < self.num_candidates:
++                    continue
+                 break
+             # Not perfect: continue with the next hint, passing the best report so far as feedback.
+             best_so_far = self._pick_best(entries)
+diff --git a/tools/solution_check.py b/tools/solution_check.py
+index 7b1fa8d..437d531 100644
+--- a/tools/solution_check.py
++++ b/tools/solution_check.py
+@@ -40,7 +40,8 @@ def tool_info():
+                 "gen_path": {"type": "string", "description": "Path to a random input generator; it is called as `python gen.py <seed>` and prints one test input to stdout (stress mode, needs brute_path)."},
+                 "num_tests": {"type": "integer", "description": "Number of random seeds to try in stress mode (default 200)."},
+                 "mode": {"type": "string", "description": "Optional generator mode (e.g. small, edge, max). If given, the generator is called as `python gen.py <seed> <mode>`. Omit it to call `python gen.py <seed>`."},
+-                "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."}
++                "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."},
++                "checker_path": {"type": "string", "description": "Optional special-judge checker for problems with several valid outputs. Run as `python -I _check.py <input_file> <contestant_output_file> <reference_output_file>`; exit code 0 means the contestant output is valid. Its stdout/stderr are shown in failure reports. Without it, outputs are compared whitespace-normalised."}
+             },
+             "required": ["solution_path"]
+         }
+@@ -188,13 +189,56 @@ def generate_input(gen_path, seed=0, mode=None, timeout=10):
+         shutil.rmtree(tmpdir, ignore_errors=True)
+ 
+ 
+-def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=False):
++def _check_verdict(tmpdir, inp, sout, ref_out):
++    """
++    Run _check.py (must exist in tmpdir) on input/contestant/reference files.
++    Returns (accepted, message) where message is the checker's stdout+stderr (clipped).
++    """
++    for name, text in (('_in.txt', inp), ('_out.txt', sout), ('_ref.txt', ref_out)):
++        with open(os.path.join(tmpdir, name), 'w') as f:
++            f.write(text)
++    st, out, err, rc, el = _run([sys.executable, '-I', '_check.py', '_in.txt', '_out.txt', '_ref.txt'],
++                                tmpdir, '', 20)
++    msg = _clip((out + err).rstrip()) or "(no checker output)"
++    if st != 'ok':
++        return False, f"checker timed out\n{msg}"
++    return rc == 0, f"checker exit code {rc}\n{msg}"
++
++
++def run_checker(checker_path, inp, contestant_out, reference_out):
++    """Public wrapper: run a special judge on one case. Returns (accepted, message)."""
++    tmpdir = _tmp_with({'_check.py': checker_path})
++    try:
++        return _check_verdict(tmpdir, inp, contestant_out, reference_out)
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def run_capture(program_path, inputs, timeout=10):
++    """Run a program on each input. Returns list of (ok, stdout) where ok is False on timeout/nonzero exit/stderr."""
++    tmpdir = _tmp_with({'_prog.py': program_path})
++    try:
++        results = []
++        for inp in inputs:
++            status, out, err, rc, _ = _run([sys.executable, '-I', '_prog.py'], tmpdir, inp, timeout)
++            results.append((status == 'ok' and rc == 0 and not err.strip(), out))
++        return results
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=False, checker_path=None):
+     """
+     Run the solution on fixed inputs. strict=True runs it through the portable-runner bootstrap
+     (2-argument pow only), so grader-incompatible pow calls surface as crashes.
++    checker_path: optional special judge (see tool_info); when given, the solution output must be accepted
++    by the checker against expected_outputs[i] (if provided) instead of exact whitespace-normalised comparison.
+     Returns dict: passed, total, max_time, crashed (timeouts / nonzero exit / stderr), report (failure text).
+     """
+-    tmpdir = _tmp_with({'_sol.py': solution_path})
++    files = {'_sol.py': solution_path}
++    if checker_path:
++        files['_check.py'] = checker_path
++    tmpdir = _tmp_with(files)
+     try:
+         cmd = _portable_runner(tmpdir) if strict else [sys.executable, '-I', '_sol.py']
+         passed, max_t, crashed = 0, 0.0, 0
+@@ -211,8 +255,13 @@ def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=F
+                 problems.append("stderr is not empty")
+             if _solution_crashed(status, rc, err):
+                 crashed += 1
++            checker_msg = ''
+             if expected_outputs is not None and i < len(expected_outputs) and status == 'ok':
+-                if _normalise(out) != _normalise(expected_outputs[i]):
++                if checker_path:
++                    accepted, checker_msg = _check_verdict(tmpdir, inp, out, expected_outputs[i])
++                    if not accepted:
++                        problems.append("checker rejected the output")
++                elif _normalise(out) != _normalise(expected_outputs[i]):
+                     problems.append("output differs from expected")
+             if problems:
+                 block = (f"[input {i}] FAIL: {', '.join(problems)}\n"
+@@ -220,6 +269,8 @@ def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=F
+                          + _fmt_run(f"solution on input {i}", status, out, err, rc, el))
+                 if expected_outputs is not None and i < len(expected_outputs):
+                     block += "\nexpected:\n" + _clip(expected_outputs[i]).rstrip()
++                if checker_msg:
++                    block += "\nchecker:\n" + checker_msg
+                 blocks.append(block)
+             else:
+                 passed += 1
+@@ -229,10 +280,12 @@ def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=F
+         shutil.rmtree(tmpdir, ignore_errors=True)
+ 
+ 
+-def _one_case(tmpdir, seed, mode, timeout, sol_cmd=None):
++def _one_case(tmpdir, seed, mode, timeout, sol_cmd=None, has_checker=False):
+     """
+-    Evaluate one stress case in tmpdir (containing _sol.py, _brute.py, _gen.py).
++    Evaluate one stress case in tmpdir (containing _sol.py, _brute.py, _gen.py, and _check.py if has_checker).
+     Returns (kind, detail, elapsed) where kind is ok | gen | brute | crash | wrong.
++    With a checker: the solution output must be accepted, and the brute output must also be accepted
++    (verdict agreement is delegated to the checker, which reads the reference via the third file).
+     """
+     label = f"seed {seed}" + ("" if mode is None else f" mode {mode}")
+     gst, gen_out, gerr, grc, _ = _run([sys.executable, '-I', '_gen.py', *_gen_args(seed, mode)], tmpdir, '', timeout)
+@@ -251,7 +304,20 @@ def _one_case(tmpdir, seed, mode, timeout, sol_cmd=None):
+         return 'crash', (f"solution FAILED on {label}: {why}\ninput:\n{_clip(test_in).rstrip()}\n"
+                          + _fmt_run("solution", sst, sout, serr, src_rc, el)
+                          + "\n" + _fmt_run("brute (expected)", bst, bout, berr, brc, 0.0)), el
+-    if _normalise(sout) != _normalise(bout):
++    if has_checker:
++        accepted, msg = _check_verdict(tmpdir, test_in, sout, bout)
++        if not accepted:
++            return 'wrong', (f"WRONG ANSWER on {label} (checker rejected the solution output)\ninput:\n{_clip(test_in).rstrip()}\n"
++                             + _fmt_run("solution", sst, sout, serr, src_rc, el)
++                             + "\n" + _fmt_run("brute (reference)", bst, bout, berr, brc, 0.0)
++                             + "\nchecker:\n" + msg), el
++        b_ok, b_msg = _check_verdict(tmpdir, test_in, bout, bout)
++        if not b_ok:
++            return 'brute', (f"checker rejects the brute output on {label} (fix the brute/checker, not the solution)\n"
++                             f"input:\n{_clip(test_in).rstrip()}\n"
++                             + _fmt_run("brute (reference)", bst, bout, berr, brc, 0.0)
++                             + "\nchecker:\n" + b_msg), el
++    elif _normalise(sout) != _normalise(bout):
+         return 'wrong', (f"WRONG ANSWER on {label}\ninput:\n{_clip(test_in).rstrip()}\n"
+                          + _fmt_run("solution", sst, sout, serr, src_rc, el)
+                          + "\n" + _fmt_run("brute (expected)", bst, bout, berr, brc, 0.0)), el
+@@ -259,7 +325,7 @@ def _one_case(tmpdir, seed, mode, timeout, sol_cmd=None):
+ 
+ 
+ def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=10, budget=_STRESS_BUDGET,
+-               strict=False):
++               strict=False, checker_path=None):
+     """
+     Compare solution against brute on generated inputs for every (mode, seed) pair.
+     strict=True runs the solution under the portable-runner bootstrap (see _portable_runner).
+@@ -274,7 +340,10 @@ def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=1
+               'budget_hit': False, 'first_failure': None, 'first_failure_kind': None}
+     if not cases:
+         return result
+-    tmpdir = _tmp_with({'_sol.py': solution_path, '_brute.py': brute_path, '_gen.py': gen_path})
++    files = {'_sol.py': solution_path, '_brute.py': brute_path, '_gen.py': gen_path}
++    if checker_path:
++        files['_check.py'] = checker_path
++    tmpdir = _tmp_with(files)
+     try:
+         sol_cmd = _portable_runner(tmpdir) if strict else None
+         t_start = time.monotonic()
+@@ -283,7 +352,7 @@ def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=1
+                 result['budget_hit'] = True
+                 break
+             result['ran'] += 1
+-            kind, detail, el = _one_case(tmpdir, seed, mode, timeout, sol_cmd)
++            kind, detail, el = _one_case(tmpdir, seed, mode, timeout, sol_cmd, has_checker=bool(checker_path))
+             result['max_time'] = max(result['max_time'], el)
+             if kind == 'ok':
+                 result['passed'] += 1
+@@ -299,7 +368,7 @@ def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=1
+ 
+ 
+ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=None, gen_path=None,
+-                  num_tests=200, timeout=10, mode=None):
++                  num_tests=200, timeout=10, mode=None, checker_path=None):
+     try:
+         timeout = max(1, int(timeout or 10))
+         num_tests = max(0, int(num_tests if num_tests is not None else 200))
+@@ -312,7 +381,7 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+         return "Error: stress mode needs both brute_path and gen_path."
+     if not stress and not inputs:
+         return "Error: provide `inputs` (for a plain check) or brute_path + gen_path (for stress mode)."
+-    for p in (brute_path, gen_path):
++    for p in (brute_path, gen_path, checker_path):
+         if p and not os.path.isfile(p):
+             return f"Error: file not found: {p}"
+ 
+@@ -328,7 +397,7 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+ 
+     # ---- plain mode: fixed inputs ----
+     if inputs:
+-        res = run_plain(solution_path, inputs, expected_outputs, timeout, strict=True)
++        res = run_plain(solution_path, inputs, expected_outputs, timeout, strict=True, checker_path=checker_path)
+         if res['report']:
+             report.append(res['report'])
+         report.append(f"{res['passed']}/{res['total']} passed, max time {res['max_time']:.3f} s")
+@@ -337,7 +406,8 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+     # ---- stress mode: brute vs solution on generated inputs ----
+     if stress:
+         res = run_stress(solution_path, brute_path, gen_path, range(num_tests),
+-                         modes=[mode] if mode else None, timeout=timeout, strict=True)
++                         modes=[mode] if mode else None, timeout=timeout, strict=True,
++                         checker_path=checker_path)
+         if res['first_failure']:
+             report.append(res['first_failure'])
+             failed = True
+diff --git a/tests/test_checker_path.py b/tests/test_checker_path.py
+new file mode 100644
+index 0000000..022ad48
+--- /dev/null
++++ b/tests/test_checker_path.py
+@@ -0,0 +1,191 @@
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++from tools import solution_check
++
++# Problem with many valid answers: print any pair a <= b with a + b == n (a, b >= 0), or "impossible".
++# Brute: prints the first valid pair. Checker accepts any valid pair (or "impossible" iff none exists).
++BRUTE = ("n = int(input())\n"
++         "for a in range(n + 1):\n"
++         "    if 2 * a <= n + 0 and a <= n - a:\n"
++         "        print(a, n - a)\n"
++         "        break\n"
++         "else:\n"
++         "    print('impossible')\n")
++CHECK = ("import sys\n"
++         "inp = open(sys.argv[1]).read().split()\n"
++         "out = open(sys.argv[2]).read().split()\n"
++         "ref = open(sys.argv[3]).read().split()\n"
++         "n = int(inp[0])\n"
++         "if out == ['impossible']:\n"
++         "    ok = ref == ['impossible']\n"
++         "    print('impossible accepted' if ok else 'said impossible but a pair exists')\n"
++         "    sys.exit(0 if ok else 1)\n"
++         "if len(out) != 2:\n"
++         "    print('expected two integers, got', out); sys.exit(1)\n"
++         "a, b = int(out[0]), int(out[1])\n"
++         "if a < 0 or b < 0 or a + b != n:\n"
++         "    print('pair does not sum to n:', a, b); sys.exit(1)\n"
++         "print('valid pair'); sys.exit(0)\n")
++GEN = ("import random, sys\n"
++       "random.seed(int(sys.argv[1]))\n"
++       "print(random.randint(0, 9))\n")
++SAMPLES = [{"input": "4\n", "output": "0 4\n"}, {"input": "7\n", "output": "0 7\n"}]
++
++GOOD_OTHER = "n = int(input())\nprint(n, 0)\n"       # different valid answer
++BAD_SUM = "n = int(input())\nprint(n, 1)\n"          # invalid answer
++CRASH = "n = int(input())\nprint(n, 0)\nraise SystemExit(3)\n"
++
++
++def _write(tmp_path, name, src):
++    p = tmp_path / name
++    p.write_text(src)
++    return str(p)
++
++
++def _agent(tmp_path, samples=SAMPLES, checker=True):
++    root = tmp_path / "repo"
++    (root / "tests").mkdir(parents=True)
++    (root / "cands").mkdir()
++    (root / "tests" / "brute.py").write_text(BRUTE)
++    (root / "tests" / "gen.py").write_text(GEN)
++    (root / "tests" / "samples.json").write_text(json.dumps(samples))
++    if checker:
++        (root / "tests" / "check.py").write_text(CHECK)
++    agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
++    agent.git_tempdir = str(root)
++    agent._init_pipeline(budget_seconds=600)
++    return agent, root
++
++
++def test_checker_accepts_valid_alternative_and_rejects_invalid(tmp_path):
++    check = _write(tmp_path, "check.py", CHECK)
++    ok, msg = solution_check.run_checker(check, "4\n", "1 3\n", "0 4\n")
++    assert ok, msg
++    ok, msg = solution_check.run_checker(check, "4\n", "1 2\n", "0 4\n")
++    assert not ok and "does not sum" in msg
++
++
++def test_run_plain_with_checker_accepts_other_valid_answer(tmp_path):
++    good = _write(tmp_path, "good.py", GOOD_OTHER)
++    check = _write(tmp_path, "check.py", CHECK)
++    res = solution_check.run_plain(good, ["4\n"], ["0 4\n"], timeout=10, checker_path=check)
++    assert res['passed'] == 1, res['report']
++    # Without a checker the same output would be rejected as a text mismatch only if it differs,
++    # so exact comparison is still in force for plain runs.
++    res = solution_check.run_plain(good, ["4\n"], ["0 4\n"], timeout=10)
++    assert res['passed'] == 0
++
++
++def test_run_plain_with_checker_rejects_invalid_and_shows_message(tmp_path):
++    bad = _write(tmp_path, "bad.py", BAD_SUM)
++    check = _write(tmp_path, "check.py", CHECK)
++    res = solution_check.run_plain(bad, ["4\n"], ["0 4\n"], timeout=10, checker_path=check)
++    assert res['passed'] == 0
++    assert "checker rejected the output" in res['report']
++    assert "does not sum to n" in res['report']
++
++
++def test_stress_with_checker_passes_alternative_and_fails_invalid(tmp_path):
++    check = _write(tmp_path, "check.py", CHECK)
++    gen = _write(tmp_path, "gen.py", GEN)
++    brute = _write(tmp_path, "brute.py", BRUTE)
++    good = _write(tmp_path, "good.py", GOOD_OTHER)
++    bad = _write(tmp_path, "bad.py", BAD_SUM)
++    st = solution_check.run_stress(good, brute, gen, range(10), checker_path=check)
++    assert st['first_failure'] is None and st['passed'] == 10, st['first_failure']
++    st = solution_check.run_stress(bad, brute, gen, range(10), checker_path=check)
++    assert st['first_failure_kind'] == 'wrong'
++    assert "WRONG ANSWER" in st['first_failure']
++    assert "does not sum to n" in st['first_failure']
++
++
++def test_stress_with_checker_still_catches_crash(tmp_path):
++    check = _write(tmp_path, "check.py", CHECK)
++    gen = _write(tmp_path, "gen.py", GEN)
++    brute = _write(tmp_path, "brute.py", BRUTE)
++    crash = _write(tmp_path, "crash.py", CRASH)
++    st = solution_check.run_stress(crash, brute, gen, range(3), checker_path=check)
++    assert st['first_failure_kind'] == 'crash'
++
++
++def test_validate_checker_accepts_samples_and_rejects_mutations(tmp_path):
++    agent, root = _agent(tmp_path)
++    problems = []
++    agent._validate_checker(agent._load_samples(), problems)
++    assert problems == [], problems
++
++
++def test_validate_checker_flags_checker_that_rejects_sample(tmp_path):
++    rejecting = "import sys\nsys.exit(1)\n"
++    agent, root = _agent(tmp_path)
++    (root / "tests" / "check.py").write_text(rejecting)
++    problems = []
++    agent._validate_checker(agent._load_samples(), problems)
++    assert any("must accept" in p for p in problems)
++
++
++def test_validate_checker_flags_checker_that_accepts_mutated_outputs(tmp_path):
++    accept_all = "import sys\nsys.exit(0)\n"
++    agent, root = _agent(tmp_path)
++    (root / "tests" / "check.py").write_text(accept_all)
++    problems = []
++    agent._validate_checker(agent._load_samples(), problems)
++    assert any("accepts a mutated output" in p for p in problems)
++
++
++def test_verdict_distribution_ignores_numeric_answers(tmp_path):
++    # Numeric first tokens carry no verdict; a constant numeric first token must not be rejected.
++    agent, root = _agent(tmp_path)
++    problems = []
++    agent._verdict_distribution(problems)
++    assert problems == [], problems
++
++
++def test_mutate_output_always_differs():
++    for text in ["0 4\n", "Yes\n", "No\n", "impossible\n", ""]:
++        assert agent_mutate(text) != text
++
++
++def agent_mutate(text):
++    return coding_agent.AgenticSystem._mutate_output(text)
++
++
++def test_validate_tests_passes_with_checker(tmp_path):
++    agent, root = _agent(tmp_path)
++    ok, report = agent._validate_tests()
++    assert ok, report
++
++
++def test_validate_tests_rejects_degenerate_generator(tmp_path):
++    # Generator always prints a 'No' instance; the verdict distribution check must reject it.
++    degenerate_gen = ("import sys\n"
++                      "print('No')\n")
++    degenerate_brute = "print('No')\n"
++    agent, root = _agent(tmp_path, checker=False)
++    (root / "tests" / "gen.py").write_text(degenerate_gen)
++    (root / "tests" / "brute.py").write_text(degenerate_brute)
++    (root / "tests" / "samples.json").write_text(json.dumps([{"input": "x\n", "output": "No\n"}]))
++    ok, report = agent._validate_tests()
++    assert not ok
++    assert "degenerate" in report and "'No'" in report
++    assert "Distribution over seeds" in report
++
++
++def test_verdict_distribution_accepts_balanced_generator(tmp_path):
++    balanced_brute = ("import sys\n"
++                      "n = int(sys.stdin.read())\n"
++                      "print('Yes' if n % 2 else 'No')\n")
++    gen = ("import random, sys\n"
++           "random.seed(int(sys.argv[1]))\n"
++           "print(random.randint(0, 99))\n")
++    agent, root = _agent(tmp_path, checker=False)
++    (root / "tests" / "brute.py").write_text(balanced_brute)
++    (root / "tests" / "gen.py").write_text(gen)
++    problems = []
++    agent._verdict_distribution(problems)
++    assert problems == [], problems

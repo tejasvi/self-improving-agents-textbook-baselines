@@ -1,0 +1,194 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d4d4f1d..2c4db4f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,7 +6,7 @@ import os
+ import re
+ import threading
+ 
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, chat_text_only
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -337,6 +337,51 @@ class AgenticSystem:
+         return ('benchmark' in lowered or 'runtime' in lowered or 'wall time' in lowered or 'seconds' in lowered) \
+             and not self._has_risk_phrase(text)
+ 
++    _CODE_BLOCK_RE = re.compile(r'```(?:python|py)?\n(.*?)```', re.DOTALL)
++
++    def _extract_code_block(self, text):
++        """
++        Return the longest fenced code block in text, or None if there is none.
++        """
++        matches = self._CODE_BLOCK_RE.findall(text or '')
++        if not matches:
++            return None
++        return max(matches, key=len)
++
++    def _pick_target_file(self):
++        """
++        Return the first candidate source file (stub files are prioritized), or None.
++        """
++        candidates = self._find_candidate_source_files()
++        return candidates[0] if candidates else None
++
++    def _text_only_solve(self, prompt):
++        """
++        Ask the model for the solution as plain text (no tools) in a fresh context.
++        Returns the reply text ('' on failure).
++        """
++        reply = chat_text_only(prompt, model=self.code_model, logging=safe_log)
++        msg_history = [
++            {"role": "user", "content": [{"type": "text", "text": prompt}]},
++            {"role": "assistant", "content": [{"type": "text", "text": reply}]},
++        ]
++        return self._last_assistant_text(msg_history)
++
++    def _is_empty_assistant_turn(self, msg_history):
++        """
++        True if the last message is an assistant turn with empty text and no tool_use.
++        """
++        if not msg_history:
++            return False
++        last = msg_history[-1]
++        if last.get('role') != 'assistant':
++            return False
++        content = last.get('content')
++        if any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in content) \
++                if isinstance(content, list) else False:
++            return False
++        return not self._last_assistant_text([last]).strip()
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -351,17 +396,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         instruction = f"""{task}
+ 
+-Follow these steps in order:
+-1. Inspect the repository and the starter/source file(s) that need to be implemented or fixed.
+-2. Before coding, extract the constraints from the problem statement (n, value ranges, time limit, number of test cases, etc.) and write down the target time complexity your solution must meet. Compute the maximum allowed complexity budget from the largest constraints (e.g. about 1e8 simple operations in Python within ~2 seconds). Pick an algorithm that fits this budget; do not plan an algorithm that is only acceptable for small inputs.
+-3. IMMEDIATELY implement the solution by calling the editor or bash tool to modify the source file. Do not just describe the solution.
+-4. After the implementation, write a brute-force comparison on tiny random inputs and check that your solution matches it. Then write a stress script that generates worst-case inputs at the MAXIMUM constraints from the problem statement, run it with `timeout 20` (or the `benchmark` tool with a timeout), and print the elapsed time.
+-5. If the measured time is over about 2 seconds, or the algorithm's complexity is above the budget from step 2, optimize the algorithm and re-run both the brute-force comparison and the max-size benchmark.
+-6. Never finish with a statement like "may be too slow", "probably too slow", "never timed", or "unverified". If you have a performance concern, fix it by changing the algorithm and measuring again.
+-
+-Never end a turn with an empty message. Read the starter file with one command, then write the implementation in your very next tool call. End with a tool call or a short summary after the files are edited.
+-
+-WARNING: Responding with only a plan, or describing the solution without editing files, is a failure. The task is not complete until the non-test source file has been modified. Do not end your turn before the source file edits are in place.
++Write the solution to the file now. Inspect the starter/source file, then implement the full solution in the non-test source file with the editor tool. Derive the constraints from the problem statement first, and choose an algorithm that fits about 1e8 simple operations in Python within ~2 seconds.
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+@@ -393,7 +428,11 @@ WARNING: Responding with only a plan, or describing the solution without editing
+                 changed = self._current_changed_files_str()
+                 safe_log(f"Patch validation failed (changed files: {changed}). Retry {attempt}/{max_retries}.")
+                 nudge = nudges[min(attempt - 1, len(nudges) - 1)]
+-                msg_history = self._clean_history(msg_history)
++                if self._is_empty_assistant_turn(msg_history):
++                    safe_log("Empty assistant turn detected (no text, no tool call). Restarting with fresh context.")
++                    msg_history = []
++                else:
++                    msg_history = self._clean_history(msg_history)
+                 msg_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+         if not self._has_source_edits():
+@@ -410,10 +449,56 @@ WARNING: Responding with only a plan, or describing the solution without editing
+             if not self._has_source_edits():
+                 safe_log("Fallback did not produce source edits.")
+ 
++        if not self._has_source_edits():
++            # Text-only extract-and-write fallback (bounded, no tools)
++            target = self._pick_target_file()
++            if target is None:
++                safe_log("Text-only fallback: no candidate source file found.")
++            else:
++                current = self._render_files([target], max_chars=20000)
++                text_prompts = [
++                    (
++                        f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                        f"Current contents of the target file `{target}`:\n{current}\n"
++                        "Write a complete, correct solution for this problem that reads from stdin and writes to stdout "
++                        "(or implements the required Solution method). "
++                        "Do not call any tools. Reply with only the complete final file contents in a single ```python block."
++                    ),
++                    (
++                        f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                        f"Target file `{target}`:\n{current}\n"
++                        "Give any correct solution, even a simple or less optimized one. "
++                        "Do not call any tools. Reply with only the complete final file contents in a single ```python block."
++                    ),
++                    (
++                        f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                        f"Target file `{target}`:\n{current}\n"
++                        "First give a short reasoning section (a few sentences on the approach and complexity), "
++                        "then the code. Do not call any tools. End with the complete final file contents in a single ```python block."
++                    ),
++                ]
++                for stage_idx, text_prompt in enumerate(text_prompts, start=1):
++                    if self._has_source_edits():
++                        break
++                    safe_log(f"Text-only fallback stage {stage_idx}/{len(text_prompts)} for {target}.")
++                    reply = self._text_only_solve(text_prompt)
++                    code = self._extract_code_block(reply)
++                    if code is None:
++                        safe_log(f"Text-only fallback stage {stage_idx}: no code block in reply.")
++                        continue
++                    with open(os.path.join(self.git_tempdir, target), 'w', encoding='utf-8') as f:
++                        f.write(code)
++                    safe_log(f"Text-only fallback stage {stage_idx}: wrote {target} from text reply.")
++                    if self._has_source_edits():
++                        safe_log(f"Edit produced by text-only fallback stage {stage_idx}.")
++                        break
++
+         if self._has_source_edits():
+             # Performance-focused final verification pass
+             verify_msg = (
+-                "Re-state the worst-case time complexity of your solution against the problem constraints, "
++                "The solution file now exists. Write a brute-force solution, compare your solution against it on "
++                "tiny random inputs, and fix any mismatch. Then re-state the worst-case time complexity of your "
++                "solution against the problem constraints, "
+                 "run the max-size benchmark (worst-case input at the maximum constraints, with a timeout, "
+                 "reporting the runtime), and if it exceeds budget, rewrite the algorithm now. "
+                 "Do not stop with known performance risks."
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..be18c1a 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -511,6 +511,34 @@ def chat_with_agent_openai(
+ 
+     return new_msg_history
+ 
++def chat_text_only(prompt, model=CLAUDE_MODEL, logging=print):
++    """
++    Plain completion call with NO tools list. Returns the response text ('' on failure).
++    """
++    try:
++        client, client_model = create_client(model)
++        if 'claude' in client_model:
++            response = client.messages.create(
++                model=client_model,
++                messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
++                max_tokens=8192,
++            )
++            text = ''.join(getattr(b, 'text', '') or '' for b in response.content)
++        else:
++            text, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message='You are a coding assistant. Answer with plain text only.',
++                print_debug=False,
++                msg_history=[],
++            )
++        logging(f"Text-only output: {text}")
++        return text or ''
++    except Exception as e:
++        logging(f"Error in chat_text_only: {str(e)}")
++        return ''
++
+ def chat_with_agent(
+     msg,
+     model=CLAUDE_MODEL,

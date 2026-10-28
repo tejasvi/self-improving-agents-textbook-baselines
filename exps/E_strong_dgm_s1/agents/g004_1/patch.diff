@@ -1,0 +1,799 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index dd17433..dfaf21c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import json
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -128,6 +129,23 @@ def _write_text(path, text):
+     with open(path, 'w', encoding='utf-8') as f:
+         f.write(text)
+ 
++CANDIDATE_METHOD = """Work like a careful competitive programmer:
++1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++2. Immediately after reading the statement, write a draft solution.py with the editor tool (command=create), even if it is simple or brute-force, before any extended analysis. No turn may end without an editor call that creates or edits the source file. Keep replies concise to avoid the output limit.
++3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++4. Write brute.py (a simple, obviously-correct brute force for small inputs) and gen.py (takes an integer seed as sys.argv[1], calls random.seed(seed), and prints one valid input to stdout). gen.py MUST be multi-mode, selecting the mode by seed % 4:
++   - seed % 4 == 0: tiny value range (e.g. values in 1..3, very small n) to force ties, equalities, duplicates and boundary cases;
++   - seed % 4 == 1: medium random sizes with typical values;
++   - seed % 4 == 2: structured/extreme cases (all equal, sorted, reversed, single element, minimum and maximum constraint values, empty-like edge cases the statement allows);
++   - seed % 4 == 3: cases biased toward nontrivial answers (e.g. re-sample until the brute answer is not 0/1/trivial, or construct inputs where the answer depends on many parts).
++   Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Read its `brute output stats` line: if distinct is small or top_frac is high (it reports TEST QUALITY: WEAK / RESULT: WEAK_TESTS), your generator is producing trivial answers; diversify gen.py and re-run. Fix every mismatch, crash or timeout it reports, then re-run until it reports RESULT: OK.
++5. Derivation audit: list every assumption your derivation relies on (e.g. monotonicity, independence of components, that a value can be reached, handling of duplicates, the modulus, off-by-one in indices). For EACH assumption, write at least one targeted test (a specific input in gen.py or a small check script) that would fail if the assumption were false, and run it. Then write an independent second solution (brute-force-free, using a DIFFERENT algorithm or formulation than solution.py, e.g. a DP or simulation instead of a closed form) saved as ref2.py, and run solution_check in differential mode: solution_path=solution.py, ref2_path=ref2.py, gen_path=gen.py, on medium-size inputs where the brute force is infeasible. Investigate and fix every DIFFERENTIAL MISMATCH (decide which of the two is wrong with a small brute-force case).
++6. Generate a maximum-size input (gen-style, with the largest constraints) and check that solution.py finishes in well under 2 seconds. The max-size test must be built so its answer is nontrivial, or so the full code path is executed (not an early exit such as a zero-answer or trivially-sized shortcut). Keep iterating on the solution until all checks pass.
++7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
++8. An unrun stress test means the task is NOT finished. Do not end your turn until step 4 (stress mode) has reported RESULT: OK and step 5 (differential mode) has reported RESULT: OK on the final version of solution.py.
++9. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
++The final solution.py is what gets graded; helper files are ignored."""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -218,54 +236,130 @@ class AgenticSystem:
+                 return False
+         return True
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    # ------------------------------------------------------------------
++    # Multi-candidate pipeline helpers
++    # ------------------------------------------------------------------
++    def _cands_dir(self):
++        d = os.path.join(self.git_tempdir, 'cands')
++        os.makedirs(d, exist_ok=True)
++        return d
+ 
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
++    def _attempt(self, task, label, hint):
++        """One fresh-context attempt (empty msg_history). Its final code goes to cands/cand_{label}.py.
++        The attempt works in its own scratch dir cands/work_{label}/ so it never clobbers other files."""
++        cand = os.path.join(self._cands_dir(), f'cand_{label}.py')
++        work = os.path.join(self._cands_dir(), f'work_{label}')
++        os.makedirs(work, exist_ok=True)
++        prompt = f"""{task}
+ 
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Immediately after reading the statement, write a draft solution.py with the editor tool (command=create), even if it is simple or brute-force, before any extended analysis. No turn may end without an editor call that creates or edits the source file. Keep replies concise to avoid the output limit.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write brute.py (a simple, obviously-correct brute force for small inputs) and gen.py (takes an integer seed as sys.argv[1], calls random.seed(seed), and prints one valid input to stdout). gen.py MUST be multi-mode, selecting the mode by seed % 4:
+-   - seed % 4 == 0: tiny value range (e.g. values in 1..3, very small n) to force ties, equalities, duplicates and boundary cases;
+-   - seed % 4 == 1: medium random sizes with typical values;
+-   - seed % 4 == 2: structured/extreme cases (all equal, sorted, reversed, single element, minimum and maximum constraint values, empty-like edge cases the statement allows);
+-   - seed % 4 == 3: cases biased toward nontrivial answers (e.g. re-sample until the brute answer is not 0/1/trivial, or construct inputs where the answer depends on many parts).
+-   Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Read its `brute output stats` line: if distinct is small or top_frac is high (it reports TEST QUALITY: WEAK / RESULT: WEAK_TESTS), your generator is producing trivial answers; diversify gen.py and re-run. Fix every mismatch, crash or timeout it reports, then re-run until it reports RESULT: OK.
+-5. Derivation audit: list every assumption your derivation relies on (e.g. monotonicity, independence of components, that a value can be reached, handling of duplicates, the modulus, off-by-one in indices). For EACH assumption, write at least one targeted test (a specific input in gen.py or a small check script) that would fail if the assumption were false, and run it. Then write an independent second solution (brute-force-free, using a DIFFERENT algorithm or formulation than solution.py, e.g. a DP or simulation instead of a closed form) saved as ref2.py, and run solution_check in differential mode: solution_path=solution.py, ref2_path=ref2.py, gen_path=gen.py, on medium-size inputs where the brute force is infeasible. Investigate and fix every DIFFERENTIAL MISMATCH (decide which of the two is wrong with a small brute-force case).
+-6. Generate a maximum-size input (gen-style, with the largest constraints) and check that solution.py finishes in well under 2 seconds. The max-size test must be built so its answer is nontrivial, or so the full code path is executed (not an early exit such as a zero-answer or trivially-sized shortcut). Keep iterating on the solution until all checks pass.
+-7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
+-8. An unrun stress test means the task is NOT finished. Do not end your turn until step 4 (stress mode) has reported RESULT: OK and step 5 (differential mode) has reported RESULT: OK on the final version of solution.py.
+-9. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
+-The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++{CANDIDATE_METHOD}
+ 
+-        # Bounded retries if no primary source file was edited
+-        retry_prompt = f"""{task}
++Independent attempt '{label}': other solvers are working on the same problem in separate sessions and their code is NOT shown to you. Do not look for or reuse any other candidate file. {hint}
+ 
+-Your previous attempt ended without editing any source file. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {self.git_tempdir}/solution.py, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
++Work only inside {work}/ for your draft, brute.py, gen.py and tests (do not edit {os.path.join(self.git_tempdir, 'solution.py')}). When your solution passes the samples and your own stress test, write the final code to {cand} with the editor tool (command=create). Your final message should state briefly which formulation you used.
+ """
+-        for attempt in range(3):
+-            if self._has_primary_edit():
+-                break
+-            safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
+-            chat_with_agent(retry_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"Attempt {label}: hint={hint[:80]}")
++        return chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _write_oracle(self, task):
++        """Chat session that writes oracle.py (statement-literal), gen_small.py and gen_medium.py.
++        Returns the path of oracle.py or None."""
++        oracle = os.path.join(self.git_tempdir, 'oracle.py')
++        prompt = f"""{task}
++
++Your job in this session is NOT to solve the problem. Write an ORACLE that follows the problem statement LITERALLY, as an independent reference for cross-checking other solutions.
++
++Requirements:
++1. Write {oracle} (a stdin/stdout program with the same I/O format as the statement). For small inputs it must enumerate every possible sequence of choices/outcomes of the process exactly as the statement describes, or run an exact DP over the raw process with fractions.Fraction (no floats). Simulate the statement's process; do NOT use a closed form or recurrence derived for the answer.
++2. Do NOT read or reuse any other solution file in {self.git_tempdir} (solution.py, cands/*). Your oracle must come from the statement alone.
++3. Write {os.path.join(self.git_tempdir, 'gen_small.py')}: takes an integer seed in sys.argv[1], calls random.seed(seed), prints one valid SMALL input on which the oracle finishes in under 1 second. Multi-mode by seed % 4: 0 tiny values with ties/duplicates; 1 small random; 2 extreme/structured (minimum/maximum allowed values, all equal, sorted, reversed); 3 inputs biased toward nontrivial answers.
++4. Write {os.path.join(self.git_tempdir, 'gen_medium.py')}: same CLI and seed-mode scheme, larger sizes (roughly up to 10-30 unless the statement forces otherwise) so that candidates with wrong asymptotics or edge-case bugs can be caught by the oracle.
++5. Check oracle.py on the statement's samples; it must match the expected sample outputs exactly. Run both generators for seeds 0..20 and run oracle.py on them to confirm valid inputs and fast runs.
++6. Final message: say which seeds/modes you covered and report any sample where the oracle disagrees with the statement (explain why).
++"""
++        safe_log("Oracle session")
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        return oracle if os.path.isfile(oracle) else None
++
++    def _verify_candidates(self, cand_paths, oracle_path, num_tests=100):
++        """Run multi_compare directly on the candidates. Returns the structured result dict."""
++        from tools import multi_compare
++        gens = [p for p in (os.path.join(self.git_tempdir, 'gen.py'),
++                            os.path.join(self.git_tempdir, 'gen_small.py'),
++                            os.path.join(self.git_tempdir, 'gen_medium.py')) if os.path.isfile(p)]
++        if not cand_paths or not gens:
++            return {'report': 'no candidates or generators', 'error': 'missing', 'compared': 0,
++                    'agree': {}, 'samples': {}, 'disagreements': [], 'times': {}, 'max_size': -1,
++                    'skipped': 0, 'reference': 'oracle' if oracle_path else 'majority'}
++        return multi_compare.compare_candidates(
++            cand_paths, gens, oracle_path=oracle_path, num_tests=num_tests, timeout=10,
++            corpus_dir=os.path.join(self.git_tempdir, 'corpus'))
++
++    def _arbitrate(self, task, cand_paths, oracle_path, result, round_no):
++        """Arbitration session: the agent decides the truth by hand and fixes wrong candidates/oracle."""
++        srcs = [f"### {p}\n```python\n{_read_text(p) or ''}\n```" for p in cand_paths]
++        hard = []
++        for d in result['disagreements'][:4]:
++            outs = "\n".join(f"  {os.path.basename(k)}: {v[1] if v[0] == 'ok' else v[0]}" for k, v in d['outputs'].items())
++            hard.append(f"input (gen {d['gen']} seed {d['seed']}):\n{d['input'][:1500]}\noutputs:\n{outs}")
++        oracle_src = _read_text(oracle_path) if oracle_path else None
++        prompt = f"""{task}
++
++ARBITRATION round {round_no}/{MAX_ARBITRATION}. The candidates disagree with each other and/or with the oracle.
++
++Candidate sources:
++{chr(10).join(srcs)}
++
++Oracle ({oracle_path or 'none'}):
++```python
++{oracle_src or '(none)'}
++```
+ 
+-        # Adversarial review rounds (bounded). Snapshot solution.py after each round and
+-        # never regress: if a round breaks verification, restore the last passing snapshot.
+-        sol_path = os.path.join(self.git_tempdir, 'solution.py')
+-        summary = _last_assistant_text(init_edit)
++Disagreeing inputs and each candidate's output (status or stdout):
++{chr(10).join(hard) or '(none)'}
++
++Checker summary:
++{result['report'][-3000:]}
++
++Steps:
++1. For the smallest disagreeing input, determine the correct answer by hand-simulating the problem statement step by step (do not trust any code).
++2. Decide which side is wrong. Fix the wrong candidate files in place under {self._cands_dir()}/ and, if the oracle is wrong, fix {oracle_path or 'oracle.py'}.
++3. Re-run the samples on the fixed files. Keep every run bounded (no unbounded loops).
++4. Finish with a short message stating which side was wrong and why.
++"""
++        safe_log(f"Arbitration round {round_no}")
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _select_best(self, cand_paths, result):
++        """Best candidate: samples pass first, then oracle agreement, then the lowest runtime on the max-size input."""
++        best, best_key = None, None
++        for p in cand_paths:
++            ok, total = result['samples'].get(p, (0, 0))
++            samples_ok = (total == 0) or (ok == total)
++            agree = result['agree'].get(p, 0)
++            t = result['times'].get(p)
++            key = (0 if samples_ok else 1, -agree, t if t is not None else float('inf'))
++            if best_key is None or key < best_key:
++                best, best_key = p, key
++        return best
++
++    def _hard_corpus_text(self):
++        corpus = os.path.join(self.git_tempdir, 'corpus')
++        if not os.path.isdir(corpus):
++            return '(none)'
++        parts = []
++        for f in sorted(os.listdir(corpus))[:5]:
++            try:
++                with open(os.path.join(corpus, f), encoding='utf-8') as fh:
++                    rec = json.load(fh)
++                parts.append(f"{f}: input={rec['input'][:800]!r} outputs={rec['outputs']}")
++            except Exception:
++                continue
++        return "\n".join(parts) or '(none)'
++
++    def _review_rounds(self, task, sol_path, summary):
++        """Bounded adversarial review rounds (snapshot + restore fallback). Gets the hard corpus and oracle path."""
+         passed, report = _verify_solution(self.git_tempdir)
+-        safe_log(f"Initial verification passed={passed}")
+         best_text = _read_text(sol_path) if passed else None
+         last_report = report
+         for review_round in range(2):
+@@ -279,6 +373,10 @@ You are now acting as an ADVERSARIAL REVIEWER of the current solution. The curre
+ {current}
+ ```
+ 
++Statement-literal oracle (independent of the candidates): {self._oracle_path or 'not available'}
++Hard-test corpus (inputs where candidates disagreed earlier; use them as extra tests):
++{self._hard_corpus_text()}
++
+ Summary of the previous attempt (last assistant message):
+ {summary[-3000:]}
+ 
+@@ -286,7 +384,7 @@ Most recent verification output (solution_check; may contain failing inputs):
+ {last_report[-4000:]}
+ 
+ Your job:
+-1. Assume the solution may be wrong. Write NEW, differently-structured generators (e.g. gen_adv.py with different value ranges, extreme sizes, adversarial structure, and inputs whose answers are nontrivial) and run solution_check in stress mode with them, plus a differential run against an independent second solution if one exists (ref2.py).
++1. Assume the solution may be wrong. Write NEW, differently-structured generators and run solution_check in stress mode with them. Also run solution.py on every hard-corpus input and compare with the oracle output (run oracle.py on the same input).
+ 2. If any mismatch, crash, timeout or wrong answer appears, find the root cause with a small brute-force case and fix solution.py.
+ 3. Keep the solution valid: re-run the samples and the original brute/gen stress test (RESULT: OK) after every edit.
+ 4. Finish with a short message stating the final solution_check RESULT lines you observed.
+@@ -303,6 +401,86 @@ Your job:
+                 safe_log("Round broke verification; restoring last passing solution.py")
+                 _write_text(sol_path, best_text)
+ 
++    def forward(self):
++        """
++        The forward function for the AgenticSystem.
++        Pipeline: cand_0 (first attempt) + K-1 fresh candidates -> oracle session -> multi_compare
++        -> bounded arbitration -> select best -> review rounds with snapshot/restore fallback.
++        """
++        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++"""
++        self._oracle_path = None
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++
++        # (a) First attempt (cand_0), then K-1 fresh-context candidates.
++        init_edit = chat_with_agent(f"{task}\n{CANDIDATE_METHOD}", model=self.code_model,
++                                    msg_history=[], logging=safe_log)
++        for attempt in range(3):
++            if self._has_primary_edit():
++                break
++            safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
++            chat_with_agent(RETRY_PROMPT_TMPL.format(task=task, sol=sol_path),
++                            model=self.code_model, msg_history=[], logging=safe_log)
++        cands_dir = self._cands_dir()
++        if os.path.isfile(sol_path):
++            _write_text(os.path.join(cands_dir, 'cand_0.py'), _read_text(sol_path))
++        summary = _last_assistant_text(init_edit)
++        for k in range(1, NUM_CANDIDATES):
++            self._attempt(task, str(k), HINTS[(k - 1) % len(HINTS)])
++        cand_paths = sorted(os.path.join(cands_dir, f) for f in os.listdir(cands_dir)
++                            if f.startswith('cand_') and f.endswith('.py'))
++        safe_log(f"Candidates: {[os.path.basename(p) for p in cand_paths]}")
++
++        # Snapshot of the solution for the fallback.
++        passed, _ = _verify_solution(self.git_tempdir)
++        safe_log(f"Initial verification passed={passed}")
++
++        # (b) oracle + generators.
++        oracle_path = self._write_oracle(task)
++        self._oracle_path = oracle_path
++
++        # (d) compare, then bounded arbitration (at most MAX_ARBITRATION rounds).
++        result = self._verify_candidates(cand_paths, oracle_path) if cand_paths else None
++        if result is not None:
++            safe_log(f"Multi-compare: compared={result['compared']} agree={result['agree']}")
++            for round_no in range(1, MAX_ARBITRATION + 1):
++                if not result['disagreements']:
++                    break
++                self._arbitrate(task, cand_paths, oracle_path, result, round_no)
++                result = self._verify_candidates(cand_paths, oracle_path)
++                safe_log(f"After arbitration {round_no}: agree={result['agree']}")
++
++        # (e) select the best candidate and copy it to solution.py.
++        if result is not None:
++            best = self._select_best(cand_paths, result)
++            if best is not None:
++                _write_text(sol_path, _read_text(best))
++                safe_log(f"Selected {best}")
++
++        # Review rounds get the hard-test corpus and the oracle path; snapshot/restore fallback.
++        self._review_rounds(task, sol_path, summary)
++
++
++# Module-level prompts and knobs for the multi-candidate pipeline.
++NUM_CANDIDATES = 3          # cand_0 (first attempt) + (NUM_CANDIDATES - 1) fresh attempts
++MAX_ARBITRATION = 2         # bounded arbitration rounds
++HINTS = [
++    "Use a different formulation than the direct DP: think about a combinatorial or matrix/generating-function view, or an invariant.",
++    "Use a different formulation than the direct DP and the generating function: simulate the process directly with a smarter data structure, or derive the answer from a decomposition of the process.",
++    "Use a different formulation than the three above: think about the problem from the answer side (count or characterise the outcomes), and verify it with a statement-literal brute force.",
++]
++RETRY_PROMPT_TMPL = """{task}
++
++Your previous attempt ended without editing any source file. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {sol}, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
++"""
++
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tools/solution_check.py b/tools/solution_check.py
+index 7a3a1ee..704ddb6 100644
+--- a/tools/solution_check.py
++++ b/tools/solution_check.py
+@@ -34,7 +34,7 @@ def tool_info():
+             "properties": {
+                 "solution_path": {"type": "string", "description": "Path to the Python solution file (reads stdin, writes stdout)."},
+                 "inputs": {"type": "array", "items": {"type": "string"}, "description": "Stdin contents to run the solution on, one string per run (e.g. each sample input, or a max-size input)."},
+-                "expected_outputs": {"type": "array", "items": {"type": "string"}, "description": "Expected stdout for each entry of `inputs`, in the same order. Compared whitespace-normalised."},
++                "expected_outputs": {"type": "array", "items": {"type": "string"}, "description": "Expected stdout for each entry of `inputs`, in the same order. Compared whitespace-normalised. A None or empty entry means run only (no comparison)."},
+                 "brute_path": {"type": "string", "description": "Path to a trusted brute-force Python reference program (stress mode, needs gen_path)."},
+                 "gen_path": {"type": "string", "description": "Path to a random input generator; it is called as `python gen.py <seed>` and prints one test input to stdout (stress mode, needs brute_path)."},
+                 "num_tests": {"type": "integer", "description": "Number of random seeds to try in stress mode (default 200)."},
+@@ -162,16 +162,19 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+                     problems.append(f"exit code {rc}")
+                 if err.strip():
+                     problems.append("stderr is not empty")
+-                if expected_outputs is not None and i < len(expected_outputs) and status == 'ok':
+-                    if _normalise(out) != _normalise(expected_outputs[i]):
++                # None or empty expected entries mean 'run only' (no comparison).
++                exp = expected_outputs[i] if expected_outputs is not None and i < len(expected_outputs) else None
++                has_exp = bool(exp and exp.strip())
++                if has_exp and status == 'ok':
++                    if _normalise(out) != _normalise(exp):
+                         problems.append("output differs from expected")
+                 if problems:
+                     failed = True
+                     report.append(f"[input {i}] FAIL: {', '.join(problems)}\n"
+                                   f"input:\n{_clip(inp).rstrip()}\n"
+                                   + _fmt_run(f"solution on input {i}", status, out, err, rc, el))
+-                    if expected_outputs is not None and i < len(expected_outputs):
+-                        report.append("expected:\n" + _clip(expected_outputs[i]).rstrip())
++                    if has_exp:
++                        report.append("expected:\n" + _clip(exp).rstrip())
+                 else:
+                     passed += 1
+             report.append(f"{passed}/{len(inputs)} passed, max time {max_t:.3f} s")
+diff --git a/tests/test_multi_compare.py b/tests/test_multi_compare.py
+new file mode 100644
+index 0000000..0959b2a
+--- /dev/null
++++ b/tests/test_multi_compare.py
+@@ -0,0 +1,91 @@
++import json
++import os
++
++from tools import multi_compare
++
++GEN = "import random, sys\nrandom.seed(int(sys.argv[1]))\nprint(random.randint(1, 50), random.randint(1, 50))\n"
++GOOD = "a, b = map(int, input().split())\nprint(a + b)\n"
++WRONG = "a, b = map(int, input().split())\nprint(a + b + (1 if a == 7 else 0))\n"
++
++
++def _write(tmp_path, name, text):
++    p = tmp_path / name
++    p.write_text(text)
++    return str(p)
++
++
++def test_schema_valid():
++    info = multi_compare.tool_info()
++    assert info["name"] == "multi_compare"
++    schema = info["input_schema"]
++    assert schema["type"] == "object"
++    assert "required" in schema and "required" not in schema["properties"]
++    for name, prop in schema["properties"].items():
++        assert "type" in prop and "description" in prop, name
++        assert set(prop) <= {"type", "description", "items"}, name
++    assert set(schema["required"]) <= set(schema["properties"])
++
++
++def test_all_agree_with_oracle(tmp_path):
++    g = _write(tmp_path, "gen.py", GEN)
++    c1 = _write(tmp_path, "c1.py", GOOD)
++    c2 = _write(tmp_path, "c2.py", GOOD)
++    orc = _write(tmp_path, "oracle.py", GOOD)
++    out = multi_compare.tool_function([c1, c2], [g], oracle_path=orc, num_tests=20)
++    assert "agreement 20/20" in out
++    assert "no disagreements" in out
++
++
++def test_one_wrong_candidate_detected(tmp_path):
++    g = _write(tmp_path, "gen.py", GEN)
++    good = _write(tmp_path, "good.py", GOOD)
++    bad = _write(tmp_path, "bad.py", WRONG)
++    orc = _write(tmp_path, "oracle.py", GOOD)
++    out = multi_compare.tool_function([good, bad], [g], oracle_path=orc, num_tests=100)
++    assert f"{good}: agreement 100/100" in out
++    assert f"{bad}: agreement" in out and f"{bad}: agreement 100/100" not in out
++    assert "disagreeing inputs" in out
++
++
++def test_majority_reference_without_oracle(tmp_path):
++    g = _write(tmp_path, "gen.py", GEN)
++    good1 = _write(tmp_path, "g1.py", GOOD)
++    good2 = _write(tmp_path, "g2.py", GOOD)
++    bad = _write(tmp_path, "bad.py", WRONG)
++    out = multi_compare.tool_function([good1, good2, bad], [g], num_tests=100)
++    assert "against majority" in out
++    assert f"{bad}: agreement" in out and f"{bad}: agreement 100/100" not in out
++
++
++def test_corpus_saved(tmp_path):
++    g = _write(tmp_path, "gen.py", GEN)
++    good = _write(tmp_path, "good.py", GOOD)
++    bad = _write(tmp_path, "bad.py", WRONG)
++    orc = _write(tmp_path, "oracle.py", GOOD)
++    corpus = tmp_path / "corpus"
++    out = multi_compare.tool_function([good, bad], [g], oracle_path=orc, num_tests=100, corpus_dir=str(corpus))
++    files = sorted(os.listdir(corpus))
++    assert files and all(f.endswith(".json") for f in files)
++    rec = json.loads((corpus / files[0]).read_text())
++    assert rec["agrees"][good] is True and rec["agrees"][bad] is False
++    assert "a + b" not in rec["input"]  # input is raw stdin text
++    assert rec["size"] == len(rec["input"].split())
++    assert "saved" in out
++
++
++def test_samples_and_stderr_reported(tmp_path):
++    g = _write(tmp_path, "gen.py", GEN)
++    crash = _write(tmp_path, "crash.py", "a, b = map(int, input().split())\nprint(a // 0)\n")
++    out = multi_compare.tool_function([crash], [g], num_tests=5,
++                                      sample_inputs=["1 2\n", "3 4\n"], sample_outputs=["3\n", None])
++    assert "samples passed 0/2" in out
++    assert "ZeroDivisionError" in out
++
++
++def test_oracle_failure_is_skipped_not_blamed(tmp_path):
++    g = _write(tmp_path, "gen.py", GEN)
++    good = _write(tmp_path, "good.py", GOOD)
++    crash_oracle = _write(tmp_path, "oracle.py", "raise SystemExit(3)\n")
++    res = multi_compare.compare_candidates([good], [g], oracle_path=crash_oracle, num_tests=10)
++    assert res["compared"] == 0 and res["skipped"] == 10
++    assert res["disagreements"] == []
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+new file mode 100644
+index 0000000..07abf79
+--- /dev/null
++++ b/tests/test_pipeline.py
+@@ -0,0 +1,48 @@
++import os
++import coding_agent as ca
++
++GOOD = "a, b = map(int, input().split())\nprint(a + b)\n"
++WRONG = "a, b = map(int, input().split())\nprint(a - b)\n"
++GEN = "import random, sys\nrandom.seed(int(sys.argv[1]))\nprint(random.randint(1, 9), random.randint(1, 9))\n"
++ORACLE = GOOD
++
++
++def test_pipeline_selects_correct_candidate(tmp_path, monkeypatch):
++    """Fake LLM: the first attempt writes a wrong solution, later attempts write the right one."""
++    calls = []
++
++    def fake_chat(msg, model=None, msg_history=None, logging=print):
++        calls.append(msg[:60])
++        d = str(tmp_path)
++        if 'oracle.py' in msg and 'NOT to solve' in msg:
++            (tmp_path / 'oracle.py').write_text(ORACLE)
++            (tmp_path / 'gen_small.py').write_text(GEN)
++            (tmp_path / 'gen_medium.py').write_text(GEN)
++            return []
++        if 'ARBITRATION' in msg or 'ADVERSARIAL' in msg:
++            return []
++        if "attempt '" in msg:
++            label = msg.split("attempt '")[1].split("'")[0]
++            code = GOOD if label in ('1',) else WRONG
++            (tmp_path / 'cands').mkdir(exist_ok=True)
++            (tmp_path / 'cands' / f'cand_{label}.py').write_text(code)
++            return []
++        # first attempt: writes solution.py (wrong)
++        (tmp_path / 'solution.py').write_text(WRONG)
++        return []
++
++    monkeypatch.setattr(ca, 'chat_with_agent', fake_chat)
++    monkeypatch.setattr(ca, '_verify_solution', lambda d, num_tests=200: (False, 'stub'))
++    agent = ca.AgenticSystem.__new__(ca.AgenticSystem)
++    agent.problem_statement = 'add two numbers'
++    agent.git_tempdir = str(tmp_path)
++    agent.base_commit = 'x'
++    agent.code_model = 'm'
++    agent.logger = None
++    agent._has_primary_edit = lambda: True
++    agent.forward()
++
++    assert open(tmp_path / 'solution.py').read() == GOOD
++    assert (tmp_path / 'cands' / 'cand_0.py').read_text() == WRONG
++    # no unbounded loop: at most 1 first attempt + oracle + (K-1) attempts + arbitration rounds + review rounds
++    assert len(calls) <= 1 + 1 + (ca.NUM_CANDIDATES - 1) + ca.MAX_ARBITRATION + 2
+diff --git a/tools/multi_compare.py b/tools/multi_compare.py
+new file mode 100644
+index 0000000..3d015b3
+--- /dev/null
++++ b/tools/multi_compare.py
+@@ -0,0 +1,290 @@
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from collections import Counter
++
++# Runs several candidate solutions on generated inputs and compares them with an
++# oracle (if given) or with the majority output. Every run uses `python -I`, like
++# solution_check. Disagreeing inputs are saved as JSON files in corpus_dir.
++
++_MAX_STREAM = 2000
++_STRESS_BUDGET = 200.0
++_MAX_SHOWN = 3
++
++
++def tool_info():
++    return {
++        "name": "multi_compare",
++        "description": """Cross-check several candidate Python solutions on generated inputs.\n
++* Each candidate and the optional oracle run in isolated mode (`python -I`) on the input produced by `python gen.py <seed>` for seeds 0..num_tests-1.\n
++* If oracle_path is given, each candidate is scored by agreement with the oracle. Otherwise each candidate is scored by agreement with the majority output.\n
++* Reports per-candidate agreement counts, the smallest disagreeing inputs with every output (raw stderr included), and whether each candidate passes the given sample inputs.\n
++* Disagreeing inputs are saved as JSON files in corpus_dir (if given) so they can be reused as hard tests.\n
++* Pass gen_paths as a list; seeds are split across the generators (each generator is called with every seed).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "candidate_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths to candidate Python solution files (each reads stdin and writes stdout)."},
++                "gen_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths to generator programs; each is called as `python gen.py <seed>` and prints one input."},
++                "oracle_path": {"type": "string", "description": "Optional path to the trusted oracle program. If omitted, the majority output is used as reference."},
++                "num_tests": {"type": "integer", "description": "Number of seeds per generator (default 100)."},
++                "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."},
++                "corpus_dir": {"type": "string", "description": "Optional directory where disagreeing inputs are saved as JSON files."},
++                "sample_inputs": {"type": "array", "items": {"type": "string"}, "description": "Optional sample inputs from the statement; candidates are checked against sample_outputs on these."},
++                "sample_outputs": {"type": "array", "items": {"type": "string"}, "description": "Expected outputs for sample_inputs, same order. A None or empty entry means run only (no comparison)."}
++            },
++            "required": ["candidate_paths", "gen_paths"]
++        }
++    }
++
++
++def _clip(s, n=_MAX_STREAM):
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++
++def _normalise(s):
++    lines = [line.rstrip() for line in (s or '').replace('\r\n', '\n').split('\n')]
++    while lines and lines[-1] == '':
++        lines.pop()
++    return '\n'.join(lines)
++
++
++def _run(path, cwd, stdin_text, timeout):
++    """Run `python -I <path>` with stdin. Returns dict(status, out, err, rc, time)."""
++    t0 = time.monotonic()
++    try:
++        p = subprocess.run([sys.executable, '-I', path], input=stdin_text, capture_output=True,
++                           text=True, timeout=timeout, cwd=cwd, errors='replace')
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout if isinstance(e.stdout, str) else ''
++        err = e.stderr if isinstance(e.stderr, str) else ''
++        return {'status': 'timeout', 'out': out, 'err': err, 'rc': None, 'time': time.monotonic() - t0}
++    return {'status': 'ok', 'out': p.stdout, 'err': p.stderr, 'rc': p.returncode, 'time': time.monotonic() - t0}
++
++
++def _gen_input(gen_path, seed, cwd, timeout):
++    """Run the generator; returns input text or None on failure."""
++    try:
++        p = subprocess.run([sys.executable, '-I', gen_path, str(seed)], input='', capture_output=True,
++                           text=True, timeout=timeout, cwd=cwd, errors='replace')
++    except subprocess.TimeoutExpired:
++        return None
++    if p.returncode != 0 or p.stderr.strip():
++        return None
++    return p.stdout
++
++
++def _fmt_raw(label, r):
++    head = f"{label}: status={r['status']} exit_code={r['rc']}"
++    body = _clip(r['out']).rstrip() or '(empty)'
++    out = f"{head}\nstdout:\n{body}"
++    if r['err'].strip():
++        out += "\nSTDERR (raw):\n" + _clip(r['err']).rstrip()
++    return out
++
++
++def _size(text):
++    return len(text.split())
++
++
++def _check_samples(path, cwd, sample_inputs, sample_outputs, timeout):
++    """Return (passed, total, problems) for the candidate on the sample inputs."""
++    total = len(sample_inputs or [])
++    passed, problems = 0, []
++    for i, inp in enumerate(sample_inputs or []):
++        r = _run(path, cwd, inp, timeout)
++        exp = sample_outputs[i] if sample_outputs is not None and i < len(sample_outputs) else None
++        bad = []
++        if r['status'] != 'ok':
++            bad.append('timeout')
++        if r['rc'] not in (0, None):
++            bad.append(f"exit code {r['rc']}")
++        if r['err'].strip():
++            bad.append('stderr not empty')
++        if exp is not None and exp.strip() and r['status'] == 'ok' and _normalise(r['out']) != _normalise(exp):
++            bad.append('output differs from expected')
++        if bad:
++            msg = f"sample {i}: {', '.join(bad)}"
++            if r['err'].strip():
++                msg += "\nSTDERR (raw):\n" + _clip(r['err'], 1000).rstrip()
++            problems.append(msg)
++        else:
++            passed += 1
++    return passed, total, problems
++
++
++def _result_key(r):
++    """Comparable key for one run: ('ok', normalised stdout) or ('fail', status)."""
++    if r['status'] != 'ok' or r['rc'] != 0 or r['err'].strip():
++        return ('fail', r['status'])
++    return ('ok', _normalise(r['out']))
++
++
++def tool_function(candidate_paths, gen_paths, oracle_path=None, num_tests=100, timeout=10,
++                  corpus_dir=None, sample_inputs=None, sample_outputs=None):
++    res = compare_candidates(candidate_paths, gen_paths, oracle_path=oracle_path, num_tests=num_tests,
++                             timeout=timeout, corpus_dir=corpus_dir, sample_inputs=sample_inputs,
++                             sample_outputs=sample_outputs)
++    return res['report']
++
++
++def compare_candidates(candidate_paths, gen_paths, oracle_path=None, num_tests=100, timeout=10,
++                       corpus_dir=None, sample_inputs=None, sample_outputs=None):
++    """Structured version of tool_function. Returns a dict with keys:
++    report (str), error (str or None), compared (int), agree {path: int},
++    samples {path: (passed, total)}, disagreements (list of dicts with size, seed, gen,
++    input, outputs {path: (status, stdout-or-status)}), reference ('oracle'|'majority')."""
++    empty = {'report': '', 'error': None, 'compared': 0, 'agree': {}, 'samples': {}, 'times': {}, 'max_size': -1,
++             'disagreements': [], 'reference': 'oracle' if oracle_path else 'majority'}
++
++    def fail(msg):
++        d = dict(empty)
++        d['error'] = msg
++        d['report'] = msg
++        return d
++
++    try:
++        num_tests = max(0, int(num_tests if num_tests is not None else 100))
++        timeout = max(1, int(timeout or 10))
++    except (TypeError, ValueError) as e:
++        return fail(f"Error: invalid numeric argument: {e}")
++    if isinstance(candidate_paths, str):
++        candidate_paths = [candidate_paths]
++    if isinstance(gen_paths, str):
++        gen_paths = [gen_paths]
++    if not candidate_paths:
++        return fail("Error: no candidate_paths given.")
++    if not gen_paths:
++        return fail("Error: no gen_paths given.")
++    for p in list(candidate_paths) + list(gen_paths) + ([oracle_path] if oracle_path else []):
++        if not os.path.isfile(p):
++            return fail(f"Error: file not found: {p}")
++
++    tmpdir = tempfile.mkdtemp(prefix='multicmp_')
++    try:
++        # Copy every program into the temp dir under a stable name.
++        names = [f"_cand{i}.py" for i in range(len(candidate_paths))]
++        for src, dst in zip(candidate_paths, names):
++            shutil.copyfile(src, os.path.join(tmpdir, dst))
++        gen_names = [f"_gen{i}.py" for i in range(len(gen_paths))]
++        for src, dst in zip(gen_paths, gen_names):
++            shutil.copyfile(src, os.path.join(tmpdir, dst))
++        if oracle_path:
++            shutil.copyfile(oracle_path, os.path.join(tmpdir, '_oracle.py'))
++
++        report = []
++        # ---- samples ----
++        sample_summary = {}
++        if sample_inputs:
++            for cp, name in zip(candidate_paths, names):
++                ok, total, probs = _check_samples(os.path.join(tmpdir, name), tmpdir,
++                                                  sample_inputs, sample_outputs, timeout)
++                sample_summary[cp] = (ok, total)
++                if probs:
++                    report.append(f"[{cp}] sample problems: " + '; '.join(probs))
++
++        # ---- generated inputs ----
++        agree = {n: 0 for n in names}
++        compared = 0
++        disagreements = []   # (size, seed, gen_name, input_text, outputs dict name->key)
++        max_size, times_at_max = -1, {}
++        skipped, oracle_errors = 0, []
++        t_start = time.monotonic()
++        stopped = False
++        for gname in gen_names:
++            for seed in range(num_tests):
++                if time.monotonic() - t_start > _STRESS_BUDGET:
++                    stopped = True
++                    break
++                inp = _gen_input(os.path.join(tmpdir, gname), seed, tmpdir, timeout)
++                if inp is None:
++                    report.append(f"generator {gname} failed on seed {seed}; skipped")
++                    continue
++                keys, raws = {}, {}
++                for name in names:
++                    raws[name] = _run(os.path.join(tmpdir, name), tmpdir, inp, timeout)
++                    keys[name] = _result_key(raws[name])
++                oracle_raw = None
++                if oracle_path:
++                    oracle_raw = _run(os.path.join(tmpdir, '_oracle.py'), tmpdir, inp, timeout)
++                    ref = _result_key(oracle_raw)
++                    if ref[0] == 'fail':
++                        # The oracle itself failed (too slow or crashed): this input cannot be judged.
++                        skipped += 1
++                        if oracle_errors is not None and len(oracle_errors) < 2:
++                            oracle_errors.append(f"seed {seed} ({gname}): " + _fmt_raw('oracle', oracle_raw))
++                        continue
++                else:
++                    ref_key, _ = Counter(keys.values()).most_common(1)[0]
++                    ref = ref_key
++                compared += 1
++                if _size(inp) >= max_size:
++                    max_size = _size(inp)
++                    times_at_max = {name: raws[name]['time'] for name in names}
++                for name in names:
++                    if keys[name] == ref:
++                        agree[name] += 1
++                if any(keys[n] != ref for n in names):
++                    disagreements.append((_size(inp), seed, gname, inp, keys, ref, raws, oracle_raw))
++            if stopped:
++                break
++
++        reference = 'oracle' if oracle_path else 'majority'
++        report.append(f"compared {compared} inputs against {reference}")
++        if skipped:
++            report.append(f"skipped {skipped} inputs where the oracle failed (timeout/crash); first oracle failures:\n" + "\n".join(oracle_errors))
++        for cp, name in zip(candidate_paths, names):
++            s = f"{cp}: agreement {agree[name]}/{compared}"
++            if cp in sample_summary:
++                s += f", samples passed {sample_summary[cp][0]}/{sample_summary[cp][1]}"
++            report.append(s)
++        if stopped:
++            report.append(f"Time budget of {_STRESS_BUDGET:.0f}s reached; stopped early.")
++
++        # ---- corpus ----
++        disagreements.sort(key=lambda d: (d[0], d[1], d[2]))
++        if corpus_dir and disagreements:
++            os.makedirs(corpus_dir, exist_ok=True)
++            for size, seed, gname, inp, keys, ref, raws, _orc in disagreements:
++                fname = f"hard_{gname[:-3]}_{seed}.json"
++                record = {
++                    'gen': gname, 'seed': seed, 'input': inp, 'size': size,
++                    'reference': reference,
++                    'outputs': {cp: keys[name][1] for cp, name in zip(candidate_paths, names)},
++                    'agrees': {cp: keys[name] == ref for cp, name in zip(candidate_paths, names)},
++                }
++                with open(os.path.join(corpus_dir, fname), 'w', encoding='utf-8') as f:
++                    json.dump(record, f, indent=2)
++            report.append(f"saved {len(disagreements)} disagreeing inputs to {corpus_dir}")
++
++        # ---- shown disagreements ----
++        if disagreements:
++            report.append(f"{len(disagreements)} disagreeing inputs; smallest {min(_MAX_SHOWN, len(disagreements))}:")
++            for size, seed, gname, inp, keys, ref, raws, orc in disagreements[:_MAX_SHOWN]:
++                lines = [f"--- {gname} seed {seed} (size {size}) input:", _clip(inp).rstrip()]
++                for cp, name in zip(candidate_paths, names):
++                    lines.append(_fmt_raw(cp, raws[name]))
++                if orc is not None:
++                    lines.append(_fmt_raw('oracle', orc))
++                report.append("\n".join(lines))
++        elif compared:
++            report.append("no disagreements")
++        result = dict(empty)
++        result.update({'report': "\n\n".join(report), 'compared': compared,
++                       'agree': {cp: agree[name] for cp, name in zip(candidate_paths, names)},
++                       'samples': sample_summary,
++                       'times': {cp: times_at_max.get(name) for cp, name in zip(candidate_paths, names)},
++                       'max_size': max_size, 'skipped': skipped,
++                       'disagreements': [
++                           {'size': d[0], 'seed': d[1], 'gen': d[2], 'input': d[3],
++                            'outputs': {cp: d[4][name] for cp, name in zip(candidate_paths, names)}}
++                           for d in disagreements]})
++        return result
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)

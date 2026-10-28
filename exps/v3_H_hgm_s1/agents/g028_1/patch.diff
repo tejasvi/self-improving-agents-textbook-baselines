@@ -1,0 +1,227 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 72a3517..8f5cb92 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,7 +7,7 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, list_non_test_tracked_files, read_starter_files
+-from utils.common_utils import extract_code_block
++from utils.common_utils import extract_code_block, extract_samples, run_samples
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -159,6 +159,42 @@ Current contents of the non-test files:
+ Your first action must be an editor tool call with command=edit on {primary_text} containing the full solution (or command=create if the file does not exist); do not explore further and do not reply with an empty message. The solution must replace the starter stub and keep the required signature, adding any missing imports. After editing, reply with a short summary of the change."""
+ 
+ 
++def _format_failures(failures, limit=3):
++    """Concise, human-readable failure report for the agent."""
++    parts = []
++    for i, f in enumerate(failures[:limit], 1):
++        status = "TIMED OUT" if f['timed_out'] else "WRONG OUTPUT"
++        parts.append(
++            f"Failure {i} ({status}):\n"
++            f"Input:\n{f['input']}"
++            f"Expected:\n{f['expected']}"
++            f"Actual stdout:\n{f['stdout'] or '(empty)'}\n"
++            f"Stderr/traceback:\n{(f['stderr'] or '(none)')[-1500:]}"
++        )
++    if len(failures) > limit:
++        parts.append(f"... and {len(failures) - limit} more failing sample(s).")
++    return "\n\n".join(parts)
++
++
++def _build_compact_fix_prompt(problem_statement, git_tempdir, failure_report):
++    """Fresh, self-contained prompt used when a fix-up reply comes back empty."""
++    starter = read_starter_files(git_tempdir)
++    starter_text = "\n\n".join(f"### {path}\n```\n{text}\n```" for path, text in starter) or "(no files)"
++    return f"""I have uploaded a code repository in the directory {git_tempdir}. Help solve the following problem.
++
++<problem_description>
++{problem_statement}
++</problem_description>
++
++Current contents of the non-test files:
++{starter_text}
++
++The current solution fails the provided samples:
++{failure_report}
++
++Your first action must be an editor tool call that fixes the bug in the primary source file (command=edit). Do not reply with an empty message. After editing, re-run the samples and reply with a short summary of the change."""
++
++
+ def _build_fallback_prompt(problem_statement, primary_path, git_tempdir):
+     """Tool-free prompt asking for the complete primary file contents."""
+     return f"""Problem:
+@@ -245,9 +281,13 @@ Rules:
+         patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+         primary_path = _primary_source_file(self.git_tempdir)
+ 
+-        # Fresh-context retries (bounded loop, never reuses the stalled history)
++        # Fresh-context retries (bounded loop, never reuses the stalled history).
++        # Stall detection is independent of has_source_edits: an empty final reply
++        # or failing samples also trigger a continuation.
++        samples = extract_samples(self.problem_statement)
+         for attempt in range(3):
+-            if has_source_edits(patch):
++            if has_source_edits(patch) and not _is_empty_reply(msg_history) \
++                    and not (samples and primary_path and run_samples(self.git_tempdir, primary_path, samples)):
+                 break
+             safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Retrying with fresh context.")
+             retry_msg = _build_retry_prompt(self.problem_statement, self.git_tempdir, primary_path, patch)
+@@ -276,6 +316,28 @@ Rules:
+                 else:
+                     safe_log("[forward] Fallback produced no code block; nothing written.")
+ 
++        # Sample-based acceptance gate: re-prompt with concrete failures, bounded rounds.
++        if samples and primary_path:
++            for round_idx in range(4):
++                failures = run_samples(self.git_tempdir, primary_path, samples)
++                if not failures:
++                    safe_log(f"[forward] Samples pass (round {round_idx + 1}).")
++                    break
++                report = _format_failures(failures)
++                safe_log(f"[forward] Sample round {round_idx + 1}/4: {len(failures)}/{len(samples)} failing.")
++                fix_msg = (f"Your solution fails the provided samples:\n{report}\n\n"
++                           f"Fix the bug in {primary_path} using the editor tool, then re-run the samples. "
++                           f"Test large inputs separately with `timeout`.")
++                msg_history = chat_with_agent(fix_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                if _is_empty_reply(msg_history):
++                    safe_log(f"[forward] Empty reply in sample round {round_idx + 1}; resending compact prompt.")
++                    compact = _build_compact_fix_prompt(self.problem_statement, self.git_tempdir, report)
++                    msg_history = chat_with_agent(compact, model=self.code_model, msg_history=[], logging=safe_log)
++                patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++            else:
++                if run_samples(self.git_tempdir, primary_path, samples):
++                    safe_log("[forward] Sample rounds exhausted; samples still failing.")
++
+         has_edit = has_source_edits(patch)
+         if has_edit:
+             # Verification pass once a source edit exists
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..93d41cf 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -11,13 +11,18 @@ def tool_info():
+ * State is persistent across command calls and discussions with the user.\n
+ * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+ * Please avoid commands that may produce a very large amount of output.\n
+-* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""",
++* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
++* Every call runs in a fresh shell with a 120s limit. Wrap long-running programs with `timeout` (e.g. `timeout 10 python sol.py`) and split long work into separate commands.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "command": {
+                     "type": "string",
+                     "description": "The bash command to run."
++                },
++                "restart": {
++                    "type": "boolean",
++                    "description": "Optional. Accepted for compatibility and ignored; every call already runs in a fresh shell."
+                 }
+             },
+             "required": ["command"]
+@@ -147,7 +152,8 @@ async def tool_function_call(command):
+     except Exception as e:
+         return f"Error: {str(e)}"
+ 
+-def tool_function(command):
++def tool_function(command, restart=False):
++    # `restart` is accepted for compatibility; each call already uses a fresh shell.
+     return asyncio.run(tool_function_call(command))
+ 
+ if __name__ == "__main__":
+diff --git a/utils/common_utils.py b/utils/common_utils.py
+index 520fab0..e6babec 100644
+--- a/utils/common_utils.py
++++ b/utils/common_utils.py
+@@ -33,3 +33,87 @@ def extract_code_block(text):
+         return None
+     _, code = matches[-1]
+     return code
++
++
++_SAMPLE_IN_RE = re.compile(
++    r'Sample\s+Input\s*(\d*)\s*:?\s*\n(.*?)(?=\n\s*Sample\s+Output|\Z)',
++    re.DOTALL | re.IGNORECASE,
++)
++_SAMPLE_OUT_RE = re.compile(
++    r'Sample\s+Output\s*(\d*)\s*:?\s*\n(.*?)(?=\n\s*Sample\s+|\n\s*Explanation|\n\s*#{1,6}\s|\n\s*Input\s*:|\n\s*Expected\s+output|\Z)',
++    re.DOTALL | re.IGNORECASE,
++)
++_IO_RE = re.compile(
++    r'Input:\s*\n(.*?)\n\s*Expected\s+output:\s*\n(.*?)(?=\n\s*Input:|\n\s*#{1,6}\s|\Z)',
++    re.DOTALL | re.IGNORECASE,
++)
++
++
++def extract_samples(problem_statement):
++    """
++    Parse example (input, expected_output) pairs from a problem statement.
++    Supports 'Sample Input N' / 'Sample Output N' blocks and 'Input:' / 'Expected output:' blocks.
++    Returns a list of (input_text, expected_output) tuples; [] if none are found.
++    """
++    if not problem_statement:
++        return []
++    samples = []
++    # Pair each 'Sample Input k' with the 'Sample Output k' that follows it
++    inputs = [(m.group(1), m.group(2)) for m in _SAMPLE_IN_RE.finditer(problem_statement)]
++    outputs = {m.group(1): m.group(2) for m in _SAMPLE_OUT_RE.finditer(problem_statement)}
++    for idx, (num, inp) in enumerate(inputs):
++        key = num if num else ''
++        out = outputs.get(key)
++        if out is None and not num:
++            # Unnumbered: take the idx-th output in order
++            out_list = list(outputs.values())
++            out = out_list[idx] if idx < len(out_list) else None
++        if out is None:
++            continue
++        inp, out = inp.strip('\n'), out.strip('\n')
++        if inp.strip() and out.strip():
++            samples.append((inp.rstrip() + '\n', out.rstrip() + '\n'))
++    if not samples:
++        for m in _IO_RE.finditer(problem_statement):
++            inp, out = m.group(1).strip('\n'), m.group(2).strip('\n')
++            if inp.strip() and out.strip():
++                samples.append((inp.rstrip() + '\n', out.rstrip() + '\n'))
++    return samples
++
++
++def run_samples(git_dir, entry_file, samples, timeout=10):
++    """
++    Run the Python file `entry_file` (relative to git_dir) on each sample input.
++    Returns a list of failure dicts with keys: input, expected, stdout, stderr, timed_out.
++    Comparison is whitespace-normalized (split/join).
++    """
++    import subprocess
++    import sys
++    import os
++
++    path = entry_file if os.path.isabs(entry_file) else os.path.join(git_dir, entry_file)
++    failures = []
++    for inp, expected in samples:
++        try:
++            proc = subprocess.run(
++                [sys.executable, path], input=inp, capture_output=True,
++                text=True, timeout=timeout, cwd=git_dir,
++            )
++            stdout, stderr, timed_out = proc.stdout, proc.stderr, False
++        except subprocess.TimeoutExpired as e:
++            stdout = e.stdout.decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
++            stderr = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or '')
++            stderr += f"\nTimed out after {timeout}s"
++            timed_out = True
++        except Exception as e:
++            stdout, stderr, timed_out = '', f"Failed to run: {e}", False
++        if timed_out or stdout.split() != expected.split():
++            failures.append({
++                'input': inp,
++                'expected': expected,
++                'stdout': stdout,
++                'stderr': stderr,
++                'timed_out': timed_out,
++            })
++    return failures
++

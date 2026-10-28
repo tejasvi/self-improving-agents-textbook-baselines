@@ -1,0 +1,286 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 11cf35c..848e0c3 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -22,7 +22,8 @@ DIFF_BUDGET = 60
+ METHOD_PROMPT = """Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool. The final solution.py must be a stdin/stdout program (read input with sys.stdin, print the answer), unless the statement asks for a Solution class method.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++3. Write the I/O contract: input format, output format, and whether the task is interactive. For interactive tasks, read all input through a token iterator over sys.stdin (never sys.stdin.read() before the interaction is over, and never assume one value per line), flush after each print, write an interactor and use the interactive_judge tool, and also run the program on a static transcript where all judge data is pre-supplied on stdin.
++3b. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 4. Write brute.py: a verified-correct brute force written directly from the statement (plain simulation or full enumeration, NOT your fast idea), as a stdin/stdout program. Write gen.py exposing gen(rng, size) that returns a small random input as a string, including degenerate cases (minimum size, all equal values, extreme values). Then run the `stress_test` tool comparing solution.py with brute.py using gen.py. Do not skip degenerate inputs. Fix every mismatch. Also enumerate all tiny inputs when feasible (enumerate_all() in gen.py).
+ 5. Save a maximum-size input allowed by the constraints as max_input.txt in the repository directory, and check that `python3 solution.py < max_input.txt` finishes well under 2 seconds. The harness uses a 3 second limit on max_input.txt.
+ 6. Audit every early return and special-case branch in the final code against inputs where its condition is false but the branch is still reached.
+@@ -224,13 +225,13 @@ class AgenticSystem:
+         text = self.problem_statement
+         if not isinstance(text, str) or not text:
+             return []
+-        in_re = re.compile(r"Sample\s+Input\s*(\d+)\s*:?", re.I)
+-        out_re = re.compile(r"Sample\s+Output\s*(\d+)\s*:?", re.I)
++        in_re = re.compile(r"(?:Sample\s+Input\s*(\d*)\s*:?|(?:Example\s+)?Input\s*(\d*)\s*:)", re.I)
++        out_re = re.compile(r"(?:Sample\s+Output\s*(\d*)\s*:?|(?:Example\s+)?(?:Expected\s+)?Output\s*(\d*)\s*:)", re.I)
+         headers = []
+         for m in in_re.finditer(text):
+-            headers.append(("in", int(m.group(1)), m.start(), m.end()))
++            headers.append(("in", int(m.group(1) or m.group(2) or 0), m.start(), m.end()))
+         for m in out_re.finditer(text):
+-            headers.append(("out", int(m.group(1)), m.start(), m.end()))
++            headers.append(("out", int(m.group(1) or m.group(2) or 0), m.start(), m.end()))
+         headers.sort(key=lambda h: h[2])
+ 
+         def clean(block):
+@@ -385,7 +386,12 @@ class AgenticSystem:
+         # 2. Max-size input saved by the agent.
+         max_ok = 1
+         max_path = os.path.join(self.git_tempdir, 'max_input.txt')
+-        if os.path.isfile(max_path):
++        is_interactive = isinstance(self.problem_statement, str) and re.search(r"interactive", self.problem_statement, re.I) is not None
++        if is_interactive:
++            # max_input.txt cannot be a full transcript for interactive problems; EOF/format
++            # behaviour is not a correctness check, so it is not scored here.
++            safe_log("_evaluate: interactive problem; skipping max_input correctness check")
++        elif os.path.isfile(max_path):
+             try:
+                 with open(max_path) as f:
+                     max_text = f.read()
+@@ -403,6 +409,7 @@ class AgenticSystem:
+ 
+         # 3. Optional differential check against brute.py using gen.py.
+         brute_ok = 1
++        differential_ran = False
+         brute_path = os.path.join(self.git_tempdir, 'brute.py')
+         gen_file = None
+         for cand in ('gen.py', 'generator.py'):
+@@ -426,12 +433,20 @@ class AgenticSystem:
+                 else:
+                     report.append(self._failure_text("brute mismatch", inp, bout, sstat, sout))
+                     break  # one counterexample is enough; avoids long repeated timeouts
++            if total > 0:
++                differential_ran = True
+             if total > 0 and agree < total:
+                 brute_ok = 0
+             safe_log(f"_evaluate: differential {agree}/{total} agree")
+ 
+         score = (samples_ok, max_ok, brute_ok)
+         passed = (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1
++        if not samples and not differential_ran:
++            # Nothing was actually verified: never report success.
++            passed = False
++            score = (0, max_ok, 0)
++            report.append("No verifiable checks ran; write your own tests (a brute force with stress_test, "
++                          "or an interactive_judge run for interactive problems, plus a static-transcript run).")
+         if not report:
+             report_text = "All available checks passed."
+         else:
+diff --git a/tools/interactive_judge.py b/tools/interactive_judge.py
+new file mode 100644
+index 0000000..3e03602
+--- /dev/null
++++ b/tools/interactive_judge.py
+@@ -0,0 +1,205 @@
++import os
++import queue
++import random
++import subprocess
++import sys
++import tempfile
++import threading
++import importlib.util
++
++_MAX_TRANSCRIPT = 3000
++_DEFAULT_LINE_TIMEOUT = 10
++
++
++def tool_info():
++    return {
++        "name": "interactive_judge",
++        "description": """Run solution.py against a user-written interactor to test an INTERACTIVE problem.
++* The interactor is a Python file that exposes either `cases()` returning a list of initial inputs (each a string) or `gen(rng, size)` returning one initial input string, plus `respond(state, query_line)`.
++* `respond(state, query_line)` must return ('reply', text) to send text back to the solution, or ('final', verdict_bool, info) to end the case. `state` is a dict you may freely mutate; it is created per case and starts as {'initial': <initial input text>}.
++* The solution is started as `python3 solution.py` with pipes; the initial input is sent first, then every line the solution prints is treated as a query.
++* Enforces a per-line timeout (a hang is reported explicitly), a max_queries limit, and reports protocol violations (solution exits early or prints nothing).
++* Returns the first failing transcript, or PASS with the number of cases run.
++* Also write a static transcript test yourself if the statement allows it (all judge data pre-supplied on stdin).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the solution.py file to test."},
++                "interactor_path": {"type": "string", "description": "Path to the Python interactor file (exposes cases() or gen(rng,size), and respond(state, query_line))."},
++                "num_cases": {"type": "integer", "description": "Number of cases to run (default 50)."},
++                "timeout": {"type": "integer", "description": "Per-line timeout in seconds (default 10)."},
++                "max_queries": {"type": "integer", "description": "Maximum number of queries per case; exceeding it is a failure. Default: no limit."}
++            },
++            "required": ["solution_path", "interactor_path"]
++        }
++    }
++
++
++def _clip(s):
++    s = str(s)
++    if len(s) <= _MAX_TRANSCRIPT:
++        return s
++    return s[:_MAX_TRANSCRIPT // 2] + "\n...<clipped>...\n" + s[-_MAX_TRANSCRIPT // 2:]
++
++
++def _load_interactor(path):
++    d = os.path.dirname(os.path.abspath(path))
++    if d not in sys.path:
++        sys.path.insert(0, d)
++    spec = importlib.util.spec_from_file_location("_interactor_mod", path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _initial_inputs(mod, num_cases):
++    """Return a list of `num_cases` initial input strings."""
++    if hasattr(mod, "cases"):
++        lst = list(mod.cases())
++        return [str(x) for x in lst[:num_cases]]
++    if hasattr(mod, "gen"):
++        rng = random.Random(12345)
++        out = []
++        for i in range(num_cases):
++            out.append(str(mod.gen(rng, i % 20 + 1)))
++        return out
++    raise AttributeError("interactor must define cases() or gen(rng, size)")
++
++
++def _run_case(solution_path, initial, respond, state_mod, line_timeout, max_queries):
++    """Run one interactive case. Returns (ok: bool, message: str, transcript: str, queries: int)."""
++    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
++    proc = subprocess.Popen(
++        [sys.executable, solution_path],
++        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        text=True, bufsize=1, env=env,
++    )
++    lines_q = queue.Queue()
++
++    def reader(pipe, q):
++        try:
++            for ln in pipe:
++                q.put(ln)
++        finally:
++            q.put(None)  # EOF sentinel
++
++    err_chunks = []
++
++    def err_reader(pipe):
++        try:
++            err_chunks.append(pipe.read())
++        except Exception:
++            pass
++
++    t_out = threading.Thread(target=reader, args=(proc.stdout, lines_q), daemon=True)
++    t_err = threading.Thread(target=err_reader, args=(proc.stderr,), daemon=True)
++    t_out.start()
++    t_err.start()
++
++    transcript = []
++    state = {"initial": initial}
++    queries = 0
++
++    def kill():
++        try:
++            proc.kill()
++        except Exception:
++            pass
++        try:
++            proc.wait(timeout=2)
++        except Exception:
++            pass
++
++    def stderr_tail():
++        t_err.join(timeout=1)
++        s = "".join(err_chunks)
++        return _clip(s[-1000:]) if s else ""
++
++    def fail(msg):
++        kill()
++        tr = _clip("".join(transcript))
++        return False, msg + ("\nstderr:\n" + stderr_tail() if stderr_tail() else ""), tr, queries
++
++    try:
++        proc.stdin.write(initial if initial.endswith("\n") else initial + "\n")
++        proc.stdin.flush()
++    except (BrokenPipeError, OSError):
++        return fail("Protocol violation: solution exited before reading the initial input.")
++
++    # Bounded loop: each iteration consumes one line of solution output or ends the case.
++    max_iters = (max_queries if max_queries else 10000) + 2
++    for _ in range(max_iters * 1000):
++        try:
++            ln = lines_q.get(timeout=line_timeout)
++        except queue.Empty:
++            return fail(f"HANG: no output line within {line_timeout}s (solution is waiting or looping).")
++        if ln is None:
++            code = proc.poll()
++            if code is None:
++                try:
++                    code = proc.wait(timeout=2)
++                except Exception:
++                    code = None
++            return fail(f"Protocol violation: solution ended (exit code {code}) without a final answer or query when expected.")
++        transcript.append("> " + ln)
++        queries += 1
++        if max_queries is not None and queries > max_queries:
++            return fail(f"Query limit exceeded: more than {max_queries} queries in one case.")
++        try:
++            res = respond(state, ln.rstrip("\n"))
++        except Exception as e:
++            return fail(f"Interactor respond() raised: {type(e).__name__}: {e}")
++        if not isinstance(res, tuple) or len(res) == 0:
++            return fail("Interactor respond() must return ('reply', text) or ('final', verdict, info).")
++        kind = res[0]
++        if kind == "reply":
++            text = str(res[1])
++            transcript.append("< " + text + ("" if text.endswith("\n") else "\n"))
++            try:
++                proc.stdin.write(text if text.endswith("\n") else text + "\n")
++                proc.stdin.flush()
++            except (BrokenPipeError, OSError):
++                return fail("Protocol violation: solution closed stdin early (it probably exited after an invalid reply).")
++        elif kind == "final":
++            verdict = bool(res[1]) if len(res) > 1 else False
++            info = res[2] if len(res) > 2 else ""
++            kill()
++            if verdict:
++                return True, "", _clip("".join(transcript)), queries
++            return False, f"Wrong answer: {info}", _clip("".join(transcript)), queries
++        else:
++            return fail(f"Interactor respond() returned unknown kind {kind!r}.")
++    return fail("Query loop bound reached (solution sends too many lines).")
++
++
++def tool_function(solution_path, interactor_path, num_cases=50, timeout=10, max_queries=None):
++    try:
++        num_cases = int(num_cases) if num_cases is not None else 50
++        line_timeout = float(timeout) if timeout is not None else _DEFAULT_LINE_TIMEOUT
++        mq = int(max_queries) if max_queries is not None else None
++    except (TypeError, ValueError) as e:
++        return f"Invalid arguments: {e}"
++    if not os.path.exists(solution_path):
++        return f"solution file not found: {solution_path}"
++    try:
++        mod = _load_interactor(interactor_path)
++    except BaseException as e:
++        return f"Failed to load interactor: {type(e).__name__}: {e}"
++    if not hasattr(mod, "respond"):
++        return "interactor must define respond(state, query_line)"
++    try:
++        inits = _initial_inputs(mod, max(1, num_cases))
++    except BaseException as e:
++        return f"Failed to create initial inputs: {type(e).__name__}: {e}"
++    if not inits:
++        return "interactor produced no cases"
++
++    total_queries = 0
++    for idx, init in enumerate(inits):
++        ok, msg, tr, q = _run_case(solution_path, init, mod.respond, None, line_timeout, mq)
++        total_queries += q
++        if not ok:
++            return (f"FAIL on case {idx + 1}/{len(inits)}: {msg}\n"
++                    f"Initial input:\n{_clip(init)}\n"
++                    f"Transcript (> solution output, < judge reply):\n{tr}")
++    return f"PASS: {len(inits)} cases passed ({total_queries} queries total)."

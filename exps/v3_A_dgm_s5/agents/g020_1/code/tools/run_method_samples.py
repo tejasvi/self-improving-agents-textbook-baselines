@@ -1,0 +1,203 @@
+import json
+import subprocess
+import sys
+
+
+_HARNESS = r'''
+import importlib.util, json, sys, traceback, math
+
+_payload = json.loads(sys.stdin.read())
+_solution_path = _payload["solution_path"]
+_class_name = _payload["class_name"]
+_method_name = _payload["method_name"]
+_samples = _payload["samples"]
+_tol = 1e-6
+
+_ns = {}
+exec("from typing import *\nfrom collections import *\nimport math, heapq, bisect, itertools, functools, re, string, sys\n", _ns)
+
+def _load():
+    with open(_solution_path, "r", encoding="utf-8") as f:
+        src = f.read()
+    ns = dict(_ns)
+    ns["__name__"] = "solution_module"
+    ns["__file__"] = _solution_path
+    exec(compile(src, _solution_path, "exec"), ns)
+    return ns
+
+def _eq(a, b):
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return math.isclose(float(a), float(b), rel_tol=_tol, abs_tol=_tol)
+        except Exception:
+            return a == b
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) and len(a) == len(b):
+        return all(_eq(x, y) for x, y in zip(a, b))
+    return a == b
+
+results = []
+try:
+    ns = _load()
+    cls = ns[_class_name]
+    if _method_name is None:
+        names = [n for n in vars(cls) if not n.startswith("_") and callable(getattr(cls, n))]
+        _method_name = names[0] if names else None
+    load_error = None
+except Exception:
+    load_error = traceback.format_exc()
+    ns = None
+
+for idx, sample in enumerate(_samples, start=1):
+    entry = {"index": idx}
+    if load_error is not None:
+        entry.update(status="FAIL", error="Could not load solution:\n" + load_error)
+        results.append(entry)
+        continue
+    args = sample.get("args", [])
+    expected = sample.get("expected")
+    entry["expected"] = expected
+    try:
+        if isinstance(args, dict):
+            call_args, call_kwargs = [], args
+        else:
+            call_args, call_kwargs = list(args), {}
+        obj = cls()
+        actual = getattr(obj, _method_name)(*call_args, **call_kwargs)
+        entry["actual"] = actual
+        if _eq(actual, expected):
+            entry["status"] = "PASS"
+        else:
+            entry["status"] = "FAIL"
+    except Exception:
+        entry.update(status="FAIL", error=traceback.format_exc())
+    results.append(entry)
+
+def _safe(v):
+    try:
+        json.dumps(v)
+        return v
+    except Exception:
+        return repr(v)
+
+for r in results:
+    for k in ("expected", "actual"):
+        if k in r:
+            r[k] = _safe(r[k])
+sys.stdout.write("\n__RESULTS__" + json.dumps(results) + "\n")
+'''
+
+
+def tool_info():
+    return {
+        "name": "run_method_samples",
+        "description": """Check a class-based solution (class Solution with a method) against a list of samples.\n
+* Imports the solution file in a subprocess (with a timeout), injects `from typing import *` and `from collections import *` so starter code without imports still loads.\n
+* Calls the method on a fresh `Solution()` instance for every sample, passing `args` (a list of positional args, or an object of keyword args), and compares the return value with `expected` (floats use a tolerance).\n
+* Returns a PASS/FAIL report per sample with the actual vs expected values and tracebacks for exceptions.\n
+* If `method_name` is omitted, the first public method of the class is used.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "solution_path": {
+                    "type": "string",
+                    "description": "Path to the Python file that defines the solution class."
+                },
+                "class_name": {
+                    "type": "string",
+                    "description": "Name of the class to instantiate (usually 'Solution')."
+                },
+                "method_name": {
+                    "type": "string",
+                    "description": "Name of the method to call. If omitted, the first public method of the class is used."
+                },
+                "samples": {
+                    "type": "array",
+                    "description": "List of samples. Each item is an object with 'args' (list of positional arguments, or an object of keyword arguments) and 'expected' (the expected return value as JSON).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "args": {
+                                "description": "Arguments for the method: a JSON list of positional arguments, or a JSON object of keyword arguments."
+                            },
+                            "expected": {
+                                "description": "The expected return value as JSON."
+                            }
+                        },
+                        "required": ["args", "expected"]
+                    }
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds for the whole run. Defaults to 10."
+                }
+            },
+            "required": ["solution_path", "class_name", "samples"]
+        }
+    }
+
+
+def tool_function(solution_path, class_name='Solution', method_name=None, samples=None, timeout=10):
+    if timeout is None:
+        timeout = 10
+    if isinstance(samples, str):
+        try:
+            samples = json.loads(samples)
+        except Exception as e:
+            return f"Error: samples must be a JSON list: {e}"
+    if not samples:
+        return "Error: no samples provided."
+    if class_name is None:
+        class_name = 'Solution'
+
+    payload = json.dumps({
+        "solution_path": solution_path,
+        "class_name": class_name,
+        "method_name": method_name,
+        "samples": samples,
+    })
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _HARNESS],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: run timed out after {timeout}s (possible infinite loop or too slow solution)."
+    except Exception as e:
+        return f"Error: could not run harness: {e}"
+
+    marker = "__RESULTS__"
+    results = None
+    if marker in proc.stdout:
+        try:
+            results = json.loads(proc.stdout.split(marker, 1)[1].strip())
+        except Exception:
+            results = None
+    if results is None:
+        return (
+            f"FAIL: harness crashed (exit code {proc.returncode}).\n"
+            f"--- stderr ---\n{proc.stderr}\n--- stdout ---\n{proc.stdout}"
+        )
+
+    reports = []
+    passed = 0
+    for r in results:
+        header = f"=== Sample {r['index']} ==="
+        if r.get("status") == "PASS":
+            passed += 1
+            reports.append(f"{header}\nPASS")
+            continue
+        lines = [header, "FAIL"]
+        if "expected" in r:
+            lines.append(f"expected: {json.dumps(r['expected'])}")
+        if "actual" in r:
+            lines.append(f"actual:   {json.dumps(r['actual'])}")
+        if r.get("error"):
+            lines.append(f"--- traceback ---\n{r['error']}")
+        reports.append("\n".join(lines))
+    summary = f"Summary: {passed}/{len(results)} samples passed."
+    if proc.stderr.strip():
+        reports.append(f"--- stderr ---\n{proc.stderr}")
+    return "\n\n".join(reports) + "\n\n" + summary

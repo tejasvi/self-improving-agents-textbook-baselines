@@ -1,0 +1,223 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 422c4c2..a89ea61 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,10 +5,13 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import ast
++import traceback
+ 
+ from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from utils import direct_llm_code, extract_python_code, final_assistant_is_empty, write_stub
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -239,13 +242,13 @@ Do not stop until the source file contains your implementation and you have veri
+         if isinstance(init_edit, list):
+             msg_history = init_edit
+ 
++        stage = 'agent'
+         for attempt in range(3):
+             if self._has_source_edits():
+                 break
+             current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+             primary = self._find_primary_source_file()
+-            last_text_empty = self._last_assistant_empty(msg_history)
+-            if last_text_empty:
++            if final_assistant_is_empty(msg_history):
+                 reason = "empty model response"
+             elif current_diff.strip():
+                 reason = "only test files modified"
+@@ -253,16 +256,19 @@ Do not stop until the source file contains your implementation and you have veri
+                 reason = "empty diff"
+             safe_log(f"[retry {attempt + 1}/3] No source edits yet; reason: {reason}; primary file: {primary}")
+ 
+-            msg_history = _sanitize_history(msg_history)
++            # Always start from a clean history: the previous one may end in empty assistant turns.
+             retry_msg = self._build_retry_prompt(primary, current_diff)
+-            retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            if isinstance(retry_history, list):
+-                msg_history = retry_history
+-            else:
++            try:
++                retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++                msg_history = retry_history if isinstance(retry_history, list) else []
++                stage = 'retry'
++            except Exception:
++                safe_log(f"Retry {attempt + 1} failed:\n{traceback.format_exc()}", level=logging.ERROR)
+                 msg_history = []
+ 
+         if not self._has_source_edits():
+-            self._fallback_write_primary_file()
++            stage = self._fallback_write_primary_file()
++        safe_log(f"Final edit stage: {stage}")
+ 
+     def _last_assistant_empty(self, msg_history):
+         if not isinstance(msg_history, list):
+@@ -325,10 +331,7 @@ Do not stop until the source file contains your implementation and you have veri
+         else:
+             target = "the primary source file"
+             file_section = "(no primary source file was identified; choose the main solution file in the repo)"
+-        return f"""No non-test source files have been modified yet (the current diff is empty or only touches test files).
+-
+-# Current Repo Edits
+-{current_diff if current_diff.strip() else "(empty diff)"}
++        return f"""No non-test source file has been modified yet.
+ 
+ {file_section}
+ 
+@@ -337,42 +340,67 @@ Do not stop until the source file contains your implementation and you have veri
+ {self.problem_statement}
+ </problem_description>
+ 
+-Your next action MUST be a call to the editor tool with command `edit` (or `create`) on {target}. Do not reply with text only.
+-Write the complete solution into {target}. After editing, run the sample tests/examples with bash, fix any failures by editing {target} again, and confirm with `git diff` that {target} was changed."""
++Write the full solution into {target} now: call the editor tool (command `edit` or `create`) on {target} with the complete program. Do not reply with text only. Then run the sample inputs from the problem statement with bash, fix any failures by editing {target} again, and confirm with `git diff` that {target} changed."""
+ 
+     def _fallback_write_primary_file(self):
+         """
+-        Deterministic fallback: ask the LLM (no tools) for the full file contents and write them.
++        Deterministic fallback: ask the LLM (no tools) for the full primary file contents and write
++        validated Python code. Up to 3 bounded attempts, varying temperature/system prompt and
++        alternating models. If every attempt fails, write a stub so the patch is non-empty.
++        Returns the stage name that produced the edit: 'fallback' or 'stub'.
+         """
++        primary = None
+         try:
+             primary = self._find_primary_source_file()
+-            if primary is None:
+-                safe_log("Fallback: no primary source file found; skipping.", level=logging.WARNING)
+-                return
+-            prompt = f"""Output ONLY the complete contents of {primary} inside a ```python block that solves the problem.
++        except Exception:
++            safe_log(f"Fallback: could not find primary file:\n{traceback.format_exc()}", level=logging.ERROR)
++        if primary is None:
++            safe_log("Fallback: no primary source file found; skipping.", level=logging.WARNING)
++            return 'none'
++        primary_path = os.path.join(self.git_tempdir, primary)
++
++        prompt = f"""Write the complete contents of {primary} as a Python program that solves the problem below.
++Output ONLY one ```python code block. The program must read from standard input and write to standard output
++(or define the required Solution class if the starter file uses one).
+ 
+ # Problem statement
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>"""
+-            client, client_model = create_client(self.code_model)
+-            response, _ = get_response_from_llm(
+-                msg=prompt,
+-                client=client,
+-                model=client_model,
+-                system_message="You are an expert competitive programmer. Respond with exactly one ```python code block.",
+-                msg_history=[],
+-            )
+-            match = re.search(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", str(response or ''), re.DOTALL)
+-            if not match:
+-                safe_log("Fallback: no python code block found in model response.", level=logging.WARNING)
+-                return
+-            code = match.group(1)
+-            with open(os.path.join(self.git_tempdir, primary), 'w') as f:
+-                f.write(code)
+-            safe_log(f"Fallback: wrote {len(code)} chars to {primary}.")
+-        except Exception as e:
+-            safe_log(f"Fallback failed: {e}", level=logging.ERROR)
++        system_prompts = [
++            "You are an expert competitive programmer. Respond with exactly one ```python code block.",
++            "You are a careful Python engineer. Output the complete, correct program inside a ```python block.",
++            "You are a meticulous algorithm designer. Reply only with a ```python fenced code block containing the full solution.",
++        ]
++        temperatures = [0.0, 0.3, 0.6]
++        base_model = self.code_model
++        other_model = OPENAI_MODEL if base_model == CLAUDE_MODEL else CLAUDE_MODEL
++        models = [base_model, other_model, base_model]
++
++        for i in range(3):
++            model = models[i]
++            try:
++                client, client_model = create_client(model)
++                text = direct_llm_code(prompt, client, client_model,
++                                       system_prompt=system_prompts[i], temperature=temperatures[i])
++                if not text or not text.strip():
++                    safe_log(f"Fallback attempt {i + 1} ({model}): empty response.", level=logging.WARNING)
++                    continue
++                code = extract_python_code(text)
++                if code is None:
++                    safe_log(f"Fallback attempt {i + 1} ({model}): no valid python code block.", level=logging.WARNING)
++                    continue
++                ast.parse(code)  # validate before writing
++                with open(primary_path, 'w') as f:
++                    f.write(code + "\n")
++                safe_log(f"Fallback: wrote {len(code)} chars to {primary} (attempt {i + 1}, {model}).")
++                return 'fallback'
++            except Exception:
++                safe_log(f"Fallback attempt {i + 1} ({model}) failed:\n{traceback.format_exc()}", level=logging.ERROR)
++                continue
++
++        safe_log("Fallback: all attempts empty or invalid; writing stub.", level=logging.WARNING)
++        return write_stub(primary_path)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/llm.py b/llm.py
+index d6b4da1..952bf0c 100644
+--- a/llm.py
++++ b/llm.py
+@@ -200,7 +200,7 @@ def get_response_from_llm(
+             system=system_message,
+             messages=new_msg_history,
+         )
+-        content = response.content[0].text
++        content = next((b.text for b in (response.content or []) if getattr(b, 'text', None)), '') or ''
+         new_msg_history = new_msg_history + [
+             {
+                 "role": "assistant",
+@@ -226,7 +226,7 @@ def get_response_from_llm(
+             stop=None,
+             seed=0,
+         )
+-        content = response.choices[0].message.content
++        content = (response.choices[0].message.content if response.choices else '') or ''
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+     elif model.startswith("o1-") or model.startswith("o3-"):
+         new_msg_history = msg_history + [{"role": "user", "content": system_message + msg}]
+@@ -242,7 +242,7 @@ def get_response_from_llm(
+             # stop=None,
+             seed=0,
+         )
+-        content = response.choices[0].message.content
++        content = (response.choices[0].message.content if response.choices else '') or ''
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+     elif model in ["deepseek-chat", "deepseek-coder"]:
+         new_msg_history = msg_history + [{"role": "user", "content": msg}]
+@@ -257,7 +257,7 @@ def get_response_from_llm(
+             n=1,
+             stop=None,
+         )
+-        content = response.choices[0].message.content
++        content = (response.choices[0].message.content if response.choices else '') or ''
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+     elif model in ["deepseek-reasoner"]:
+         new_msg_history = msg_history + [{"role": "user", "content": msg}]
+@@ -270,7 +270,7 @@ def get_response_from_llm(
+             n=1,
+             stop=None,
+         )
+-        content = response.choices[0].message.content
++        content = (response.choices[0].message.content if response.choices else '') or ''
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+         reasoning_content = response.choices[0].message.reasoning_content
+     elif model.startswith("llama3.1-"):
+@@ -288,7 +288,7 @@ def get_response_from_llm(
+             n=1,
+             stop=None,
+         )
+-        content = response.choices[0].message.content
++        content = (response.choices[0].message.content if response.choices else '') or ''
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+         resoning_content = response.choices[0].message.reasoning_content
+     else:

@@ -1,0 +1,246 @@
+diff --git a/tests/test_run_io_tests_tool.py b/tests/test_run_io_tests_tool.py
+new file mode 100644
+index 0000000..a895ec9
+--- /dev/null
++++ b/tests/test_run_io_tests_tool.py
+@@ -0,0 +1,88 @@
++import os
++import copy
++
++import pytest
++
++from tools.run_io_tests import tool_function, tool_info, normalize_output, truncate_field
++
++
++ECHO_DOUBLE = "n = int(input())\nprint(n * 2)\n"
++
++
++@pytest.fixture
++def write_script(tmp_path):
++    def _write(code, name="sol.py"):
++        p = tmp_path / name
++        p.write_text(code)
++        return str(p)
++    return _write
++
++
++def test_schema_nesting():
++    info = tool_info()
++    assert info["name"] == "run_io_tests"
++    schema = info["input_schema"]
++    assert schema["type"] == "object"
++    assert set(schema["required"]) == {"solution_path", "test_cases"}
++    allowed = {"type", "description", "properties", "required", "items"}
++    for name, prop in schema["properties"].items():
++        assert "type" in prop and "description" in prop, name
++        assert set(prop) <= allowed, name
++    items = schema["properties"]["test_cases"]["items"]
++    assert set(items["required"]) == {"input", "expected_output"}
++    assert set(items["properties"]) == {"input", "expected_output"}
++
++
++def test_all_pass(write_script):
++    path = write_script(ECHO_DOUBLE)
++    out = tool_function(path, [{"input": "2\n", "expected_output": "4\n"}, {"input": "5\n", "expected_output": "10"}])
++    assert "Case 1: PASS" in out and "Case 2: PASS" in out
++    assert "Summary: 2/2 passed." in out
++
++
++def test_wrong_answer_shows_details(write_script):
++    path = write_script("n = int(input())\nprint(n * 3)\n")
++    out = tool_function(path, [{"input": "2\n", "expected_output": "4\n"}])
++    assert "Case 1: FAIL" in out
++    assert "Summary: 0/1 passed." in out
++    assert "Expected output:" in out and "Actual stdout:" in out
++    assert "6" in out
++
++
++def test_whitespace_tolerant(write_script):
++    path = write_script("print('hi   ')\nprint()\nprint()\n")
++    out = tool_function(path, [{"input": "", "expected_output": "hi\n"}])
++    assert "Case 1: PASS" in out
++
++
++def test_timeout_does_not_block_other_cases(write_script):
++    path = write_script("import time\nn = int(input())\nif n == 0:\n    time.sleep(5)\nprint(n)\n")
++    out = tool_function(path, [{"input": "0\n", "expected_output": "0\n"}, {"input": "7\n", "expected_output": "7\n"}],
++                        timeout_seconds=0.5)
++    assert "Case 1: TIMEOUT" in out
++    assert "Case 2: PASS" in out
++    assert "Summary: 1/2 passed." in out
++
++
++def test_runtime_error_reports_stderr(write_script):
++    path = write_script("raise ValueError('boom')\n")
++    out = tool_function(path, [{"input": "", "expected_output": "x\n"}])
++    assert "Case 1: RUNTIME ERROR" in out
++    assert "boom" in out
++
++
++def test_invalid_arguments_return_error_strings(write_script):
++    path = write_script(ECHO_DOUBLE)
++    assert tool_function("relative.py", [{"input": "", "expected_output": ""}]).startswith("Error:")
++    assert tool_function("/nonexistent/x.py", [{"input": "", "expected_output": ""}]).startswith("Error:")
++    assert tool_function(path, []).startswith("Error:")
++    assert tool_function(path, [{"input": "1"}]).startswith("Error:")
++    assert tool_function(path, [{"input": "1", "expected_output": "2"}], timeout_seconds=0).startswith("Error:")
++
++
++def test_helpers():
++    assert normalize_output("a  \nb\n\n\n") == ["a", "b"]
++    assert normalize_output("") == []
++    long = "x" * 1500
++    t = truncate_field(long)
++    assert len(t) < 1500 and "clipped" in t
+diff --git a/tools/run_io_tests.py b/tools/run_io_tests.py
+new file mode 100644
+index 0000000..6b146ce
+--- /dev/null
++++ b/tools/run_io_tests.py
+@@ -0,0 +1,146 @@
++import os
++import subprocess
++import sys
++
++MAX_FIELD_CHARS = 1000
++DEFAULT_TIMEOUT_SECONDS = 10
++
++
++def tool_info():
++    return {
++        "name": "run_io_tests",
++        "description": """Run a Python solution program on a list of test cases and compare its standard output with the expected output.\n
++* Each test case provides an `input` string that is fed to the program's standard input, and an `expected_output` string.\n
++* Comparison is whitespace-tolerant: trailing spaces on each line and trailing blank lines are ignored.\n
++* The report contains one line per case (PASS, FAIL, TIMEOUT, or RUNTIME ERROR), a summary, and the details of failing cases (input, expected output, actual stdout, and stderr).\n
++* Use this tool for stdin/stdout programs. For a method of a `Solution` class, write your own harness instead.\n
++* Each case runs in a separate process with a per-case time limit, so a slow or hanging case does not block the others.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Absolute path to the Python solution file to run."
++                },
++                "test_cases": {
++                    "type": "array",
++                    "description": "List of test cases. Each test case has an 'input' (stdin) and an 'expected_output' (expected stdout).",
++                    "items": {
++                        "type": "object",
++                        "properties": {
++                            "input": {
++                                "type": "string",
++                                "description": "Text fed to the program's standard input."
++                            },
++                            "expected_output": {
++                                "type": "string",
++                                "description": "Expected text the program writes to standard output."
++                            }
++                        },
++                        "required": ["input", "expected_output"]
++                    }
++                },
++                "timeout_seconds": {
++                    "type": "number",
++                    "description": "Per-case time limit in seconds (default 10)."
++                }
++            },
++            "required": ["solution_path", "test_cases"]
++        }
++    }
++
++
++def truncate_field(text, max_chars=MAX_FIELD_CHARS):
++    """Keep the head of long text and mark how much was clipped."""
++    if text is None:
++        return ""
++    if len(text) <= max_chars:
++        return text
++    return text[:max_chars] + f"\n... <{len(text) - max_chars} chars clipped>"
++
++
++def normalize_output(text):
++    """Strip trailing spaces on each line and drop trailing blank lines."""
++    lines = [line.rstrip() for line in (text or "").splitlines()]
++    while lines and lines[-1] == "":
++        lines.pop()
++    return lines
++
++
++def run_case(solution_path, case_input, timeout_seconds):
++    """Run the solution once. Returns (status, stdout, stderr)."""
++    try:
++        proc = subprocess.run(
++            [sys.executable, solution_path],
++            input=case_input,
++            capture_output=True,
++            text=True,
++            timeout=timeout_seconds,
++        )
++    except subprocess.TimeoutExpired:
++        return "TIMEOUT", "", f"Timed out after {timeout_seconds} seconds."
++    except Exception as e:
++        return "RUNTIME ERROR", "", f"Error running command: {e}"
++
++    if proc.returncode != 0:
++        return "RUNTIME ERROR", proc.stdout, proc.stderr
++    return None, proc.stdout, proc.stderr
++
++
++def tool_function(solution_path, test_cases, timeout_seconds=None):
++    """
++    Run the solution on each test case and compare its stdout with the expected output.
++    Returns a text report. Errors are reported as strings starting with 'Error:'.
++    """
++    try:
++        if not isinstance(solution_path, str) or not os.path.isabs(solution_path):
++            return f"Error: solution_path must be an absolute path, got {solution_path}."
++        if not os.path.isfile(solution_path):
++            return f"Error: solution file {solution_path} does not exist."
++        if not isinstance(test_cases, list) or len(test_cases) == 0:
++            return "Error: test_cases must be a non-empty list of objects with 'input' and 'expected_output'."
++        if timeout_seconds is None:
++            timeout_seconds = DEFAULT_TIMEOUT_SECONDS
++        if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
++            return "Error: timeout_seconds must be a positive number."
++
++        for i, case in enumerate(test_cases, start=1):
++            if not isinstance(case, dict) or "input" not in case or "expected_output" not in case:
++                return f"Error: test case {i} must be an object with 'input' and 'expected_output'."
++
++        report_lines = []
++        details = []
++        passed = 0
++        total = len(test_cases)
++
++        for i, case in enumerate(test_cases, start=1):
++            case_input = str(case["input"])
++            expected = str(case["expected_output"])
++            status, stdout, stderr = run_case(solution_path, case_input, timeout_seconds)
++
++            if status is None:
++                if normalize_output(stdout) == normalize_output(expected):
++                    status = "PASS"
++                else:
++                    status = "FAIL"
++
++            if status == "PASS":
++                passed += 1
++            else:
++                details.append(
++                    f"--- Case {i}: {status} ---\n"
++                    f"Input:\n{truncate_field(case_input)}\n"
++                    f"Expected output:\n{truncate_field(expected)}\n"
++                    f"Actual stdout:\n{truncate_field(stdout)}\n"
++                    f"Stderr:\n{truncate_field(stderr)}"
++                )
++            report_lines.append(f"Case {i}: {status}")
++
++        summary = f"Summary: {passed}/{total} passed."
++        report = "\n".join(report_lines) + "\n" + summary
++        if details:
++            report += "\n\n" + "\n\n".join(details)
++        return report
++
++    except Exception as e:
++        return f"Error: {str(e)}"

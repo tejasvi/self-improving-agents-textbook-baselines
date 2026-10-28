@@ -1,0 +1,368 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3703691..3fb1389 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,13 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import sys
++import time
++
++try:
++    import resource
++except ImportError:  # non-POSIX
++    resource = None
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -157,7 +164,7 @@ class AgenticSystem:
+             return True
+         if base.startswith('test_') or base.endswith('_test.py') or base.endswith('.spec.js') or base.endswith('.test.js'):
+             return True
+-        if base in ('brute.py', 'gen.py', 'conftest.py'):
++        if base in ('brute.py', 'gen.py', 'conftest.py', 'max_gen.py', 'maxgen.py', 'max_input.txt', 'maxinput.txt'):
+             return True
+         return False
+ 
+@@ -184,6 +191,71 @@ class AgenticSystem:
+                 return False
+         return True
+ 
++    # ---- scale gate: run solution.py on the agent-created max-size input ----
++    _SCALE_TIME_LIMIT = 5          # seconds for solution.py on the max-size input
++    _SCALE_MEM_LIMIT_MB = 512      # address-space limit for solution.py / generator
++    _SCALE_INPUT_FILES = ('max_input.txt', 'maxinput.txt')
++    _SCALE_GEN_FILES = ('max_gen.py', 'maxgen.py')
++
++    def _scale_limit_preexec(self):
++        def _apply():
++            if resource is not None:
++                limit = self._SCALE_MEM_LIMIT_MB * 1024 * 1024
++                resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
++        return _apply if (resource is not None and os.name == 'posix') else None
++
++    def _scale_gate(self):
++        """
++        Returns (ok, raw_report). Runs `python3 solution.py` on the max-size input the agent
++        was asked to create (max_input.txt, or the output of max_gen.py) with a time and
++        memory limit. The raw stderr / timing is returned verbatim; no error parsing is done.
++        """
++        cwd = self.git_tempdir
++        sol = os.path.join(cwd, 'solution.py')
++        if not os.path.isfile(sol):
++            return False, "solution.py does not exist."
++        preexec = self._scale_limit_preexec()
++        input_path = None
++        for name in self._SCALE_INPUT_FILES:
++            if os.path.isfile(os.path.join(cwd, name)):
++                input_path = os.path.join(cwd, name)
++                break
++        if input_path is None:
++            for name in self._SCALE_GEN_FILES:
++                gen = os.path.join(cwd, name)
++                if os.path.isfile(gen):
++                    try:
++                        gp = subprocess.run(['python3', name], cwd=cwd, capture_output=True,
++                                            text=True, timeout=10, preexec_fn=preexec, errors='replace')
++                    except subprocess.TimeoutExpired:
++                        return False, f"{name} timed out after 10s while generating the max-size input."
++                    if gp.returncode != 0 or gp.stderr.strip():
++                        return False, (f"{name} failed (exit code {gp.returncode}).\n"
++                                       f"STDERR (raw):\n{gp.stderr[-3000:]}")
++                    input_path = os.path.join(cwd, '_max_input_generated.txt')
++                    with open(input_path, 'w') as f:
++                        f.write(gp.stdout)
++                    break
++        if input_path is None:
++            return False, ("No max-size input found. Create max_input.txt or max_gen.py "
++                           "that prints a maximum-size input.")
++        with open(input_path, 'r', errors='replace') as f:
++            stdin_text = f.read()
++        t0 = time.monotonic()
++        try:
++            p = subprocess.run(['python3', 'solution.py'], cwd=cwd, input=stdin_text, capture_output=True,
++                               text=True, timeout=self._SCALE_TIME_LIMIT, preexec_fn=preexec, errors='replace')
++        except subprocess.TimeoutExpired as e:
++            el = time.monotonic() - t0
++            err = e.stderr if isinstance(e.stderr, str) else ''
++            return False, (f"TIMEOUT: solution.py did not finish within {self._SCALE_TIME_LIMIT}s "
++                           f"on the max-size input (elapsed {el:.2f}s).\nSTDERR (raw):\n{err[-3000:]}")
++        el = time.monotonic() - t0
++        if p.returncode != 0 or p.stderr.strip():
++            return False, (f"solution.py FAILED on the max-size input: exit code {p.returncode}, time {el:.2f}s.\n"
++                           f"STDERR (raw):\n{p.stderr[-3000:]}")
++        return True, f"OK: finished in {el:.2f}s on the max-size input."
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -197,29 +269,46 @@ class AgenticSystem:
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+         method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++1. Read the statement and constraints. Write down the maximum constraint values and a short complexity estimate (approximate number of operations AND memory at the maximum constraints) before choosing an algorithm. Python does roughly 10^7 simple operations per second, so aim for well under that. A draft whose operations or memory would exceed the limits (e.g. an O(W*H) table with W,H up to 10^6) is NOT a final answer: derive a fundamentally faster algorithm (formulas, prefix sums, sorting, combinatorics with factorials, two pointers, etc.).
+ 2. Immediately after reading the statement, write a draft solution.py with the editor tool (command=create), even if it is simple or brute-force, before any extended analysis. No turn may end without an editor call that creates or edits the source file. Keep replies concise to avoid the output limit.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
++3. Early on, also create a max-size input generator `max_gen.py` (prints one input with the largest constraints, e.g. all limits at their maximum) or a file `max_input.txt`. Run `python3 solution.py < max_input.txt` and check the time and memory. This is mandatory: solution.py must finish within about 4 seconds and within 512 MB on it.
++4. Run solution.py on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 5. Write brute.py (a simple, obviously-correct brute force) and gen.py (takes an integer seed as sys.argv[1], uses random.seed(seed), and prints one small random valid input to stdout). Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Fix every mismatch, crash or timeout it reports, then re-run it until it reports RESULT: OK.
+-6. Generate a maximum-size input (gen-style, with the largest constraints) and check that solution.py finishes in well under 2 seconds. Keep iterating on the solution until all checks pass.
+-7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement and on the max-size input, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
+-8. An unrun stress test means the task is NOT finished. Do not end your turn until step 5 (stress mode) has been run and reported RESULT: OK on the final version of solution.py.
++6. Run the `solution_check` tool with max_gen_path=max_gen.py (or the max_input file) to test solution.py at maximum size. If it reports TIMEOUT or MemoryError, the algorithm is too slow or too big: state the operation count at max constraints, derive a better algorithm, verify it against brute.py on small inputs, and update solution.py. Keep iterating until the max-size check reports OK.
++7. Before finishing, run the `solution_check` tool (plain mode, with `inputs` and `expected_outputs`) on ALL sample inputs from the statement, with max_gen_path set, using a fresh copy of solution.py. Treat any stderr output, nonzero exit code, timeout or wrong output as a failure and fix it.
++8. An unrun stress test means the task is NOT finished. Do not end your turn until step 5 (stress mode) has been run and reported RESULT: OK on the final version of solution.py, and the max-size check passes.
+ 9. Avoid shadowing Python builtins in your code (do not name variables or functions `pow`, `min`, `max`, `sum`, `input`, `list`, `str`, `id`, `hash`, `format`, etc.). Prefer simple, portable constructs. If you are unsure whether the environment provides a function (e.g. the 3-argument `pow` or a library), define a local helper instead, e.g. `def modpow(b, e, m):` implemented with a loop or `pow` with 2 arguments only.
+ The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Bounded retries if no primary source file was edited
+-        retry_prompt = f"""{task}
+-
+-Your previous attempt ended without editing any source file. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {self.git_tempdir}/solution.py, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
+-"""
+-        for attempt in range(3):
+-            if self._has_primary_edit():
++        # Bounded continuation loop (same conversation): require a primary source edit AND
++        # a passing max-size scale gate. Failures are sent back with the raw output.
++        for attempt in range(5):
++            edit_ok = self._has_primary_edit()
++            gate_ok, gate_raw = (False, "skipped: no primary source edit yet.")
++            if edit_ok:
++                gate_ok, gate_raw = self._scale_gate()
++            if edit_ok and gate_ok:
++                safe_log(f"Checks passed on attempt {attempt}.")
+                 break
+-            safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
+-            chat_with_agent(retry_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"Checks failed (edit={edit_ok}, scale_gate={gate_ok}); continuation {attempt + 1}/5")
++            if not edit_ok:
++                follow_up = (f"Your previous attempt ended without editing any source file. In your very next reply "
++                             f"call the editor tool (command=create) to write a first-draft solution.py at "
++                             f"{self.git_tempdir}/solution.py, even if it is a simple or brute-force solution. "
++                             f"Keep your reasoning brief. Then create max_gen.py (max-size input generator), "
++                             f"test on the samples, and refine.")
++            else:
++                follow_up = (f"Your solution.py failed the max-size check. Raw output:\n{gate_raw}\n\n"
++                             f"The current approach is too slow or uses too much memory for the constraints. "
++                             f"State the operation count and memory at the maximum constraints, derive a fundamentally "
++                             f"better algorithm (e.g. O(N) or O(N log N) formulas, prefix sums, combinatorics with "
++                             f"factorials), verify it against brute.py on small inputs, and update solution.py. "
++                             f"Do not finish until the max-size check passes.")
++            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        else:
++            safe_log("Max continuation attempts reached; checks may still be failing.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/solution_check.py b/tools/solution_check.py
+index 21d5cc0..005ea7c 100644
+--- a/tools/solution_check.py
++++ b/tools/solution_check.py
+@@ -7,6 +7,11 @@ import sys
+ import tempfile
+ import time
+ 
++try:
++    import resource
++except ImportError:  # non-POSIX
++    resource = None
++
+ # Grader-style checker for stdin-based Python solutions.
+ # The solution is copied into a fresh temp dir as _sol.py and run with `python -I`
+ # (isolated mode: no cwd / user site on sys.path, no PYTHON* env vars), so the
+@@ -14,6 +19,8 @@ import time
+ 
+ _MAX_STREAM = 4000        # chars of stdout/stderr kept per run
+ _STRESS_BUDGET = 240.0    # total wall-clock seconds allowed for stress mode
++_MAX_RUN_TIMEOUT = 4.0    # time limit (s) for the max-size input run
++_DEFAULT_MEM_MB = 512     # address-space limit (MB) for child processes
+ 
+ 
+ def tool_info():
+@@ -24,6 +31,8 @@ def tool_info():
+ * Without brute_path/gen_path: runs every entry of `inputs` and reports stdout, stderr, exit code and elapsed time. If `expected_outputs` is given, compares each output (whitespace-normalised) with the matching expected output.\n
+ * With brute_path and gen_path (stress mode): for seeds 0..num_tests-1, runs `python gen.py <seed>` to make an input, then runs both the brute-force reference and the solution on it. Stops at the first mismatch, runtime error (nonzero exit) or timeout and prints the input and both outputs.\n
+ * Any stderr is shown verbatim. A nonzero exit code or any stderr output is a failure.\n
++* `memory_limit_mb` (default 512) caps the address space of every child process (RLIMIT_AS); peak memory is reported.\n
++* With `max_gen_path`: runs `python -I max_gen.py` (no arguments) to print a maximum-size input, then runs the solution on it with a ~4s limit and reports OK / TIMEOUT / MemoryError with elapsed time and memory.\n
+ * Pass the same solution file again after every edit; the check always uses the current contents.""",
+         "input_schema": {
+             "type": "object",
+@@ -34,7 +43,9 @@ def tool_info():
+                 "brute_path": {"type": "string", "description": "Path to a trusted brute-force Python reference program (stress mode, needs gen_path)."},
+                 "gen_path": {"type": "string", "description": "Path to a random input generator; it is called as `python gen.py <seed>` and prints one test input to stdout (stress mode, needs brute_path)."},
+                 "num_tests": {"type": "integer", "description": "Number of random seeds to try in stress mode (default 200)."},
+-                "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."}
++                "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."},
++                "memory_limit_mb": {"type": "integer", "description": "Address-space memory limit in MB for each child process (default 512)."},
++                "max_gen_path": {"type": "string", "description": "Path to a script that prints a maximum-size input (run with no arguments). The solution is run on it with a ~4s time limit and the result is reported as OK, TIMEOUT or MemoryError, with time and memory."}
+             },
+             "required": ["solution_path"]
+         }
+@@ -75,12 +86,29 @@ def _builtin_shadow_warnings(src):
+     return sorted(set(found))
+ 
+ 
+-def _run(cmd, cwd, stdin_text, timeout):
++def _limit_memory(mem_mb):
++    """Returns a preexec_fn that caps the address space of the child (POSIX only)."""
++    def _apply():
++        if resource is not None and mem_mb:
++            limit = int(mem_mb) * 1024 * 1024
++            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
++    return _apply
++
++
++def _peak_child_mem_mb():
++    """Peak RSS (MB) over all waited-for children so far (ru_maxrss is KB on Linux)."""
++    if resource is None:
++        return 0.0
++    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0
++
++
++def _run(cmd, cwd, stdin_text, timeout, memory_limit_mb=_DEFAULT_MEM_MB):
+     """Run a command; returns (status, stdout, stderr, rc, elapsed). status in ok|timeout."""
+     t0 = time.monotonic()
++    preexec = _limit_memory(memory_limit_mb) if (resource is not None and os.name == 'posix') else None
+     try:
+         p = subprocess.run(cmd, input=stdin_text, capture_output=True, text=True,
+-                           timeout=timeout, cwd=cwd, errors='replace')
++                           timeout=timeout, cwd=cwd, errors='replace', preexec_fn=preexec)
+     except subprocess.TimeoutExpired as e:
+         out = e.stdout if isinstance(e.stdout, str) else ''
+         err = e.stderr if isinstance(e.stderr, str) else ''
+@@ -98,11 +126,24 @@ def _fmt_run(label, status, out, err, rc, elapsed):
+     return "\n".join(lines)
+ 
+ 
++def _max_run_status(status, rc, out, err):
++    """Classify a max-size run as OK / TIMEOUT / MemoryError / ERROR (raw text is kept in the report)."""
++    if status == 'timeout':
++        return 'TIMEOUT'
++    low = err.lower()
++    if 'memoryerror' in low or 'cannot allocate memory' in low:
++        return 'MemoryError'
++    if rc != 0 or err.strip():
++        return 'ERROR'
++    return 'OK'
++
++
+ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=None, gen_path=None,
+-                  num_tests=200, timeout=10):
++                  num_tests=200, timeout=10, memory_limit_mb=_DEFAULT_MEM_MB, max_gen_path=None):
+     try:
+         timeout = max(1, int(timeout or 10))
+         num_tests = max(0, int(num_tests if num_tests is not None else 200))
++        memory_limit_mb = int(memory_limit_mb if memory_limit_mb else _DEFAULT_MEM_MB)
+     except (TypeError, ValueError) as e:
+         return f"Error: invalid numeric argument: {e}"
+     if not solution_path or not os.path.isfile(solution_path):
+@@ -110,9 +151,9 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+     stress = bool(brute_path) or bool(gen_path)
+     if stress and not (brute_path and gen_path):
+         return "Error: stress mode needs both brute_path and gen_path."
+-    if not stress and not inputs:
+-        return "Error: provide `inputs` (for a plain check) or brute_path + gen_path (for stress mode)."
+-    for p in (brute_path, gen_path):
++    if not stress and not inputs and not max_gen_path:
++        return "Error: provide `inputs` (plain check), brute_path + gen_path (stress mode), or max_gen_path."
++    for p in (brute_path, gen_path, max_gen_path):
+         if p and not os.path.isfile(p):
+             return f"Error: file not found: {p}"
+ 
+@@ -124,6 +165,7 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+     try:
+         shutil.copyfile(solution_path, os.path.join(tmpdir, '_sol.py'))
+         report = []
++        plain_failed, stress_failed, max_failed = False, None, False
+         if warnings:
+             report.append("WARNING (builtin shadowing, can break in the grader):\n  " + "\n  ".join(warnings))
+ 
+@@ -131,7 +173,7 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+         if inputs:
+             passed, max_t, failed = 0, 0.0, False
+             for i, inp in enumerate(inputs):
+-                status, out, err, rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, inp, timeout)
++                status, out, err, rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, inp, timeout, memory_limit_mb)
+                 max_t = max(max_t, el)
+                 problems = []
+                 if status == 'timeout':
+@@ -154,9 +196,7 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+                     passed += 1
+             report.append(f"{passed}/{len(inputs)} passed, max time {max_t:.3f} s")
+             if failed:
+-                report.append("RESULT: FAILED")
+-            elif not warnings:
+-                report.append("RESULT: OK")
++                plain_failed = True
+ 
+         # ---- stress mode: brute vs solution on generated inputs ----
+         if stress:
+@@ -168,18 +208,18 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+                 if time.monotonic() - t_start > _STRESS_BUDGET:
+                     report.append(f"Stress budget of {_STRESS_BUDGET:.0f}s reached; stopped early.")
+                     break
+-                gst, gen_out, gerr, grc, _ = _run([sys.executable, '-I', '_gen.py', str(seed)], tmpdir, '', timeout)
++                gst, gen_out, gerr, grc, _ = _run([sys.executable, '-I', '_gen.py', str(seed)], tmpdir, '', timeout, memory_limit_mb)
+                 if gst != 'ok' or grc != 0:
+                     mismatch = f"generator failed on seed {seed}\n" + _fmt_run("gen", gst, gen_out, gerr, grc, 0.0)
+                     break
+                 test_in = gen_out
+-                bst, bout, berr, brc, _ = _run([sys.executable, '-I', '_brute.py'], tmpdir, test_in, timeout)
++                bst, bout, berr, brc, _ = _run([sys.executable, '-I', '_brute.py'], tmpdir, test_in, timeout, memory_limit_mb)
+                 if bst != 'ok' or brc != 0 or berr.strip():
+                     mismatch = (f"brute-force reference failed on seed {seed} (fix the brute/gen, not the solution)\n"
+                                 f"input:\n{_clip(test_in).rstrip()}\n"
+                                 + _fmt_run("brute", bst, bout, berr, brc, 0.0))
+                     break
+-                sst, sout, serr, src_rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, test_in, timeout)
++                sst, sout, serr, src_rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, test_in, timeout, memory_limit_mb)
+                 max_t = max(max_t, el)
+                 ran += 1
+                 if sst == 'timeout' or src_rc != 0 or serr.strip():
+@@ -195,11 +235,33 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+                     break
+             if mismatch:
+                 report.append(mismatch)
+-                report.append(f"RESULT: FAILED (stress: {ran}/{num_tests} seeds ran before failure)")
++                stress_failed = f"stress: {ran}/{num_tests} seeds ran before failure"
+             else:
+                 report.append(f"stress: {ran}/{num_tests} passed, max time {max_t:.3f} s")
+-                if not warnings:
+-                    report.append("RESULT: OK")
++        # ---- max-size check: run solution on the maximum-size input ----
++        if max_gen_path:
++            shutil.copyfile(max_gen_path, os.path.join(tmpdir, '_max_gen.py'))
++            gst, max_in, gerr, grc, _ = _run([sys.executable, '-I', '_max_gen.py'], tmpdir, '', 30, memory_limit_mb)
++            if gst != 'ok' or grc != 0 or gerr.strip():
++                max_failed = True
++                report.append("MAX-SIZE CHECK: ERROR while generating the max-size input\n"
++                              + _fmt_run("max_gen", gst, max_in, gerr, grc, 0.0))
++            else:
++                sst, sout, serr, src_rc, el = _run([sys.executable, '-I', '_sol.py'], tmpdir, max_in,
++                                                   min(timeout, _MAX_RUN_TIMEOUT) if timeout else _MAX_RUN_TIMEOUT,
++                                                   memory_limit_mb)
++                verdict = _max_run_status(sst, src_rc, sout, serr)
++                mem = _peak_child_mem_mb()
++                max_failed = verdict != 'OK'
++                report.append(f"MAX-SIZE CHECK: {verdict} time={el:.3f}s peak_child_mem={mem:.1f}MB "
++                              f"(limit {memory_limit_mb}MB, time limit {_MAX_RUN_TIMEOUT:.0f}s)\n"
++                              + _fmt_run("solution on max-size input", sst, sout, serr, src_rc, el))
++        if plain_failed or stress_failed or max_failed:
++            reasons = [r for r in (("plain" if plain_failed else ""), stress_failed,
++                                   ("max-size" if max_failed else "")) if r]
++            report.append("RESULT: FAILED (" + "; ".join(reasons) + ")")
++        elif not warnings:
++            report.append("RESULT: OK")
+         return "\n\n".join(report)
+     finally:
+         shutil.rmtree(tmpdir, ignore_errors=True)
+diff --git a/null b/null
+new file mode 100644
+index 0000000..e69de29

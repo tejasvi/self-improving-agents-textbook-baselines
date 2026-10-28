@@ -1,0 +1,221 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 291d77f..606ee0b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -387,23 +387,33 @@ class AgenticSystem:
+ 
+     def _safe_chat(self, msg, history):
+         """
+-        Call chat_with_agent, never raising. On failure, log and return the sanitized input history.
++        Call chat_with_agent, never raising. If the reply is degenerate (empty or no tool call),
++        retry once with a continuation prompt that carries the state forward, then make one last
++        attempt that asks only for the next bash command.
+         """
+         try:
+             new_history = chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
+             if new_history is None:
+                 raise ValueError("chat_with_agent returned None")
+             if new_history and self._is_degenerate_assistant(new_history[-1]):
+-                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent; retrying once with a shortened prompt",
++                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent; retrying with a continuation prompt",
+                          level=logging.WARNING)
+-                short_prompt = self._shortened_prompt(msg)
+-                retry_history = chat_with_agent(short_prompt, model=self.code_model,
+-                                                msg_history=self._sanitize_history(history),
++                cont_prompt = self._continuation_prompt(msg, new_history)
++                retry_history = chat_with_agent(cont_prompt, model=self.code_model,
++                                                msg_history=self._sanitize_history(new_history),
+                                                 logging=safe_log)
+                 if retry_history and not self._is_degenerate_assistant(retry_history[-1]):
+                     return retry_history
+-                safe_log("[safe_chat] shortened retry still degenerate", level=logging.WARNING)
+-                return retry_history or new_history
++                safe_log("[safe_chat] continuation retry still degenerate; asking for the next bash command",
++                         level=logging.WARNING)
++                last_prompt = "Write the next bash command you will run. Reply with a single tool call."
++                final_history = chat_with_agent(last_prompt, model=self.code_model,
++                                                msg_history=self._sanitize_history(retry_history or new_history),
++                                                logging=safe_log)
++                if final_history and not self._is_degenerate_assistant(final_history[-1]):
++                    return final_history
++                safe_log("[safe_chat] final attempt still degenerate", level=logging.WARNING)
++                return final_history or retry_history or new_history
+             elif len(new_history) <= len(history):
+                 safe_log("[safe_chat] chat_with_agent added no messages", level=logging.WARNING)
+             return new_history
+@@ -411,15 +421,73 @@ class AgenticSystem:
+             safe_log(f"[safe_chat] exception from chat_with_agent: {type(e).__name__}: {e}", level=logging.ERROR)
+             return self._sanitize_history(history)
+ 
+-    def _shortened_prompt(self, msg):
++    def _read_notes_tail(self, limit=2000):
++        """Last `limit` characters of the agent's notes file (empty string if missing)."""
++        try:
++            from tools.notes import NOTES_PATH
++            with open(NOTES_PATH) as f:
++                content = f.read()
++        except Exception:
++            return ''
++        return content[-limit:]
++
++    def _state_summary(self, history):
++        """One or two lines describing the current verification state. Never raises."""
++        try:
++            failed, excerpt = self._current_verification(history)
++        except Exception as e:
++            return f"state: verification unavailable ({type(e).__name__}: {e})"
++        if not failed:
++            return "state: samples and perf checks pass (or nothing left to verify)"
++        lines = [l.strip() for l in (excerpt or '').splitlines() if l.strip()]
++        for l in lines:
++            if re.match(r'^Sample \d+: (TIMEOUT|MISMATCH|ERROR)', l) or 'TIMEOUT' in l or 'PERF FAIL' in l:
++                return f"state: {l[:200]}"
++        return f"state: verification failed: {(lines[-1] if lines else 'no report')[:200]}"
++
++    def _continuation_prompt(self, msg, history):
++        """
++        Retry prompt sent after an empty/stalled turn. Carries state forward instead of the
++        problem excerpt: verification summary, last tool call and result, notes tail, and one directive.
++        """
++        summary = self._state_summary(history)
++        last_call, last_result = None, None
++        for kind, name, text in self._history_events(history):
++            if kind == 'call':
++                last_call = (name, text)
++                last_result = None
++            elif kind == 'result':
++                last_result = (name, text)
++
++        def clip(t, n=1500):
++            t = t or ''
++            return t if len(t) <= n else t[:n] + '...(truncated)'
++
++        call_txt = f"{last_call[0]}: {clip(last_call[1], 500)}" if last_call else "(none)"
++        result_txt = clip(last_result[1]) if last_result else "(none)"
++        notes = self._read_notes_tail(2000) or "(no notes yet)"
++        directive = ("Directive: make the next tool call now (edit the solution file, run the samples, or run "
++                     "perf_check). Do not reply with text alone and do not announce a plan.")
++        return (
++            "Continue the task. Previous turn produced no tool call.\n"
++            f"{summary}\n\n"
++            f"Most recent tool call: {call_txt}\n"
++            f"Most recent tool result:\n{result_txt}\n\n"
++            f"Notes (tail):\n{notes}\n\n"
++            f"{directive}\n\n"
++            f"Original request began: {(msg or '')[:200]!r}"
++        )
++
++    def _task_reference(self, task, rnd):
+         """
+-        A minimal prompt for a retry: the problem excerpt plus the instruction only.
++        Repair prompts point at the notes file. The full problem statement is re-sent only on the
++        first repair round; later rounds rely on the notes and the solution file.
+         """
+-        excerpt = (self.problem_statement or '')[:3000]
+-        return ("Instruction: continue the task by making the next tool call (edit the solution file, "
+-                "or run tests). Do not reply with an empty message.\n\n"
+-                f"Problem excerpt:\n{excerpt}\n\n"
+-                f"(Original message began: {(msg or '')[:200]!r})")
++        pointer = ("Progress so far is recorded in the notes file (use the notes tool with command 'read' "
++                   "to review it, and append each new finding).")
++        if rnd <= 1:
++            return f"{pointer}\n\nProblem statement:\n{self.problem_statement}"
++        return pointer
+ 
+     _SAMPLE_FAILURE_MARKERS = ('DIFFER', 'MISMATCH')
+     _SAMPLE_PASS_MARKER = 'ALL SAMPLES EXACT MATCH'
+@@ -778,7 +846,7 @@ class AgenticSystem:
+                     "(Yes/No) for small n; (3) use the stress_test tool with a generator that produces both Yes and No "
+                     "instances, and fix the solution until it reports ALL OK; (4) check that the solution's Yes/No "
+                     "decision is never wrong, especially on inputs whose answer is Yes.\n\n"
+-                    f"Original task:\n{task}"
++                    f"{self._task_reference(task, rnd)}"
+                 )
+                 msg_history = self._safe_chat(multi_prompt, self._sanitize_history(msg_history))
+                 continue
+@@ -801,7 +869,7 @@ class AgenticSystem:
+                     "(5) Run perf_check (or perf_check_method for Solution-class tasks) again on the same maximum-size "
+                     "inputs and keep improving until every line says OK and the summary says ALL PERF OK.\n"
+                     "Always make the tool call rather than announcing a next step.\n\n"
+-                    f"Original task:\n{task}"
++                    f"{self._task_reference(task, rnd)}"
+                 )
+                 msg_history = self._safe_chat(perf_prompt, self._sanitize_history(msg_history))
+                 final_failed, final_excerpt = True, excerpt
+@@ -816,7 +884,7 @@ class AgenticSystem:
+                 "Rewrite the solution file with the editor tool (use `edit`, after viewing it). Then call "
+                 "run_samples again and the brute-force stress test (stress_test tool). Do not stop until the report says "
+                 "ALL SAMPLES EXACT MATCH. Always make the tool call rather than announcing a next step.\n\n"
+-                f"Original task:\n{task}"
++                f"{self._task_reference(task, rnd)}"
+             )
+             msg_history = self._safe_chat(repair_prompt, self._sanitize_history(msg_history))
+             final_failed, final_excerpt = True, excerpt
+@@ -850,7 +918,8 @@ Follow this workflow:
+ 8. Multi-answer problems (the statement says any valid answer, any of them, or multiple solutions are accepted): do not chase sample bytes. Instead require (a) a validator that checks any output against the statement's rules, (b) a brute-force *existence* answer (Yes/No) at moderate n (about 8-12), and (c) a generator that biases toward both outcomes (Yes and No instances, including many likely Yes cases). Run stress_test with the solution, brute force, generator, and checker_path=validator, and fix the solution until it reports ALL OK. run_samples will report a MULTI-ANSWER line for such problems; that is expected once the validator passes.
+ 9. Use the stress_test tool (not ad hoc heredoc harnesses) for randomized comparison. It takes absolute paths and a timeout, and reports the first failing seed with input and outputs.
+ 
+-10. Performance gate: before coding, count the basic operations at the maximum constraints and state the complexity. Then write at least 2 maximum-size inputs (for example a worst-case no-answer input and a many-distinct-values or many-duplicates input) to /tmp/perf_inputs/ and run perf_check on them; a Python solution must finish within 3s per input.
++10. Hypothesis-driven search: when the brute force is easy but the efficient algorithm is unknown, tabulate brute-force results over small parameters into the notes (notes tool, command 'append'), state a hypothesis for the formula, write it as a function, and compare it with the brute force over a small parameter grid. Record the first failing parameters in the notes before the next hypothesis. A placeholder brute-force solution that fails perf checks is not finished.
++11. Performance gate: before coding, count the basic operations at the maximum constraints and state the complexity. Then write at least 2 maximum-size inputs (for example a worst-case no-answer input and a many-distinct-values or many-duplicates input) to /tmp/perf_inputs/ and run perf_check on them; a Python solution must finish within 3s per input.
+ 
+ Environment facts: python3 is available; numpy is NOT installed (check with `python3 -c 'import numpy'` before relying on it). Use only the standard library unless you verify otherwise.
+ 
+diff --git a/tools/notes.py b/tools/notes.py
+new file mode 100644
+index 0000000..28455be
+--- /dev/null
++++ b/tools/notes.py
+@@ -0,0 +1,52 @@
++import os
++
++NOTES_PATH = '/tmp/agent_notes.md'
++MAX_READ_CHARS = 20000
++
++
++def tool_info():
++    return {
++        'name': 'notes',
++        'description': (
++            'Persistent scratch notes for this task. Use command "append" with "text" to record findings '
++            '(brute-force tables, hypotheses, formulas, first failing parameters, next steps) after each major '
++            'finding. Use command "read" to get the current contents. Both commands return the full notes.'
++        ),
++        'input_schema': {
++            'type': 'object',
++            'properties': {
++                'command': {
++                    'type': 'string',
++                    'description': 'Either "append" (add text to the notes) or "read" (return the notes).',
++                },
++                'text': {
++                    'type': 'string',
++                    'description': 'Text to append to the notes. Only used with command "append".',
++                },
++            },
++            'required': ['command'],
++        },
++    }
++
++
++def tool_function(command, text=None):
++    if command not in ('append', 'read'):
++        return f"Error: unknown command {command!r}; use 'append' or 'read'."
++    if command == 'append':
++        if not text:
++            return "Error: 'text' is required for command 'append'."
++        try:
++            with open(NOTES_PATH, 'a') as f:
++                f.write(text.rstrip('\n') + '\n')
++        except OSError as e:
++            return f"Error: cannot write notes: {e}"
++    try:
++        with open(NOTES_PATH) as f:
++            content = f.read()
++    except FileNotFoundError:
++        return "(notes are empty)"
++    except OSError as e:
++        return f"Error: cannot read notes: {e}"
++    if len(content) > MAX_READ_CHARS:
++        content = '...(truncated)...\n' + content[-MAX_READ_CHARS:]
++    return content if content.strip() else "(notes are empty)"

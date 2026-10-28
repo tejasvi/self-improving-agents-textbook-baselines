@@ -1,0 +1,170 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 4893feb..b8fe4c1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -190,6 +190,79 @@ def _message_text(message):
+     return ""
+ 
+ 
++FAILURE_MARKERS = ('Traceback', 'AssertionError', 'FAILED', 'wrong answer', 'Error:')
++TIMEOUT_MARKERS = ('timed out', 'TimeoutExpired', 'Timeout')
++
++def _message_flat_text(message):
++    """
++    Return all textual content of a message, including tool_result blocks and
++    'Tool Result:' text, as a single string.
++    """
++    if not isinstance(message, dict):
++        return ""
++    content = message.get('content')
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts = []
++        for block in content:
++            if isinstance(block, dict):
++                if block.get('type') == 'tool_result':
++                    parts.append(str(block.get('content', '')))
++                elif block.get('type') == 'text':
++                    parts.append(str(block.get('text', '')))
++                else:
++                    parts.append(str(block))
++            elif block is not None:
++                parts.append(str(block))
++        return "\n".join(parts)
++    return "" if content is None else str(content)
++
++def _last_verification_failed(msg_history, tail_size=6, excerpt_chars=3000):
++    """
++    Inspect the tail of the message history. Returns (failed, excerpt):
++      - failed is True when the most recent tool result contains failure evidence
++        (Traceback, AssertionError, FAILED, wrong answer, Error:) and is not merely
++        a timeout of an unrelated command, or when the final assistant message is empty.
++      - excerpt is the raw text (tail) to show the agent.
++    No error parsing is performed; the raw output is passed through.
++    """
++    if not isinstance(msg_history, list) or not msg_history:
++        return False, ""
++    tail = [m for m in msg_history[-tail_size:] if isinstance(m, dict)]
++
++    # Most recent tool result (user message carrying tool output).
++    last_result = None
++    for message in reversed(tail):
++        if message.get('role') != 'user':
++            continue
++        text = _message_flat_text(message)
++        if 'Tool Result' in text or any(
++            isinstance(b, dict) and b.get('type') == 'tool_result'
++            for b in (message.get('content') or []) if isinstance(message.get('content'), list)
++        ):
++            last_result = text
++            break
++
++    if last_result is not None:
++        has_marker = any(marker in last_result for marker in FAILURE_MARKERS)
++        is_timeout = any(marker in last_result for marker in TIMEOUT_MARKERS)
++        only_timeout = is_timeout and not any(
++            m in last_result for m in ('Traceback', 'AssertionError', 'FAILED', 'wrong answer')
++        )
++        if has_marker and not only_timeout:
++            return True, last_result[-excerpt_chars:]
++
++    # Final assistant message empty/degenerate.
++    for message in reversed(msg_history):
++        if isinstance(message, dict) and message.get('role') == 'assistant':
++            if _is_empty_content(message.get('content')):
++                excerpt = last_result[-excerpt_chars:] if last_result else "(final assistant message was empty)"
++                return True, excerpt
++            break
++    return False, ""
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -268,11 +341,11 @@ IMPORTANT: This task is NOT finished until the primary source file has been edit
+ Follow this workflow:
+ 1. Explore the repository with bash (e.g. `ls`, `cat` the starter/source file, look at existing tests and any examples in the problem statement).
+ 2. Implement the solution directly in the existing starter or source file using the editor tool (create or edit). Do not just print the code in your reply. If the starter file lacks needed imports (e.g. `from typing import List`), add them.
+-3. Write quick tests: run the examples from the problem statement with bash. Where useful, write a brute-force solution and compare it against your implementation on many small random inputs.
+-4. Fix any failures you find by editing the source file again, and re-run the tests until they pass.
++3. Write quick tests: run the examples from the problem statement with bash. Where useful, write a brute-force solution and compare it against your implementation on many small random inputs. Save the brute-force stress test to a file (e.g. /tmp/stress.py) so it can be re-run later.
++4. Fix any failures you find by editing the source file again, and re-run the tests (including `python /tmp/stress.py`) until they pass. If any test fails, keep debugging; do not stop while a test is failing.
+ 5. Finally run `git diff` or `git status` to confirm that the primary source file was modified. If it was not, go back to step 2.
+ 
+-Do not stop until the source file contains your implementation and you have verified it."""
++Never end your turn with an empty message. Do not stop until the source file contains your implementation and all of your tests pass."""
+         msg_history = []
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         if isinstance(init_edit, list):
+@@ -307,6 +380,26 @@ Do not stop until the source file contains your implementation and you have veri
+             else:
+                 msg_history = []
+ 
++        # Bounded verify-and-repair phase: re-engage the agent while the last
++        # verification shows failure evidence (or the final response is empty).
++        for repair_round in range(3):
++            failed, excerpt = _last_verification_failed(msg_history)
++            if not failed:
++                break
++            primary = self._find_primary_source_file()
++            safe_log(f"[repair {repair_round + 1}/3] Last verification failed; primary file: {primary}")
++            if self._last_assistant_empty(msg_history):
++                # Degenerate history: fresh compact history, alternate models on odd rounds.
++                repair_model = self.code_model if repair_round % 2 == 0 else self._other_model()
++                repair_history = []
++            else:
++                repair_model = self.code_model if repair_round % 2 == 0 else self._other_model()
++                repair_history = _sanitize_history(msg_history)
++            repair_msg = self._build_repair_prompt(primary, excerpt)
++            repair_result = chat_with_agent(repair_msg, model=repair_model, msg_history=repair_history, logging=safe_log)
++            if isinstance(repair_result, list):
++                msg_history = repair_result
++
+         if not self._has_source_edits():
+             self._fallback_write_primary_file()
+             safe_log(f"Post-fallback check: source edits present = {self._has_source_edits()}")
+@@ -411,6 +504,43 @@ Your next action MUST be a call to the editor tool with command `edit` (or `crea
+ Your next action MUST be a call to the editor tool with command `edit` (or `create`) on {target}. Do not reply with text only.
+ Write the complete solution into {target}. After editing, run the sample tests/examples with bash, fix any failures by editing {target} again, and confirm with `git diff` that {target} was changed."""
+ 
++    def _build_repair_prompt(self, primary, excerpt):
++        """
++        Focused prompt for a verify-and-repair round: raw failing output, current
++        primary file content, and the problem statement.
++        """
++        if primary is not None:
++            try:
++                with open(os.path.join(self.git_tempdir, primary), 'r', errors='replace') as f:
++                    file_content = f.read()
++            except Exception as e:
++                file_content = f"(could not read file: {e})"
++            file_section = f"# Current content of {primary}\n```\n{file_content}\n```"
++            target = primary
++        else:
++            file_section = "(no primary source file was identified)"
++            target = "the primary source file"
++        excerpt_text = excerpt if excerpt.strip() else "(no output captured)"
++        return f"""The last verification of your solution FAILED or your last response was empty. The run is not finished.
++
++# Raw failing output (most recent tool result)
++```
++{excerpt_text}
++```
++
++{file_section}
++
++# Problem statement
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Repair the solution:
++(a) Explain the root cause: why the current algorithm is wrong, using the failing input/counterexample above.
++(b) Reconsider the approach instead of tweaking a heuristic or adding special cases. Prefer a provably correct method (e.g. binary search on the answer with a feasibility check, or dynamic programming).
++(c) Fix {target} by editing it with the editor tool (write the complete corrected file).
++(d) Re-run the same brute-force stress test (e.g. `python /tmp/stress.py`; recreate it if missing) and the samples from the problem statement. Finish only when they all pass. Never end your turn with an empty message."""
++
+     def _fallback_write_primary_file(self):
+         """
+         Deterministic fallback: ask the LLM (no tools) for the full file contents and write them.

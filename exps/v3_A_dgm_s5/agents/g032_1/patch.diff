@@ -1,0 +1,199 @@
+diff --git a/solution.py b/solution.py
+index 635710e..267a597 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,8 +1,188 @@
+-import sys
++"""
++Coding agent helpers: deduplicated statements, empty-turn-aware retries,
++alternate-model selection, and a two-stage "approach then code" fallback.
+ 
+-def main():
+-    data = sys.stdin.read()
+-    print(data.strip())
++`chat_fn(prompt, model, msg_history, temperature)` must return the updated
++message history (list of dicts with 'role' and 'content'). It stands in for
++`chat_with_agent`, so the logic can be unit-tested with a mock.
++"""
++import logging
++import re
+ 
+-if __name__ == '__main__':
+-    main()
++logger = logging.getLogger("coding_agent")
++
++CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
++OPENAI_MODEL = "gpt-4o"
++MODEL_CANDIDATES = [CLAUDE_MODEL, OPENAI_MODEL]
++
++WORKFLOW_HEADER = (
++    "Use the editor tool to create solution.py in the repository containing a standalone program "
++    "that reads stdin and writes stdout.\n"
++    "Steps: understand the problem, write a simple correct solution, test it on "
++    "the samples with bash, fix any failures, then finish.\n"
++    "For interactive problems, implement the protocol: print each query, flush "
++    "stdout, and read the judge's reply from stdin.\n"
++)
++
++
++def _dedupe_statement(text):
++    """Drop exact duplicate blank-line-separated blocks, keeping first occurrences."""
++    if not text:
++        return text or ""
++    blocks = re.split(r"\n\s*\n", text)
++    seen = set()
++    kept = []
++    for block in blocks:
++        stripped = block.strip()
++        if not stripped:
++            continue
++        key = re.sub(r"\s+", " ", stripped)
++        if key in seen:
++            continue
++        seen.add(key)
++        kept.append(stripped)
++    return "\n\n".join(kept)
++
++
++def _pick_alt_model(current_model, candidates=None):
++    """Return the first configured model different from current_model, or None."""
++    for model in (candidates or MODEL_CANDIDATES):
++        if model != current_model:
++            return model
++    logger.warning("No alternative model differs from %s", current_model)
++    return None
++
++
++def _last_assistant_empty(history):
++    """True if the last assistant turn has no non-whitespace text and no tool_use."""
++    if not history:
++        return False
++    last = None
++    for msg in reversed(history):
++        if msg.get("role") == "assistant":
++            last = msg
++            break
++    if last is None:
++        return False
++    content = last.get("content", "")
++    if isinstance(content, str):
++        return not content.strip()
++    text_parts = []
++    for block in content or []:
++        if not isinstance(block, dict):
++            text_parts.append(str(block))
++            continue
++        if block.get("type") == "tool_use":
++            return False
++        if block.get("type") == "text":
++            text_parts.append(block.get("text", ""))
++    return not "".join(text_parts).strip()
++
++
++def _response_metadata(history):
++    """Extract stop_reason/usage from the last message if present."""
++    meta = {}
++    if history:
++        last = history[-1]
++        if isinstance(last, dict):
++            for key in ("stop_reason", "usage"):
++                if key in last:
++                    meta[key] = last[key]
++    return meta
++
++
++def _call_with_empty_retry(chat_fn, statement, model, msg_history, max_tries=3,
++                           temperature=0.0):
++    """
++    Call chat_fn; if the final assistant turn is empty, retry up to max_tries
++    times with progressively simpler prompts and different models/temperatures.
++    Returns (history, ok).
++    """
++    base = list(msg_history or [])
++    full_prompt = WORKFLOW_HEADER + "\nProblem statement:\n" + _dedupe_statement(statement)
++    short_prompt = (
++        "Use the editor tool to write /solution.py now.\n\nProblem statement:\n"
++        + _dedupe_statement(statement)
++    )
++    minimal_prompt = "Use the editor tool to write solution.py for this problem.\n\n" + _dedupe_statement(statement)
++    prompts = [full_prompt, short_prompt, minimal_prompt]
++
++    history = base
++    current_model = model
++    current_temp = temperature
++    for attempt in range(max_tries):
++        prompt = prompts[min(attempt, len(prompts) - 1)]
++        if attempt == 0:
++            use_model, use_temp = model, temperature
++        elif attempt == 1:
++            alt = _pick_alt_model(model)
++            if alt is not None:
++                use_model, use_temp = alt, temperature
++            else:
++                use_model, use_temp = model, 0.7
++        else:
++            use_model = current_model
++            use_temp = current_temp if attempt == 1 else (0.3 if temperature != 0.3 else 0.5)
++
++        logger.info("attempt=%d model=%s temp=%s prompt_len=%d history_len=%d",
++                    attempt, use_model, use_temp, len(prompt), len(base))
++        history = chat_fn(prompt, use_model, list(base), use_temp)
++        if not _last_assistant_empty(history):
++            return history, True
++        logger.warning("Empty assistant turn: attempt=%d model=%s history_len=%d meta=%s",
++                       attempt, use_model, len(history or []), _response_metadata(history))
++        current_model = use_model
++        current_temp = use_temp
++    return history, False
++
++
++def _two_stage_fallback(chat_fn, statement, model, msg_history):
++    """Ask for an algorithm description first, then request solution.py."""
++    stmt = _dedupe_statement(statement)
++    stage1 = ("Describe the algorithm for this problem in 5-10 sentences. "
++              "Plain text only, no code.\n\n" + stmt)
++    h1 = chat_fn(stage1, model, list(msg_history or []), 0.0)
++    description = ""
++    if h1 and h1[-1].get("role") == "assistant":
++        content = h1[-1].get("content", "")
++        if isinstance(content, str):
++            description = content
++        else:
++            description = "".join(b.get("text", "") for b in content
++                                  if isinstance(b, dict) and b.get("type") == "text")
++    if not description.strip():
++        logger.warning("Two-stage fallback: stage 1 returned no description")
++    stage2 = ("Algorithm description:\n" + description.strip() +
++              "\n\nNow write the full solution.py with the editor tool.\n\nProblem statement:\n" + stmt)
++    h2 = chat_fn(stage2, model, list(h1 or []), 0.0)
++    return h2
++
++
++if __name__ == "__main__":
++    logging.basicConfig(level=logging.INFO)
++
++    # Self-test with a mock that returns empty turns for the first K calls.
++    def make_mock(k):
++        calls = []
++
++        def mock(prompt, model, history, temperature):
++            calls.append((prompt, model, temperature))
++            if len(calls) <= k:
++                reply = [{"type": "text", "text": ""}]
++            else:
++                reply = [{"type": "tool_use", "name": "editor", "input": {"path": "/solution.py"}}]
++            return history + [{"role": "user", "content": prompt},
++                              {"role": "assistant", "content": reply}]
++        return mock, calls
++
++    dup = "Input and Output\nRead n.\n\nInput and Output\nRead n.\n\nExample: 1"
++    assert _dedupe_statement(dup) == "Input and Output\nRead n.\n\nExample: 1"
++
++    mock, calls = make_mock(2)
++    hist, ok = _call_with_empty_retry(mock, dup, CLAUDE_MODEL, [], max_tries=3)
++    assert ok, "should succeed on third call"
++    assert len(calls) == 3
++    assert len({c[0] for c in calls}) == 3, "prompts should differ"
++    assert calls[1][1] != CLAUDE_MODEL, "alt model should differ"
++    assert _pick_alt_model(CLAUDE_MODEL) != CLAUDE_MODEL
++    print("self-test passed")

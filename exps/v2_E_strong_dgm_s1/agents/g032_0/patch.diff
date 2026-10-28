@@ -1,0 +1,495 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 23d5433..3f7e7d5 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,6 @@
+ import argparse
+ import ast
++import json
+ import subprocess
+ import sys
+ import logging
+@@ -49,6 +50,7 @@ TEST_COMMANDS = {
+ MAX_ATTEMPTS = 4          # total solve attempts
+ MAX_NUDGES = 2            # re-prompts when solution.py is missing / unchanged
+ STRESS_SEEDS = 200        # random seeds for brute-vs-solution stress test
++STRESS_MEDIUM_SEEDS = 60  # medium-size (gen.py SEED medium) seeds, run after the tiny ones
+ STRESS_BUDGET_S = 120     # wall-clock cap for the stress phase
+ RUN_TIMEOUT_S = 10        # timeout for every solution / generator / brute run
+ REPORT_CLIP = 2000        # max chars of any raw input/output in a report
+@@ -86,6 +88,14 @@ ASSUMPTION_AUDIT_LINE = ("Your code is unchanged, so the harness will judge it a
+ HYPOTHESIS_LINE = ("Test your assumptions about the input/output format explicitly (extra tokens in the stream, data on one "
+                    "line, trailing whitespace, a flattened stdin file for interactive problems) rather than repeating the same code.")
+ 
++HEURISTIC_AUDIT_STEP = """6. Heuristic audit (mandatory before finishing; do not skip):
++   (a) Write the list of every heuristic in solution.py (caps on DP state such as a carry bound, restricted candidate ranges, pruning bounds, early breaks, assumed limits on values) to heuristics.md, one per line, with the reason it is believed safe.
++   (b) Create exact.py: the SAME algorithm with all caps, prunes and restricted ranges removed. It must be polynomial in the input size (it may be slow, but it must not be exponential or enumerate the full value range when the statement allows large values). Do not claim it is exact unless it is derived from the statement's state definition.
++   (c) Verify exact.py against brute.py on tiny inputs (run both on a short loop of random tiny inputs). If they differ, fix exact.py first.
++   (d) Run compare_functions(fast_path=solution.py, ref_path=exact.py, mode='random', max_cases>=500, arg_expr=...) over MEDIUM-size inputs (n in roughly 50-300) drawn from structured generators: large counts, skewed sizes, all-equal values, two-value mixes, boundary values (0, 1, max limit). Use arg_expr to build these structured inputs, not only uniform ranges.
++   (e) Any mismatch must be fixed: repair or remove the heuristic that causes it, then re-run (d). You may not finish with a heuristic that was not compared against exact.py at medium sizes. Do not claim an unproven bound is correct; if a bound is unproven, replace it with the exact polynomial version or prove it.
++"""
++
+ ORACLE_TEMPLATE = """You are writing test helpers for the competitive programming problem below. Work in the directory {d}.
+ Do NOT read or use solution.py; write the helpers independently from the statement only.
+ 
+@@ -95,10 +105,133 @@ Do NOT read or use solution.py; write the helpers independently from the stateme
+ 
+ Create these three files in {d}:
+ 1. brute.py: an obviously correct exhaustive solution that reads stdin and writes stdout exactly like the problem requires. No optimisation; it only has to be correct on small inputs.
+-2. gen.py: a random generator of SMALL valid inputs that respects the constraints. Usage `python3 gen.py SEED` prints one input to stdout. Use random.Random(int(sys.argv[1])) so it is deterministic per seed.
++2. gen.py: a random generator of valid inputs that respects the constraints. Usage `python3 gen.py SEED SIZE_CLASS` where SIZE_CLASS is `tiny` (n up to about 8, small values) or `medium` (n in roughly 50-300, large counts, skewed sizes, all-equal values, two-value mixes, boundary values). Prints one input to stdout. Use random.Random(int(sys.argv[1])) so it is deterministic per seed. If SIZE_CLASS is missing, default to tiny.
+ 3. gen_big.py: a generator of MAX-SIZE valid inputs. Usage `python3 gen_big.py SEED` prints one input at the largest allowed constraints. Cycle through adversarial shapes by seed (e.g. seed%4: all-equal values, random values, sorted/reverse-sorted, many distinct values or skewed sizes), so that pruning/early-break heuristics are stressed.
+ 
+-Then check brute.py by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Finish by making sure all three files exist."""
++Then check brute.py by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds (both size classes) to check that its output is valid. Finish by making sure all three files exist."""
++
++CLASS_ORACLE_TEMPLATE = """You are writing test helpers for the competitive programming problem below. Work in the directory {d}.
++Do NOT read or use solution.py; write the helpers independently from the statement only.
++
++<problem_description>
++{statement}
++</problem_description>
++
++This is a Solution-class task: the grader calls the method of class Solution (the method named in the statement's starter code) with Python arguments. Create these three files in {d}. The harness calls them directly, without stdin:
++1. brute.py: an obviously correct exhaustive implementation exposing a module-level function `solve(*args)` that takes the SAME arguments as the Solution method (positionally) and returns the SAME value. No optimisation; it only has to be correct on small inputs. Keep a `if __name__ == "__main__":` block that is optional.
++2. gen.py: a random generator. Usage `python3 gen.py SEED SIZE_CLASS`, where SIZE_CLASS is `tiny` (small sizes, values) or `medium` (sizes in roughly 50-300, large counts, skewed sizes, all-equal values, two-value mixes, boundary values). It prints ONE Python literal on one line: a tuple of the positional arguments for the method, e.g. `([3, 1, 2], 5)` (use repr of the values; lists, strings, ints only). Use random.Random(int(sys.argv[1])) so it is deterministic per seed. Default to tiny if SIZE_CLASS is missing.
++3. gen_big.py: a generator of MAX-SIZE valid arguments. Usage `python3 gen_big.py SEED` prints one Python literal tuple of the arguments at the largest allowed constraints. Cycle through adversarial shapes by seed (seed%4: all-equal values, random values, sorted/reverse-sorted, many distinct values or skewed sizes).
++
++Then check brute.py: for each sample in the statement, call `solve(*args)` on the sample arguments and compare with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds (both size classes) and check that `ast.literal_eval` parses each output. Finish by making sure all three files exist."""
++
++
++# Driver for Solution-class tasks, run as `python3 -c`. Reads a JSON payload on stdin and prints one JSON line per case.
++CLASS_DRIVER = r'''
++import sys, json, ast, time, signal, importlib.util, traceback
++
++class _Timeout(Exception):
++    pass
++
++def _alarm(signum, frame):
++    raise _Timeout()
++
++def _load(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++def _args(text):
++    val = ast.literal_eval(text)
++    return val if isinstance(val, tuple) else (val,)
++
++def _short(v):
++    s = repr(v)
++    return s if len(s) <= 2000 else s[:2000] + '...'
++
++def _emit(line):
++    sys.stdout.write('@@RES ' + line + '\n')
++    sys.stdout.flush()
++
++def main():
++    cfg = json.loads(sys.stdin.read())
++    signal.signal(signal.SIGALRM, _alarm)
++    T = max(1, int(cfg['timeout']))
++    try:
++        sol = _load('solution_mod', 'solution.py').Solution()
++        fn = getattr(sol, cfg['method'])
++        load_err = None
++    except BaseException:
++        load_err = traceback.format_exc()
++    if cfg['mode'] == 'time':
++        for i, text in enumerate(cfg['cases']):
++            if load_err:
++                _emit(json.dumps({'i': i, 'kind': 'sol_error', 'err': load_err}))
++                continue
++            try:
++                args = _args(text)
++                signal.alarm(T)
++                t0 = time.monotonic()
++                fn(*args)
++                dt = time.monotonic() - t0
++                signal.alarm(0)
++                _emit(json.dumps({'i': i, 'kind': 'ok', 'dt': dt}))
++            except _Timeout:
++                _emit(json.dumps({'i': i, 'kind': 'sol_timeout', 'err': f'solution timed out after {T}s'}))
++            except BaseException:
++                signal.alarm(0)
++                _emit(json.dumps({'i': i, 'kind': 'sol_error', 'err': traceback.format_exc()}))
++        return
++    try:
++        brute = _load('brute_mod', 'brute.py')
++        bsolve = brute.solve
++        b_err = None
++    except BaseException:
++        b_err = traceback.format_exc()
++    if b_err is not None:
++        for i in range(len(cfg['cases'])):
++            _emit(json.dumps({'i': i, 'kind': 'brute_error', 'err': b_err}))
++        return
++    budget = float(cfg.get('budget', 120))
++    start = time.monotonic()
++    for i, text in enumerate(cfg['cases']):
++        if time.monotonic() - start > budget:
++            break
++        base = {'i': i}
++        try:
++            signal.alarm(T)
++            expected = bsolve(*_args(text))
++            signal.alarm(0)
++        except _Timeout:
++            _emit(json.dumps(dict(base, kind='brute_timeout', err='brute.solve timed out')))
++            continue
++        except BaseException:
++            signal.alarm(0)
++            _emit(json.dumps(dict(base, kind='brute_error', err=traceback.format_exc())))
++            continue
++        if load_err:
++            _emit(json.dumps(dict(base, kind='sol_error', expected=_short(expected), err=load_err)))
++            continue
++        try:
++            signal.alarm(T)
++            actual = fn(*_args(text))
++            signal.alarm(0)
++        except _Timeout:
++            _emit(json.dumps(dict(base, kind='sol_timeout', expected=_short(expected),
++                                  err=f'solution timed out after {T}s')), flush=True)
++            continue
++        except BaseException:
++            signal.alarm(0)
++            _emit(json.dumps(dict(base, kind='sol_error', expected=_short(expected),
++                                  err=traceback.format_exc())), flush=True)
++            continue
++        if actual == expected:
++            _emit(json.dumps(dict(base, kind='ok')))
++        else:
++            _emit(json.dumps(dict(base, kind='mismatch', expected=_short(expected), actual=_short(actual))))
++
++main()
++'''
+ 
+ 
+ # Thread-local storage for logger instances
+@@ -370,8 +503,9 @@ class AgenticSystem:
+ 
+     def _run_stress(self):
+         """
+-        If gen.py and brute.py exist, compare solution.py against brute.py on STRESS_SEEDS seeds.
+-        Returns (mismatch_found, ran, report). Stops at the first mismatch.
++        If gen.py and brute.py exist, compare solution.py against brute.py on STRESS_SEEDS tiny seeds and
++        STRESS_MEDIUM_SEEDS medium seeds (gen.py SEED SIZE_CLASS). Returns (mismatch_found, ran, report).
++        Stops at the first mismatch.
+         """
+         gen = os.path.join(self.git_tempdir, 'gen.py')
+         brute = os.path.join(self.git_tempdir, 'brute.py')
+@@ -379,45 +513,158 @@ class AgenticSystem:
+             return False, 0, "Stress skipped: gen.py and/or brute.py missing."
+         start = time.monotonic()
+         ran = 0
+-        for seed in range(1, STRESS_SEEDS + 1):
+-            if time.monotonic() - start > STRESS_BUDGET_S:
+-                break
++        for size, n_seeds in (('tiny', STRESS_SEEDS), ('medium', STRESS_MEDIUM_SEEDS)):
++            for seed in range(1, n_seeds + 1):
++                if time.monotonic() - start > STRESS_BUDGET_S:
++                    return False, ran, f"Stress: budget exhausted after {ran} cases (no mismatch found so far)."
++                try:
++                    g = subprocess.run(['python3', 'gen.py', str(seed), size], cwd=self.git_tempdir,
++                                       capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++                except subprocess.TimeoutExpired:
++                    return False, ran, f"helper script failed: gen.py timed out on seed {seed} ({size}) (not counted against solution.py)."
++                if g.returncode != 0:
++                    return False, ran, (f"helper script failed: gen.py crashed on seed {seed} ({size}) (not counted against solution.py).\n"
++                                        f"stderr:\n{(g.stderr or '')[-REPORT_CLIP:]}")
++                inp = g.stdout
++                try:
++                    b = subprocess.run(['python3', 'brute.py'], cwd=self.git_tempdir, input=inp,
++                                       capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++                    b_out, b_err, b_rc = b.stdout, b.stderr, b.returncode
++                except subprocess.TimeoutExpired:
++                    return False, ran, (f"helper script failed: brute.py timed out on seed {seed} ({size}) "
++                                        f"(not counted against solution.py); input:\n{inp[:REPORT_CLIP]}")
++                try:
++                    s = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=inp,
++                                       capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++                    s_out, s_err, s_rc = s.stdout, s.stderr, s.returncode
++                except subprocess.TimeoutExpired:
++                    return True, ran, (f"solution.py TIMED OUT on seed {seed} ({size}, limit {RUN_TIMEOUT_S}s).\n"
++                                       f"input:\n{inp[:REPORT_CLIP]}\nbrute output:\n{b_out[:REPORT_CLIP]}")
++                ran += 1
++                if b_rc != 0:
++                    # The helper is broken, not the solution: report it, but do not penalise solution.py.
++                    return False, ran, (f"helper script failed: brute.py crashed on seed {seed} ({size}) "
++                                        f"(not counted against solution.py; fix brute.py).\n"
++                                        f"input:\n{inp[:REPORT_CLIP]}\nbrute stderr:\n{b_err[-REPORT_CLIP:]}")
++                if s_out.split() != b_out.split():
++                    return True, ran, (f"MISMATCH on seed {seed} ({size}).\ninput:\n{inp[:REPORT_CLIP]}"
++                                       f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
++                                       f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
++                                       f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}\n"
++                                       f"Note: brute.py itself may be wrong; verify it against the statement.")
++        return False, ran, f"Stress: {ran} cases run (tiny + medium), no mismatch."
++
++    def _class_method_name(self):
++        """Name of the target method, from the first `def name(self, ...)` in the statement (not __init__)."""
++        for m in re.finditer(r"def\s+(\w+)\s*\(\s*self\b", self.problem_statement or ''):
++            if m.group(1) != '__init__':
++                return m.group(1)
++        return None
++
++    def _collect_literals(self, script, seed_args_list):
++        """Run gen script (or gen_big) for each arg list; return (list_of_literal_texts, error_report or None)."""
++        texts = []
++        for args in seed_args_list:
+             try:
+-                g = subprocess.run(['python3', 'gen.py', str(seed)], cwd=self.git_tempdir,
++                g = subprocess.run(['python3', script] + [str(a) for a in args], cwd=self.git_tempdir,
+                                    capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+             except subprocess.TimeoutExpired:
+-                return True, ran, f"gen.py timed out on seed {seed}."
++                return texts, f"helper script failed: {script} timed out on {args} (not counted against solution.py)."
+             if g.returncode != 0:
+-                return False, ran, (f"helper script failed: gen.py crashed on seed {seed} (not counted against solution.py).\n"
+-                                    f"stderr:\n{(g.stderr or '')[-REPORT_CLIP:]}")
+-            inp = g.stdout
+-            try:
+-                b = subprocess.run(['python3', 'brute.py'], cwd=self.git_tempdir, input=inp,
+-                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+-                b_out, b_err, b_rc = b.stdout, b.stderr, b.returncode
+-            except subprocess.TimeoutExpired:
+-                return False, ran, (f"helper script failed: brute.py timed out on seed {seed} "
+-                                    f"(not counted against solution.py); input:\n{inp[:REPORT_CLIP]}")
+-            try:
+-                s = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=inp,
+-                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+-                s_out, s_err, s_rc = s.stdout, s.stderr, s.returncode
+-            except subprocess.TimeoutExpired:
+-                return True, ran, (f"solution.py TIMED OUT on seed {seed} (limit {RUN_TIMEOUT_S}s).\n"
+-                                   f"input:\n{inp[:REPORT_CLIP]}\nbrute output:\n{b_out[:REPORT_CLIP]}")
+-            ran += 1
+-            if b_rc != 0:
+-                # The helper is broken, not the solution: report it, but do not penalise solution.py.
+-                return False, ran, (f"helper script failed: brute.py crashed on seed {seed} "
+-                                    f"(not counted against solution.py; fix brute.py).\n"
+-                                    f"input:\n{inp[:REPORT_CLIP]}\nbrute stderr:\n{b_err[-REPORT_CLIP:]}")
+-            if s_out.split() != b_out.split():
+-                return True, ran, (f"MISMATCH on seed {seed}.\ninput:\n{inp[:REPORT_CLIP]}"
+-                                   f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
+-                                   f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
+-                                   f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}\n"
+-                                   f"Note: brute.py itself may be wrong; verify it against the statement.")
+-        return False, ran, f"Stress: {ran} seeds run, no mismatch."
++                return texts, (f"helper script failed: {script} crashed on {args} (not counted against solution.py).\n"
++                               f"stderr:\n{(g.stderr or '')[-REPORT_CLIP:]}")
++            texts.append((args, g.stdout.strip()))
++        return texts, None
++
++    def _run_driver(self, payload, timeout_s):
++        """Run the class-task driver in an isolated subprocess. Returns (results_list, error or None)."""
++        try:
++            p = subprocess.run(['python3', '-c', CLASS_DRIVER], cwd=self.git_tempdir,
++                               input=json.dumps(payload), capture_output=True, text=True, timeout=timeout_s)
++        except subprocess.TimeoutExpired:
++            return [], f"driver timed out after {timeout_s}s"
++        results = []
++        for ln in (p.stdout or '').splitlines():
++            if ln.startswith('@@RES '):
++                try:
++                    results.append(json.loads(ln[len('@@RES '):]))
++                except ValueError:
++                    pass
++        err = None
++        if p.returncode != 0 or not results:
++            err = f"driver exit {p.returncode}: {(p.stderr or '')[-REPORT_CLIP:]}"
++        return results, err
++
++    def _run_class_stress(self):
++        """
++        Class-task stress: brute.py exposes solve(*args); gen.py SEED SIZE prints a Python-literal argument tuple.
++        Calls Solution().<method>(*args) and brute.solve(*args) in an isolated driver. Returns (mismatch, ran, report).
++        """
++        gen = os.path.join(self.git_tempdir, 'gen.py')
++        brute = os.path.join(self.git_tempdir, 'brute.py')
++        if not (os.path.isfile(gen) and os.path.isfile(brute)):
++            return False, 0, "Stress skipped: gen.py and/or brute.py missing (class task needs both)."
++        method = self._class_method_name()
++        if method is None:
++            return False, 0, "Stress skipped: could not find the target method (`def name(self, ...)`) in the statement."
++        texts = []
++        for size, n_seeds in (('tiny', STRESS_SEEDS), ('medium', STRESS_MEDIUM_SEEDS)):
++            got, err = self._collect_literals('gen.py', [(s, size) for s in range(1, n_seeds + 1)])
++            texts.extend(got)
++            if err:
++                return False, len(texts), err
++        cases = [t for _, t in texts]
++        payload = {'mode': 'stress', 'method': method, 'cases': cases, 'timeout': RUN_TIMEOUT_S,
++                   'budget': STRESS_BUDGET_S}
++        results, err = self._run_driver(payload, STRESS_BUDGET_S + 4 * RUN_TIMEOUT_S)
++        if err and not results:
++            return False, 0, f"helper script failed: class stress driver error ({err}); not counted against solution.py."
++        ran = len(results)
++        bad = [r for r in results if r.get('kind') != 'ok']
++        if not bad:
++            return False, ran, f"Stress (class): {ran} cases run (tiny + medium), no mismatch."
++        helper = [r for r in bad if r['kind'] in ('brute_error', 'brute_timeout')]
++        if helper and len(helper) == len(bad):
++            r = helper[0]
++            return False, ran, (f"helper script failed: brute.solve {r['kind']} on case {r['i']} "
++                                f"(not counted against solution.py; fix brute.py).\n"
++                                f"args: {cases[r['i']][:REPORT_CLIP]}\n{r.get('err', '')[-REPORT_CLIP:]}")
++        # Smallest counterexample by input size, preferring solution failures.
++        sol_bad = [r for r in bad if r['kind'] not in ('brute_error', 'brute_timeout')]
++        pick = min(sol_bad, key=lambda r: len(cases[r['i']]))
++        return True, ran, (f"MISMATCH (class task, method {method}); smallest of {len(sol_bad)} failing cases.\n"
++                           f"kind: {pick['kind']}\nargs:\n{cases[pick['i']][:REPORT_CLIP]}\n"
++                           f"expected (brute.solve):\n{pick.get('expected', '')[:REPORT_CLIP]}\n"
++                           f"actual (Solution.{method}):\n{pick.get('actual', '')[:REPORT_CLIP]}\n"
++                           f"error:\n{pick.get('err', '')[-REPORT_CLIP:]}\n"
++                           f"Note: brute.py itself may be wrong; verify it against the statement.")
++
++    def _run_class_timing(self):
++        """Time Solution().<method>(*args) on gen_big.py SEED outputs (class tasks). Returns (ok, report)."""
++        gen_big = os.path.join(self.git_tempdir, 'gen_big.py')
++        method = self._class_method_name()
++        if not os.path.isfile(gen_big) or method is None:
++            return False, "Timing skipped: gen_big.py missing (write it to test max-size inputs)."
++        texts, err = self._collect_literals('gen_big.py', [(s,) for s in range(4)])
++        if err:
++            return False, err
++        payload = {'mode': 'time', 'method': method, 'cases': [t for _, t in texts], 'timeout': RUN_TIMEOUT_S}
++        results, err = self._run_driver(payload, 4 * RUN_TIMEOUT_S + 10)
++        if err and not results:
++            return False, f"Timing driver failed: {err}"
++        lines, ok = [], True
++        for r in results:
++            if r.get('kind') != 'ok':
++                ok = False
++                lines.append(f"seed {r['i']}: {r.get('kind')} {r.get('err', '')[-REPORT_CLIP:]}")
++            elif r['dt'] > TIME_LIMIT_S:
++                ok = False
++                lines.append(f"seed {r['i']}: SLOW {r['dt']:.2f}s (soft limit {TIME_LIMIT_S}s)")
++            else:
++                lines.append(f"seed {r['i']}: ok {r['dt']:.2f}s")
++        if len(results) < len(texts):
++            ok = False
++        return ok, "Max-size timing (class task):\n" + "\n".join(lines)
+ 
+     def _run_timing(self):
+         """Run solution.py on max-size inputs from gen_big.py. Returns (ok, report)."""
+@@ -483,14 +730,14 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+    Run solution.py on every sample and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 4. Closed form / hypothesis testing: when the fast formula is not known, form explicit hypotheses (e.g. a candidate formula in n, k, and parity features). Test each one with compare_functions(fast_path=solution.py, ref_path=brute.py, arg_ranges or arg_expr over small inputs, features for bucketing). Work from the smallest counterexamples and refine the hypothesis; do not guess at random.
+ 5. Stress compare early: write a random small-input generator and run a stress test of a few hundred cases comparing solution.py with brute.py. Fix every mismatch before doing any performance work. If the optimized formulation keeps producing mismatches, replace it with a simpler DP over the brute force's state definition rather than adding case analysis.
+-6. Adversarial performance check (do this after correctness passes):
++""" + HEURISTIC_AUDIT_STEP + """7. Adversarial performance check (do this after correctness passes):
+    a. Write the worst-case operation count of solution.py as a number at maximum constraints (e.g. n=2*10^5 with a nested loop gives about 4*10^10). Show the estimate.
+    b. List at least 5 adversarial max-size inputs, including inputs that defeat any pruning or early-break logic in your solution: all identical elements (e.g. `'a'*20000`), a single value repeated the maximum number of times, all distinct values, skewed sizes, sorted or reverse-sorted input, and inputs with maximum distinct values so that every loop runs to its maximum.
+    c. Generate them with Python expressions (e.g. `'a'*20000`, `list(range(200000))`) and time them with the bench_solution tool (or bash with `timeout 10 python3 solution.py < big.txt`).
+    d. If any case takes more than about 1s, or the estimated operation count is over about 5*10^7, throw away the heuristic approach and look for a lower-complexity formulation. Do not micro-optimize a bad algorithm.
+    e. Pruning/early-break heuristics do not count as a complexity guarantee; test inputs that defeat them.
+    f. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
+-7. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++8. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+ 
+     def _brute_fallback(self):
+         """Copy brute.py over solution.py if brute.py passes the samples. Returns a message or None."""
+@@ -526,6 +773,7 @@ Harness report:
+ Diagnose the root cause first. If your algorithm is fundamentally wrong, derive a different one; do not just patch special cases.
+ If the previous solution failed stress or relied on heavy case analysis (modular wrap-around enumeration, sign tracking), re-derive a simpler formulation: start from brute.py's state definition and use a DP over the single free coordinate with O(Q*N) transitions, so that it matches the brute force by construction.
+ {HYPOTHESIS_LINE}
++{HEURISTIC_AUDIT_STEP}
+ {self._timeout_hint(feedback)}{self._interactive_hint()}{STDLIB_LINE} Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
+ """
+ 
+@@ -562,7 +810,8 @@ If the previous solution failed stress or relied on heavy case analysis (modular
+                 "Keep reasoning brief and write the file with the editor tool.")
+ 
+     def _oracle_prompt(self):
+-        return ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement)
++        template = CLASS_ORACLE_TEMPLATE if self._is_class_task() else ORACLE_TEMPLATE
++        return template.format(d=self.git_tempdir, statement=self.problem_statement)
+ 
+     @staticmethod
+     def _last_reply_text(history):
+@@ -756,8 +1005,15 @@ Action: rewrite solution.py NOW in pure Python (standard library only; no numpy/
+             samples_all_pass = passed == total and not samples_timeout
+             interactive = self._is_interactive() and not class_task
+             if class_task:
+-                # Solution-class tasks: the harness cannot run them; the agent checks samples itself.
+-                pass
++                # Solution-class tasks: oracle phase via brute.solve / gen.py literals, no stdin protocol.
++                if not all(os.path.isfile(os.path.join(self.git_tempdir, f))
++                           for f in ('brute.py', 'gen.py', 'gen_big.py')):
++                    self._ask(self._oracle_prompt())
++                stress_mismatch, _, stress_report = self._run_class_stress()
++                report_parts.append(stress_report)
++                if not stress_mismatch:
++                    timing_ok, timing_report = self._run_class_timing()
++                    report_parts.append(timing_report)
+             elif interactive:
+                 # Interactive tasks: plain-pipe stress/timing would feed brute.py / solution.py the wrong protocol.
+                 report_parts.append("Stress/timing skipped: interactive problem; the harness cannot drive the judge.")
+@@ -775,10 +1031,9 @@ Action: rewrite solution.py NOW in pure Python (standard library only; no numpy/
+             else:
+                 report_parts.append("Oracle/stress phase skipped until all samples pass.")
+ 
+-            if class_task or interactive:
+-                if interactive and not class_task:
+-                    safe_log(f"WARNING attempt {k}: interactive problem; harness skipped samples, stress and timing "
+-                             "(score is not a real check).")
++            if interactive and not class_task:
++                safe_log(f"WARNING attempt {k}: interactive problem; harness skipped samples, stress and timing "
++                         "(score is not a real check).")
+                 score = (True, 0, True, True)
+             else:
+                 # Leading element: a candidate that crashes on import ranks strictly lowest.
+@@ -796,8 +1051,9 @@ Action: rewrite solution.py NOW in pure Python (standard library only; no numpy/
+                 # The harness cannot check interactive tasks, so no retry signal exists here; the bounded
+                 # layout follow-up after this loop is the extra attempt. Never treat the attempt as clean.
+                 break
+-            clean = class_task or (samples_all_pass and not stress_mismatch and timing_ok and not samples_timeout)
+-            if clean and (class_task or not stress_mismatch):
++            # Class tasks are clean only after the class stress and timing ran and passed.
++            clean = samples_all_pass and not stress_mismatch and timing_ok and not samples_timeout
++            if clean and not interactive:
+                 break  # all harness checks passed for this attempt
+ 
+         # Independent of the attempt index: if no candidate passes any sample (or the best one crashes on import),
+diff --git a/solution.py b/solution.py
+index a2eb8a6..b4d5be7 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,9 +1,8 @@
+-# Placeholder solution file. The actual changes are applied to the coding agent repo in /dgm.
+-# The requested harness changes live in /dgm/coding_agent.py (see its git diff).
++# Pure standard library solution. No third-party packages.
+ # ASSUMED CONTRACT (statement not available; edit if the real statement differs):
+-#   stdin : "N L R", then N integers (the hidden array), tokens may be split across lines.
++#   stdin : "N L R", then N integers (tokens may be split across lines).
+ #   stdout: "! S" where S = sum of array elements v with L <= v <= R.
+-# Pure standard library. Single pass over the array, O(N) time, O(1) extra memory.
++# Single pass over the array: O(N) time, O(1) extra memory.
+ import sys
+ 
+ 
+@@ -19,6 +18,8 @@ def solve(data):
+ 
+ def main():
+     data = sys.stdin.read().split()
++    if not data:
++        return
+     print(f"! {solve(data)}")
+ 
+ 
+diff --git a/tools/formula_check.py b/tools/formula_check.py
+index 57fb734..15cc49a 100644
+--- a/tools/formula_check.py
++++ b/tools/formula_check.py
+@@ -183,7 +183,8 @@ def tool_info():
+ * Exceptions in either function count as mismatches. Each call is limited to timeout_s seconds.
+ * Returns a compact report (<3000 chars): cases run, mismatch count and rate, the 10 smallest counterexamples (args, expected, got, diff), and the mismatch rate per feature value.
+ * Use features (Python expressions over argument names or a0, a1, ...; e.g. 'a%2', 'a==b') to see which input classes the candidate gets wrong.
+-* Use it to test each closed-form hypothesis against brute.py, and work from the smallest counterexamples.""",
++* Use it to test each closed-form hypothesis against brute.py, and work from the smallest counterexamples.
++* Heuristic audit: use arg_expr to generate MEDIUM-size structured inputs (e.g. '[([v]*n, k) for n in range(50,300,37) for v in (0,1,10**9)]' or random skewed lists) and compare solution.py against a polynomial exact version of the same algorithm (ref_path=exact.py, ref_func e.g. 'solve', or a Solution method name). Use mode='random' with max_cases>=500 for this. Brute force alone is too slow at these sizes; a polynomial exact ref_func is the intended oracle for heuristics.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {

@@ -1,0 +1,599 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f99599d..afd0c94 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -12,7 +12,9 @@ from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, filter_patch_by_files
+ from utils.verify_common import file_sha256, load_records, candidate_dir, candidate_path
++import shutil
+ import tempfile
++import time
+ import uuid
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -102,6 +104,9 @@ def safe_log(message, level=logging.INFO):
+ 
+ import re
+ 
++MIN_TOKENS_TIER_B = 30
++PRECISION_TOL = 1e-11
++
+ _CUT_OFF_PHRASE = 'Your last reply was cut off by the output limit'
+ _EMPTY_REPLIES = ('', '(no output)')
+ 
+@@ -327,18 +332,40 @@ class AgenticSystem:
+                 return rec
+         return None
+ 
+-    def _verification_status(self):
+-        """Return the list of unmet verification requirements for the current solution.py.
++    def _independent_ref(self, rec, sha):
++        """True if the reference recorded by `rec` exists, is unchanged, and is not solution.py itself."""
++        ref = rec.get('reference_path')
++        if not ref:
++            return False
++        ref_sha = file_sha256(ref)
++        return ref_sha is not None and ref_sha != sha and ref_sha == rec.get('reference_sha256')
+ 
+-        Records are keyed by the sha256 of solution.py, so evidence recorded for an
+-        older version of the file never counts for the current one.
+-        """
+-        sol = self._solution_path()
+-        sha = file_sha256(sol)
+-        if sha is None:
+-            return ["solution.py does not exist or is empty; write it first"]
+-        missing = []
++    def _declared_tokens(self, sha):
++        """declared_max_tokens from the newest run_clean record for `sha`, or None."""
++        rec = self._latest_record('run_clean', sha, lambda r: r.get('declared_max_tokens'))
++        try:
++            return int(rec['declared_max_tokens']) if rec else None
++        except (TypeError, ValueError):
++            return None
++
++    def _tier_b_needed(self, sha):
++        """Measured input tokens a Tier-B stress run must reach: 30, or the statement maximum if smaller."""
++        declared = self._declared_tokens(sha)
++        return min(MIN_TOKENS_TIER_B, declared) if declared and declared > 0 else MIN_TOKENS_TIER_B
++
++    def _tier_b_record(self, sha):
++        needed = self._tier_b_needed(sha)
++        return self._latest_record('stress_compare', sha,
++                                   lambda r: r.get('num_tests', 0) >= 50 and r.get('max_input_tokens', 0) >= needed)
++
++    def _clean_record(self, sha):
++        return self._latest_record('run_clean', sha,
++                                   lambda r: r.get('all_exit_zero') and r.get('max_size_ok')
++                                   and float(r.get('max_elapsed', 1e9)) < 2.0)
+ 
++    def _unmet_for_sha(self, sha):
++        """Unmet requirements for the solution with hash `sha`. Empty list means verified."""
++        missing = []
+         samples = self._latest_record('check_samples', sha)
+         if samples is not None and samples.get('no_samples'):
+             pass  # statement has no samples; recorded explicitly
+@@ -348,29 +375,43 @@ class AgenticSystem:
+         elif not samples.get('samples_ok') or samples.get('samples_total', 0) <= 0:
+             missing.append("(a) check_samples did not pass every sample on the current solution.py")
+ 
+-        stress = self._latest_record('stress_compare', sha, lambda r: r.get('num_tests', 0) >= 100)
+-        if stress is None:
+-            missing.append("(b) no stress_compare with >=100 tests on the current solution.py")
+-        elif stress.get('mismatches', 1) != 0 or stress.get('crashes', 1) != 0:
+-            missing.append("(b) latest stress_compare on the current solution.py has mismatches or crashes")
+-        else:
+-            ref = stress.get('reference_path')
+-            ref_sha = file_sha256(ref) if ref else None
+-            if ref_sha is None:
+-                missing.append("(c) the reference file used by stress_compare is missing")
+-            elif ref_sha == sha:
+-                missing.append("(c) the reference file is identical to solution.py; write an independent reference")
+-            elif ref_sha != stress.get('reference_sha256'):
+-                missing.append("(c) the reference file changed after stress_compare ran; re-run stress_compare")
+-
+-        clean = self._latest_record('run_clean', sha,
+-                                    lambda r: r.get('all_exit_zero') and r.get('max_size')
+-                                    and float(r.get('max_elapsed', 1e9)) < 2.0)
+-        if clean is None:
+-            missing.append("(d) no run_clean record on a max-size input with exit 0 and elapsed < 2s "
++        tier_a = self._latest_record('stress_compare', sha, lambda r: r.get('num_tests', 0) >= 100)
++        if tier_a is None:
++            missing.append("(b) no tiny exhaustive stress_compare (>=100 tests) on the current solution.py")
++        elif tier_a.get('mismatches', 1) != 0 or tier_a.get('crashes', 1) != 0:
++            missing.append("(b) latest tiny stress_compare has mismatches or crashes")
++        elif not self._independent_ref(tier_a, sha):
++            missing.append("(b) the reference is missing, identical to solution.py, or changed after stress_compare ran")
++
++        tier_b = self._tier_b_record(sha)
++        needed = self._tier_b_needed(sha)
++        if tier_b is None:
++            missing.append(f"(c) no stress_compare with >=50 tests and max_input_tokens >= {needed} "
++                           "against an independent reference on the current solution.py")
++        elif tier_b.get('mismatches', 1) != 0 or tier_b.get('crashes', 1) != 0:
++            missing.append("(c) latest large-input stress_compare has mismatches or crashes")
++        elif not self._independent_ref(tier_b, sha):
++            missing.append("(c) the large-input reference is missing, identical to solution.py, or changed")
++        elif tier_b.get('real_valued') and not float(tier_b.get('max_rel', float('inf'))) <= PRECISION_TOL:
++            missing.append(f"(d) real-valued outputs: max_rel={tier_b.get('max_rel')} must be <= {PRECISION_TOL} "
++                           "against an exact (Fraction/Decimal) reference")
++
++        if self._clean_record(sha) is None:
++            missing.append("(e) no run_clean record with declared_max_tokens, max_size_ok=true and elapsed < 2s "
+                            "on the current solution.py")
+         return missing
+ 
++    def _verification_status(self):
++        """Return the list of unmet verification requirements for the current solution.py.
++
++        Records are keyed by the sha256 of solution.py, so evidence recorded for an
++        older version of the file never counts for the current one.
++        """
++        sha = file_sha256(self._solution_path())
++        if sha is None:
++            return ["solution.py does not exist or is empty; write it first"]
++        return self._unmet_for_sha(sha)
++
+     def _score_for_sha(self, sha):
+         """Score tuple for the solution version with hash `sha` (higher is better)."""
+         samples = self._latest_record('check_samples', sha)
+@@ -382,26 +423,21 @@ class AgenticSystem:
+             mismatches = 10 ** 9
+         else:
+             mismatches = stress.get('mismatches', 0) + stress.get('crashes', 0)
++        tier_b = self._tier_b_record(sha)
++        if tier_b is None:
++            tier_b_bad = 10 ** 9
++            max_rel = float('inf')
++        else:
++            tier_b_bad = tier_b.get('mismatches', 0) + tier_b.get('crashes', 0)
++            max_rel = float(tier_b.get('max_rel', float('inf')))
+         clean = self._latest_record('run_clean', sha)
+         runtime = float(clean.get('max_elapsed', 1e9)) if clean else 1e9
+         complete = 1 if self._is_complete_for_sha(sha) else 0
+-        return (samples_passing, -mismatches, complete, -runtime)
++        return (samples_passing, -mismatches, -tier_b_bad, complete, -max_rel, -runtime)
+ 
+     def _is_complete_for_sha(self, sha):
+         """True if the evidence for hash `sha` alone satisfies every requirement."""
+-        samples = self._latest_record('check_samples', sha)
+-        if samples is None or not (samples.get('samples_ok') or samples.get('no_samples')):
+-            return False
+-        stress = self._latest_record('stress_compare', sha, lambda r: r.get('num_tests', 0) >= 100)
+-        if stress is None or stress.get('mismatches', 1) != 0 or stress.get('crashes', 1) != 0:
+-            return False
+-        ref_sha = stress.get('reference_sha256')
+-        if not ref_sha or ref_sha == sha:
+-            return False
+-        clean = self._latest_record('run_clean', sha,
+-                                    lambda r: r.get('all_exit_zero') and r.get('max_size')
+-                                    and float(r.get('max_elapsed', 1e9)) < 2.0)
+-        return clean is not None
++        return not self._unmet_for_sha(sha)
+ 
+     def _snapshot(self, snapshots, label):
+         """Record the current solution.py (hash, content, score) as a candidate."""
+@@ -513,20 +549,22 @@ class AgenticSystem:
+                 + "\n\nLatest tool evidence for the current solution.py:\n"
+                 + self._recent_evidence_text()
+                 + "\n\nDo the following now, using the tools:\n"
+-                "1. Run check_samples with EVERY sample from the statement (exact expected outputs). Fix any failure. "
+-                "If the statement has no samples or the problem is interactive, call check_samples with no_samples=true "
+-                "instead. Never write judge or wrapper code into solution.py; if you need one, build it in a separate "
+-                "directory and use it only as the generator or reference side of stress_compare.\n"
+-                "2. Write an INDEPENDENT reference in a separate file (e.g. /tmp/ref.py). It must use a different "
+-                "algorithm or formulation from solution.py: exact fractions.Fraction arithmetic, exhaustive "
+-                "enumeration / brute force, or a different DP direction. Do not copy solution.py.\n"
+-                "3. Write a generator script (takes a seed argument, prints one input) that covers edge cases: "
+-                "minimum and maximum sizes, degenerate values (zeros, all-zero-but-one, duplicates), and boundary values. "
+-                "Keep small inputs so the reference runs fast.\n"
+-                "4. Run stress_compare with at least 100 tests (solution vs reference and generator).\n"
++                "1. Write a short written test plan first: min and max N, min and max values, special structures "
++                "(all equal, sorted, alternating, all-min, all-max). Then run check_samples with EVERY sample "
++                "(exact expected outputs). Fix any failure. If the statement has no samples or is interactive, call "
++                "check_samples with no_samples=true. Never write judge or wrapper code into solution.py.\n"
++                "2. Write a generator script that takes SEED and an optional MODE argument (random, all_min, all_max, "
++                "sorted, alternating, special) and prints one input.\n"
++                "3. Write an INDEPENDENT reference in a separate file (e.g. /tmp/ref.py) with a different algorithm: "
++                "exhaustive brute force for tiny inputs, and for mid-size inputs an exact method (fractions.Fraction / "
++                "decimal, or an independent polynomial/DP formulation). Do not copy solution.py.\n"
++                "4. Run stress_compare: >=100 tiny tests (exhaustive-style), then >=50 mid-size tests with "
++                "max_input_tokens >= 30 (use the `modes` argument for several generator modes). Fix every mismatch.\n"
+                 "5. When solution and reference disagree, do NOT assume the solution is right. Re-read the problem "
+                 "statement and decide which program is wrong; then fix that program and re-test.\n"
+-                "6. Run run_clean on a max-size input and confirm it finishes well under 2 seconds with exit 0.\n"
++                "6. Run run_clean on all samples and a maximum-size input, passing declared_max_tokens = the token count "
++                "of the largest input the constraints allow. It must finish well under 2 seconds with exit 0 and "
++                "max_size_ok=true.\n"
+                 "Finish by making sure solution.py is the final version you verified. Do not use `while True`."
+             )
+             msg_history = chat_with_agent(
+@@ -554,6 +592,93 @@ class AgenticSystem:
+                 parts.append(f"first failing stress input: {stress['first_failure']}")
+         return "\n".join(parts) if parts else None
+ 
++    def _add_snapshot_for_path(self, snapshots, path, label):
++        """Snapshot an arbitrary solution file (e.g. solution_b.py) so _restore_best can choose it."""
++        sha = file_sha256(path)
++        if sha is None:
++            return None
++        with open(path, 'r', errors='replace') as f:
++            code = f.read()
++        if not os.path.isfile(candidate_path(sha)):
++            os.makedirs(candidate_dir(), exist_ok=True)
++            with open(candidate_path(sha), 'w') as f:
++                f.write(code)
++        snapshots.append({'label': label, 'sha': sha, 'code': code, 'score': self._score_for_sha(sha)})
++        safe_log(f"[forward] snapshot '{label}' sha={sha[:12]}")
++        return sha
++
++    def _disagreements_since(self, start_ts):
++        """Failing stress_compare records (mismatches or crashes) written after start_ts."""
++        bad = []
++        for rec in load_records():
++            if rec.get('tool') != 'stress_compare' or float(rec.get('timestamp', 0)) < start_ts:
++                continue
++            if rec.get('mismatches') or rec.get('crashes'):
++                bad.append(rec)
++        return bad
++
++    def _second_candidate(self, msg_history, snapshots):
++        """Write an independent candidate B, differential-test A vs B, adjudicate (<=2 rounds), keep the best."""
++        sol = self._solution_path()
++        if not os.path.isfile(sol):
++            return
++        work = os.path.join(tempfile.gettempdir(), f"cand_{uuid.uuid4().hex}")
++        os.makedirs(work, exist_ok=True)
++        ref_a = os.path.join(work, 'candidate_A.py')
++        shutil.copyfile(sol, ref_a)  # frozen copy of candidate A, used as the differential reference
++        b_path = os.path.join(self.git_tempdir, 'solution_b.py')
++        with open(sol, 'r', errors='replace') as f:
++            code_a = f.read()
++        modes = "random, all_min, all_max, sorted_asc, sorted_desc, alternating"
++        start_ts = time.time()
++        prompt = (
++            "Second independent candidate. Below are the problem statement and candidate A (solution.py). "
++            f"Do NOT edit {sol}. Instead write candidate B to {b_path} using the editor tool (`create`), "
++            "using a DIFFERENT algorithm or formulation from candidate A (e.g. a different DP direction, "
++            "a closed form, or a simpler exhaustive method). Make B read stdin and print the same output format.\n"
++            "Then, using the tools:\n"
++            f"1. Run check_samples on solution_b.py with every sample from the statement.\n"
++            f"2. Write (or reuse) a generator that takes SEED and an optional MODE argument, with modes: {modes}. "
++            "Use mid-size inputs for the modes; keep inputs small enough for the brute force.\n"
++            f"3. Run stress_compare with solution_path={b_path} and reference_path={ref_a} (candidate A) "
++            f"on each mode in the list above (use the `modes` argument, num_tests >= 50).\n"
++            "4. Run stress_compare of candidate A (solution.py) against an exact brute force on tiny inputs (>=100 tests).\n"
++            "5. Run run_clean on solution_b.py with a max-size input and declared_max_tokens.\n"
++            f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"<candidate_A>\n{code_a}\n</candidate_A>"
++        )
++        safe_log("[forward] second candidate stage: writing solution_b.py")
++        history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log) or []
++        b_sha = self._add_snapshot_for_path(snapshots, b_path, 'candidate B') if os.path.isfile(b_path) else None
++        if b_sha is None:
++            safe_log("[forward] candidate B was not written; keeping candidate A")
++            return
++        for rnd in range(1, 3):
++            bad = self._disagreements_since(start_ts)
++            if not bad:
++                safe_log("[forward] A and B agree on every differential run")
++                break
++            start_ts = time.time()
++            first = [str(r.get('first_failure')) for r in bad[:2]]
++            adj = (
++                f"Adjudication round {rnd}/2. Candidate A (solution.py) and candidate B (solution_b.py) disagree, "
++                f"or a run crashed. First failures:\n" + "\n".join(first) + "\n\n"
++                "1. Find the SMALLEST input on which they disagree (you may build it with a small script).\n"
++                "2. Check that input with an exact brute force written in a separate file, re-reading the statement.\n"
++                "3. Decide which program is wrong and fix ONLY that program (solution.py or solution_b.py). "
++                f"If the reference {ref_a} is wrong, fix the program and re-test.\n"
++                "4. Re-run the differential stress_compare (solution_b.py vs candidate A reference, all modes) to confirm."
++            )
++            history = chat_with_agent(adj, model=self.code_model, msg_history=_sanitize_history(history),
++                                      logging=safe_log) or history
++            b_sha = self._add_snapshot_for_path(snapshots, b_path, f'candidate B adjudicated {rnd}') or b_sha
++        self._add_snapshot_for_path(snapshots, sol, 'candidate A after second stage')
++        try:
++            os.remove(b_path)
++        except OSError:
++            pass
++        shutil.rmtree(work, ignore_errors=True)
++
+     def _fallback_write_solution(self):
+         """Last resort: one tool-free LLM call that returns the full solution.py."""
+         path = self._solution_path()
+@@ -696,33 +821,9 @@ Within your first few tool calls, write a first-draft solution.py (even brute fo
+         self._snapshot(snapshots, 'initial')
+         msg_history = self._reflect(msg_history, snapshots)
+ 
+-        # Optional fresh attempt when the best candidate still fails samples or stress tests.
++        # Always write and cross-check an independent candidate B, then keep the best-scoring version.
+         self._restore_best(snapshots)
+-        failing = self._failing_summary()
+-        if failing and self._has_real_edit():
+-            with open(self._solution_path(), 'r', errors='replace') as f:
+-                previous_code = f.read()
+-            fresh_prompt = (
+-                "A previous attempt at this problem failed verification. Its code is below, followed by the failing evidence. "
+-                "Study why it fails, then write a DIFFERENT approach in solution.py (a different algorithm or formulation). "
+-                "Then verify it: run check_samples on every sample, write an independent brute-force reference and a "
+-                "generator with edge cases, run stress_compare with at least 100 tests, and run_clean on a max-size input. "
+-                "When solution and reference disagree, re-read the problem statement to decide which one is wrong.\n\n"
+-                f"<previous_solution>\n{previous_code}\n</previous_solution>\n\n"
+-                f"<failing_evidence>\n{failing}\n</failing_evidence>\n\n"
+-                f"Problem statement again:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n"
+-                f"{method}"
+-            )
+-            safe_log("[forward] starting a fresh attempt with failing evidence")
+-            fresh_history = chat_with_agent(
+-                fresh_prompt,
+-                model=self.code_model,
+-                msg_history=[],
+-                logging=safe_log,
+-            ) or []
+-            self._snapshot(snapshots, 'fresh attempt')
+-            self._reflect(fresh_history, snapshots)
+-
++        self._second_candidate(msg_history, snapshots)
+         self._restore_best(snapshots)
+ 
+ def main():
+diff --git a/solution.py b/solution.py
+index 31f3acf..32ad5c3 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,16 +1,33 @@
+-# Fallback solution.py.
+-#
+-# No competitive-programming problem statement was supplied with this task, so
+-# there is no algorithm to implement. This is a brute-force fallback: it reads
+-# all of stdin and writes it back unchanged. Replace it once a statement is given.
++"""Short helper sketch for the verification-evidence changes.
+ 
+-import sys
++Mirrors the gate rules requested for coding_agent.py:
++- run_clean evidence is only trusted if the tool-measured max_input_tokens
++  reaches 90% of the declared maximum (agent-supplied max_size is ignored).
++- stress evidence needs a measured max_input_tokens >= 30 (or the statement
++  maximum if smaller) and max_rel <= 1e-11 for real-valued outputs.
++"""
+ 
+ 
+-def main():
+-    data = sys.stdin.read()
+-    sys.stdout.write(data)
++def max_size_ok(max_input_tokens, declared_max_tokens):
++    if declared_max_tokens is None or declared_max_tokens <= 0:
++        return False
++    return max_input_tokens >= 0.9 * declared_max_tokens
++
++
++def stress_tier_ok(max_input_tokens, statement_max_tokens=None):
++    needed = 30
++    if statement_max_tokens is not None:
++        needed = min(needed, statement_max_tokens)
++    return max_input_tokens >= needed
++
++
++def precision_ok(max_rel, is_real_valued):
++    if not is_real_valued:
++        return True
++    return max_rel is not None and max_rel <= 1e-11
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    print(max_size_ok(1, 1000))  # False: 1-element input cannot pass
++    print(stress_tier_ok(8))     # False
++    print(precision_ok(1e-13, True))  # True
+diff --git a/tools/run_clean.py b/tools/run_clean.py
+index b817a15..8b7d3dd 100644
+--- a/tools/run_clean.py
++++ b/tools/run_clean.py
+@@ -37,9 +37,13 @@ def tool_info():
+                     "type": "integer",
+                     "description": "Per-run time limit in seconds (default 10)."
+                 },
++                "declared_max_tokens": {
++                    "type": "integer",
++                    "description": "Number of whitespace-separated tokens in the largest input allowed by the constraints (computed by you from N, value limits, etc.). The tool measures the tokens of your inputs itself and reports max_size_ok=true only if the largest input reaches 90% of this number."
++                },
+                 "max_size": {
+                     "type": "boolean",
+-                    "description": "Set to true when the inputs are maximum-size inputs from the constraints (used to verify the time limit)."
++                    "description": "Deprecated and ignored. Kept for backwards compatibility; the tool no longer trusts it. Use declared_max_tokens instead."
+                 }
+             },
+             "required": ["solution_path"]
+@@ -110,7 +114,7 @@ def _fmt(idx, label, r):
+             f"stderr:\n{r['stderr'] if r['stderr'] else '(empty)'}\n")
+ 
+ 
+-def tool_function(solution_path, inputs=None, timeout=10, max_size=False):
++def tool_function(solution_path, inputs=None, timeout=10, max_size=False, declared_max_tokens=None):
+     try:
+         timeout = max(1, min(int(timeout or 10), 120))
+     except (TypeError, ValueError):
+@@ -124,6 +128,12 @@ def tool_function(solution_path, inputs=None, timeout=10, max_size=False):
+         inputs = [inputs]
+     if not inputs:
+         inputs = ['']
++    try:
++        declared = int(declared_max_tokens) if declared_max_tokens is not None else None
++    except (TypeError, ValueError):
++        declared = None
++    max_input_tokens = max(len(str(x).split()) for x in inputs)
++    size_ok = declared is not None and declared > 0 and max_input_tokens >= 0.9 * declared
+ 
+     out_parts = []
+     notes = _static_scan(source)
+@@ -165,7 +175,11 @@ def tool_function(solution_path, inputs=None, timeout=10, max_size=False):
+             'max_elapsed': round(max_elapsed, 3),
+             'timeout': timeout,
+             'max_input_chars': max((len(x) for x in inputs), default=0),
+-            'max_size': bool(max_size),
++            'max_input_tokens': max_input_tokens,
++            'declared_max_tokens': declared,
++            'max_size_ok': bool(size_ok),
+         })
++        out_parts.append(f"== Size check: max_input_tokens={max_input_tokens}, "
++                         f"declared_max_tokens={declared}, max_size_ok={bool(size_ok)} ==")
+ 
+     return _clip("\n".join(out_parts), 20000)
+diff --git a/tools/stress_compare.py b/tools/stress_compare.py
+index 5e9ba16..de07b9d 100644
+--- a/tools/stress_compare.py
++++ b/tools/stress_compare.py
+@@ -12,7 +12,7 @@ def tool_info():
+     return {
+         "name": "stress_compare",
+         "description": """Stress-test a solution against a reference program using a random input generator, comparing outputs token by token.\n
+-* `generator_path` is a script run as `python3 generator.py SEED` (SEED is an integer 1..num_tests) that prints one test input to stdout.
++* `generator_path` is a script run as `python3 generator.py SEED [MODE]` (SEED is an integer 1..num_tests; MODE is optional, see `mode`/`modes`) that prints one test input to stdout.
+ * Both `solution_path` and `reference_path` are run with `python3 -I` with the generated input piped to stdin.
+ * Numeric tokens are compared by absolute and relative difference (max error is reported); other tokens must match exactly.
+ * Returns raw data: counts of exact string matches and mismatches beyond rel_tol, the max absolute and relative error seen, and the input and both outputs for the worst case and the first failing case. Crashes and timeouts are reported with raw stderr.
+@@ -40,6 +40,15 @@ def tool_info():
+                     "type": "integer",
+                     "description": "Per-run time limit in seconds for each program (default 10)."
+                 },
++                "mode": {
++                    "type": "string",
++                    "description": "Optional mode name passed to the generator as a second argument (`python3 generator.py SEED MODE`), e.g. random, all_min, all_max, sorted, alternating. Omit to call the generator with only SEED."
++                },
++                "modes": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Optional list of mode names. If given, num_tests seeds are run for each mode in turn (one evidence record per mode); overrides mode."
++                },
+                 "rel_tol": {
+                     "type": "number",
+                     "description": "Relative/absolute tolerance above which a numeric mismatch counts as a failure (default 1e-11)."
+@@ -108,40 +117,37 @@ def _compare(out_a, out_b, rel_tol):
+     return False, ok, max_abs, max_rel
+ 
+ 
+-def tool_function(solution_path, reference_path, generator_path, num_tests=200, timeout=10, rel_tol=1e-11):
+-    try:
+-        num_tests = max(1, min(int(num_tests or 200), 2000))
+-    except (TypeError, ValueError):
+-        num_tests = 200
+-    try:
+-        timeout = max(1, min(int(timeout or 10), 120))
+-    except (TypeError, ValueError):
+-        timeout = 10
+-    try:
+-        rel_tol = float(rel_tol) if rel_tol is not None else 1e-11
+-    except (TypeError, ValueError):
+-        rel_tol = 1e-11
+-    for p in (solution_path, reference_path, generator_path):
+-        if not os.path.isfile(p):
+-            return f"Error: file not found: {p}"
++def _has_real_tokens(out):
++    """True if any output token is a non-integer numeric token (has a '.' or an exponent)."""
++    for tok in out.split():
++        if NUM_RE.match(tok) and ('.' in tok or 'e' in tok.lower()):
++            return True
++    return False
++
+ 
++def _run_mode(solution_path, reference_path, generator_path, num_tests, timeout, rel_tol, mode):
++    """Run num_tests seeds for one generator mode; append one evidence record; return report lines."""
+     total = 0
+     exact = 0
+     mismatches = 0
+     max_abs = 0.0
+     max_rel = 0.0
++    max_input_tokens = 0
++    real_valued = False
+     worst = None  # (rel, seed, input, sol_out, ref_out)
+     first_fail = None
+     crashes = []
++    gen_args = [str(mode)] if mode else []
+ 
+     for seed in range(1, num_tests + 1):
+-        gen = subprocess.run([sys.executable, '-I', generator_path, str(seed)], capture_output=True,
+-                             text=True, timeout=60, errors='replace')
++        gen = subprocess.run([sys.executable, '-I', generator_path, str(seed)] + gen_args,
++                             capture_output=True, text=True, timeout=60, errors='replace')
+         if gen.returncode != 0:
+-            return (f"Generator failed at seed {seed} (exit {gen.returncode}).\n"
+-                    f"stderr:\n{_clip(gen.stderr)}")
++            return [f"Generator failed at seed {seed} mode={mode!r} (exit {gen.returncode}).",
++                    f"stderr:\n{_clip(gen.stderr)}"]
+         data = gen.stdout
+         total += 1
++        max_input_tokens = max(max_input_tokens, len(data.split()))
+         sol = _run(solution_path, data, timeout)
+         ref = _run(reference_path, data, timeout)
+         if not sol['ok'] or not ref['ok']:
+@@ -157,6 +163,8 @@ def tool_function(solution_path, reference_path, generator_path, num_tests=200,
+             if len(crashes) >= 3:
+                 break
+             continue
++        if not real_valued:
++            real_valued = _has_real_tokens(sol['stdout']) or _has_real_tokens(ref['stdout'])
+         is_exact, ok, a, r = _compare(sol['stdout'], ref['stdout'], rel_tol)
+         if is_exact:
+             exact += 1
+@@ -177,17 +185,24 @@ def tool_function(solution_path, reference_path, generator_path, num_tests=200,
+         'solution_sha256': file_sha256(solution_path),
+         'reference_path': os.path.abspath(reference_path),
+         'reference_sha256': file_sha256(reference_path),
++        'generator_path': os.path.abspath(generator_path),
++        'mode': mode,
+         'num_tests': total,
+         'mismatches': mismatches,
+         'crashes': len(crashes),
+         'max_rel': max_rel,
+         'max_abs': max_abs,
++        'max_input_tokens': max_input_tokens,
++        'real_valued': real_valued,
+         'rel_tol': rel_tol,
+         'first_failure': _failure_detail(first_fail),
+     })
+ 
+     lines = [
++        f"mode: {mode!r}",
+         f"tests run: {total}",
++        f"max input tokens: {max_input_tokens}",
++        f"real-valued outputs detected: {real_valued}",
+         f"exact string matches: {exact}",
+         f"mismatches beyond rel_tol={rel_tol}: {mismatches}",
+         f"max abs error: {max_abs}",
+@@ -210,4 +225,34 @@ def tool_function(solution_path, reference_path, generator_path, num_tests=200,
+         lines += [f"--- crash/timeout (seed {c['seed']}) ---", f"input:\n{c['input']}",
+                   f"solution exit={c['solution']['exit']} stderr:\n{c['solution']['stderr']}",
+                   f"reference exit={c['reference']['exit']} stderr:\n{c['reference']['stderr']}"]
+-    return "\n".join(lines)
++    return lines
++
++
++def tool_function(solution_path, reference_path, generator_path, num_tests=200, timeout=10, rel_tol=1e-11,
++                  mode=None, modes=None):
++    try:
++        num_tests = max(1, min(int(num_tests or 200), 2000))
++    except (TypeError, ValueError):
++        num_tests = 200
++    try:
++        timeout = max(1, min(int(timeout or 10), 120))
++    except (TypeError, ValueError):
++        timeout = 10
++    try:
++        rel_tol = float(rel_tol) if rel_tol is not None else 1e-11
++    except (TypeError, ValueError):
++        rel_tol = 1e-11
++    for p in (solution_path, reference_path, generator_path):
++        if not os.path.isfile(p):
++            return f"Error: file not found: {p}"
++    if isinstance(modes, str):
++        modes = [modes]
++    if modes:
++        mode_list = [str(m) for m in modes][:10]
++    else:
++        mode_list = [str(mode)] if mode else [None]
++
++    out = []
++    for m in mode_list:
++        out += _run_mode(solution_path, reference_path, generator_path, num_tests, timeout, rel_tol, m)
++    return "\n".join(out)

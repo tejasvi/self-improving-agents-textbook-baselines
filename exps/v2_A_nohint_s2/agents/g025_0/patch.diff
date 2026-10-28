@@ -1,0 +1,163 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 6cefcc7..20a2e2f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,8 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
++import sys
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -122,6 +124,64 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
++    def _patch_nonempty(self):
++        """True if the git diff versus base_commit has any content."""
++        return bool(diff_versus_commit(self.git_tempdir, self.base_commit).strip())
++
++    def _target_file_ok(self):
++        """
++        True if solution.py (or any new/modified .py file in the diff) exists
++        and passes `python -m py_compile`.
++        """
++        candidates = []
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
++        if os.path.isfile(solution_path):
++            candidates.append(solution_path)
++        diff = diff_versus_commit(self.git_tempdir, self.base_commit)
++        for line in diff.splitlines():
++            if line.startswith('+++ b/') and line.endswith('.py'):
++                path = os.path.join(self.git_tempdir, line[len('+++ b/'):].strip())
++                if os.path.isfile(path) and path not in candidates:
++                    candidates.append(path)
++        if not candidates:
++            return False
++        for path in candidates:
++            try:
++                result = subprocess.run(
++                    [sys.executable, '-m', 'py_compile', path],
++                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
++                )
++            except subprocess.TimeoutExpired:
++                return False
++            if result.returncode != 0:
++                safe_log(f"py_compile failed for {path}: {result.stderr.decode(errors='replace')}")
++                return False
++        return True
++
++    def _extract_code_block(self, text):
++        """Return the contents of the first ```python fenced block in text, or None."""
++        if not text:
++            return None
++        match = re.search(r"```python[ \t]*\n(.*?)```", text, re.DOTALL)
++        return match.group(1) if match else None
++
++    def _last_assistant_text(self, msg_history):
++        """Concatenate the text of the last assistant message in msg_history."""
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            parts = []
++            for block in content or []:
++                if isinstance(block, dict) and block.get('type') == 'text':
++                    parts.append(block.get('text', ''))
++                elif hasattr(block, 'text') and isinstance(getattr(block, 'text'), str):
++                    parts.append(block.text)
++            return '\n'.join(parts)
++        return ''
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -165,26 +225,69 @@ IMPORTANT:
+ - Never end your turn with only a plan or only code in the reply. You must actually create/edit the solution file with the editor tool before finishing.
+ - Do not finish until the solution file exists and passes all sample tests.
+ - Avoid infinite loops or waiting on input in your test commands; always provide input and use timeouts (e.g. `timeout 10`).
++"""
++        if 'interactive' in self.problem_statement.lower():
++            workflow += """
++INTERACTIVE PROBLEM: This problem is interactive. Build a local judge/simulator script under /tmp that runs solution.py through subprocess pipes (stdin/stdout). Generate a hidden random input (e.g. a random array), answer each query from the solution according to the hidden input, count the queries and validate both the query count limit and the final answer. The solution must flush stdout after every query print (e.g. `print(..., flush=True)`). Test the solution with this judge on several random hidden inputs, including edge cases.
+ """
+         instruction = f"{task}{workflow}"
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Completion check: make sure a non-empty patch exists. Retry a bounded number of times.
+-        for attempt in range(3):
+-            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if diff.strip():
++        # Completion check: make sure a non-empty, compilable solution exists.
++        # Escalating bounded recovery strategies (no unbounded loops).
++        strategies = [
++            (
++                "keep_history",
++                "Your previous turn made no tool calls, so no solution file was written. "
++                "You must call the editor tool now to create the solution file (solution.py in the repository "
++                "unless the task specifies another file) with a complete implementation. "
++                "Do not reply with only text or a plan; make the tool call.",
++                False,
++            ),
++            (
++                "fresh_history",
++                f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"The repository is in {self.git_tempdir}. Create solution.py now with the editor tool; "
++                "the first version can be simple. Use bash to run it on the sample input afterwards.",
++                True,
++            ),
++            (
++                "code_block_fallback",
++                "Reply with the complete program as a single ```python code block and nothing else. "
++                "It must read stdin and write stdout (or implement the required Solution class method) "
++                "and be a complete, runnable file.",
++                None,
++            ),
++        ]
++
++        patch_ok = self._patch_nonempty() and self._target_file_ok()
++        for attempt, (name, prompt, fresh) in enumerate(strategies, start=1):
++            if patch_ok:
+                 break
+-            safe_log(f"Empty patch detected (attempt {attempt + 1}); requesting implementation.")
+-            retry_msg = (
+-                "Your patch is empty. The solution file still has not been written. "
+-                "Implement the full solution now, save it with the editor tool, and run the sample tests "
+-                "from the problem statement via bash. Do not reply with only a plan."
+-            )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-
+-        # Optional verification pass once a non-empty patch exists.
+-        diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-        if diff.strip():
++            safe_log(f"Empty or non-compilable patch detected; recovery attempt {attempt} (strategy: {name}).")
++            if name == "code_block_fallback":
++                reply_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                code = self._extract_code_block(self._last_assistant_text(reply_history))
++                if code is None:
++                    safe_log("Fallback: no ```python code block found in reply.")
++                else:
++                    target = os.path.join(self.git_tempdir, 'solution.py')
++                    with open(target, 'w') as f:
++                        f.write(code)
++                    safe_log(f"Fallback: wrote {len(code)} characters to {target}.")
++                msg_history = reply_history
++            else:
++                if fresh:
++                    msg_history = []
++                msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            patch_ok = self._patch_nonempty() and self._target_file_ok()
++            safe_log(f"Recovery attempt {attempt} ({name}) result: patch_ok={patch_ok}")
++
++        if not patch_ok:
++            safe_log("WARNING: all recovery strategies exhausted; patch is still empty or does not compile.")
++
++        # Optional verification pass once a non-empty, compilable patch exists.
++        if patch_ok:
+             verify_msg = """Now verify your solution thoroughly before finishing:
+ 1. Re-run all sample tests from the problem statement via bash and confirm the outputs match exactly.
+ 2. Run a random stress test comparing your solution against your brute-force reference on many small random inputs. Fix any mismatch.

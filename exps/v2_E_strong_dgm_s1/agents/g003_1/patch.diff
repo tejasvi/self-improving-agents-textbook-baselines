@@ -1,0 +1,168 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index bf06de5..425f8f8 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,10 +3,11 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, filter_patch_by_files
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -93,6 +94,50 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++
++HELPER_PREFIXES = ('test_', 'brute', 'gen', 'checker', 'sample')
++HELPER_MARKERS = ('_test.', '.test.')
++PRIMARY_NAME = 'solution.py'
++
++def _is_helper_file(name):
++    base = os.path.basename(name).lower()
++    return base.startswith(HELPER_PREFIXES) or any(m in base for m in HELPER_MARKERS)
++
++def _split_patch_blocks(patch_str):
++    """Split a git diff into {filename: block_text}, keyed by the b/ path."""
++    blocks = {}
++    current = None
++    for line in patch_str.splitlines():
++        if line.startswith("diff --git"):
++            m = re.match(r"diff --git a/(.*) b/(.*)$", line)
++            current = m.group(2) if m else line
++            blocks[current] = [line]
++        elif current is not None:
++            blocks[current].append(line)
++    return {k: "\n".join(v) for k, v in blocks.items()}
++
++def _has_code_lines(lines):
++    for line in lines:
++        s = line.strip()
++        if s and not s.startswith('#'):
++            return True
++    return False
++
++def _is_degenerate_history(msg_history):
++    """True when every assistant reply is empty or '(no output)'."""
++    texts = []
++    for msg in msg_history or []:
++        if msg.get('role') != 'assistant':
++            continue
++        content = msg.get('content')
++        if isinstance(content, str):
++            texts.append(content)
++        elif isinstance(content, list):
++            for block in content:
++                if isinstance(block, dict) and block.get('type') == 'text':
++                    texts.append(block.get('text', ''))
++    return all((not t.strip()) or t.strip() == '(no output)' for t in texts)
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -137,6 +182,37 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++
++    def _has_primary_edit(self):
++        """
++        True if the primary deliverable (solution.py, or if absent any non-helper source file)
++        has added lines containing real code (not only comments/whitespace) in the git diff.
++        """
++        patch = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        blocks = _split_patch_blocks(patch)
++        if not blocks:
++            return False
++        if PRIMARY_NAME in blocks or os.path.exists(os.path.join(self.git_tempdir, PRIMARY_NAME)):
++            candidates = [PRIMARY_NAME] if PRIMARY_NAME in blocks else []
++        else:
++            candidates = [f for f in blocks if not _is_helper_file(f)]
++        for name in candidates:
++            added = [l[1:] for l in blocks[name].splitlines()
++                     if l.startswith('+') and not l.startswith('+++')]
++            if not _has_code_lines(added):
++                continue
++            path = os.path.join(self.git_tempdir, name)
++            try:
++                with open(path, 'r', errors='replace') as f:
++                    content = f.read()
++            except OSError:
++                continue
++            # Must be longer than the placeholder and contain real code, not just template comments.
++            if len(content.strip()) <= 62 or not _has_code_lines(content.splitlines()):
++                continue
++            return True
++        return False
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -149,7 +225,9 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
++        method = """Step 0: before anything else, write your best-effort complete solution.py using the editor tool (even if unverified), then improve it with the steps below.
++
++Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py). Save every sample's input as sampleN.in and its expected output as sampleN.out, and diff the solution's output against sampleN.out exactly (e.g. `python3 solution.py < sampleN.in | diff - sampleN.out`).
+@@ -162,9 +240,48 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ For `Solution` class-method tasks, use the method_stress_test tool instead of stress_test: give solution_file, class_name, method_name, reference_file (the relaxed/exact reference from step 4b, with a different reference_method_name only if needed), generator_file (gen(seed, scale) returning the list of positional arguments), scales covering tiny, medium and large, and a few hundred seeds in total. Check the max solution time per scale. Running this comparison over several scales is mandatory before you finish.
+ 8. Run the validator (or compare with the reference) on max-size outputs too, not only on small ones, and time the max-size runs: solution.py must finish well under 2 seconds. A fast output that is invalid is still wrong.
+ 9. Once all tests pass, re-read solution.py and look for untested branches (edge cases such as n=1, empty results, all-equal values, boundary values, negative numbers, answers that must be -1). Add tests that exercise them. Prefer a simpler, verifiable algorithm over an unverifiable clever one: if a clever algorithm (e.g. FFT/convolution tricks) cannot be validated at medium scale against the brute force or the checker, replace it with a simpler approach that fits the time limit.
+-10. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++10. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored.
++
++Guidance: Keep replies concise; do not re-print the README; create files in a single editor call; avoid re-printing large files."""
+         instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = []
++        try:
++            msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"Initial agent call failed: {e}")
++
++        simplest_prompt_tail = (
++            f"Write the simplest correct solution to {self.git_tempdir}/solution.py now with a single editor call. "
++            "Do not explore the repo. Do not write elaborate tests."
++        )
++        for attempt in range(3):
++            try:
++                if self._has_primary_edit():
++                    safe_log(f"Primary edit detected before retry attempt {attempt + 1}; stopping retries.")
++                    break
++            except Exception as e:
++                safe_log(f"Edit check failed: {e}")
++            safe_log(f"No primary edit to solution.py; retry attempt {attempt + 1}/3.")
++            is_last = attempt == 2
++            retry_msg = (
++                f"{task}\n\n"
++                "You have not yet modified solution.py. Your very next action MUST be an editor `create` or `str_replace` call "
++                f"that writes a complete solution to {self.git_tempdir}/solution.py. Do not explore the repo first or write long explanations. "
++                "After saving, run it on the samples and fix it.\n"
++            )
++            if is_last:
++                retry_msg = f"{task}\n\n" + simplest_prompt_tail + "\n"
++            history = [] if _is_degenerate_history(msg_history) else self.get_current_edits()
++            try:
++                msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=history, logging=safe_log)
++            except Exception as e:
++                safe_log(f"Retry attempt {attempt + 1} failed: {e}")
++                continue
++            try:
++                if self._has_primary_edit():
++                    safe_log(f"Retry attempt {attempt + 1} produced a valid edit to solution.py.")
++            except Exception as e:
++                safe_log(f"Edit check after retry {attempt + 1} failed: {e}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

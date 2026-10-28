@@ -1,0 +1,749 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0575ad7..a5da39e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import tempfile
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -24,9 +25,21 @@ CONTINUATION_ROUNDS = 2   # max continuation re-prompts per solver/repair sessio
+ TIME_LIMIT = 4            # per-run limit (s) for samples / stress / max-size runs
+ STRESS_SEEDS = 150        # seeds per stress mode (2 modes -> 300 cases)
+ STRESS_MODES = ['small', 'edge']
+-GEN_MODES = ['small', 'edge', 'medium', 'max']
++GEN_MODES = ['small', 'edge', 'medium', 'adversarial', 'max']
+ MEDIUM_MODE = 'medium'
+ MAX_MODE = 'max'
++ADVERSARIAL_MODE = 'adversarial'
++ORACLE_SEEDS = 12              # seeds per oracle-judged mode (medium, adversarial) in candidate scoring -> 24 cases
++MIN_VERIFIED_MEDIUM = 20       # RESULT: OK requires at least this many oracle-verified medium/adversarial cases
++SLOW_LIMIT = TIME_LIMIT / 2    # adversarial runs slower than this are performance failures
++ORACLE_VALIDATION_SEEDS = 50   # seeds for each of small and edge when validating oracle vs brute (100 cases)
++ORACLE_MEDIUM_CHECKS = 5       # medium inputs the oracle must solve within TIME_LIMIT
++# Trivial wrong programs; a design whose checker/oracle accepts any of them is rejected.
++MUTANTS = {
++    'constant0': "print(0)\n",
++    'echo_first_token': "import sys\ndata = sys.stdin.read().split()\nprint(data[0] if data else 0)\n",
++    'input_length': "import sys\nprint(len(sys.stdin.read()))\n",
++}
+ CHECKED_SEEDS = 4         # seeds per checker-judged medium / max case in candidate scoring
+ CROSS_SEEDS = 40          # extra generated inputs used to cross-check two candidates' verdicts
+ STRESS_BUDGET = 120.0     # seconds per candidate's stress run at most
+@@ -253,6 +266,8 @@ class AgenticSystem:
+         self.gen_path = os.path.join(self.git_tempdir, 'tests', 'gen.py')
+         self.samples_path = os.path.join(self.git_tempdir, 'tests', 'samples.json')
+         self.checker_path = os.path.join(self.git_tempdir, 'tests', 'checker.py')
++        self.oracle_path = os.path.join(self.git_tempdir, 'tests', 'oracle.py')
++        self.mode_path = os.path.join(self.git_tempdir, 'tests', 'mode.txt')
+         self.cands_dir = os.path.join(self.git_tempdir, 'cands')
+         self.solution_path = os.path.join(self.git_tempdir, 'solution.py')
+         self.best_checkpoint_score = None
+@@ -291,6 +306,19 @@ class AgenticSystem:
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+ 
++    def _answer_kind(self):
++        """'unique' or 'multi' from tests/mode.txt (the design's statement of the answer kind); None if invalid."""
++        try:
++            with open(self.mode_path, 'r') as f:
++                value = f.read().strip().lower()
++        except OSError:
++            return None
++        return value if value in ('unique', 'multi') else None
++
++    def _judge_checker(self, kind):
++        """The checker judges outputs only for multi-answer problems; unique answers are compared with the oracle."""
++        return self.checker_path if kind == 'multi' else None
++
+     def _load_samples(self):
+         """Return list of (input, output) from tests/samples.json. Raises ValueError if malformed."""
+         with open(self.samples_path, 'r') as f:
+@@ -367,9 +395,92 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             verdict, msg = solution_check.check_verdict_pair(self.checker_path, text, "0\n", timeout=TIME_LIMIT)
+             if 'traceback' in msg.lower():
+                 problems.append(f"tests/checker.py crashes on {mode} input (dummy output):\n{msg}")
++        problems.extend(self._validate_oracle(samples))
+         if problems:
+             return False, "\n\n".join(problems)
+-        return True, f"tests valid: {len(samples)} samples checked by checker; generator modes {GEN_MODES} run"
++        return True, (f"tests valid: {len(samples)} samples checked by checker; generator modes {GEN_MODES} run; "
++                      f"oracle agrees with brute on {2 * ORACLE_VALIDATION_SEEDS} small/edge inputs; "
++                      f"oracle solves {ORACLE_MEDIUM_CHECKS} medium inputs in time; mutants rejected")
++
++    def _validate_oracle(self, samples):
++        """
++        Oracle checks (returns a list of raw problem reports, empty if all pass):
++          1. tests/oracle.py exists and produces brute's output (exact text) on the samples
++          2. oracle == brute on small and edge generated inputs (ORACLE_VALIDATION_SEEDS seeds each)
++          3. oracle finishes on ORACLE_MEDIUM_CHECKS medium inputs within TIME_LIMIT
++          4. mutant programs (MUTANTS) do not score perfect under the medium/adversarial oracle scoring
++        """
++        if not os.path.isfile(self.oracle_path):
++            return [f"missing file: {self.oracle_path}"]
++        problems = []
++        kind = self._answer_kind()
++        if kind is None:
++            problems.append(f"tests/mode.txt must contain 'unique' or 'multi' (found: {self._read_file(self.mode_path)[:40]!r})")
++        ores = solution_check.run_plain(self.oracle_path, [i for i, _ in samples], None, timeout=TIME_LIMIT)
++        if ores['crashed']:
++            problems.append("tests/oracle.py fails on the samples:\n" + ores['report'])
++        # 2. oracle vs brute on small and edge inputs (exact text match of the two programs' outputs)
++        disagreements = []
++        for mode in ('small', 'edge'):
++            for seed in range(ORACLE_VALIDATION_SEEDS):
++                text, err = solution_check.generate_input(self.gen_path, seed, mode, timeout=TIME_LIMIT)
++                if text is None:
++                    continue
++                bouts = solution_check.collect_outputs(self.brute_path, [text], timeout=TIME_LIMIT, strict=False)
++                oouts = solution_check.collect_outputs(self.oracle_path, [text], timeout=TIME_LIMIT, strict=False)
++                if bouts[0] is None or oouts[0] is None:
++                    if bouts[0] is not None or oouts[0] is not None:
++                        disagreements.append(f"mode {mode} seed {seed}: one of brute/oracle crashed or timed out\n"
++                                             f"input:\n{text.rstrip()}")
++                    continue
++                if solution_check._normalise(bouts[0]) != solution_check._normalise(oouts[0]):
++                    disagreements.append(f"mode {mode} seed {seed}: oracle and brute disagree\n"
++                                         f"input:\n{text.rstrip()}\n"
++                                         f"brute output: {bouts[0].strip()[:200]!r}\n"
++                                         f"oracle output: {oouts[0].strip()[:200]!r}")
++                    if len(disagreements) >= 3:
++                        break
++            if len(disagreements) >= 3:
++                break
++        if disagreements:
++            problems.append("tests/oracle.py disagrees with tests/brute.py:\n" + "\n\n".join(disagreements))
++        # 3. oracle on medium inputs (timing)
++        medium_inputs = []
++        for seed in range(ORACLE_MEDIUM_CHECKS):
++            text, _ = solution_check.generate_input(self.gen_path, seed, MEDIUM_MODE, timeout=TIME_LIMIT)
++            if text is not None:
++                medium_inputs.append(text)
++        if medium_inputs:
++            mres = solution_check.run_plain(self.oracle_path, medium_inputs, None, timeout=TIME_LIMIT)
++            if mres['crashed']:
++                problems.append(f"tests/oracle.py fails or exceeds {TIME_LIMIT}s on medium inputs:\n" + mres['report'])
++        # 4. mutants: trivial wrong programs must not pass the oracle-judged scoring
++        problems.extend(self._mutant_check(kind))
++        return problems
++
++    def _mutant_check(self, kind):
++        """Score trivial wrong programs against the oracle on small/edge/medium/adversarial inputs (light scoring)."""
++        problems = []
++        tmp = tempfile.mkdtemp(prefix='mutants_')
++        try:
++            for name, src in MUTANTS.items():
++                path = os.path.join(tmp, f"{name}.py")
++                with open(path, 'w') as f:
++                    f.write(src)
++                res = solution_check.run_vs_oracle(path, self.oracle_path, self.gen_path, range(ORACLE_SEEDS),
++                                                   modes=[MEDIUM_MODE, ADVERSARIAL_MODE], timeout=TIME_LIMIT,
++                                                   budget=60.0, strict=True,
++                                                   checker_path=self._judge_checker(kind))
++                # the mutant must fail on the oracle-judged inputs; passing all verified cases is a failure
++                if res['verified'] > 0 and res['passed'] == res['verified'] and res['wrong'] == 0 \
++                        and res['crashed'] == 0 and res['unverified'] == 0:
++                    problems.append(f"checker/oracle accepts a trivial wrong program ({name}): all "
++                                    f"{res['verified']} verified medium/adversarial cases passed. Strengthen "
++                                    f"tests/oracle.py and tests/checker.py (the oracle must be exact and the "
++                                    f"checker must compare answers), then re-design the tests.")
++        finally:
++            shutil.rmtree(tmp, ignore_errors=True)
++        return problems
+ 
+     @staticmethod
+     def _corrupt(out):
+@@ -400,6 +511,7 @@ Work from the problem statement alone. Create these files with the editor tool:
+    - no mode or 'small': small random valid inputs (small enough for the brute force). Vary the sizes a lot across seeds (some seeds tiny, some at the upper end of what brute can handle), not always the same size.
+    - 'edge': edge cases (minimal sizes, equal values, boundaries of the constraints), still small.
+    - 'medium': mid-size valid inputs (roughly 50-500 elements or equivalent), too large for the brute force but still quick to solve. Vary sizes across seeds.
++   - 'adversarial': structured worst cases, varied by seed: few distinct values or letters (2-3), skewed distributions, all-equal values, periodic patterns, boundary sizes (smallest and largest n), and values at the extremes of the constraints. Choose a structure from the seed (e.g. seed % k) so that different seeds produce different kinds. Sizes should be medium-to-max so that slow algorithms are exposed.
+    - 'max': a maximum-size valid input using the largest constraints from the statement.
+    Use random.seed(int(sys.argv[1])). Print exactly one valid input to stdout.
+ 3. {self.samples_path}
+@@ -409,9 +521,14 @@ Work from the problem statement alone. Create these files with the editor tool:
+    - If several answers may be valid (e.g. "print any", construction tasks, or any optimal arrangement), verify EVERY constraint stated in the problem on the output (e.g. recompute the claimed value, check each rule), not just the printed verdict.
+    - If the answer is unique, compare the output with the reference answer computed by brute.py for that input (normalise trailing whitespace and line endings) and exit nonzero on mismatch. Make the checker itself independent of the solution's algorithm.
+    - Use only the standard library. The checker must accept every sample expected output in samples.json.
+-   - checker.py must never refuse an input: for large inputs (too big for brute.py) it must verify the output structurally (recompute the claimed values, check every constraint), or print OK_UNVERIFIED and exit 0. Never print 'too large to verify' or 'cannot verify' and never crash on any input.
+-
+-Check that: the generator runs for seeds 0..4 in every mode; brute.py runs on the sample inputs; checker.py accepts each sample expected output and rejects a corrupted one. Do not write anything else under tests/ except these files.
++   - checker.py must never refuse an input: it must verify the output structurally (recompute the claimed values, check every constraint) on every input size. Never print 'too large to verify' or 'cannot verify' and never crash on any input.
++5. {self.oracle_path}
++   An EXACT, polynomial-time reference program (stdin to stdout, same input and output format as the problem). It must use a different method from brute.py (e.g. a DP or a formula-based or greedy-with-proof approach instead of enumeration) and be fast enough for medium inputs (roughly 50-500 elements or equivalent) within a few seconds. It must agree with brute.py on small inputs. Its output must be the exact answer in the problem's format.
++6. {self.mode_path}
++   A single word: `unique` if the problem has exactly one correct output for each input, or `multi` if several outputs may be valid (then checker.py judges the output, and the oracle is only used for diagnostics). The harness compares the solution with the oracle on medium and adversarial inputs when the mode is `unique`.
++
++Check that: the generator runs for seeds 0..4 in every mode; brute.py runs on the sample inputs; checker.py accepts each sample expected output and rejects a corrupted one; oracle.py matches brute.py on small inputs and runs quickly on medium inputs. Do not write anything else under tests/ except these files.
++The harness also runs trivial wrong programs (constant output, echo of the first input token, print of the input length) against the oracle and checker: they must be rejected.
+ Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins.
+ """
+         if feedback:
+@@ -425,19 +542,24 @@ Fix the files so that every check passes.
+ 
+     def _score_candidate(self, path):
+         """
+-        Harness-side scoring. Returns (score, report) where score = (samples_passed, stress_passed, checked_passed, no_crash).
+-        checked_passed counts the checker-judged medium and max-size cases that pass.
+-        Higher is better. Perfect score means all samples pass, all stress cases pass, nothing crashes.
++        Harness-side scoring. Returns (score, report) where
++          score = (samples_passed, stress_passed, checked_passed, verified_medium, no_crash).
++        checked_passed counts the checker-judged medium and max-size cases that pass (unverified excluded).
++        verified_medium counts medium/adversarial cases that the oracle (or, for multi-answer problems, the checker)
++        judged ok; unverified cases do not count. Higher is better.
++        Perfect = all samples pass, all stress cases pass, nothing crashes, verified_medium >= MIN_VERIFIED_MEDIUM,
++        and every adversarial run is under SLOW_LIMIT.
+         """
++        zero = (0, 0, 0, 0, 0)
+         if not os.path.isfile(path):
+-            return (0, 0, 0, 0), f"candidate file not found: {path}"
++            return zero, f"candidate file not found: {path}"
+         if not (os.path.isfile(self.brute_path) and os.path.isfile(self.gen_path)
+                 and os.path.isfile(self.samples_path) and os.path.isfile(self.checker_path)):
+-            return (0, 0, 0, 0), "test harness files are missing; cannot score"
++            return zero, "test harness files are missing; cannot score"
+         try:
+             samples = self._load_samples()
+         except (ValueError, OSError) as e:
+-            return (0, 0, 0, 0), f"tests/samples.json is invalid: {e}"
++            return zero, f"tests/samples.json is invalid: {e}"
+         n = len(samples)
+         report = []
+ 
+@@ -467,6 +589,28 @@ Fix the files so that every check passes.
+                       + (f", unverified: {cres['unverified']}" if cres.get('unverified') else "")
+                       + (" (budget reached)" if cres['budget_hit'] else ""))
+ 
++        # Oracle-judged medium and adversarial cases (exact reference, not a range check). Adversarial runs are timed:
++        # a run over SLOW_LIMIT is a performance failure.
++        ores = {'verified': 0, 'passed': 0, 'unverified': 0, 'crashed': 0, 'wrong': 0, 'slow': 0,
++                'oracle_failed': 0, 'max_time': 0.0, 'budget_hit': False, 'first_failure': None,
++                'first_slow': None, 'total': 0}
++        if os.path.isfile(self.oracle_path):
++            ores = solution_check.run_vs_oracle(
++                path, self.oracle_path, self.gen_path, range(ORACLE_SEEDS),
++                modes=[MEDIUM_MODE, ADVERSARIAL_MODE], timeout=TIME_LIMIT,
++                budget=max(10.0, min(STRESS_BUDGET, self._time_left() / 4)), strict=True,
++                checker_path=self._judge_checker(self._answer_kind()), slow_limit=SLOW_LIMIT)
++            if ores['first_failure']:
++                report.append("medium/adversarial input FAILED (oracle/checker):\n" + ores['first_failure'])
++            if ores['first_slow']:
++                report.append("PERFORMANCE FAILURE (adversarial input too slow):\n" + ores['first_slow'])
++            report.append(f"medium/adversarial (oracle-verified): {ores['verified']}/{ores['total']} verified and passed, "
++                          f"unverified {ores['unverified']}, wrong {ores['wrong']}, crashed {ores['crashed']}, "
++                          f"slow {ores['slow']} (limit {SLOW_LIMIT:.2f} s), max time {ores['max_time']:.3f} s"
++                          + (" (budget reached)" if ores['budget_hit'] else ""))
++        else:
++            report.append("tests/oracle.py is missing: medium/adversarial inputs cannot be verified")
++
+         stress_budget = min(STRESS_BUDGET, max(10.0, self._time_left() / 4))
+         st = solution_check.run_stress(path, self.brute_path, self.gen_path, range(STRESS_SEEDS),
+                                        modes=STRESS_MODES, timeout=TIME_LIMIT, budget=stress_budget,
+@@ -477,11 +621,15 @@ Fix the files so that every check passes.
+                       + (f", unverified: {st['unverified']}" if st.get('unverified') else "")
+                       + (" (budget reached)" if st['budget_hit'] else ""))
+ 
+-        no_crash = int(sres['crashed'] == 0 and max_ok and st['crashed'] == 0 and not lint)
++        no_crash = int(sres['crashed'] == 0 and max_ok and st['crashed'] == 0 and ores['crashed'] == 0
++                       and ores['oracle_failed'] == 0 and not lint)
+         checked_total = cres['total']   # effective totals: inconclusive (unverified) cases are excluded
+-        score = (sres['passed'], st['passed'], checked_passed, no_crash)
+-        perfect = (score == (sres['total'], st['total'], checked_total, 1) and not st['budget_hit']
+-                   and not cres['budget_hit'] and not lint)
++        verified_medium = ores['verified']
++        score = (sres['passed'], st['passed'], checked_passed, verified_medium, no_crash)
++        perfect = (score[:3] == (sres['total'], st['total'], checked_total) and score[4] == 1
++                   and not st['budget_hit'] and not cres['budget_hit'] and not lint
++                   and ores['wrong'] == 0 and ores['slow'] == 0 and not ores['budget_hit']
++                   and verified_medium >= MIN_VERIFIED_MEDIUM)
+         report.append("RESULT: OK" if perfect else "RESULT: FAILED")
+         return score, "\n\n".join(report)
+ 
+@@ -506,7 +654,7 @@ Fix the files so that every check passes.
+ Strategy for this attempt: {hint}
+ 
+ Write your complete solution to {out_path} using the editor tool (command=create). Do NOT write or edit {self.solution_path}; the harness will pick the best candidate.
+-The test harness already exists: the brute force is {self.brute_path}, the generator is {self.gen_path} (usage: `python3 gen.py <seed> [small|edge|max]`) and the samples are in {self.samples_path}.
++The test harness already exists: the brute force is {self.brute_path}, the generator is {self.gen_path} (usage: `python3 gen.py <seed> [small|edge|max|adversarial]`), the exact oracle is {self.oracle_path} (use solution_check with oracle_path on medium and adversarial inputs), and the samples are in {self.samples_path}.
+ Steps:
+ 1. Read the statement and constraints; choose an algorithm whose complexity fits the limits (Python does roughly 10^7 simple operations per second).
+ 2. Write the draft to {out_path} immediately, then run it on every sample and compare exactly.
+@@ -515,6 +663,7 @@ Steps:
+ Do not run any single command longer than 60 seconds.
+ Avoid shadowing Python builtins. Keep replies concise.
+ Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins.
++The oracle {self.oracle_path} is an exact reference for medium and adversarial inputs. Use the solution_check tool with oracle_path={self.oracle_path} and gen_path={self.gen_path} to compare your solution with it on medium and adversarial inputs (modes medium and adversarial), and fix any mismatch or slowness there (an adversarial input must run well under {SLOW_LIMIT:.0f} seconds).
+ """
+         if feedback:
+             prompt += f"\nPrevious attempt feedback (raw harness report):\n{feedback}\n"
+@@ -606,7 +755,7 @@ Raw harness report for this code (inputs, actual output, expected output, stderr
+ Summary of earlier attempts:
+ {hist}
+ 
+-Write the full repaired solution to {out_path} using the editor tool (command=create). Do NOT edit {self.solution_path}. Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins. Re-check against the samples in {self.samples_path} and the stress test with {self.brute_path} and {self.gen_path} (run `python3 gen.py <seed> [small|edge|max]`). Do not run any single command longer than 60 seconds. Keep replies concise.
++Write the full repaired solution to {out_path} using the editor tool (command=create). Do NOT edit {self.solution_path}. Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins. Re-check against the samples in {self.samples_path}, the stress test with {self.brute_path} and {self.gen_path} (run `python3 gen.py <seed> [small|edge|max|adversarial]`), and the medium/adversarial comparison with the oracle {self.oracle_path} (solution_check with oracle_path). Raw reports list oracle mismatches and slow adversarial runs; fix those. Do not run any single command longer than 60 seconds. Keep replies concise.
+ """
+         return self._run_to_completion(prompt, out_path)
+ 
+@@ -614,7 +763,7 @@ Write the full repaired solution to {out_path} using the editor tool (command=cr
+         """Copy the best candidate to solution.py and re-run the final validation."""
+         if best_path and os.path.isfile(best_path):
+             shutil.copyfile(best_path, self.solution_path)
+-        score, report = self._score_candidate(self.solution_path) if os.path.isfile(self.solution_path) else ((0, 0, 0, 0), 'no solution.py')
++        score, report = self._score_candidate(self.solution_path) if os.path.isfile(self.solution_path) else ((0, 0, 0, 0, 0), 'no solution.py')
+         safe_log(f"FINAL solution.py score={score}")
+         if os.path.isfile(self.solution_path) and not self._is_perfect_report(report) and self._time_left() > 0:
+             # Short repair session on the final file, using the raw strict-mode report (lint / traceback included).
+@@ -704,7 +853,7 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+                 entries = [(self.scores[p][0], p, self.scores[p][1]) for _, p, _ in entries]
+ 
+         best = self._pick_best(entries) if entries else None
+-        best_score, best_path, best_report = best if best else ((0, 0, 0, 0), None, 'no candidate produced a file')
++        best_score, best_path, best_report = best if best else ((0, 0, 0, 0, 0), None, 'no candidate produced a file')
+ 
+         # 3. Reflection: repair the best candidate, keep best-so-far
+         wrong_streak = 0
+diff --git a/tests/test_checkpoint_stall.py b/tests/test_checkpoint_stall.py
+index 4872bc8..28fd48e 100644
+--- a/tests/test_checkpoint_stall.py
++++ b/tests/test_checkpoint_stall.py
+@@ -33,7 +33,7 @@ def test_checkpoint_copies_only_on_improvement(tmp_path):
+     cand.write_text(CORRECT)
+     assert agent._checkpoint(str(cand), (1, 0, 0, 0)) is False  # equal: not copied
+     assert (root / "solution.py").read_text() == WRONG
+-    assert agent._checkpoint(str(cand), (0, 0, 0, 0)) is False  # worse: not copied
++    assert agent._checkpoint(str(cand), (0, 0, 0, 0, 0)) is False  # worse: not copied
+     assert (root / "solution.py").read_text() == WRONG
+     assert agent._checkpoint(str(cand), (2, 0, 0, 0)) is True  # better: copied
+     assert (root / "solution.py").read_text() == CORRECT
+@@ -65,7 +65,7 @@ def test_continuation_stops_on_unchanged_file(tmp_path, monkeypatch):
+     calls = []
+     monkeypatch.setattr(coding_agent, "chat_with_agent", lambda *a, **k: calls.append(1))
+     # score never changes and the file is never edited -> the loop must stop after the first identical round
+-    monkeypatch.setattr(agent, "_score_candidate", lambda p: ((0, 0, 0, 0), "same report"))
++    monkeypatch.setattr(agent, "_score_candidate", lambda p: ((0, 0, 0, 0, 0), "same report"))
+     agent._run_to_completion("task", str(out), max_rounds=5)
+     assert len(calls) == 2  # initial session + one continuation; then stall detected
+ 
+@@ -81,7 +81,7 @@ def test_continuation_stops_on_identical_report(tmp_path, monkeypatch):
+         out.write_text(WRONG + f"# edit {len(calls)}\n")  # file changes every round
+ 
+     monkeypatch.setattr(coding_agent, "chat_with_agent", fake_chat)
+-    monkeypatch.setattr(agent, "_score_candidate", lambda p: ((0, 0, 0, 0), "identical report"))
++    monkeypatch.setattr(agent, "_score_candidate", lambda p: ((0, 0, 0, 0, 0), "identical report"))
+     agent._run_to_completion("task", str(out), max_rounds=5)
+     assert len(calls) == 2
+ 
+diff --git a/tests/test_portability.py b/tests/test_portability.py
+index b01dbe7..e1ab2a9 100644
+--- a/tests/test_portability.py
++++ b/tests/test_portability.py
+@@ -57,6 +57,8 @@ def _agent(tmp_path):
+     (root / "tests" / "gen.py").write_text(GEN)
+     (root / "tests" / "samples.json").write_text(json.dumps(SAMPLES))
+     (root / "tests" / "checker.py").write_text(CHECKER)
++    (root / "tests" / "oracle.py").write_text(BRUTE)
++    (root / "tests" / "mode.txt").write_text("unique\n")
+     agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
+     agent.git_tempdir = str(root)
+     agent._init_pipeline(budget_seconds=600)
+@@ -96,7 +98,7 @@ def test_three_arg_pow_candidate_is_not_perfect(tmp_path):
+     agent, root = _agent(tmp_path)
+     score, rep = agent._score_candidate(_write(root, "pow3.py", POW3))
+     assert "pow() with 3 arguments" in rep
+-    assert score[3] == 0
++    assert score[4] == 0
+     assert rep.splitlines()[-1] == "RESULT: FAILED"
+     assert not agent._is_perfect_report(rep)
+ 
+@@ -104,14 +106,14 @@ def test_three_arg_pow_candidate_is_not_perfect(tmp_path):
+ def test_numpy_candidate_is_not_perfect(tmp_path):
+     agent, root = _agent(tmp_path)
+     score, rep = agent._score_candidate(_write(root, "np.py", NUMPY))
+-    assert "'numpy'" in rep and score[3] == 0
++    assert "'numpy'" in rep and score[4] == 0
+     assert not agent._is_perfect_report(rep)
+ 
+ 
+ def test_modpow_candidate_is_perfect(tmp_path):
+     agent, root = _agent(tmp_path)
+     score, rep = agent._score_candidate(_write(root, "modpow.py", MODPOW))
+-    assert score[3] == 1 and score[0] == len(SAMPLES)
++    assert score[4] == 1 and score[0] == len(SAMPLES)
+     assert "LINT" not in rep
+     assert rep.splitlines()[-1] == "RESULT: OK"
+     assert agent._is_perfect_report(rep)
+diff --git a/tests/test_scoring_selection.py b/tests/test_scoring_selection.py
+index dced58d..fbaf094 100644
+--- a/tests/test_scoring_selection.py
++++ b/tests/test_scoring_selection.py
+@@ -33,6 +33,8 @@ def _agent(tmp_path, samples=SAMPLES):
+     (root / "tests" / "gen.py").write_text(GEN)
+     (root / "tests" / "samples.json").write_text(json.dumps(samples))
+     (root / "tests" / "checker.py").write_text(CHECKER)
++    (root / "tests" / "oracle.py").write_text(BRUTE)
++    (root / "tests" / "mode.txt").write_text("unique\n")
+     agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
+     agent.git_tempdir = str(root)
+     agent._init_pipeline(budget_seconds=600)
+@@ -54,7 +56,7 @@ def _write(root, name, src):
+ def test_perfect_candidate_scores_top(tmp_path):
+     agent, root = _agent(tmp_path)
+     score, rep = agent._score_candidate(_write(root, "good.py", CORRECT))
+-    assert score[0] == 2 and score[3] == 1 and score[1] > 0 and score[2] > 0
++    assert score[0] == 2 and score[4] == 1 and score[1] > 0 and score[2] > 0 and score[3] >= 0
+     assert rep.splitlines()[-1] == "RESULT: OK"
+ 
+ 
+@@ -73,8 +75,8 @@ def test_scores_order_candidates_and_pick_highest(tmp_path):
+     assert best[1].endswith("good.py")
+     by_name = {os.path.basename(p): s for s, p, _ in entries}
+     assert by_name["good.py"] > by_name["wrong.py"]
+-    assert by_name["good.py"][3] == 1
+-    assert by_name["crash.py"][3] == 0
++    assert by_name["good.py"][4] == 1
++    assert by_name["crash.py"][4] == 0
+     assert by_name["wrong.py"][0] == 0
+ 
+ 
+@@ -82,20 +84,20 @@ def test_partial_sample_credit_counts(tmp_path):
+     agent, root = _agent(tmp_path)
+     score, rep = agent._score_candidate(_write(root, "partial.py", WRONG_SAMPLES_ONLY))
+     assert score[0] == 1  # (1, 2) matches the sample; (5, 5) does not
+-    assert score[3] == 1  # no crash, just wrong answers
++    assert score[4] == 1  # no crash, just wrong answers
+     assert "RESULT: FAILED" in rep
+ 
+ 
+ def test_pick_best_ties_keep_earliest_and_empty_is_none(tmp_path):
+     assert coding_agent.AgenticSystem._pick_best([]) is None
+-    entries = [((2, 5, 3, 1), "a.py", ""), ((2, 5, 3, 1), "b.py", "")]
++    entries = [((2, 5, 3, 1, 1), "a.py", ""), ((2, 5, 3, 1, 1), "b.py", "")]
+     assert coding_agent.AgenticSystem._pick_best(entries)[1] == "a.py"
+ 
+ 
+ def test_missing_candidate_scores_zero(tmp_path):
+     agent, root = _agent(tmp_path)
+     score, rep = agent._score_candidate(str(root / "cands" / "nope.py"))
+-    assert score == (0, 0, 0, 0)
++    assert score == (0, 0, 0, 0, 0)
+     assert "not found" in rep
+ 
+ 
+diff --git a/tools/solution_check.py b/tools/solution_check.py
+index 128a68d..2b7fb09 100644
+--- a/tools/solution_check.py
++++ b/tools/solution_check.py
+@@ -30,6 +30,7 @@ def tool_info():
+ * With brute_path and gen_path (stress mode): for seeds 0..num_tests-1, runs `python gen.py <seed>` (or `python gen.py <seed> <mode>` when `mode` is given) to make an input, then runs both the brute-force reference and the solution on it. Stops at the first mismatch, runtime error (nonzero exit) or timeout and prints the input and both outputs.\n
+ * With checker_path: outputs are judged by `python checker.py input output` (exit 0 = valid) instead of text equality.\n
+ * Any stderr is shown verbatim. A nonzero exit code or any stderr output is a failure.\n
++* With oracle_path (plus gen_path): runs the solution against an exact polynomial-time oracle on medium and adversarial generated inputs (modes medium and adversarial, or only `mode` when given). Only oracle-judged cases count as verified; checker-inconclusive cases are reported as unverified. Slow runs are reported as performance failures.\n
+ * Pass the same solution file again after every edit; the check always uses the current contents.""",
+         "input_schema": {
+             "type": "object",
+@@ -42,6 +43,7 @@ def tool_info():
+                 "num_tests": {"type": "integer", "description": "Number of random seeds to try in stress mode (default 200)."},
+                 "mode": {"type": "string", "description": "Optional generator mode (e.g. small, edge, max). If given, the generator is called as `python gen.py <seed> <mode>`. Omit it to call `python gen.py <seed>`."},
+                 "checker_path": {"type": "string", "description": "Optional path to tests/checker.py, called as `python checker.py <input_file> <output_file>` (exit 0 = valid). When given, solution outputs are judged by the checker instead of exact text equality; with brute_path too, the Yes/No first token must also match the brute."},
++                "oracle_path": {"type": "string", "description": "Optional path to tests/oracle.py, an exact polynomial-time reference. With gen_path, the solution is compared with the oracle on medium and adversarial inputs (or on `mode` when given)."},
+                 "timeout": {"type": "integer", "description": "Per-run time limit in seconds (default 10)."}
+             },
+             "required": ["solution_path"]
+@@ -428,6 +430,111 @@ def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=1
+         shutil.rmtree(tmpdir, ignore_errors=True)
+ 
+ 
++def _one_oracle_case(tmpdir, seed, mode, timeout, sol_cmd, checker_path):
++    """
++    One medium/adversarial case for run_vs_oracle. Returns (kind, detail, elapsed), kind in
++    ok | gen | brute | crash | wrong | inconclusive.
++      - checker_path given (multi-answer): the checker alone judges the solution's output.
++      - no checker (unique answer): the solution's output must equal the oracle's output (normalised).
++    The oracle is the tmpdir's _brute.py and must succeed; if it does not, kind='brute' (harness fault).
++    """
++    label = f"seed {seed} mode {mode}"
++    gst, gen_out, gerr, grc, _ = _run([sys.executable, '-I', '_gen.py', *_gen_args(seed, mode)], tmpdir, '', timeout)
++    if gst != 'ok' or grc != 0:
++        return 'gen', f"generator failed on {label}\n" + _fmt_run("gen", gst, gen_out, gerr, grc, 0.0), 0.0
++    test_in = gen_out
++    bst, bout, berr, brc, bel = _run([sys.executable, '-I', '_brute.py'], tmpdir, test_in, timeout)
++    if bst != 'ok' or brc != 0 or berr.strip():
++        return 'brute', (f"oracle failed on {label}\ninput:\n{_clip(test_in).rstrip()}\n"
++                         + _fmt_run("oracle", bst, bout, berr, brc, bel)), bel
++    sst, sout, serr, src_rc, el = _run(sol_cmd, tmpdir, test_in, timeout)
++    if _solution_crashed(sst, src_rc, serr):
++        why = 'timeout' if sst == 'timeout' else (f'exit code {src_rc}' if src_rc != 0 else 'stderr not empty')
++        return 'crash', (f"solution FAILED on {label}: {why}\ninput:\n{_clip(test_in).rstrip()}\n"
++                         + _fmt_run("solution", sst, sout, serr, src_rc, el)), el
++    if checker_path:
++        verdict, msg = _check_verdict(tmpdir, test_in, sout, timeout)
++        if verdict == 'inconclusive':
++            return 'inconclusive', msg, el
++        if verdict == 'wrong':
++            return 'wrong', (f"WRONG ANSWER on {label} (checker rejected the solution's output)\n"
++                             f"input:\n{_clip(test_in).rstrip()}\n"
++                             + _fmt_run("solution", sst, sout, serr, src_rc, el) + "\n" + msg), el
++        return 'ok', '', el
++    if _normalise(sout) != _normalise(bout):
++        return 'wrong', (f"WRONG ANSWER on {label} (differs from the oracle)\ninput:\n{_clip(test_in).rstrip()}\n"
++                         + _fmt_run("solution", sst, sout, serr, src_rc, el)
++                         + "\n" + _fmt_run("oracle (expected)", bst, bout, berr, brc, bel)), el
++    return 'ok', '', el
++
++
++def run_vs_oracle(solution_path, oracle_path, gen_path, seeds, modes=None, timeout=10, budget=_STRESS_BUDGET,
++                  strict=True, checker_path=None, slow_limit=None):
++    """
++    Like run_stress, but the reference is an exact polynomial-time oracle (tests/oracle.py) that is run on
++    medium / adversarial inputs. Judging:
++      - checker_path given (multi-answer problem): the checker judges the solution's output.
++      - otherwise (unique answer): the solution's output must equal the oracle's output (whitespace-normalised).
++    Counts:
++      verified   cases judged ok by the reference (the only ones that count as verified)
++      unverified checker inconclusive (not a pass, not a failure; excluded from total)
++      crashed    solution crash / timeout / nonzero exit / stderr
++      wrong      solution output differs from the oracle (or is rejected by the checker)
++      slow       verified cases whose solution run took longer than slow_limit (performance failure)
++      oracle_failed  the oracle itself crashed or timed out (harness fault, reported as a failure)
++    Returns dict: total, ran, verified, passed (== verified), unverified, crashed, slow, oracle_failed,
++                  max_time, budget_hit, first_failure, first_slow.
++    """
++    seeds = list(seeds)
++    modes = [None] if not modes else list(modes)
++    cases = [(m, s) for m in modes for s in seeds]
++    result = {'total': len(cases), 'ran': 0, 'verified': 0, 'passed': 0, 'unverified': 0, 'crashed': 0,
++              'wrong': 0, 'slow': 0, 'oracle_failed': 0, 'max_time': 0.0, 'budget_hit': False,
++              'first_failure': None, 'first_slow': None}
++    if not cases:
++        return result
++    files = {'_sol.py': solution_path, '_brute.py': oracle_path, '_gen.py': gen_path}
++    if checker_path:
++        files['_checker.py'] = checker_path
++    tmpdir = _tmp_with(files)
++    try:
++        sol_cmd = _portable_runner(tmpdir) if strict else None
++        t_start = time.monotonic()
++        for mode, seed in cases:
++            if time.monotonic() - t_start > budget:
++                result['budget_hit'] = True
++                break
++            result['ran'] += 1
++            kind, detail, el = _one_oracle_case(tmpdir, seed, mode, timeout, sol_cmd, checker_path)
++            result['max_time'] = max(result['max_time'], el)
++            if kind == 'ok':
++                result['verified'] += 1
++                result['passed'] += 1
++                if slow_limit is not None and el > slow_limit:
++                    result['slow'] += 1
++                    if result['first_slow'] is None:
++                        result['first_slow'] = (f"SLOW on mode {mode} seed {seed}: {el:.3f}s "
++                                                f"(limit {slow_limit:.3f}s)\n" + detail)
++                continue
++            if kind == 'inconclusive':
++                result['unverified'] += 1
++                continue
++            if kind == 'brute':
++                result['oracle_failed'] += 1
++                detail = ("ORACLE FAILED (tests/oracle.py crashed or timed out; fix the oracle, not the solution)\n"
++                          + detail)
++            if kind in ('crash', 'gen'):
++                result['crashed'] += 1
++            if kind == 'wrong':
++                result['wrong'] += 1
++            if result['first_failure'] is None:
++                result['first_failure'] = detail
++        result['total'] -= result['unverified']
++        return result
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
+ def run_checked(solution_path, gen_path, checker_path, seeds, modes=('medium', 'max'), timeout=10,
+                 budget=_STRESS_BUDGET, strict=True):
+     """
+@@ -487,7 +594,7 @@ def run_checked(solution_path, gen_path, checker_path, seeds, modes=('medium', '
+ 
+ 
+ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=None, gen_path=None,
+-                  num_tests=200, timeout=10, mode=None, checker_path=None):
++                  num_tests=200, timeout=10, mode=None, checker_path=None, oracle_path=None):
+     try:
+         timeout = max(1, int(timeout or 10))
+         num_tests = max(0, int(num_tests if num_tests is not None else 200))
+@@ -498,9 +605,11 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+     stress = bool(brute_path) or bool(gen_path)
+     if stress and not (brute_path and gen_path):
+         return "Error: stress mode needs both brute_path and gen_path."
+-    if not stress and not inputs:
+-        return "Error: provide `inputs` (for a plain check) or brute_path + gen_path (for stress mode)."
+-    for p in (brute_path, gen_path, checker_path):
++    if oracle_path and not gen_path:
++        return "Error: oracle mode needs gen_path."
++    if not stress and not oracle_path and not inputs:
++        return "Error: provide `inputs` (for a plain check), brute_path + gen_path (for stress mode), or oracle_path + gen_path."
++    for p in (brute_path, gen_path, checker_path, oracle_path):
+         if p and not os.path.isfile(p):
+             return f"Error: file not found: {p}"
+ 
+@@ -536,6 +645,17 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+             report.append(f"stress: {res['passed']}/{res['total']} passed, max time {res['max_time']:.3f} s"
+                           + ("; stopped early (budget)" if res['budget_hit'] else ""))
+ 
++    # ---- oracle mode: medium / adversarial inputs judged against tests/oracle.py ----
++    if oracle_path:
++        omodes = [mode] if mode else ['medium', 'adversarial']
++        res = run_vs_oracle(solution_path, oracle_path, gen_path, range(num_tests), modes=omodes,
++                            timeout=timeout, strict=True, checker_path=checker_path)
++        if res['first_failure']:
++            report.append(res['first_failure'])
++            failed = True
++        report.append(f"oracle (modes {omodes}): verified {res['verified']}/{res['total']}, "
++                      f"unverified {res['unverified']}, max time {res['max_time']:.3f} s")
++
+     if failed:
+         report.append("RESULT: FAILED")
+     else:
+diff --git a/tests/test_oracle.py b/tests/test_oracle.py
+new file mode 100644
+index 0000000..d044680
+--- /dev/null
++++ b/tests/test_oracle.py
+@@ -0,0 +1,134 @@
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++from tools import solution_check
++
++# Problem for these tests: print a + b for "a b" input. Generator: small random pairs, medium/adversarial larger.
++GEN = ("import random, sys\n"
++       "random.seed(int(sys.argv[1]))\n"
++       "mode = sys.argv[2] if len(sys.argv) > 2 else 'small'\n"
++       "if mode in ('medium', 'adversarial', 'max'):\n"
++       "    print(random.randint(10**6, 10**9), random.randint(10**6, 10**9))\n"
++       "else:\n"
++       "    print(random.randint(0, 9), random.randint(0, 9))\n")
++BRUTE = "a, b = map(int, input().split())\nprint(a + b)\n"
++ORACLE_OK = "a, b = map(int, input().split())\nprint(a + b)\n"
++ORACLE_WRONG_MEDIUM = ("a, b = map(int, input().split())\n"
++                       "print(a + b if a < 10**6 else a + b + 1)\n")  # agrees with brute on small inputs only
++CHECKER = ("import sys\n"
++           "inp = open(sys.argv[1]).read().split()\n"
++           "out = open(sys.argv[2]).read().split()\n"
++           "exp = str(sum(map(int, inp)))\n"
++           "if out != [exp]:\n"
++           "    print('expected', exp, 'got', out)\n"
++           "    sys.exit(1)\n")
++SAMPLES = [{"input": "1 2\n", "output": "3\n"}]
++
++
++def _agent(tmp_path, oracle=ORACLE_OK, mode="unique"):
++    root = tmp_path / "repo"
++    (root / "tests").mkdir(parents=True)
++    (root / "cands").mkdir()
++    (root / "tests" / "brute.py").write_text(BRUTE)
++    (root / "tests" / "gen.py").write_text(GEN)
++    (root / "tests" / "samples.json").write_text(json.dumps(SAMPLES))
++    (root / "tests" / "checker.py").write_text(CHECKER)
++    (root / "tests" / "oracle.py").write_text(oracle)
++    (root / "tests" / "mode.txt").write_text(mode + "\n")
++    agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
++    agent.git_tempdir = str(root)
++    agent._init_pipeline(budget_seconds=600)
++    return agent, root
++
++
++def _write(root, name, src):
++    p = root / "cands" / name
++    p.write_text(src)
++    return str(p)
++
++
++def test_oracle_disagreeing_with_brute_is_rejected(tmp_path):
++    agent, root = _agent(tmp_path, oracle="a, b = map(int, input().split())\nprint(a * b)\n")
++    problems = agent._validate_oracle(agent._load_samples())
++    assert any("disagrees with tests/brute.py" in p for p in problems)
++
++
++def test_agreeing_oracle_has_no_oracle_problems(tmp_path):
++    agent, root = _agent(tmp_path)
++    assert agent._validate_oracle(agent._load_samples()) == []
++
++
++def test_mutants_are_rejected_by_oracle_scoring(tmp_path):
++    agent, root = _agent(tmp_path)
++    problems = agent._mutant_check(agent._answer_kind())
++    assert problems == []  # the correct oracle + checker reject all three mutants
++
++
++def test_mutant_accepted_by_weak_oracle_is_reported(tmp_path):
++    # A checker that accepts any output (no comparison) plus an oracle is the 'weak checker' case:
++    # for a multi-answer design the checker judges, so a permissive checker must trigger the mutant report.
++    agent, root = _agent(tmp_path)
++    (root / "tests" / "checker.py").write_text("import sys\nsys.exit(0)\n")
++    (root / "tests" / "mode.txt").write_text("multi\n")
++    problems = agent._mutant_check(agent._answer_kind())
++    assert any("accepts a trivial wrong program" in p for p in problems)
++
++
++def test_unverified_is_not_counted_as_verified(tmp_path):
++    # Checker that always reports the inconclusive marker: every case must be unverified, none verified.
++    root = tmp_path / "r"
++    (root / "tests").mkdir(parents=True)
++    (root / "tests" / "gen.py").write_text(GEN)
++    (root / "tests" / "checker.py").write_text(
++        "import sys\nprint('too large to verify (OK_UNVERIFIED)')\nsys.exit(1)\n")
++    sol = root / "sol.py"
++    sol.write_text(ORACLE_OK)
++    res = solution_check.run_vs_oracle(str(sol), str(sol), str(root / "tests" / "gen.py"),
++                                       range(3), modes=['medium'], timeout=10, strict=True,
++                                       checker_path=str(root / "tests" / "checker.py"))
++    assert res['verified'] == 0
++    assert res['unverified'] == 3
++    assert res['total'] == 0
++
++
++def test_perfect_requires_verified_medium_minimum(tmp_path, monkeypatch):
++    agent, root = _agent(tmp_path)
++    good = _write(root, "good.py", ORACLE_OK)
++    real = solution_check.run_vs_oracle
++
++    def few(*a, **kw):
++        res = real(*a, **kw)
++        res['verified'] = res['passed'] = 5          # below MIN_VERIFIED_MEDIUM
++        return res
++    monkeypatch.setattr(solution_check, "run_vs_oracle", few)
++    score, rep = agent._score_candidate(good)
++    assert score[3] == 5
++    assert rep.splitlines()[-1] == "RESULT: FAILED"
++
++
++def test_perfect_requires_no_slow_adversarial(tmp_path, monkeypatch):
++    agent, root = _agent(tmp_path)
++    good = _write(root, "good.py", ORACLE_OK)
++    real = solution_check.run_vs_oracle
++
++    def slow(*a, **kw):
++        res = real(*a, **kw)
++        res['slow'] = 1
++        return res
++    monkeypatch.setattr(solution_check, "run_vs_oracle", slow)
++    score, rep = agent._score_candidate(good)
++    assert rep.splitlines()[-1] == "RESULT: FAILED"
++
++
++def test_wrong_on_medium_candidate_is_not_perfect(tmp_path):
++    agent, root = _agent(tmp_path)
++    wrong = _write(root, "cap.py", ORACLE_WRONG_MEDIUM)
++    score, rep = agent._score_candidate(wrong)
++    assert score[0] == 1           # samples and small stress still pass
++    assert score[4] == 1
++    assert rep.splitlines()[-1] == "RESULT: FAILED"
++    assert "medium/adversarial input FAILED" in rep

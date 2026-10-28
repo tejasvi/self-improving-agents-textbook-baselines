@@ -1,0 +1,460 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ca0569c..ed5b005 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -10,6 +10,7 @@ import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, simple_chat
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools import stress_test as stress_tool
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -330,6 +331,216 @@ Copy the sample inputs and outputs exactly, preserving line breaks. If there are
+ 
+         return "BRIEFING FROM PRIOR SESSIONS (continue from this progress; do NOT redo earlier exploration):\n\n" + "\n\n".join(parts) + "\n\n"
+ 
++    def _build_oracle_and_gen(self, samples, attempts=2):
++        """
++        Ask the LLM for a brute-force oracle and a seeded random generator, write them to
++        /tmp/auto_oracle_<pid>.py and /tmp/auto_gen_<pid>.py, and sanity-check the oracle on the
++        small samples. Returns (oracle_path, gen_path, note), or (None, None, reason) on failure.
++        """
++        pid = os.getpid()
++        oracle_path = f"/tmp/auto_oracle_{pid}.py"
++        gen_path = f"/tmp/auto_gen_{pid}.py"
++        small_samples = [s for s in samples if len(s["input"]) <= 300][:5]
++        sample_text = "\n".join(
++            f"--- sample input ---\n{s['input']}--- sample output ---\n{s['output']}"
++            for s in small_samples
++        ) or "(no small samples available)"
++
++        feedback = ""
++        last_reason = "no response"
++        for attempt in range(attempts):
++            prompt = f"""You are helping verify a competitive programming solution. Write two Python programs for the problem below.
++
++1. ORACLE: a trustworthy brute-force solution. It reads the input from stdin and prints the answer in exactly the required output format. It must be obviously correct (exhaustive search or direct simulation, no clever formulas). It must run FAST on tiny inputs: use scaled-down parameters (small N, small K, small coordinates, small values) so that each run takes well under 1 second. It must handle the case where the problem's answer is a multi-valued/canonical output by producing the same canonical answer as the official problem statement.
++2. GENERATOR: a program that reads one integer seed from sys.argv[1], uses random.Random(seed) (only), and prints ONE random valid input in the exact input format, with SMALL parameters (so that the oracle is fast). Vary sizes across seeds, include edge cases (minimum values, duplicates, ties) frequently.
++
++Return exactly two tagged blocks and nothing else:
++<oracle_code>
++...python code...
++</oracle_code>
++<generator_code>
++...python code...
++</generator_code>
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++Small sample tests from the statement (the oracle must reproduce these outputs):
++{sample_text}
++{feedback}"""
++            text = simple_chat(prompt, model=self.code_model, max_tokens=8192, logging=safe_log) or ""
++            oracle_code, gen_code = self._parse_oracle_gen_response(text)
++            if not oracle_code or not gen_code:
++                last_reason = "could not parse <oracle_code>/<generator_code> blocks from the response"
++                safe_log(f"[oracle] attempt {attempt + 1}: {last_reason}")
++                feedback = f"\nYour previous answer could not be parsed: {last_reason}. Return exactly the two tagged blocks.\n"
++                continue
++            with open(oracle_path, "w") as f:
++                f.write(oracle_code.rstrip() + "\n")
++            with open(gen_path, "w") as f:
++                f.write(gen_code.rstrip() + "\n")
++
++            # The generator must produce a non-empty input for a seed.
++            gcode, gout, gerr, gtimeout = self._run_py(["python3", gen_path, "0"], None, 10)
++            if gtimeout or gcode != 0 or not gout.strip():
++                last_reason = f"generator failed for seed 0 (timeout={gtimeout}, exit={gcode}, stderr={gerr.strip()[:300]})"
++                safe_log(f"[oracle] attempt {attempt + 1}: {last_reason}")
++                feedback = f"\nYour previous generator failed: {last_reason}.\n"
++                continue
++
++            # Sanity-check the oracle on the small samples (timeout protects against slow oracles).
++            mismatch = None
++            for sample in small_samples:
++                stdin_text = sample["input"] if sample["input"].endswith("\n") else sample["input"] + "\n"
++                ocode, oout, oerr, otimeout = self._run_py(["python3", oracle_path], stdin_text, 10)
++                if otimeout:
++                    mismatch = "the oracle TIMED OUT on a small sample"
++                    break
++                if ocode != 0:
++                    mismatch = f"the oracle crashed (exit {ocode}): {oerr.strip()[:300]}"
++                    break
++                if oout.split() != sample["output"].split():
++                    mismatch = (f"the oracle output differs from the sample.\n"
++                                f"input:\n{sample['input']}expected:\n{sample['output']}got:\n{oout}")
++                    break
++            if mismatch:
++                last_reason = mismatch
++                safe_log(f"[oracle] attempt {attempt + 1}: oracle not trustworthy: {mismatch[:500]}")
++                feedback = f"\nYour previous oracle was NOT trustworthy: {mismatch}\nFix the oracle so it reproduces the samples.\n"
++                continue
++
++            note = "oracle reproduces all small samples" if small_samples else "no small samples to check the oracle against"
++            safe_log(f"[oracle] built oracle at {oracle_path} and generator at {gen_path}; {note}.")
++            return oracle_path, gen_path, note
++        return None, None, last_reason
++
++    @staticmethod
++    def _parse_oracle_gen_response(text):
++        """Extract (oracle_code, generator_code) from tagged blocks (fallback: JSON). Strips markdown fences."""
++        def strip_fences(code):
++            code = code.strip()
++            m = re.match(r"^```[a-zA-Z0-9]*\s*\n(.*?)\n?```\s*$", code, re.DOTALL)
++            return m.group(1).strip() if m else code
++
++        oracle = re.search(r"<oracle_code>(.*?)</oracle_code>", text or "", re.DOTALL)
++        gen = re.search(r"<generator_code>(.*?)</generator_code>", text or "", re.DOTALL)
++        if oracle and gen:
++            return strip_fences(oracle.group(1)), strip_fences(gen.group(1))
++        obj = re.search(r"\{.*\}", text or "", re.DOTALL)
++        if obj:
++            try:
++                data = json.loads(obj.group(0))
++                return str(data.get("oracle_code", "")), str(data.get("generator_code", ""))
++            except Exception:
++                pass
++        return "", ""
++
++    @staticmethod
++    def _run_py(argv, stdin_text, timeout):
++        """Run a command with a timeout. Returns (returncode, stdout, stderr, timed_out)."""
++        try:
++            proc = subprocess.run(argv, input=stdin_text, capture_output=True, text=True, timeout=timeout)
++            return proc.returncode, proc.stdout, proc.stderr, False
++        except subprocess.TimeoutExpired:
++            return None, "", "", True
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        """Best-effort text of the last assistant message (dicts or SDK objects)."""
++        def get(obj, key):
++            if isinstance(obj, dict):
++                return obj.get(key)
++            return getattr(obj, key, None)
++        def block_text(block):
++            t = get(block, "text")
++            return t if isinstance(t, str) else None
++        for msg in reversed(msg_history or []):
++            if get(msg, "role") != "assistant":
++                continue
++            content = get(msg, "content")
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                parts = [t for t in (block_text(b) for b in content) if t]
++                return "\n".join(parts)
++            return ""
++        return ""
++
++    def _stress_round(self, solution_path, oracle_path, gen_path, seed_start, num_tests=300):
++        """Run the stress comparison in Python. Returns (passed, report)."""
++        report = stress_tool.tool_function(
++            solution_cmd=f"python3 {solution_path}",
++            oracle_cmd=f"python3 {oracle_path}",
++            gen_cmd=f"python3 {gen_path}",
++            num_tests=num_tests,
++            seed_start=seed_start,
++            timeout_sec=10,
++        )
++        passed = report.startswith("STRESS TEST PASSED")
++        return passed, report
++
++    def _stress_repair_chat(self, task, report, solution_path, oracle_path, gen_path, label):
++        """One repair round for a stress counterexample."""
++        current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        repair_msg = f"""{self._briefing()}{task}
++
++STRESS-TEST COUNTEREXAMPLE ({label}). The solution was compared against a brute-force oracle on random small inputs and it FAILED. Raw report:
++
++{report}
++
++Paths:
++- Solution file: {solution_path}
++- Oracle (trusted brute force): {oracle_path}
++- Random input generator: {gen_path}  (run as `python3 {gen_path} <seed>`)
++
++Current diff:
++{current_diff if current_diff.strip() else '(empty)'}
++
++Instructions:
++- The counterexample is a real failure. A counterexample means the formula/algorithm is WRONG. Do NOT patch the solution for this one input (no special-casing, no if-branches for it).
++- Re-derive the algorithm from the oracle's outputs on the small counterexample and on other small inputs: run the oracle directly with bash (`timeout 10 python3 {oracle_path} < input`), tabulate the answers, and find the structure that explains them.
++- Write the corrected solution to {solution_path} with the editor tool (overwrite it), then re-run the sample inputs.
++- Re-run the stress test on the new solution (the harness will do this automatically) and append your findings to {self.notes_path}.
++- Use `timeout` on every oracle or solution run in bash. Do not reply with text only.
++"""
++        self._last_history = chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"[{label}] repair chat finished.")
++
++    def _stress_phase(self, task, samples):
++        """
++        Unconditional differential stress phase: build an oracle and generator, then run up to 3
++        stress rounds, repairing on mismatch. Returns True if the oracle was built and used.
++        """
++        solution_path = self._solution_path()
++        if not solution_path or not os.path.exists(solution_path):
++            safe_log("[stress] no solution file found; skipping stress phase.")
++            return False
++        oracle_path, gen_path, note = self._build_oracle_and_gen(samples)
++        if not oracle_path:
++            safe_log(f"[stress] could not build a trustworthy oracle ({note}); skipping stress phase.")
++            return False
++        for round_idx in range(3):
++            passed, report = self._stress_round(solution_path, oracle_path, gen_path, seed_start=round_idx * 300)
++            safe_log(f"[stress round {round_idx}] {report}")
++            if passed:
++                safe_log(f"[stress round {round_idx}] passed; stopping stress rounds.")
++                return True
++            self._stress_repair_chat(task, report, solution_path, oracle_path, gen_path, f"stress round {round_idx}")
++            solution_path = self._solution_path() or solution_path
++        return True
++
++    def _unverified_claim(self, last_text):
++        """True if the agent's last message or the notes admit the solution is unverified/guessed."""
++        try:
++            with open(self.notes_path, "r") as f:
++                notes = f.read()
++        except OSError:
++            notes = ""
++        pattern = re.compile(r"unverified|\bguess|not verified", re.IGNORECASE)
++        return bool(pattern.search(last_text or "") or pattern.search(notes))
++
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -350,11 +561,13 @@ Follow this step-by-step workflow:
+ 2) Reason about the algorithm and the complexity needed for the input constraints before writing code.
+    If the statement allows multiple valid outputs (e.g. "if there are multiple solutions, print any"), do NOT assume any valid output is accepted. Assume the grader compares against the reference output, and choose the lexicographically smallest / first-in-natural-enumeration-order answer as the canonical answer. Design the algorithm so that this canonical answer is produced efficiently at max constraints, controlling tie-breaking explicitly.
+ 3) BEFORE exploring, write a straightforward correct brute-force/baseline solution (it may be slow) to the solution file with the editor tool, verify it on small samples, and record that in the notes file. Only then explore faster ideas.
++   The brute-force oracle must run QUICKLY on tiny inputs: scale the parameters down (small N, small K, small coordinates) so every oracle run takes well under a second. Never run an oracle on max-size input without `timeout`.
+    Save the brute force as a versioned oracle /tmp/oracle_v1.py (never overwrite an existing /tmp file: check with `ls /tmp` first and use a new version number such as oracle_v2.py instead of `cat >` over an existing file).
+    Never spend more than ~15 tool calls without updating the solution file; when a new idea is verified against the baseline, overwrite the solution file with it. Do not print large tables or long exploratory output.
+    The file MUST be written to disk.
+ 4) Run the program on every sample input in the problem statement with bash and compare its output with the expected output. Fix any mismatch and re-run until all samples pass. If the statement allows multiple valid outputs, verify that every sample expected output equals your canonical answer; if it does not, your choice of canonical order is wrong, so revise it.
+ 5) For tricky or hard problems, write brute.py (save it as /tmp/oracle_v1.py or a new versioned name; never overwrite an existing oracle in /tmp) that returns the canonical answer by exhaustive enumeration in canonical order, and stress-test solution.py by EXACT output comparison on at least 1000 random small inputs (small value ranges to force duplicates and ties). Only fall back to a validity checker if the exact rule is impossible to match. Fix any differences.
++5b) A pattern-based or empirically guessed formula is NOT final. It must be tested against the brute-force oracle on many small random inputs (exact output comparison) before the solution file is considered final. Say "verified" in your notes only after this test passes.
+ 6) Never end your turn with only text. Replying without writing the solution file to disk counts as FAILURE. Only finish after the solution file has been written and verified.
+ """
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+@@ -418,6 +631,20 @@ Instructions:
+             chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[verify round {round_idx}] repair chat finished.")
+ 
++        # Differential stress phase: always runs (even when samples pass). Compares the solution
++        # against a brute-force oracle on random small inputs and repairs on mismatch.
++        task_for_stress = task
++        self._last_history = []
++        self._stress_phase(task_for_stress, samples)
++
++        # Extra round if the agent's last message or the notes admit the solution is unverified/guessed.
++        last_text = self._last_assistant_text(getattr(self, "_last_history", []))
++        if self._unverified_claim(last_text):
++            safe_log("[stress] agent message or notes mention unverified/guessed results; running one more stress/repair round.")
++            solution_path = self._solution_path()
++            if solution_path and os.path.exists(solution_path):
++                self._stress_phase(task_for_stress, samples)
++
+         # Formula-validation phase: always runs (even when samples pass). Samples and random
+         # tests re-check only the small range the agent already used, so a wrong empirical
+         # formula can survive; this phase pushes the oracle range and tests competing hypotheses.
+@@ -446,7 +673,7 @@ Random tests on a tiny range do NOT validate a formula: a wrong pattern can pass
+ - Append to {self.notes_path} a line of the form `validated up to N=X` (with X the largest N fully checked against the oracle, or the largest N checked in the diversified set), plus the list of hypotheses tested and their outcome.
+ - Do not reply with text only; finish only after the checks have been run and the notes are updated.
+ """
+-            chat_with_agent(val_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            self._last_history = chat_with_agent(val_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[validation round {val_idx}] formula-validation chat finished.")
+ 
+         # Final guarantee: if the solution is still a stub or unchanged, ask once more for the baseline from the notes.
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..769ae97 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import os
++import shlex
+ 
+ def tool_info():
+     return {
+@@ -18,6 +19,14 @@ def tool_info():
+                 "command": {
+                     "type": "string",
+                     "description": "The bash command to run."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Optional. Seconds before the command is killed. Default 90, maximum 110. Use a small value for commands that might hang, e.g. running an oracle or a solution."
++                },
++                "restart": {
++                    "type": "boolean",
++                    "description": "Optional. Set to true to restart the shell before running the command. Accepted for compatibility; each call already starts a fresh shell."
+                 }
+             },
+             "required": ["command"]
+@@ -128,15 +137,33 @@ def filter_error(error):
+         i += 1
+     return '\n'.join(filtered_lines).strip()
+ 
+-async def tool_function_call(command):
++DEFAULT_COMMAND_TIMEOUT = 90
++MAX_COMMAND_TIMEOUT = 110
++
++def wrap_with_timeout(command, timeout_sec):
++    """Run the command under coreutils `timeout` so a hung command cannot eat the whole session window."""
++    quoted = shlex.quote(command)
++    return (
++        f"timeout -k 5 {timeout_sec} bash -c {quoted}; __rc=$?; "
++        f"if [ $__rc -eq 124 ] || [ $__rc -eq 137 ]; then "
++        f"echo '[command killed: exceeded {timeout_sec}s timeout]'; fi"
++    )
++
++async def tool_function_call(command, timeout=None, restart=None):
+     """Execute a command in the bash shell."""
+     try:
++        try:
++            timeout_sec = int(timeout) if timeout not in (None, "") else DEFAULT_COMMAND_TIMEOUT
++        except (TypeError, ValueError):
++            timeout_sec = DEFAULT_COMMAND_TIMEOUT
++        timeout_sec = max(1, min(timeout_sec, MAX_COMMAND_TIMEOUT))
++
+         bash_session = BashSession()
+ 
+         if not bash_session._started:
+             await bash_session.start()
+ 
+-        output, error = await bash_session.run(command)
++        output, error = await bash_session.run(wrap_with_timeout(command, timeout_sec))
+         error = filter_error(error)
+         result = ""
+         if output:
+@@ -147,8 +174,8 @@ async def tool_function_call(command):
+     except Exception as e:
+         return f"Error: {str(e)}"
+ 
+-def tool_function(command):
+-    return asyncio.run(tool_function_call(command))
++def tool_function(command, timeout=None, restart=None):
++    return asyncio.run(tool_function_call(command, timeout=timeout, restart=restart))
+ 
+ if __name__ == "__main__":
+     # Example usage
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..53f1acb
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,108 @@
++import subprocess
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Differential stress test: compare a solution program against a brute-force oracle on randomly generated inputs.
++
++* gen_cmd is a shell command called as `gen_cmd <seed>` for each seed in [seed_start, seed_start + num_tests). It must print one complete random test input (stdin text) to stdout. The generator should produce SMALL inputs so the oracle is fast.
++* solution_cmd and oracle_cmd read the test input on stdin and print the answer on stdout (e.g. `python3 /dgm/solution.py`, `python3 /tmp/auto_oracle_123.py`).
++* Outputs are compared token-wise (whitespace-separated tokens must match exactly, in order).
++* The report contains ONLY the number of tests passed and, for the SMALLEST failing input (by length), the input, the expected (oracle) output and the actual (solution) output. A failing counterexample means the solution's algorithm/formula is wrong: re-derive it from the oracle's outputs rather than patching it.
++* If the oracle itself fails (timeout, crash), the tool reports that instead, so the oracle can be fixed.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command for the solution under test; reads stdin, writes stdout."
++                },
++                "oracle_cmd": {
++                    "type": "string",
++                    "description": "Shell command for the trusted brute-force oracle; reads stdin, writes stdout."
++                },
++                "gen_cmd": {
++                    "type": "string",
++                    "description": "Shell command called as '<gen_cmd> <seed>' that prints one random small test input to stdout."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of random tests to run (seeds seed_start .. seed_start+num_tests-1). Default 300."
++                },
++                "seed_start": {
++                    "type": "integer",
++                    "description": "First seed passed to the generator. Default 0."
++                },
++                "timeout_sec": {
++                    "type": "integer",
++                    "description": "Per-run timeout in seconds for each program. Default 10."
++                }
++            },
++            "required": ["solution_cmd", "oracle_cmd", "gen_cmd"]
++        }
++    }
++
++def _run(cmd, stdin_text, timeout):
++    try:
++        proc = subprocess.run(cmd, shell=True, input=stdin_text, capture_output=True,
++                              text=True, timeout=timeout)
++        return proc.returncode, proc.stdout, proc.stderr, False
++    except subprocess.TimeoutExpired:
++        return None, "", "", True
++
++def _tokens(text):
++    return (text or "").split()
++
++def tool_function(solution_cmd, oracle_cmd, gen_cmd, num_tests=300, seed_start=0, timeout_sec=10):
++    try:
++        num_tests = int(num_tests) if num_tests else 300
++    except (TypeError, ValueError):
++        num_tests = 300
++    try:
++        seed_start = int(seed_start) if seed_start is not None else 0
++    except (TypeError, ValueError):
++        seed_start = 0
++    try:
++        timeout_sec = int(timeout_sec) if timeout_sec else 10
++    except (TypeError, ValueError):
++        timeout_sec = 10
++
++    passed = 0
++    failures = []  # (input_text, expected, actual, reason)
++    for seed in range(seed_start, seed_start + num_tests):
++        gcode, gout, gerr, gtimeout = _run(f"{gen_cmd} {seed}", None, timeout_sec)
++        if gtimeout or gcode != 0:
++            return (f"Generator failed at seed={seed}: "
++                    f"{'timeout' if gtimeout else (gerr.strip()[:500] or f'exit {gcode}')}. Passed {passed} test(s) before this.")
++        test_input = gout
++        if test_input and not test_input.endswith("\n"):
++            test_input += "\n"
++
++        ocode, oout, oerr, otimeout = _run(oracle_cmd, test_input, timeout_sec)
++        if otimeout or ocode != 0:
++            return (f"ORACLE FAILED at seed={seed} (timeout={otimeout}, exit={ocode}); "
++                    f"oracle stderr: {oerr.strip()[:500]}. Passed {passed} test(s) before this. "
++                    f"The oracle must be fast and correct on tiny inputs; fix the oracle or the generator.\n"
++                    f"--- input ---\n{test_input}")
++
++        scode, sout, serr, stimeout = _run(solution_cmd, test_input, timeout_sec)
++        if stimeout:
++            failures.append((test_input, oout, "", "solution TIMEOUT"))
++        elif scode != 0:
++            failures.append((test_input, oout, sout, f"solution exit {scode}: {serr.strip()[:500]}"))
++        elif _tokens(sout) != _tokens(oout):
++            failures.append((test_input, oout, sout, "output mismatch"))
++        else:
++            passed += 1
++
++    total = num_tests
++    if not failures:
++        return f"STRESS TEST PASSED: {passed}/{total} random tests matched the oracle (seeds {seed_start}..{seed_start + total - 1})."
++
++    best = min(failures, key=lambda f: len(f[0]))
++    test_input, expected, actual, reason = best
++    return (f"STRESS TEST FAILED: passed {passed}/{total} tests; {len(failures)} failing. "
++            f"Smallest failing input (reason: {reason}):\n"
++            f"--- input ---\n{test_input}"
++            f"--- expected (oracle) ---\n{expected.strip()}\n"
++            f"--- actual (solution) ---\n{actual.strip()}")

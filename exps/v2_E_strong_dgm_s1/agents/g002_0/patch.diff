@@ -1,0 +1,378 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f425dfd..e1d5c8e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,6 +1,10 @@
+ import argparse
+ import subprocess
+ import logging
++import re
++import shutil
++import time
++import uuid
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+@@ -39,6 +43,37 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++# Harness settings for the multi-attempt loop (all loops are bounded `for` loops)
++MAX_ATTEMPTS = 4          # total solve attempts
++MAX_NUDGES = 2            # re-prompts when solution.py is missing / unchanged
++STRESS_SEEDS = 200        # random seeds for brute-vs-solution stress test
++STRESS_BUDGET_S = 120     # wall-clock cap for the stress phase
++RUN_TIMEOUT_S = 10        # timeout for every solution / generator / brute run
++REPORT_CLIP = 2000        # max chars of any raw input/output in a report
++CODE_CLIP = 30000
++TIME_LIMIT_S = 1.0        # soft limit for a max-size run         # max chars of solution code pasted into a prompt
++
++FIRST_DRAFT_LINE = ("Write a complete first draft of solution.py within your first few tool calls and keep your "
++                    "reasoning brief; never end your turn without having written the file.")
++
++NUDGE_LINE = ("IMPORTANT: the previous reply did not create or change solution.py. "
++              "You must create the file now with the editor tool, then test it.")
++
++ORACLE_TEMPLATE = """You are writing test helpers for the competitive programming problem below. Work in the directory {d}.
++Do NOT read or use solution.py; write the helpers independently from the statement only.
++
++<problem_description>
++{statement}
++</problem_description>
++
++Create these three files in {d}:
++1. brute.py: an obviously correct exhaustive solution that reads stdin and writes stdout exactly like the problem requires. No optimisation; it only has to be correct on small inputs.
++2. gen.py: a random generator of SMALL valid inputs that respects the constraints. Usage `python3 gen.py SEED` prints one input to stdout. Use random.Random(int(sys.argv[1])) so it is deterministic per seed.
++3. gen_big.py: a generator of MAX-SIZE valid inputs. Usage `python3 gen_big.py SEED` prints one input at the largest allowed constraints. Cycle through adversarial shapes by seed (e.g. seed%4: all-equal values, random values, sorted/reverse-sorted, many distinct values or skewed sizes), so that pruning/early-break heuristics are stressed.
++
++Then check brute.py by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Finish by making sure all three files exist."""
++
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -137,11 +172,184 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def forward(self):
++    # ------------------------------------------------------------------
++    # Harness-side evaluation helpers
++    # ------------------------------------------------------------------
++
++    def _sol_path(self):
++        return os.path.join(self.git_tempdir, 'solution.py')
++
++    def _read_solution(self):
++        try:
++            with open(self._sol_path()) as f:
++                return f.read()
++        except OSError:
++            return None
++
++    def _snapshot(self, k):
++        """Copy solution.py to /tmp/attempts/<run>/attempt_k.py. Returns the snapshot path or None."""
++        if not os.path.isfile(self._sol_path()):
++            return None
++        snap_dir = os.path.join('/tmp/attempts', self._run_id)
++        os.makedirs(snap_dir, exist_ok=True)
++        dst = os.path.join(snap_dir, f'attempt_{k}.py')
++        shutil.copyfile(self._sol_path(), dst)
++        return dst
++
++    def _check_basic(self):
++        """solution.py exists, is non-empty and compiles. Returns (ok, message)."""
++        path = self._sol_path()
++        if not os.path.isfile(path):
++            return False, "solution.py does not exist."
++        if os.path.getsize(path) == 0 or not open(path).read().strip():
++            return False, "solution.py is empty."
++        try:
++            p = subprocess.run(['python3', '-m', 'py_compile', 'solution.py'], cwd=self.git_tempdir,
++                               capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++        except subprocess.TimeoutExpired:
++            return False, "py_compile timed out."
++        if p.returncode != 0:
++            return False, "solution.py does not compile:\n" + (p.stderr or p.stdout)[-REPORT_CLIP:]
++        return True, "solution.py exists, is non-empty and compiles."
++
++    def _is_class_task(self):
++        return re.search(r"\bclass\s+Solution\b", self.problem_statement or '') is not None
++
++    @staticmethod
++    def _clean_block(text):
++        lines = [ln for ln in text.splitlines() if not ln.strip().startswith('```')]
++        return '\n'.join(lines).strip('\n')
++
++    def _parse_samples(self):
++        """Extract (index, input, expected) from 'Sample Input N' / 'Sample Output N' blocks."""
++        pat = re.compile(
++            r"Sample Input\s*(\d+)\s*:?[ \t]*\n(.*?)\n[ \t]*Sample Output\s*\1\s*:?[ \t]*\n"
++            r"(.*?)(?=\n[ \t]*\n|\n[ \t]*```|\n[ \t]*Sample Input\s*\d+|\Z)",
++            re.S | re.I)
++        samples = []
++        for m in pat.finditer(self.problem_statement or ''):
++            inp = self._clean_block(m.group(2))
++            out = self._clean_block(m.group(3))
++            samples.append((int(m.group(1)), inp + '\n', out))
++        return samples
++
++    def _run_samples(self):
++        """
++        Run solution.py on each parsed sample. Returns (passed, total, timed_out, report).
++        For Solution-class tasks nothing is run; the report tells the agent to check samples itself.
++        """
++        if self._is_class_task():
++            return 0, 0, False, ("This is a Solution-class task, so the harness did not run the samples. "
++                                 "Check every sample yourself with a driver script that calls Solution.")
++        samples = self._parse_samples()
++        if not samples:
++            return 0, 0, False, "No 'Sample Input N' / 'Sample Output N' blocks were found in the statement."
++        passed, timed_out, parts = 0, False, []
++        for idx, inp, exp in samples:
++            try:
++                p = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=inp,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                timed_out = True
++                parts.append(f"Sample {idx}: TIMEOUT after {RUN_TIMEOUT_S}s\n"
++                             f"input:\n{inp[:REPORT_CLIP]}\nexpected:\n{exp[:REPORT_CLIP]}")
++                continue
++            actual = p.stdout
++            if actual.split() == exp.split():
++                passed += 1
++            else:
++                parts.append(f"Sample {idx}: FAILED\ninput:\n{inp[:REPORT_CLIP]}"
++                             f"expected:\n{exp[:REPORT_CLIP]}\nactual:\n{actual[:REPORT_CLIP]}"
++                             f"stderr:\n{(p.stderr or '')[-REPORT_CLIP:]}\n(exit code {p.returncode})")
++        report = f"Samples passed: {passed}/{len(samples)}."
++        if parts:
++            report += "\n" + "\n".join(parts)
++        return passed, len(samples), timed_out, report
++
++    def _run_stress(self):
+         """
+-        The forward function for the AgenticSystem.
++        If gen.py and brute.py exist, compare solution.py against brute.py on STRESS_SEEDS seeds.
++        Returns (mismatch_found, ran, report). Stops at the first mismatch.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++        gen = os.path.join(self.git_tempdir, 'gen.py')
++        brute = os.path.join(self.git_tempdir, 'brute.py')
++        if not (os.path.isfile(gen) and os.path.isfile(brute)):
++            return False, 0, "Stress skipped: gen.py and/or brute.py missing."
++        start = time.monotonic()
++        ran = 0
++        for seed in range(1, STRESS_SEEDS + 1):
++            if time.monotonic() - start > STRESS_BUDGET_S:
++                break
++            try:
++                g = subprocess.run(['python3', 'gen.py', str(seed)], cwd=self.git_tempdir,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                return True, ran, f"gen.py timed out on seed {seed}."
++            if g.returncode != 0:
++                return True, ran, f"gen.py failed on seed {seed}:\nstderr:\n{(g.stderr or '')[-REPORT_CLIP:]}"
++            inp = g.stdout
++            try:
++                b = subprocess.run(['python3', 'brute.py'], cwd=self.git_tempdir, input=inp,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++                b_out, b_err, b_rc = b.stdout, b.stderr, b.returncode
++            except subprocess.TimeoutExpired:
++                return True, ran, f"brute.py timed out on seed {seed}; input:\n{inp[:REPORT_CLIP]}"
++            try:
++                s = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=inp,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++                s_out, s_err, s_rc = s.stdout, s.stderr, s.returncode
++            except subprocess.TimeoutExpired:
++                return True, ran, (f"solution.py TIMED OUT on seed {seed} (limit {RUN_TIMEOUT_S}s).\n"
++                                   f"input:\n{inp[:REPORT_CLIP]}\nbrute output:\n{b_out[:REPORT_CLIP]}")
++            ran += 1
++            if b_rc != 0:
++                return True, ran, (f"brute.py crashed on seed {seed}; brute may be wrong.\n"
++                                   f"input:\n{inp[:REPORT_CLIP]}\nbrute stderr:\n{b_err[-REPORT_CLIP:]}")
++            if s_out.split() != b_out.split():
++                return True, ran, (f"MISMATCH on seed {seed}.\ninput:\n{inp[:REPORT_CLIP]}"
++                                   f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
++                                   f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
++                                   f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}\n"
++                                   f"Note: brute.py itself may be wrong; verify it against the statement.")
++        return False, ran, f"Stress: {ran} seeds run, no mismatch."
++
++    def _run_timing(self):
++        """Run solution.py on max-size inputs from gen_big.py. Returns (ok, report)."""
++        gen_big = os.path.join(self.git_tempdir, 'gen_big.py')
++        if not os.path.isfile(gen_big):
++            return False, "Timing skipped: gen_big.py missing (write it to test max-size inputs)."
++        lines, ok = [], True
++        for seed in range(4):
++            try:
++                g = subprocess.run(['python3', 'gen_big.py', str(seed)], cwd=self.git_tempdir,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                return False, f"gen_big.py timed out on seed {seed}."
++            if g.returncode != 0:
++                return False, f"gen_big.py failed on seed {seed}:\n{(g.stderr or '')[-REPORT_CLIP:]}"
++            t0 = time.monotonic()
++            try:
++                s = subprocess.run(['python3', 'solution.py'], cwd=self.git_tempdir, input=g.stdout,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                return False, f"solution.py TIMED OUT on max-size seed {seed} (limit {RUN_TIMEOUT_S}s)."
++            dt = time.monotonic() - t0
++            if s.returncode != 0:
++                ok = False
++                lines.append(f"seed {seed}: crashed in {dt:.2f}s, stderr:\n{(s.stderr or '')[-REPORT_CLIP:]}")
++            elif dt > TIME_LIMIT_S:
++                ok = False
++                lines.append(f"seed {seed}: SLOW {dt:.2f}s (soft limit {TIME_LIMIT_S}s)")
++            else:
++                lines.append(f"seed {seed}: ok {dt:.2f}s")
++        return ok, "Max-size timing:\n" + "\n".join(lines)
++
++    # ------------------------------------------------------------------
++    # Prompts
++    # ------------------------------------------------------------------
++
++    def _task_text(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -149,7 +357,9 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
++
++    def _method_text(self):
++        return """Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+@@ -162,8 +372,123 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+    e. Pruning/early-break heuristics do not count as a complexity guarantee; test inputs that defeat them.
+    f. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
+ 6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _retry_prompt(self, feedback, prev_code):
++        code = (prev_code or '')[:CODE_CLIP]
++        code_block = f"```python\n{code}\n```" if code.strip() else "(solution.py is currently missing or empty)"
++        return f"""{self._task_text()}
++You are on a retry. A previous attempt at this problem was judged by an independent harness. The best code so far is in {self._sol_path()}:
++
++{code_block}
++
++Harness report:
++{feedback}
++
++Diagnose the root cause first. If your algorithm is fundamentally wrong, derive a different one; do not just patch special cases.
++Then update solution.py with the editor tool, run the samples yourself (for a Solution class, use a driver script), and re-test with a brute-force stress test and max-size timing. Keep reasoning brief and never end your turn without having written the file.
++"""
++
++    def _oracle_prompt(self):
++        return ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement)
++
++    def _ask(self, prompt):
++        """One fresh (msg_history=[]) agent call. Errors are logged and treated as a no-op reply."""
++        try:
++            chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"Agent call failed: {e!r}")
++
++    def _ask_until_changed(self, prompt, before):
++        """Call the agent; re-prompt (bounded) if solution.py is still missing, empty or unchanged."""
++        for n in range(MAX_NUDGES + 1):
++            p = prompt if n == 0 else f"{NUDGE_LINE}\n\n{prompt}"
++            self._ask(p)
++            cur = self._read_solution()
++            if cur is not None and cur.strip() and cur != before:
++                return True
++            safe_log(f"solution.py missing/empty/unchanged after call {n + 1}; re-prompting.")
++        return False
++
++    # ------------------------------------------------------------------
++    # Main loop
++    # ------------------------------------------------------------------
++
++    def forward(self):
++        """
++        Bounded multi-attempt loop. Each attempt is judged by the harness; the best snapshot wins.
++        Score = (samples_passed, stress_ok, no_timeout); ties go to the later attempt.
++        """
++        self._run_id = uuid.uuid4().hex[:12]
++        best = None  # (score, k, snapshot_path)
++        feedback = None
++        prev_code = self._read_solution()
++        class_task = self._is_class_task()
++
++        for k in range(MAX_ATTEMPTS):
++            before = self._read_solution() if k > 0 else None
++            if k == 0:
++                prompt = self._task_text() + "\n" + self._method_text() + "\n\n" + FIRST_DRAFT_LINE
++            else:
++                prompt = self._retry_prompt(feedback, prev_code)
++            changed = self._ask_until_changed(prompt, before)
++            if not changed:
++                safe_log(f"Attempt {k}: agent produced no solution.py change after {MAX_NUDGES + 1} calls.")
++
++            ok, basic_msg = self._check_basic()
++            if not ok:
++                score = (-1, False, False)
++                feedback = f"Basic check FAILED: {basic_msg}\nWrite solution.py now."
++                safe_log(f"Attempt {k} score={score}\n{feedback}")
++                prev_code = self._read_solution()
++                continue
++
++            passed, total, samples_timeout, sample_report = self._run_samples()
++            report_parts = [basic_msg, sample_report]
++            stress_mismatch = False
++            timing_ok = True
++
++            # No parseable samples is not a failure: the stress phase still runs.
++            samples_all_pass = passed == total and not samples_timeout
++            if class_task:
++                # Solution-class tasks: the harness cannot run them; the agent checks samples itself.
++                pass
++            elif samples_all_pass:
++                # Oracle phase: make brute.py / gen.py / gen_big.py if missing, then stress and time.
++                if not all(os.path.isfile(os.path.join(self.git_tempdir, f))
++                           for f in ('brute.py', 'gen.py', 'gen_big.py')):
++                    self._ask(self._oracle_prompt())
++                stress_mismatch, _, stress_report = self._run_stress()
++                report_parts.append(stress_report)
++                if not stress_mismatch:
++                    timing_ok, timing_report = self._run_timing()
++                    report_parts.append(timing_report)
++            else:
++                report_parts.append("Oracle/stress phase skipped until all samples pass.")
++
++            if class_task:
++                score = (0, True, True)
++            else:
++                score = (passed, not stress_mismatch, not samples_timeout and timing_ok)
++            snap = self._snapshot(k)
++            safe_log(f"Attempt {k} score={score} snapshot={snap}\n" + "\n".join(report_parts))
++
++            # ">=" so a later attempt wins ties, but never loses to a better earlier one.
++            if snap is not None and (best is None or score >= best[0]):
++                best = (score, k, snap)
++            prev_code = self._read_solution()
++            feedback = "\n\n".join(p for p in report_parts if p)
++
++            clean = class_task or (samples_all_pass and not stress_mismatch and timing_ok and not samples_timeout)
++            if clean and (class_task or not stress_mismatch):
++                break  # all harness checks passed for this attempt
++
++        if best is None:
++            safe_log("No valid solution.py was produced by any attempt.")
++            return
++        score, k, snap = best
++        shutil.copyfile(snap, self._sol_path())
++        safe_log(f"Final: restored attempt {k} with score {score} to solution.py")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

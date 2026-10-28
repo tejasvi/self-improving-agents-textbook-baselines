@@ -1,0 +1,292 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 72a3517..3762ad1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,7 +6,8 @@ import os
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, list_non_test_tracked_files, read_starter_files
++from llm import create_client, get_response_from_llm
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, rank_candidate_source_files, read_starter_files
+ from utils.common_utils import extract_code_block
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -129,19 +130,41 @@ def _last_assistant_text(msg_history):
+     return ''
+ 
+ 
+-def _primary_source_file(git_tempdir):
+-    """Return the primary non-test tracked file (first by sorted git ls-files, skipping dotfiles), or None."""
+-    candidates = [p for p in list_non_test_tracked_files(git_tempdir)
+-                  if not os.path.basename(p).startswith('.')]
++_DEFAULT_SOLUTION_FILES = {
++    'python': 'solution.py',
++    'cpp': 'solution.cpp',
++    'java': 'Solution.java',
++    'go': 'solution.go',
++    'rust': 'solution.rs',
++    'javascript': 'solution.js',
++}
++
++
++def _default_solution_file(language):
++    """Name of the source file to create when the repo has no candidate file."""
++    return _DEFAULT_SOLUTION_FILES.get((language or '').lower(), 'solution.py')
++
++
++def _primary_source_file(git_tempdir, problem_statement, language):
++    """Return the top-ranked candidate source file (see rank_candidate_source_files), or None."""
++    candidates = rank_candidate_source_files(git_tempdir, problem_statement, language)
+     return candidates[0] if candidates else None
+ 
+ 
+-def _build_retry_prompt(problem_statement, git_tempdir, primary_path, patch):
++def _build_retry_prompt(problem_statement, git_tempdir, primary_path, patch, candidates, language):
+     """Compact, self-contained retry prompt for a fresh context."""
+     patch_display = patch.strip() if patch.strip() else "EMPTY (no changes at all)"
+-    starter = read_starter_files(git_tempdir)
++    starter = read_starter_files(git_tempdir, paths=candidates)
+     starter_text = "\n\n".join(f"### {path}\n```\n{text}\n```" for path, text in starter) or "(no files)"
+-    primary_text = primary_path if primary_path else "(no non-test file found; create the appropriate source file)"
++    if primary_path:
++        target_text = f"The file to implement is `{primary_path}`."
++        action = (f"Your first action must be an editor tool call with command=edit on `{primary_path}` "
++                  f"containing the full solution. Do not edit any README or documentation file.")
++    else:
++        default = _default_solution_file(language)
++        target_text = f"No candidate source file exists; create `{default}`."
++        action = (f"Your first action must be an editor tool call with command=create on `{default}` "
++                  f"containing the full solution. Do not write code into any README or documentation file.")
+     return f"""I have uploaded a code repository in the directory {git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -151,20 +174,24 @@ def _build_retry_prompt(problem_statement, git_tempdir, primary_path, patch):
+ No source edits were detected so far. The current diff against the base commit is:
+ {patch_display}
+ 
+-Primary source file: {primary_text}
++{target_text}
+ 
+-Current contents of the non-test files:
++Current contents of the candidate source files:
+ {starter_text}
+ 
+-Your first action must be an editor tool call with command=edit on {primary_text} containing the full solution (or command=create if the file does not exist); do not explore further and do not reply with an empty message. The solution must replace the starter stub and keep the required signature, adding any missing imports. After editing, reply with a short summary of the change."""
++{action} Do not explore further and do not reply with an empty message. The solution must replace the starter stub and keep the required signature, adding any missing imports. After editing, reply with a short summary of the change."""
+ 
+ 
+-def _build_fallback_prompt(problem_statement, primary_path, git_tempdir):
+-    """Tool-free prompt asking for the complete primary file contents."""
++def _build_fallback_prompt(problem_statement, primary_path, git_tempdir, language='python'):
++    """Tool-free prompt asking for the complete solution file contents as a single code block."""
++    if primary_path:
++        target = f"the complete contents of `{primary_path}` (inside {git_tempdir})"
++    else:
++        target = f"the complete contents of a new `{_default_solution_file(language)}` file"
+     return f"""Problem:
+ {problem_statement}
+ 
+-Output the complete contents of {primary_path} (inside {git_tempdir}) that solves the problem, in one ```python fenced block, and nothing else. Keep the required signature and any imports needed. If the file is not Python, use the fence language matching its extension."""
++Output {target} that solves the problem, in one fenced code block and nothing else. Keep the required signature and any imports needed. Use the fence language matching the file extension."""
+ 
+ 
+ class AgenticSystem:
+@@ -223,8 +250,21 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
++        candidates = rank_candidate_source_files(self.git_tempdir, self.problem_statement, self.language)
++        primary_path = candidates[0] if candidates else None
++        if primary_path:
++            starter = read_starter_files(self.git_tempdir, paths=candidates)
++            starter_text = "\n\n".join(f"### {path}\n```\n{text}\n```" for path, text in starter) or "(no files)"
++            target_block = (f"The file to implement is `{primary_path}`; its current contents are:\n"
++                            f"```\n{dict(starter).get(primary_path, '')}\n```\n\n"
++                            f"Other candidate files:\n{starter_text}\n")
++        else:
++            target_block = (f"No candidate source file exists in the repository; create "
++                            f"`{_default_solution_file(self.language)}` with the solution.\n")
++
+         instruction = f"""{task}
+ 
++{target_block}
+ Follow these steps in order:
+ 1. Inspect the repository: read the starter file(s) (e.g. with bash `cat`, `ls`, `find`) to learn the required function/class signature and any existing tests.
+ 2. Design the algorithm: reason carefully about the problem's constraints and the most efficient correct approach.
+@@ -243,38 +283,45 @@ Rules:
+             safe_log("[forward] Stall detected: last assistant message is empty after initial pass.")
+ 
+         patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-        primary_path = _primary_source_file(self.git_tempdir)
+ 
+         # Fresh-context retries (bounded loop, never reuses the stalled history)
+         for attempt in range(3):
+             if has_source_edits(patch):
+                 break
+             safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Retrying with fresh context.")
+-            retry_msg = _build_retry_prompt(self.problem_statement, self.git_tempdir, primary_path, patch)
++            retry_msg = _build_retry_prompt(self.problem_statement, self.git_tempdir, primary_path, patch, candidates, self.language)
+             msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             if _is_empty_reply(msg_history):
+                 safe_log(f"[forward] Stall detected on retry attempt {attempt + 1}/3 (empty reply).")
+             patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+ 
+-        # Tool-free fallback: ask for the full primary file as a single code block
++        # Tool-free fallback: plain LLM call (no tools) asking for the full solution as a single code block
+         if not has_source_edits(patch):
+             safe_log("[forward] Still no source edits after retries. Trying tool-free fallback.")
+-            if primary_path is None:
+-                safe_log("[forward] Fallback skipped: no non-test tracked files found.")
++            target = primary_path or _default_solution_file(self.language)
++            fallback_msg = _build_fallback_prompt(self.problem_statement, primary_path, self.git_tempdir, self.language)
++            try:
++                client, client_model = create_client(self.code_model)
++                reply_text, _ = get_response_from_llm(
++                    msg=fallback_msg,
++                    client=client,
++                    model=client_model,
++                    system_message="You are a coding assistant. Reply with only the requested code in one fenced code block.",
++                    msg_history=[],
++                )
++            except Exception as e:
++                safe_log(f"[forward] Fallback LLM call failed: {e}")
++                reply_text = ''
++            code = extract_code_block(reply_text or '')
++            if code and code.strip():
++                if not code.endswith('\n'):
++                    code += '\n'
++                with open(os.path.join(self.git_tempdir, target), 'w', encoding='utf-8') as f:
++                    f.write(code)
++                safe_log(f"[forward] Fallback wrote {len(code)} chars to {target}.")
++                patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+             else:
+-                fallback_msg = _build_fallback_prompt(self.problem_statement, primary_path, self.git_tempdir)
+-                fallback_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-                reply_text = _last_assistant_text(fallback_history)
+-                code = extract_code_block(reply_text)
+-                if code and code.strip():
+-                    if not code.endswith('\n'):
+-                        code += '\n'
+-                    with open(os.path.join(self.git_tempdir, primary_path), 'w', encoding='utf-8') as f:
+-                        f.write(code)
+-                    safe_log(f"[forward] Fallback wrote {len(code)} chars to {primary_path}.")
+-                    patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-                else:
+-                    safe_log("[forward] Fallback produced no code block; nothing written.")
++                safe_log("[forward] Fallback produced no code block; nothing written.")
+ 
+         has_edit = has_source_edits(patch)
+         if has_edit:
+diff --git a/utils/git_utils.py b/utils/git_utils.py
+index 2750cd1..616b210 100644
+--- a/utils/git_utils.py
++++ b/utils/git_utils.py
+@@ -227,14 +227,17 @@ def list_non_test_tracked_files(git_dname):
+     return sorted(f for f in files if f and not is_test_file(f))
+ 
+ 
+-def read_starter_files(git_dname, max_chars_per_file=4000, max_files=5):
++def read_starter_files(git_dname, max_chars_per_file=4000, max_files=5, paths=None):
+     """
+-    Read the contents of the non-test tracked files in `git_dname`.
++    Read the contents of the non-test tracked files in `git_dname` (or of the explicit
++    relative `paths` list, in order, when given).
+     Returns a list of (relative_path, content) tuples. Unreadable files are skipped,
+     and long contents are truncated.
+     """
+     contents = []
+-    for rel_path in list_non_test_tracked_files(git_dname):
++    if paths is None:
++        paths = list_non_test_tracked_files(git_dname)
++    for rel_path in paths:
+         if len(contents) >= max_files:
+             break
+         full_path = os.path.join(git_dname, rel_path)
+@@ -294,16 +297,17 @@ def _most_recent_scratch_file(git_dname, extension, search_root='/tmp', max_file
+     return best_path
+ 
+ 
+-def write_fallback_solution(git_dname, primary_path=None):
++def write_fallback_solution(git_dname, primary_path=None, problem_statement='', language='python'):
+     """
+     Deterministic fallback used when the agent produced no source edits.
+-    Writes a solution into the primary (first non-test tracked) file, choosing the most
++    Writes a solution into the primary file (the top-ranked candidate from
++    `rank_candidate_source_files` unless `primary_path` is given), choosing the most
+     recently modified scratch file with the same extension found outside the repo (e.g. in /tmp),
+     or else a minimal stdin/stdout stub for that extension.
+     Returns the relative path written, or None if there is no primary file.
+     """
+     if primary_path is None:
+-        candidates = list_non_test_tracked_files(git_dname)
++        candidates = rank_candidate_source_files(git_dname, problem_statement, language)
+         if not candidates:
+             return None
+         primary_path = candidates[0]
+@@ -327,3 +331,65 @@ def write_fallback_solution(git_dname, primary_path=None):
+         f.write(text)
+     print(f"write_fallback_solution: wrote {source} to {primary_path}")
+     return primary_path
++
++
++_DOC_METADATA_EXTENSIONS = ('.md', '.txt', '.rst', '.json', '.yml', '.toml', '.cfg', '.lock')
++
++_LANGUAGE_EXTENSIONS = {
++    'python': ('.py',),
++    'cpp': ('.cpp', '.cc'),
++    'java': ('.java',),
++    'go': ('.go',),
++    'rust': ('.rs',),
++    'javascript': ('.js',),
++}
++
++_PLACEHOLDER_RE = re.compile(r'\bpass\b|TODO|Write your solution|not implemented|unimplemented!', re.IGNORECASE)
++
++
++def _is_doc_or_metadata_file(path):
++    base = os.path.basename(path)
++    if base.startswith('.'):
++        return True
++    if base.upper().startswith('LICENSE'):
++        return True
++    return base.lower().endswith(_DOC_METADATA_EXTENSIONS)
++
++
++def rank_candidate_source_files(git_dname, problem_statement, language):
++    """
++    Rank the non-test tracked source files in `git_dname` by how likely they are to be
++    the file the solution must be written into. Documentation/metadata files and dotfiles
++    are dropped. Scoring (generic, language-agnostic heuristics):
++      +100 if the file's basename appears in the problem statement,
++      +20  if the extension matches the task language,
++      +10  if the file is small (<500 chars) or contains placeholder markers,
++      +5   for names like solution/main.
++    Returns the candidate paths sorted by descending score (ties keep path order).
++    """
++    problem_statement = problem_statement or ''
++    lang_exts = _LANGUAGE_EXTENSIONS.get((language or '').lower(), ())
++    scored = []
++    for rel_path in list_non_test_tracked_files(git_dname):
++        if _is_doc_or_metadata_file(rel_path):
++            continue
++        base = os.path.basename(rel_path)
++        stem, ext = os.path.splitext(base)
++        score = 0
++        if base and base in problem_statement:
++            score += 100
++        if ext.lower() in lang_exts:
++            score += 20
++        full_path = os.path.join(git_dname, rel_path)
++        try:
++            with open(full_path, 'r', encoding='utf-8') as f:
++                text = f.read()
++        except (OSError, UnicodeDecodeError):
++            text = ''
++        if len(text) < 500 or _PLACEHOLDER_RE.search(text):
++            score += 10
++        if stem.lower() in ('solution', 'main'):
++            score += 5
++        scored.append((-score, rel_path))
++    scored.sort()
++    return [path for _, path in scored]

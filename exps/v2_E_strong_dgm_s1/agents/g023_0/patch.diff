@@ -1,0 +1,610 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index bb16ab0..516aca3 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,6 +8,8 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import time
++import json
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, simple_completion
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -43,6 +45,22 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++SAMPLE_RE = re.compile(
++    r"Sample Input\s*(\d+)\s*\n(.*?)\n\s*Sample Output\s*\1\s*\n(.*?)"
++    r"(?=\n\s*(?:Sample Input|Explanation|##|$))",
++    re.S,
++)
++EXAMPLE_RE = re.compile(
++    r"Input:?\s*\n(.*?)\n\s*Output:?\s*\n(.*?)"
++    r"(?=\n\s*(?:Input:|Example|Explanation|$))",
++    re.S | re.I,
++)
++BRUTE_TIMEOUT_FEEDBACK = (
++    "The candidate is a brute force that times out on max constraints (too slow). "
++    "Derive an efficient algorithm or closed form. Use brute.py only as an oracle: "
++    "print small-case tables, hypothesize a pattern or formula, and verify it against the brute force."
++)
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -175,6 +193,7 @@ class AgenticSystem:
+             "Write the simplest correct solution first, even if it is slow. Reply with ONLY one ```python code block with the full solution; no explanation.",
+             "Start with at most 5 lines of plan as comments, then the code. Reply with ONLY one ```python code block; no text outside it.",
+         ]
++        think_limit = " Think for at most 10 lines before the code block."
+         failure = None
+         for attempt in range(max_tries):
+             safe_log(f"bootstrap: attempt {attempt + 1}/{max_tries}")
+@@ -184,11 +203,12 @@ class AgenticSystem:
+ {self.problem_statement}
+ </problem_description>
+ 
+-{strategies[attempt % len(strategies)]}"""
++{strategies[attempt % len(strategies)]}{think_limit}"""
+             if failure:
+                 prompt += f"\n\nPrevious attempt failed: {failure}. Fix that in the new code block."
+-            text = simple_completion(prompt, model=self.code_model, logging=safe_log)
+-            match = re.search(r'```python\s*\n(.*?)```', text or '', re.S)
++            text = simple_completion(prompt, model=self.code_model, logging=safe_log, max_tokens=16000)
++            match = re.search(r'```python\s*\n(.*?)```', text or '', re.S) or \
++                re.search(r'```[a-zA-Z]*\s*\n(.*?)```', text or '', re.S)
+             if not match or not match.group(1).strip():
+                 failure = "reply had no ```python code block"
+                 safe_log(f"bootstrap: {failure}")
+@@ -202,64 +222,186 @@ class AgenticSystem:
+             safe_log(f"bootstrap: {failure}")
+         return False
+ 
+-    def _run_program(self, cmd_args, stdin_text, timeout=5):
+-        """Run a command in git_tempdir. Returns (ok, stdout) with ok False on error or timeout."""
++    def _extract_samples(self):
++        """
++        Parse Sample Input N / Sample Output N blocks (fallback: Example / Input: / Output:) from the
++        problem statement and write sampleN.in / sampleN.out into git_tempdir. Writes nothing if no
++        sample is found. Returns the number of samples written.
++        """
++        statement = self.problem_statement or ''
++        samples = []
++        for m in SAMPLE_RE.finditer(statement):
++            samples.append((int(m.group(1)), m.group(2).strip('\n') + '\n', m.group(3).strip() + '\n'))
++        if not samples:
++            for i, m in enumerate(EXAMPLE_RE.finditer(statement), start=1):
++                inp = m.group(1).strip('\n')
++                out = m.group(2).strip()
++                if inp.strip() and out:
++                    samples.append((i, inp + '\n', out + '\n'))
++        if not samples:
++            safe_log("_extract_samples: no samples found in the problem statement")
++            return 0
++        for idx, inp, out in samples:
++            with open(os.path.join(self.git_tempdir, f'sample{idx}.in'), 'w') as f:
++                f.write(inp)
++            with open(os.path.join(self.git_tempdir, f'sample{idx}.out'), 'w') as f:
++                f.write(out)
++        safe_log(f"_extract_samples: wrote {len(samples)} sample(s) to {self.git_tempdir}")
++        return len(samples)
++
++    def _run_timed(self, cmd_args, stdin_text, timeout):
++        """Run cmd in git_tempdir. Returns (ok, stdout, elapsed, timed_out, stderr_tail)."""
++        start = time.time()
+         try:
+             r = subprocess.run(cmd_args, input=stdin_text, cwd=self.git_tempdir,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=timeout, check=False)
+         except subprocess.TimeoutExpired:
+-            return False, "(timeout)"
++            return False, '', float(timeout), True, '(timeout)'
++        except OSError as e:
++            return False, '', time.time() - start, False, str(e)
++        elapsed = time.time() - start
+         if r.returncode != 0:
+-            return False, (r.stdout + r.stderr)[-500:]
+-        return True, r.stdout
++            return False, r.stdout, elapsed, False, (r.stdout + r.stderr)[-500:]
++        return True, r.stdout, elapsed, False, ''
++
++    def _make_large_input(self):
++        """Ask the model for a short generator printing a max-constraint input. Returns text or None."""
++        prompt = f"""Write a short Python 3 program that prints ONE valid input for the problem below, at MAXIMUM constraints
++(largest sizes, largest values, worst-case structure). It must print only the input to standard output.
++Reply with ONLY one ```python code block, at most 30 lines, no explanation.
+ 
+-    def _score_candidate(self, candidate_path, n_stress=100):
++<problem_description>
++{self.problem_statement}
++</problem_description>"""
++        text = simple_completion(prompt, model=self.code_model, logging=safe_log, max_tokens=4000)
++        match = re.search(r'```(?:python)?\s*\n(.*?)```', text or '', re.S)
++        if not match:
++            safe_log("_make_large_input: no code block in reply")
++            return None
++        gen_path = os.path.join(tempfile.gettempdir(), f'large_gen_{os.getpid()}_{id(self)}.py')
++        with open(gen_path, 'w') as f:
++            f.write(match.group(1))
++        ok, out, _, _, err = self._run_timed(['python3', gen_path], None, 10)
++        if not ok or not out.strip():
++            safe_log(f"_make_large_input: generator failed: {err[-200:]}")
++            return None
++        return out
++
++    def _get_large_input(self):
++        """Large input for timing: gen.py at a large scale if present, else a model-written generator."""
++        if getattr(self, '_large_cache', None) is not None:
++            return self._large_cache or None
++        large = None
++        gen = os.path.join(self.git_tempdir, 'gen.py')
++        if os.path.isfile(gen):
++            ok, out, _, _, err = self._run_timed(['python3', gen, '0', '8'], None, 10)
++            if ok and out.strip():
++                large = out
++            else:
++                safe_log(f"_get_large_input: gen.py 0 8 failed: {err[-200:]}")
++        if large is None:
++            large = self._make_large_input()
++        self._large_cache = large or ''
++        return large
++
++    def _score_candidate(self, candidate_path, n_stress=100, sample_timeout=5.0, large_timeout=3.0):
+         """
+-        Score a candidate solution file. Score = (samples passed, stress seeds agreeing with brute.py).
+-        Returns (score_tuple, feedback) where feedback describes the first failure (or '').
++        Score a candidate solution file. Returns a verdict dict:
++        {samples_pass, samples_total, stress_pass, stress_total, max_time, timed_out, perfect, feedback}.
++        perfect is True only if samples_total > 0, all samples pass, no timeout, and all stress cases agree.
+         """
++        feedback = []
++        max_time = 0.0
++        timed_out = False
+         sample_ins = sorted(glob.glob(os.path.join(self.git_tempdir, 'sample*.in')))
+         samples = [(p, p[:-3] + '.out') for p in sample_ins if os.path.isfile(p[:-3] + '.out')]
+-        sample_pass = 0
+-        feedback = ''
++        samples_total = len(samples)
++        samples_pass = 0
+         for in_path, out_path in samples:
+             with open(in_path) as f:
+                 inp = f.read()
+             with open(out_path) as f:
+                 expected = f.read()
+-            ok, got = self._run_program(['python3', candidate_path], inp)
+-            if ok and got.split() == expected.split():
+-                sample_pass += 1
+-            elif not feedback:
+-                feedback = (f"sample {os.path.basename(in_path)} failed.\nInput:\n{inp[:1000]}\n"
+-                            f"Expected:\n{expected[:500]}\nActual:\n{got[:500]}")
++            ok, got, elapsed, to, err = self._run_timed(['python3', candidate_path], inp, sample_timeout)
++            max_time = max(max_time, elapsed)
++            name = os.path.basename(in_path)
++            if to:
++                timed_out = True
++                feedback.append(f"sample {name} timed out after {sample_timeout}s.")
++            elif not ok:
++                feedback.append(f"sample {name} runtime error:\n{err[-500:]}")
++            elif got.split() == expected.split():
++                samples_pass += 1
++            else:
++                feedback.append(f"sample {name} failed.\nInput:\n{inp[:1000]}\n"
++                                f"Expected:\n{expected[:500]}\nActual:\n{got[:500]}")
++
+         stress_pass, stress_total = 0, 0
+         brute = os.path.join(self.git_tempdir, 'brute.py')
+         gen = os.path.join(self.git_tempdir, 'gen.py')
+         if os.path.isfile(brute) and os.path.isfile(gen):
+             for seed in range(n_stress):
+                 scale = 1 + (seed % 2)
+-                g = subprocess.run(['python3', gen, str(seed), str(scale)], cwd=self.git_tempdir,
+-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=False)
+-                if g.returncode != 0 or not g.stdout.strip():
++                ok_g, inp, _, _, _ = self._run_timed(['python3', gen, str(seed), str(scale)], None, 10)
++                if not ok_g or not inp.strip():
+                     continue
+-                stress_total += 1
+-                inp = g.stdout
+-                ok_b, exp = self._run_program(['python3', brute], inp)
++                ok_b, exp, _, b_to, _ = self._run_timed(['python3', brute], inp, sample_timeout)
+                 if not ok_b:
+-                    stress_total -= 1
+                     continue
+-                ok, got = self._run_program(['python3', candidate_path], inp)
+-                if ok and got.split() == exp.split():
++                stress_total += 1
++                ok, got, elapsed, to, err = self._run_timed(['python3', candidate_path], inp, sample_timeout)
++                max_time = max(max_time, elapsed)
++                if to:
++                    timed_out = True
++                    feedback.append(f"random input (gen.py seed {seed} scale {scale}) timed out.")
++                elif ok and got.split() == exp.split():
+                     stress_pass += 1
+-                elif not feedback:
+-                    feedback = (f"random input (gen.py seed {seed} scale {scale}) gave a wrong answer.\n"
+-                                f"Input:\n{inp[:1000]}\nExpected (brute.py):\n{exp[:500]}\nActual:\n{got[:500]}")
+-        score = (sample_pass, stress_pass)
+-        safe_log(f"score: {os.path.basename(candidate_path)} samples {sample_pass}/{len(samples)} "
+-                 f"stress {stress_pass}/{stress_total}")
+-        return score, len(samples), stress_total, feedback
++                elif not ok:
++                    feedback.append(f"random input (gen.py seed {seed} scale {scale}) runtime error:\n{err[-300:]}")
++                else:
++                    feedback.append(f"random input (gen.py seed {seed} scale {scale}) gave a wrong answer.\n"
++                                    f"Input:\n{inp[:1000]}\nExpected (brute.py):\n{exp[:500]}\nActual:\n{got[:500]}")
++                if len(feedback) >= 3:
++                    break
++
++        large = self._get_large_input()
++        if large:
++            ok, _, elapsed, to, err = self._run_timed(['python3', candidate_path], large, large_timeout)
++            max_time = max(max_time, elapsed)
++            if to:
++                timed_out = True
++                feedback.append(f"max-constraint input timed out after {large_timeout}s.")
++            elif not ok:
++                feedback.append(f"max-constraint input runtime error:\n{err[-300:]}")
++        else:
++            safe_log("_score_candidate: no large input available, timing check skipped")
++
++        if samples_total == 0:
++            feedback.append("No sample tests were extracted, so correctness on the samples is unverified.")
++        if timed_out:
++            feedback.insert(0, BRUTE_TIMEOUT_FEEDBACK)
++
++        perfect = (
++            samples_total > 0
++            and samples_pass == samples_total
++            and not timed_out
++            and stress_pass == stress_total
++        )
++        verdict = {
++            "samples_pass": samples_pass,
++            "samples_total": samples_total,
++            "stress_pass": stress_pass,
++            "stress_total": stress_total,
++            "max_time": round(max_time, 3),
++            "timed_out": timed_out,
++            "perfect": perfect,
++            "feedback": "\n".join(feedback),
++        }
++        safe_log(f"score: {os.path.basename(candidate_path)} samples {samples_pass}/{samples_total} "
++                 f"stress {stress_pass}/{stress_total} max_time {verdict['max_time']} "
++                 f"timed_out={timed_out} perfect={perfect}")
++        return verdict
+ 
+     def forward(self):
+         """
+@@ -267,6 +409,8 @@ class AgenticSystem:
+         candidate scoring and selection.
+         """
+         sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        # Write sample files before any LLM call so the agent and the scorer can use them.
++        n_samples = self._extract_samples()
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -287,52 +431,64 @@ Work like a careful competitive programmer. Keep your reasoning short and act wi
+             intro = f"{sol_path} already exists. Review it first."
+         else:
+             intro = f"{sol_path} does not exist or does not compile yet. Use the editor tool now to create it with a complete solution."
++        samples_note = (f"{n_samples} sample(s) were already written as sampleN.in / sampleN.out in {self.git_tempdir}."
++                        if n_samples else "No samples were extracted automatically: create sampleN.in / sampleN.out from the statement yourself.")
+         refine_steps = f"""{intro}
+-1. Save each sample as sampleN.in / sampleN.out in {self.git_tempdir} and run sample_check with solution_cmd='python3 solution.py'. Fix any DIFFERENT sample; match the expected output format exactly.
+-2. Write brute.py (obviously correct, slow is fine) and gen.py (`python3 gen.py SEED SCALE` prints one valid input; cover tiny, medium, duplicate-heavy and edge cases).
++1. {samples_note} Run sample_check with solution_cmd='python3 solution.py'. Fix any DIFFERENT sample; match the expected output format exactly.
++2. Write brute.py (obviously correct, slow is fine) and gen.py (`python3 gen.py SEED SCALE` prints one valid input; cover tiny, medium, duplicate-heavy and edge cases). Save your findings in notes.md as you go.
+ 3. Run stress_test (or method_stress_test for a Solution class) comparing solution against brute.py over a few hundred seeds and several scales. Fix every failure.
+-4. Check timing on max-size inputs (must be well under 2 seconds) and the edge cases (n=1, empty results, all-equal values).
++4. Check timing on max-size inputs (must be well under 2 seconds) and the edge cases (n=1, empty results, all-equal values). A brute force is NOT an acceptable final solution if it is too slow for the max constraints.
+ """
+         refine_prompt = refine_base + "\n" + refine_steps
+         safe_log("phase 2: refinement attempt 1")
+         chat_with_agent(refine_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Phase 3: candidate scoring and selection.
++        # Phase 3: candidate scoring; up to 3 refinements (4 candidates total).
+         candidates_dir = tempfile.mkdtemp(prefix='candidates_')
+-        candidates = []  # (score, path)
+-        last_feedback = ''
+-        for k in range(1, 4):
++        candidates = []  # (verdict, path)
++        max_refinements = 3
++        for k in range(1, max_refinements + 2):
+             if not self._has_solution():
+                 safe_log(f"candidate {k}: no valid solution.py, nothing to snapshot")
+                 break
+             cand_path = os.path.join(candidates_dir, f'solution_{k}.py')
+             shutil.copyfile(sol_path, cand_path)
+-            score, n_samples, n_stress, feedback = self._score_candidate(cand_path)
+-            candidates.append((score, cand_path))
+-            perfect = score[0] == n_samples and score[1] == n_stress
+-            safe_log(f"candidate {k}: score={score} (samples total {n_samples}, stress total {n_stress}) perfect={perfect}")
+-            if perfect or k == 3:
++            verdict = self._score_candidate(cand_path)
++            candidates.append((verdict, cand_path))
++            safe_log(f"candidate {k}: {verdict}")
++            if verdict["perfect"] or k > max_refinements:
+                 break
+-            # Refine again with the failure as context.
+-            different = " Try a DIFFERENT algorithm or approach, since the same fix failed before." if k >= 2 else ""
++            if verdict["timed_out"]:
++                problem = (f"{BRUTE_TIMEOUT_FEEDBACK}\n"
++                           f"Read the existing {os.path.join(self.git_tempdir, 'brute.py')}, notes.md and any table or "
++                           f"notes files in {self.git_tempdir} first.")
++            else:
++                different = " Try a DIFFERENT algorithm or approach, since the same fix failed before." if k >= 2 else ""
++                problem = (f"{sol_path} exists but fails the checks (samples passed "
++                           f"{verdict['samples_pass']}/{verdict['samples_total']}, random stress agreed "
++                           f"{verdict['stress_pass']}/{verdict['stress_total']}).\n"
++                           f"Fix solution.py so it matches the expected output on this case, re-run sample_check and "
++                           f"stress_test, and fix anything else that fails.{different}")
+             refine_prompt = f"""{refine_base}
+-{sol_path} exists but fails the checks (samples passed {score[0]}/{n_samples}, random stress agreed {score[1]}/{n_stress}).
+-Failing case:
+-{feedback or '(no failing case recorded)'}
+-
+-Fix solution.py so it matches the expected output on this case, re-run sample_check and stress_test, and fix anything else that fails.{different}
++{problem}
++Failing case / feedback:
++{verdict['feedback'] or '(no failing case recorded)'}
+ """
+             safe_log(f"phase 2: refinement attempt {k + 1} with feedback")
+             chat_with_agent(refine_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Restore the best-scoring candidate.
++        # Restore the best candidate by (samples passed, not timed out, stress passed).
+         if candidates:
+-            best_score, best_path = max(candidates, key=lambda c: c[0])
++            best_verdict, best_path = max(
++                candidates,
++                key=lambda c: (c[0]["samples_pass"], not c[0]["timed_out"], c[0]["stress_pass"]),
++            )
+             shutil.copyfile(best_path, sol_path)
+-            safe_log(f"phase 3: restored best candidate {best_path} with score {best_score}")
++            safe_log(f"phase 3: restored best candidate {best_path} with verdict {best_verdict}")
+         has_solution = self._has_solution()
+         safe_log(f"forward: final _has_solution() = {has_solution}")
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 1eba8bc..276c402 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -14,8 +14,11 @@ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+ MAX_TURNS = 40
+ MAX_EMPTY_RETRIES = 2
+-FORCED_ACTION_MSG = ("Your reply was empty or cut off by the output limit. Do not analyze further. "
+-                     "Call the editor tool now to create or fix solution.py, keeping your reasoning very short.")
++FORCED_ACTION_MSG = ("Your reply was empty. Do not analyze further. "
++                     "Call a tool now, keeping your reasoning very short.")
++CUTOFF_ACTION_MSG = ("Your reply was cut off by the output limit. Do not keep reasoning in text. "
++                     "Write your findings to notes.md in the working directory (short bullet points: "
++                     "what you tested, results, open questions) and continue with a short tool call.")
+ 
+ def process_tool_call(tools_dict, tool_name, tool_input):
+     try:
+@@ -393,7 +396,8 @@ def chat_with_agent_claude(
+                     logging(f"chat_with_agent: empty or cut-off reply (stop_reason={response.stop_reason}); forced retry {empty_retries}/{MAX_EMPTY_RETRIES}")
+                     assistant_content = [{"type": "text", "text": b.text} for b in text_blocks] or [{"type": "text", "text": "(no output)"}]
+                     new_msg_history.append({"role": "assistant", "content": assistant_content})
+-                    new_msg_history.append({"role": "user", "content": [{"type": "text", "text": FORCED_ACTION_MSG}]})
++                    forced = CUTOFF_ACTION_MSG if cut_off else FORCED_ACTION_MSG
++                    new_msg_history.append({"role": "user", "content": [{"type": "text", "text": forced}]})
+                 else:
+                     break
+             else:
+@@ -519,7 +523,7 @@ def chat_with_agent_openai(
+ 
+     return new_msg_history
+ 
+-def simple_completion(msg, model=CLAUDE_MODEL, logging=print, max_retry=2):
++def simple_completion(msg, model=CLAUDE_MODEL, logging=print, max_retry=2, max_tokens=16000):
+     """
+     Tool-free single-turn completion. Returns the reply text, or '' on failure.
+     Used for bootstrapping a solution without relying on tool calls.
+@@ -534,7 +538,7 @@ def simple_completion(msg, model=CLAUDE_MODEL, logging=print, max_retry=2):
+             if 'claude' in client_model:
+                 response = client.messages.create(
+                     model=client_model,
+-                    max_tokens=16000,
++                    max_tokens=max_tokens,
+                     messages=[{"role": "user", "content": [{"type": "text", "text": msg}]}],
+                 )
+                 text = ''.join((getattr(b, 'text', '') or '') for b in response.content
+diff --git a/solution.py b/solution.py
+index 38692bc..6a3e5ec 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,11 +1,180 @@
++# Plan: standalone helpers for the coding-agent changes, since coding_agent.py is not provided.
++# 1) Extract Sample Input/Output blocks (regex, then Example/Input:/Output: fallback) and write sampleN.in/.out.
++# 2) Run candidates with timeouts and build a structured verdict (samples, stress, max_time, timed_out, feedback).
++# 3) perfect requires samples_total > 0, all samples pass, no timeout, and all stress cases pass.
++# 4) pick_best sorts by (samples_pass, not timed_out, stress_pass); feedback text covers the brute-force timeout case.
++# 5) main reads a problem statement from stdin, writes sample files to a directory, and prints a JSON summary.
++import json
++import os
++import re
++import subprocess
+ import sys
++import time
++
++SAMPLE_RE = re.compile(
++    r"Sample Input\s*(\d+)\s*\n(.*?)\n\s*Sample Output\s*\1\s*\n(.*?)"
++    r"(?=\n\s*(?:Sample Input|Explanation|##|$))",
++    re.S,
++)
++EXAMPLE_RE = re.compile(
++    r"Input:?\s*\n(.*?)\n\s*Output:?\s*\n(.*?)"
++    r"(?=\n\s*(?:Input:|Example|Explanation|$))",
++    re.S | re.I,
++)
++
++BRUTE_TIMEOUT_FEEDBACK = (
++    "The candidate is a brute force that times out on max constraints. "
++    "Derive an efficient algorithm or closed form. Use brute.py only as an oracle: "
++    "print small-case tables, hypothesize a pattern or formula, and verify it "
++    "against the brute force. Read the existing brute.py and notes files first."
++)
++
++
++def extract_samples(statement):
++    """Return list of (index, input_text, output_text) tuples found in the statement."""
++    samples = []
++    if not statement:
++        return samples
++    for m in SAMPLE_RE.finditer(statement):
++        samples.append((int(m.group(1)), m.group(2).strip("\n") + "\n", m.group(3).strip() + "\n"))
++    if not samples:
++        for i, m in enumerate(EXAMPLE_RE.finditer(statement), start=1):
++            inp = m.group(1).strip("\n")
++            out = m.group(2).strip()
++            if inp and out:
++                samples.append((i, inp + "\n", out + "\n"))
++    return samples
++
++
++def write_samples(statement, directory):
++    """Write sampleN.in / sampleN.out into directory. Returns number written (0 = nothing written)."""
++    samples = extract_samples(statement)
++    if not samples:
++        return 0
++    os.makedirs(directory, exist_ok=True)
++    for idx, inp, out in samples:
++        with open(os.path.join(directory, f"sample{idx}.in"), "w") as f:
++            f.write(inp)
++        with open(os.path.join(directory, f"sample{idx}.out"), "w") as f:
++            f.write(out)
++    return len(samples)
++
++
++def run_program(cmd, inp, timeout):
++    """Run cmd with stdin inp. Returns (stdout, elapsed, timed_out, error)."""
++    start = time.time()
++    try:
++        p = subprocess.run(cmd, input=inp, capture_output=True, text=True, timeout=timeout)
++        return p.stdout, time.time() - start, False, p.stderr if p.returncode != 0 else ""
++    except subprocess.TimeoutExpired:
++        return "", float(timeout), True, ""
++    except OSError as e:
++        return "", time.time() - start, False, str(e)
++
++
++def same_output(a, b):
++    return a.split() == b.split()
++
++
++def score_candidate(cmd, samples, stress_inputs=None, brute_cmd=None,
++                    large_input=None, sample_timeout=5.0, large_timeout=3.0):
++    """
++    cmd: candidate command list, e.g. ["python3", "solution.py"]
++    samples: list of (idx, input_text, expected_output)
++    stress_inputs: list of input strings; expected answers come from brute_cmd if given
++    large_input: max-constraint input text for timing (optional)
++    Returns verdict dict.
++    """
++    stress_inputs = stress_inputs or []
++    feedback = []
++    max_time = 0.0
++    timed_out = False
++
++    samples_total = len(samples)
++    samples_pass = 0
++    for idx, inp, exp in samples:
++        out, elapsed, to, err = run_program(cmd, inp, sample_timeout)
++        max_time = max(max_time, elapsed)
++        if to:
++            timed_out = True
++            feedback.append(f"sample {idx}: timed out after {sample_timeout}s")
++        elif err:
++            feedback.append(f"sample {idx}: runtime error: {err.strip()[-300:]}")
++        elif same_output(out, exp):
++            samples_pass += 1
++        else:
++            feedback.append(f"sample {idx}: wrong answer. expected={exp.strip()!r} got={out.strip()!r}")
++
++    stress_total = 0
++    stress_pass = 0
++    for inp in stress_inputs:
++        if brute_cmd is None:
++            break
++        expected, _, bto, _ = run_program(brute_cmd, inp, sample_timeout)
++        if bto:
++            continue
++        stress_total += 1
++        out, elapsed, to, err = run_program(cmd, inp, sample_timeout)
++        max_time = max(max_time, elapsed)
++        if to:
++            timed_out = True
++        elif not err and same_output(out, expected):
++            stress_pass += 1
++        else:
++            feedback.append("stress case: mismatch against oracle")
++
++    if large_input is not None:
++        _, elapsed, to, _ = run_program(cmd, large_input, large_timeout)
++        max_time = max(max_time, elapsed)
++        if to:
++            timed_out = True
++            feedback.append(f"large input: timed out after {large_timeout}s")
++
++    if timed_out:
++        feedback.append(BRUTE_TIMEOUT_FEEDBACK)
++
++    perfect = (
++        samples_total > 0
++        and samples_pass == samples_total
++        and not timed_out
++        and stress_pass == stress_total
++    )
++    return {
++        "samples_pass": samples_pass,
++        "samples_total": samples_total,
++        "stress_pass": stress_pass,
++        "stress_total": stress_total,
++        "max_time": round(max_time, 3),
++        "timed_out": timed_out,
++        "perfect": perfect,
++        "feedback": "\n".join(feedback),
++    }
++
++
++def pick_best(verdicts):
++    """Return index of best verdict by (samples_pass, not timed_out, stress_pass)."""
++    if not verdicts:
++        return -1
++    best = 0
++    best_key = None
++    for i, v in enumerate(verdicts):
++        key = (v["samples_pass"], not v["timed_out"], v["stress_pass"])
++        if best_key is None or key > best_key:
++            best_key = key
++            best = i
++    return best
+ 
+ 
+ def main():
+-    data = sys.stdin.read().split()
+-    # Placeholder: no problem statement was provided with this request.
+-    # Echo the input tokens back so the program is a valid stdin/stdout program.
+-    print(" ".join(data))
++    statement = sys.stdin.read()
++    directory = sys.argv[1] if len(sys.argv) > 1 else "work"
++    count = write_samples(statement, directory)
++    samples = extract_samples(statement)
++    print(json.dumps({
++        "directory": directory,
++        "samples_written": count,
++        "sample_indices": [s[0] for s in samples],
++    }))
+ 
+ 
+ if __name__ == "__main__":

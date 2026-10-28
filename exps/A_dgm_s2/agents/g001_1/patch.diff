@@ -1,0 +1,200 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d40faa1..b407716 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -177,6 +177,128 @@ class AgenticSystem:
+         files = self._changed_files(diff)
+         return ', '.join(files) if files else 'none'
+ 
++    def _clean_history(self, msg_history):
++        """
++        Remove trailing assistant messages whose text is empty/whitespace-only,
++        and drop any message whose content list is empty.
++        """
++        def _text_of(msg):
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                parts = []
++                for block in content:
++                    if isinstance(block, dict):
++                        if block.get('type') == 'text':
++                            parts.append(block.get('text') or '')
++                    elif getattr(block, 'type', None) == 'text':
++                        parts.append(getattr(block, 'text', '') or '')
++                return ''.join(parts)
++            return ''
++
++        cleaned = []
++        for msg in msg_history or []:
++            content = msg.get('content')
++            if isinstance(content, list) and len(content) == 0:
++                continue
++            if content is None or (isinstance(content, str) and content.strip() == ''):
++                continue
++            cleaned.append(msg)
++
++        # Strip trailing assistant messages with no text and no tool calls (bounded loop)
++        for _ in range(len(cleaned)):
++            if not cleaned:
++                break
++            last = cleaned[-1]
++            if last.get('role') != 'assistant' or _text_of(last).strip():
++                break
++            content = last.get('content')
++            has_tool_use = isinstance(content, list) and any(
++                (isinstance(b, dict) and b.get('type') == 'tool_use') or getattr(b, 'type', None) == 'tool_use'
++                for b in content
++            )
++            if has_tool_use:
++                break
++            cleaned.pop()
++        return cleaned
++
++    _SOURCE_EXTS = ('.py', '.js', '.go', '.rs', '.java', '.cpp', '.h')
++    _STUB_MARKERS = ('pass', 'TODO', 'NotImplemented', 'unimplemented')
++
++    def _find_candidate_source_files(self):
++        """
++        List tracked, non-test, non-README, non-hidden source files in git_tempdir,
++        with stub-like files (containing pass/TODO/NotImplemented/unimplemented) first.
++        """
++        try:
++            result = subprocess.run(
++                ['git', 'ls-files'],
++                cwd=self.git_tempdir,
++                capture_output=True,
++                text=True,
++                check=False,
++            )
++        except Exception as e:
++            safe_log(f"Failed to list git files: {e}")
++            return []
++        if result.returncode != 0:
++            return []
++
++        candidates = []
++        for path in result.stdout.splitlines():
++            path = path.strip()
++            if not path:
++                continue
++            parts = path.replace('\\', '/').split('/')
++            basename = parts[-1]
++            if any(p.startswith('.') for p in parts):
++                continue
++            if basename.upper().startswith('README'):
++                continue
++            if self._is_test_file(path):
++                continue
++            if not path.endswith(self._SOURCE_EXTS):
++                continue
++            candidates.append(path)
++
++        def _priority(path):
++            full = os.path.join(self.git_tempdir, path)
++            try:
++                with open(full, 'r', encoding='utf-8', errors='ignore') as f:
++                    text = f.read()
++            except OSError:
++                return 1
++            return 0 if any(m in text for m in self._STUB_MARKERS) else 1
++
++        return sorted(candidates, key=lambda p: (_priority(p), p))
++
++    def _render_files(self, files, max_chars=6000):
++        """
++        Read the given files (relative to git_tempdir) and format them for a prompt,
++        truncating the total output to roughly max_chars.
++        """
++        parts = []
++        used = 0
++        for path in files:
++            full = os.path.join(self.git_tempdir, path)
++            try:
++                with open(full, 'r', encoding='utf-8', errors='ignore') as f:
++                    text = f.read()
++            except OSError as e:
++                text = f"<could not read: {e}>"
++            header = f"--- {path} ---\n"
++            budget = max_chars - used - len(header)
++            if budget <= 0:
++                parts.append(f"--- {path} --- <omitted: max size reached>")
++                break
++            if len(text) > budget:
++                text = text[:budget] + "\n... <truncated>"
++            block = header + text + "\n"
++            parts.append(block)
++            used += len(block)
++        return "\n".join(parts) if parts else "<no candidate source files found>"
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -197,23 +319,56 @@ Follow these steps in order:
+ 3. Write and run tests, or a brute-force comparison against your solution, using the provided tests if any.
+ 4. Fix any bugs found by the tests or comparison, editing the source file again as needed.
+ 
++Never end a turn with an empty message. Read the starter file with one command, then write the implementation in your very next tool call. End with a tool call or a short summary after the files are edited.
++
+ WARNING: Responding with only a plan, or describing the solution without editing files, is a failure. The task is not complete until the non-test source file has been modified. Do not end your turn before the source file edits are in place.
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         # Post-run validation: ensure non-test source files were edited, with bounded retries
+         max_retries = 3
+-        for attempt in range(1, max_retries + 1):
+-            if self._has_source_edits():
+-                break
+-            changed = self._current_changed_files_str()
+-            safe_log(f"Patch validation failed (changed files: {changed}). Retry {attempt}/{max_retries}.")
+-            nudge = (
+-                f"No changes to the main source code were detected (changed files: {changed}). "
+-                "Do not just describe the solution. Use the editor tool now to implement it in the "
+-                "correct source file (not a test file), then run tests."
++        if not self._has_source_edits():
++            candidates = self._find_candidate_source_files()
++            candidate_str = self._render_files(candidates)
++            nudges = [
++                (
++                    "Your last turn ended without editing any source file. Problem statement reminder:\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                    f"Candidate source files:\n{candidate_str}\n"
++                    "Call the editor tool now to implement the solution in the correct non-test source file. "
++                    "Do not explore further."
++                ),
++                (
++                    "Output a tool call now that writes the full implementation with the editor tool "
++                    "(command 'edit' or 'create' with the complete file content). No prose."
++                ),
++                (
++                    "Final attempt. Your next output must be a single editor tool call that writes the "
++                    "complete implementation to the source file. No other text."
++                ),
++            ]
++            for attempt in range(1, max_retries + 1):
++                if self._has_source_edits():
++                    break
++                changed = self._current_changed_files_str()
++                safe_log(f"Patch validation failed (changed files: {changed}). Retry {attempt}/{max_retries}.")
++                nudge = nudges[min(attempt - 1, len(nudges) - 1)]
++                msg_history = self._clean_history(msg_history)
++                msg_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        if not self._has_source_edits():
++            safe_log("Fallback: fresh context with minimal edit-only prompt.")
++            candidates = self._find_candidate_source_files()
++            fallback_prompt = (
++                "Do not explore. Implement the solution now.\n\n"
++                f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Candidate source files:\n{self._render_files(candidates)}\n"
++                "Make exactly one `editor` tool call with command `edit` that overwrites the target "
++                "source file (not a test file) with the full solution."
+             )
+-            msg_history = chat_with_agent(nudge, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            msg_history = chat_with_agent(fallback_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            if not self._has_source_edits():
++                safe_log("Fallback did not produce source edits.")
+ 
+         if self._has_source_edits():
+             # Optional short verification pass, once source edits exist

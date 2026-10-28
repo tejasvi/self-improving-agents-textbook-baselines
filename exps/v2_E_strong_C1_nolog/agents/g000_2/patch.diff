@@ -1,0 +1,237 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..b06ef30 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,9 +4,16 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import tempfile
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from prompts.coding_prompts import (
++    PROBLEM_TEMPLATE, SOLVE_PROMPT, VERIFY_PROMPT, REPAIR_PROMPT,
++    last_assistant_text, parse_verdict,
++)
++
++MAX_REPAIR_ROUNDS = 2
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -140,24 +147,50 @@ class AgenticSystem:
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Pipeline: solve -> verify (fresh context) -> up to MAX_REPAIR_ROUNDS of repair + verify.
++        """
++        repo = self.git_tempdir
++        problem_text = PROBLEM_TEMPLATE.format(repo=repo, problem=self.problem_statement)
++        scratch = tempfile.mkdtemp(prefix='verify_')
++
++        # Phase 1: solve (writes solution.py and checks samples)
++        solve_instruction = SOLVE_PROMPT.format(task=problem_text, repo=repo)
++        msg_history = chat_with_agent(solve_instruction, model=self.code_model, msg_history=[], logging=safe_log)
++
++        # Phase 2: independent verification in a fresh context
++        verify_instruction = VERIFY_PROMPT.format(problem=self.problem_statement, repo=repo, scratch=scratch)
++        verify_result = self._run_verify(verify_instruction)
++
++        # Phase 3: bounded repair loop
++        for _ in range(MAX_REPAIR_ROUNDS):
++            if verify_result.get('passed'):
++                break
++            repair_instruction = REPAIR_PROMPT.format(
++                problem=self.problem_statement,
++                repo=repo,
++                feedback=verify_result.get('feedback', ''),
++            )
++            safe_log("\n===== Repair round =====")
++            chat_with_agent(repair_instruction, model=self.code_model, msg_history=[], logging=safe_log)
++            verify_instruction = VERIFY_PROMPT.format(problem=self.problem_statement, repo=repo, scratch=scratch)
++            verify_result = self._run_verify(verify_instruction)
++
++        if not verify_result.get('passed'):
++            safe_log("Final verdict: FAIL or unknown after repair rounds")
++        return msg_history
++
++    def _run_verify(self, verify_instruction):
++        """
++        Run one verification pass in a fresh context.
++        Returns a dict with 'passed' (bool) and 'feedback' (str).
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        history = chat_with_agent(verify_instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        text = last_assistant_text(history)
++        verdict = parse_verdict(text)
++        if verdict is None:
++            text = text or "(verifier returned no text)"
++            return {'passed': False, 'feedback': f"No VERDICT line found. Verifier output:\n{text[-4000:]}"}
++        return {'passed': verdict, 'feedback': text[-4000:]}
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/prompts/coding_prompts.py b/prompts/coding_prompts.py
+new file mode 100644
+index 0000000..0d30707
+--- /dev/null
++++ b/prompts/coding_prompts.py
+@@ -0,0 +1,142 @@
++"""
++Prompts for the multi-phase competitive programming workflow used by AgenticSystem.forward().
++
++Phases:
++  1. solve_prompt   - analyse the problem, write solution.py, check samples.
++  2. verify_prompt  - fresh context: independent brute force, generator, stress test,
++                      timing test. Must end with `VERDICT: PASS` or `VERDICT: FAIL`.
++  3. repair_prompt  - fresh context: fix solution.py given failure details.
++"""
++
++VERDICT_PASS = "VERDICT: PASS"
++VERDICT_FAIL = "VERDICT: FAIL"
++
++PROBLEM_TEMPLATE = """I have uploaded a code repository in the directory {repo}. Help solve the following problem.
++
++<problem_description>
++{problem}
++</problem_description>
++
++Your task is to make changes to the files in the {repo} directory to address the <problem_description>. I have already taken care of the required dependencies.
++"""
++
++SOLVE_PROMPT = """{task}
++
++The final answer must be the file {repo}/solution.py.
++
++Phase: SOLVE.
++1. Read the statement carefully. Write down the constraints, the exact input/output format, and the sample cases.
++2. Consider candidate algorithms. For each, state its time and memory complexity and check it against the constraints (Python does roughly 10^7 simple operations per second, so aim well under that). List the edge cases (n=1, empty input, equal values, maximum values, duplicates, etc.) and the common pitfalls.
++3. Write {repo}/solution.py with the editor tool. Requirements:
++   - If the task is a complete program, read from sys.stdin (use sys.stdin.readline or sys.stdin.buffer.read for fast IO) and write with print/sys.stdout.write. Match the output format exactly (spacing, newlines, case, YES/NO style).
++   - Avoid deep recursion; use iteration, or raise the limit with sys.setrecursionlimit together with threading.stack_size if recursion is truly needed.
++   - If the task is a method of a `Solution` class, keep the class and method signature exactly as given and start the file with `from typing import *`.
++   - Keep the file free of debug prints and leftover test code.
++4. Run solution.py on every sample in the statement and compare the output with the expected output exactly. For a stdin program use `python3 solution.py < sample.txt`. For a `Solution` class method, write a small driver script outside the repo that calls the method on the sample arguments.
++5. If a sample fails, fix solution.py and re-run until every sample matches.
++
++Do not write brute-force or stress-test files in this phase; a separate reviewer will verify the solution afterwards.
++"""
++
++VERIFY_PROMPT = """I have a competitive programming problem and a candidate solution at {repo}/solution.py. The solution was written by someone else and has not been fully tested. Your job is to independently find out whether it is correct and fast enough.
++
++<problem_description>
++{problem}
++</problem_description>
++
++Phase: VERIFY. Work through these steps in order:
++1. Re-read the problem statement carefully. Note the exact input and output format, the constraints, and any tricky wording (ties, ordering, "any valid answer", 0-indexed vs 1-indexed, etc.).
++2. Write a brute-force reference, {scratch}/brute.py, directly from the statement. Do not read solution.py first, and keep the brute force simple and obviously correct, even if it is slow. It must read the same stdin format and print the same output format.
++3. Write {scratch}/gen.py, which prints one random small valid input to stdout. It must respect every constraint in the statement and use a seed argument for reproducibility. Include edge cases with small values as well.
++4. Write a stress script {scratch}/stress.py that runs gen.py with seeds 1..300 (a few hundred cases), runs both {repo}/solution.py and brute.py on each input with a timeout (e.g. 10 seconds), and compares the outputs. For answers that may legitimately differ (multiple valid answers), compare with a checker instead of exact equality. On the first mismatch, print the input, the expected output, the actual output, and stop.
++5. Run the stress test. If there is a mismatch, decide from the statement whether brute.py or solution.py is wrong. Fix the wrong one, and re-run until all cases pass.
++6. Write a max-size input according to the constraints (for example n = the upper bound with random or adversarial values) and time `python3 {repo}/solution.py`. If it takes more than about 1-2 seconds, optimize the algorithm and re-run the stress test.
++7. Make sure {repo}/solution.py is clean: no debug prints, no leftover test code, and it reads stdin and writes stdout as the statement requires. Remove the scratch files from {scratch} when you are done, and do not leave them in {repo}.
++
++Your final message must summarise what you tested and the results. End your response with exactly one line: `VERDICT: PASS` if solution.py is correct on all stress tests and fast enough, otherwise `VERDICT: FAIL`.
++"""
++
++REPAIR_PROMPT = """I have a competitive programming problem and a candidate solution at {repo}/solution.py. An independent review found that it is NOT correct or not fast enough.
++
++<problem_description>
++{problem}
++</problem_description>
++
++Review report (failure details):
++<failure>
++{feedback}
++</failure>
++
++Phase: REPAIR.
++1. Re-read the problem statement and the failure details. Decide whether the failing case reflects a real bug in solution.py or a misreading of the statement. Check the sample cases again.
++2. Reconsider the algorithm. If the approach is wrong or too slow for the constraints, switch to a correct approach with an acceptable complexity rather than patching locally.
++3. Fix {repo}/solution.py with the editor tool. Keep the required input/output format and signature, avoid debug prints, and avoid deep recursion.
++4. Re-run the samples from the statement and the failing case from the report, and confirm they now match the expected output. If you write any helper scripts, keep them outside {repo}.
++
++Summarise what was wrong and what you changed.
++"""
++
++
++def _text_of_content(content):
++    """Return plain text from a message content field (str or list of blocks)."""
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts = []
++        for block in content:
++            if isinstance(block, str):
++                parts.append(block)
++            elif isinstance(block, dict):
++                if isinstance(block.get('text'), str):
++                    parts.append(block['text'])
++            elif isinstance(getattr(block, 'text', None), str):
++                parts.append(block.text)
++        return "\n".join(parts)
++    return ""
++
++
++def message_text(msg):
++    """Extract the text from one message of a chat_with_agent history (dict, str or response object)."""
++    if msg is None:
++        return ""
++    if isinstance(msg, str):
++        return msg
++    if isinstance(msg, dict):
++        return _text_of_content(msg.get('content'))
++    output_text = getattr(msg, 'output_text', None)
++    if isinstance(output_text, str):
++        return output_text
++    output = getattr(msg, 'output', None)
++    if isinstance(output, list):
++        return "\n".join(_text_of_content(getattr(item, 'content', None)) for item in output)
++    content = getattr(msg, 'content', None)
++    if content is not None:
++        return _text_of_content(content)
++    return str(msg)
++
++
++def last_assistant_text(msg_history):
++    """
++    Return the text of the last non-user message in a chat_with_agent history.
++    Returns "" if the history is not a list or contains no usable text.
++    """
++    if not isinstance(msg_history, list):
++        return ""
++    for msg in reversed(msg_history):
++        if isinstance(msg, dict) and msg.get('role') == 'user':
++            continue
++        text = message_text(msg)
++        if text.strip():
++            return text
++    return ""
++
++
++def parse_verdict(text):
++    """Return True for PASS, False for FAIL, None if no verdict is found. Uses the last verdict line."""
++    import re
++    if not isinstance(text, str):
++        return None
++    matches = re.findall(r"VERDICT:\s*(PASS|FAIL)\b", text)
++    if not matches:
++        return None
++    return matches[-1] == "PASS"

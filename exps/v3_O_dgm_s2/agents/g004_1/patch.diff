@@ -1,0 +1,479 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d3dcc7c..f2a16e2 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import traceback
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -143,44 +144,97 @@ class AgenticSystem:
+         """Return a diff string representing changes made since the base commit."""
+         return str(diff_versus_commit(self.git_tempdir, self.base_commit))
+ 
+-    def _patch_touches_source(self, patch: str) -> bool:
+-        """Return True if the patch modifies any non-test source file.
+-
+-        The function parses lines starting with ``diff --git a/<path> b/<path>``
+-        and checks the target file name against common test file patterns.
+-        Patterns considered test files are case‑insensitive matches for:
+-
+-        * ``test`` or ``tests`` in the path
+-        * file names starting with ``test_``
+-        * file names containing ``_test.``
+-        * file names containing ``.spec.``
++    def _is_test_path(self, path: str) -> bool:
++        """Determine whether a file path should be considered a test file.
++        Criteria:
++        - any directory component (case‑insensitive) is in {test, tests, __tests__, spec}
++        - basename matches one of the regexes:
++          ^test_.*
++          .*_test\.[^.]+$
++          .*\.spec\.[^.]+$
++          .*\.test\.[^.]+$
++          conftest.py
++        """
++        parts = path.replace('\\', '/').split('/')
++        # Check directory components
++        test_dirs = {'test', 'tests', '__tests__', 'spec'}
++        for comp in parts[:-1]:
++            if comp.lower() in test_dirs:
++                return True
++        basename = parts[-1]
++        lower = basename.lower()
++        if lower.startswith('test_'):
++            return True
++        if lower.endswith('_test.py') or lower.endswith('_test.rb') or lower.endswith('_test.go') or lower.endswith('_test.ts') or lower.endswith('_test.js'):
++            return True
++        if '.spec.' in lower:
++            return True
++        if '.test.' in lower:
++            return True
++        if lower == 'conftest.py':
++            return True
++        return False
+ 
+-        If any diff header does **not** match these patterns, the function
+-        returns ``True`` indicating that the patch touches source code.
++    def _patch_touches_source(self, patch: str) -> bool:
++        """Return True if the patch modifies any non‑test source file.
++        The function parses diff headers of the form ``diff --git a/... b/...``
++        and applies the test detection logic from ``_is_test_path``.
+         """
++        import re
++        pattern = re.compile(r'^diff --git a/(.+?) b/(.+?)$')
+         for line in patch.splitlines():
+-            if line.startswith('diff --git'):
+-                # Extract the b/ path (new file path)
+-                parts = line.split(' b/')
+-                if len(parts) < 2:
+-                    continue
+-                b_path = parts[1].strip()
+-                # Normalise to lower‑case for pattern checks
+-                lower = b_path.lower()
+-                test_patterns = [
+-                    'test',
+-                    'tests',
+-                    'test_',
+-                    '_test.',
+-                    '.spec.'
+-                ]
+-                if any(p in lower for p in test_patterns):
+-                    # This diff block is likely a test file – ignore it
+-                    continue
+-                # If we reach here, it's a non‑test file
++            m = pattern.match(line)
++            if not m:
++                continue
++            a_path, b_path = m.group(1), m.group(2)
++            # Use the destination path (b_path) for classification
++            if not self._is_test_path(b_path):
+                 return True
+         return False
+ 
++    def _candidate_source_files(self):
++        """Return a list of up to ~10 candidate source files to edit.
++        Uses ``git ls-files`` to list tracked files, filters out test files,
++        and prefers files containing markers of unimplemented code.
++        """
++        try:
++            result = subprocess.check_output(['git', 'ls-files'], cwd=self.git_tempdir, text=True)
++            files = [f for f in result.splitlines() if f]
++        except subprocess.CalledProcessError:
++            safe_log('Failed to list git tracked files.', level=logging.ERROR)
++            return []
++        source_files = [f for f in files if not self._is_test_path(f)]
++        # Score files based on presence of keywords
++        def score(path):
++            try:
++                content = open(os.path.join(self.git_tempdir, path), 'r', encoding='utf-8', errors='ignore').read()
++            except Exception:
++                return 0
++            score = 0
++            for kw in ['NotImplementedError', 'pass', 'TODO']:
++                if kw in content:
++                    score += 1
++            return score
++        source_files.sort(key=lambda p: score(p), reverse=True)
++        return source_files[:10]
++
++    def _safe_chat(self, prompt, msg_history):
++        """Wrap ``chat_with_agent`` with error handling and logging.
++        Returns the updated message history (or the original on error).
++        After a successful call, logs a one‑line summary containing the
++        history length and the number of ``tool_use`` blocks.
++        """
++        try:
++            new_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        except Exception:
++            safe_log('Exception in chat_with_agent:\n' + traceback.format_exc(), level=logging.ERROR)
++            return msg_history
++        # Summarise
++        length = len(new_history)
++        tool_uses = sum(1 for msg in new_history if isinstance(msg.get('tool_calls'), list) and msg['tool_calls'])
++        safe_log(f"Chat returned {length} messages, {tool_uses} tool_use blocks.")
++        return new_history
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -193,10 +247,6 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        # 1) Explore the repository and open the starter file(s).
+-        # 2) Implement the solution by calling the editor tool (edit/create) on the primary source file.
+-        # 3) Write and run small tests with bash, including the examples from the problem statement.
+-        # 4) Do not finish until the source file has been modified; never only describe the code in text.
+         instruction = (
+             f"{task}\n"
+             "Please follow this numbered workflow:\n"
+@@ -205,54 +255,72 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             "3) Write and run small tests via bash, incorporating the problem's examples.\n"
+             "4) Ensure the source file is edited before finishing; do not merely describe the solution.\n"
+         )
+-        # Initial interaction with the LLM
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        # Initial interaction with the LLM using safe wrapper
++        msg_history = self._safe_chat(instruction, msg_history=[])
+ 
+-        # -----------------------------------------------------------------
+-        # Retry loop – up to three attempts to obtain a valid patch.
+-        # -----------------------------------------------------------------
++        # Retry loop – up to three attempts
+         for attempt in range(3):
+             patch = self._get_patch()
+-            # Determine patch validity
++            # Check validity before proceeding
+             if patch.strip() and self._patch_touches_source(patch):
+                 safe_log(f"Valid patch obtained on attempt {attempt+1}")
+                 break
+-            # Prepare corrective feedback
++            # Determine issue type
+             if not patch.strip():
+                 issue = "empty patch"
+             elif not self._patch_touches_source(patch):
+-                issue = "patch only modifies test files"
++                issue = "test‑only patch"
+             else:
+                 issue = "unknown issue"
+             safe_log(f"Attempt {attempt+1} produced {issue}; constructing corrective message.")
++            # Build corrective feedback
++            status_output = ''
++            try:
++                status_output = subprocess.check_output(['git', 'status', '--short'], cwd=self.git_tempdir, text=True)
++            except subprocess.CalledProcessError:
++                pass
++            candidates = self._candidate_source_files()
++            candidate_list = '\n'.join(f"- {c}" for c in candidates) or '(none)'
+             corrective = (
+-                f"The previous attempt resulted in an {issue}. "
+-                "Please ensure you first view the starter file (using the `view` tool) and then edit it (using `edit` or `create`). "
+-                "The tool call should be a valid JSON object, e.g.:\n"
+-                "{\"command\": \"edit\", \"path\": \"/path/to/file.py\", \"file_text\": \"# your code here\"}\n"
+-                "After editing, run the relevant tests via the `bash` tool."
++                f"The previous attempt resulted in an {issue}.\n"
++                f"Current git status:\n{status_output}\n"
++                f"Consider editing one of the following source files (preferably containing unimplemented sections):\n{candidate_list}\n\n"
++                "You must use the editor tool. First, view the file with `command=\"view\"` and the appropriate path, then call `command=\"edit\"` (or `create` if the file does not exist) with the full new content. Do not reply with only text."
+             )
+-            # Append corrective message to history and invoke the agent again
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            # On final attempt, reset history and give compact prompt
++            if attempt == 2:
++                msg_history = []
++                compact_prompt = (
++                    f"Problem statement:\n{self.problem_statement}\n\n"
++                    f"Candidate source files:\n{candidate_list}\n\n"
++                    "Use the editor tool to view and then edit one of these files with a full implementation."
++                )
++                msg_history = self._safe_chat(compact_prompt, msg_history=[])
++            else:
++                msg_history = self._safe_chat(corrective, msg_history)
+             safe_log(f"Retry {attempt+1} completed.")
+         else:
+-            # Exhausted attempts – log a warning
++            # Exhausted attempts – log diagnostics
+             safe_log("Failed to obtain a valid source‑modifying patch after 3 attempts.")
++            final_diff = self._get_patch()
++            final_status = ''
++            try:
++                final_status = subprocess.check_output(['git', 'status', '--short'], cwd=self.git_tempdir, text=True)
++            except subprocess.CalledProcessError:
++                pass
++            safe_log(f"Final diff:\n{final_diff}\nFinal status:\n{final_status}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+     parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+     parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
++    parser.add_argument('--chat_history_file', required=True, help='Path to chat history markdown file')
++    parser.add_argument('--test_description', default=None, help='Optional test description')
++    parser.add_argument('--self_improve', action='store_true', help='Enable self‑improvement mode')
++    parser.add_argument('--language', default='python', help='Programming language of the task')
+     args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
++    agent = AgenticSystem(
+         problem_statement=args.problem_statement,
+         git_tempdir=args.git_dir,
+         base_commit=args.base_commit,
+@@ -261,15 +329,7 @@ def main():
+         self_improve=args.self_improve,
+         language=args.language,
+     )
++    agent.forward()
+ 
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
++if __name__ == '__main__':
+     main()
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..04c0c64 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,17 +1,11 @@
++import subprocess
++import shlex
+ import asyncio
+-import os
+ 
+ def tool_info():
+     return {
+         "name": "bash",
+-        "description": """Run commands in a bash shell\n
+-* When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.\n
+-* You don't have access to the internet via this tool.\n
+-* You do have access to a mirror of common linux and python packages via apt and pip.\n
+-* State is persistent across command calls and discussions with the user.\n
+-* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+-* Please avoid commands that may produce a very large amount of output.\n
+-* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""",
++        "description": """Run commands in a bash shell\n\n* When invoking this tool, the contents of the \"command\" parameter does NOT need to be XML-escaped.\n* You don't have access to the internet via this tool.\n* You do have access to a mirror of common linux and python packages via apt and pip.\n* State is persistent across command calls and discussions with the user.\n* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n* Please avoid commands that may produce a very large amount of output.\n* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+@@ -25,141 +19,67 @@ def tool_info():
+     }
+ 
+ class BashSession:
+-    """A session of a bash shell."""
++    """Simple asynchronous session that runs each command via subprocess.
++    This replaces the previous complex interactive implementation and avoids
++    hangs caused by reading from internal buffers. The API matches the test
++    expectations: ``start`` (async) and ``run`` (async) returning a tuple
++    ``(output, error)``.
++    """
+     def __init__(self):
+         self._started = False
+-        self._process = None
+-        self._timed_out = False
+-        self._timeout = 120.0  # seconds
+-        self._sentinel = "<<exit>>"
+-        self._output_delay = 0.2  # seconds
+ 
+     async def start(self):
+-        if self._started:
+-            return
+-        self._process = await asyncio.create_subprocess_shell(
+-            "/bin/bash -i",
+-            preexec_fn=os.setsid,
+-            stdin=asyncio.subprocess.PIPE,
+-            stdout=asyncio.subprocess.PIPE,
+-            stderr=asyncio.subprocess.PIPE,
+-            env=os.environ.copy()  # Ensures inheritance of the current environment
+-        )
++        # No persistent shell needed; just mark the session as started.
+         self._started = True
++        return
+ 
+-    def stop(self):
+-        if not self._started:
+-            return
+-        if self._process.returncode is None:
+-            self._process.terminate()
+-        self._process = None
+-        self._started = False
+-
+-    async def run(self, command):
++    async def run(self, command: str):
+         if not self._started:
+             raise ValueError("Session has not started.")
+-        if self._process.returncode is not None:
+-            raise ValueError(f"Bash has exited with returncode {self._process.returncode}")
+-        if self._timed_out:
+-            raise ValueError(
+-                f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-            )
+-        
+-        # Send command
+-        self._process.stdin.write(
+-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
+-        )
+-        await self._process.stdin.drain()
+-
+-        # Read output until sentinel
+         try:
+-            output = ''
+-            start_time = asyncio.get_event_loop().time()
+-            
+-            while True:
+-                if asyncio.get_event_loop().time() - start_time > self._timeout:
+-                    self._timed_out = True
+-                    raise ValueError(
+-                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-                    )
+-                
+-                await asyncio.sleep(self._output_delay)
+-                # Read from the internal buffer
+-                stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+-                stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
+-                if self._sentinel in stdout_data:
+-                    output = stdout_data[: stdout_data.index(self._sentinel)]
+-                    break
+-
+-            # Clear buffers
+-            self._process.stdout._buffer.clear()
+-            self._process.stderr._buffer.clear()
+-
+-            output = output.strip()
+-            error = stderr_data.strip()
+-
++            completed = subprocess.run(
++                command,
++                shell=True,
++                cwd=None,
++                capture_output=True,
++                text=True,
++                timeout=120,
++            )
++            output = completed.stdout.strip()
++            error = completed.stderr.strip()
+             return output, error
+-
++        except subprocess.TimeoutExpired:
++            return "", f"Timed out: command exceeded 120 seconds"
+         except Exception as e:
+-            self._timed_out = True
+-            raise ValueError(str(e))
+-
+-def filter_error(error):
+-    # Filter out errors that we do not want to see
+-    filtered_lines = []
+-    i = 0
+-    error_lines = error.splitlines()
+-    while i < len(error_lines):
+-        line = error_lines[i]
+-
+-        # Skip the next lines if ioctl error, add relevant lines
+-        if "Inappropriate ioctl for device" in line:
+-            i += 3
+-            if '<<exit>>' in error_lines[i]:
+-                i += 1
+-            while i < len(error_lines) - 1:
+-                filtered_lines.append(error_lines[i])
+-                i += 1
+-            i += 1
+-            continue
+-
+-        filtered_lines.append(line)
+-        i += 1
+-    return '\n'.join(filtered_lines).strip()
++            return "", f"Error: {str(e)}"
+ 
+-async def tool_function_call(command):
+-    """Execute a command in the bash shell."""
++def tool_function(command: str) -> str:
++    """Execute a bash command synchronously and return its output.
++    Captures both stdout and stderr. Errors are prefixed with "Error:".
++    """
+     try:
+-        bash_session = BashSession()
+-
+-        if not bash_session._started:
+-            await bash_session.start()
+-
+-        output, error = await bash_session.run(command)
+-        error = filter_error(error)
+-        result = ""
+-        if output:
+-            result += output
+-        if error:
+-            result += "\nError:\n" + error
+-        return result.strip()
++        completed = subprocess.run(
++            command,
++            shell=True,
++            cwd=None,
++            capture_output=True,
++            text=True,
++            timeout=120,
++        )
++        output = completed.stdout.strip()
++        error = completed.stderr.strip()
++        if completed.returncode != 0 and error:
++            return f"{output}\nError:\n{error}".strip()
++        return output
++    except subprocess.TimeoutExpired:
++        return "Error: Timed out after 120 seconds"
+     except Exception as e:
+         return f"Error: {str(e)}"
+ 
+-def tool_function(command):
+-    return asyncio.run(tool_function_call(command))
+-
+ if __name__ == "__main__":
+-    # Example usage
+     import sys
+-
+-    # Check if the script is called with arguments
+     if len(sys.argv) < 2:
+         print("Usage: python bash.py '<command>'")
+     else:
+-        # Extract the command from the command-line arguments
+-        input_command = ' '.join(sys.argv[1:])
+-        # Run the tool_function asynchronously
+-        result = tool_function(input_command)
+-        print(result)
+\ No newline at end of file
++        cmd = ' '.join(sys.argv[1:])
++        print(tool_function(cmd))

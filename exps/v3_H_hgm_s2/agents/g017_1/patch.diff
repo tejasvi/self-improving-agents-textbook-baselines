@@ -1,0 +1,286 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e961f1f..3a079c3 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -232,6 +232,73 @@ def _outputs_match(actual, expected):
+     norm = lambda t: [ln.strip() for ln in t.strip().splitlines() if ln.strip()]
+     return norm(actual) == norm(expected)
+ 
++
++MAX_ATTEMPTS = 4
++MAX_LLM_CALLS = 12
++STRESS_CASES = 200
++STRESS_TIMEOUT_SECONDS = 5
++
++STRATEGY_HINTS = [
++    "Repair the current solution: keep the overall approach, fix the failing cases.",
++    "Brute-force the small cases, then find the pattern/formula and implement it.",
++    "Try a fundamentally different algorithm and verify it against the samples.",
++    "Simplify: implement the most direct correct approach, then test every sample.",
++]
++
++def _is_trivial_stub(code, base_content):
++    """True if code is unchanged from base, or only prints a constant / has a placeholder comment."""
++    if code is None or not code.strip():
++        return True
++    if base_content is not None and code.strip() == base_content.strip():
++        return True
++    lower = code.lower()
++    if 'not yet verified' in lower or 'placeholder' in lower or 'todo: implement' in lower:
++        return True
++    body = [ln.strip() for ln in code.splitlines() if ln.strip() and not ln.strip().startswith('#')]
++    prints = [ln for ln in body if ln.startswith('print(')]
++    if prints and len(prints) == len(body) and all(re.fullmatch(r'print\(\s*-?\d+\s*\)', p) for p in prints):
++        return True
++    return False
++
++def _run_samples(self, target):
++    """
++    Run `sys.executable target` on each parsed sample. Returns (passed, total, first_failure).
++    first_failure is None on success, else a string describing input/expected/actual.
++    With no parsed samples, total=0 and passed is 1 only if the file is a non-trivial change.
++    """
++    target_path = os.path.join(self.git_tempdir, target)
++    samples = _parse_samples(self.problem_statement)
++    if not os.path.exists(target_path):
++        return 0, len(samples), f"{target} does not exist"
++    with open(target_path) as f:
++        code = f.read()
++    if not samples:
++        base = None
++        try:
++            r = subprocess.run(["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:{target}"],
++                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++            if r.returncode == 0:
++                base = r.stdout.decode(errors='replace')
++        except Exception:
++            base = None
++        if _is_trivial_stub(code, base):
++            return 0, 0, "no samples parsed and the file looks like a placeholder/stub"
++        return 1, 0, None
++    passed = 0
++    for idx, (inp, expected) in enumerate(samples):
++        try:
++            run = subprocess.run([sys.executable, target_path], input=inp, capture_output=True,
++                                 text=True, timeout=SAMPLE_TIMEOUT_SECONDS, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return passed, len(samples), f"sample {idx}: input:\n{inp}\nTIMEOUT after {SAMPLE_TIMEOUT_SECONDS}s"
++        if run.returncode != 0:
++            return passed, len(samples), f"sample {idx}: input:\n{inp}\nexpected:\n{expected}\ntraceback:\n{run.stderr}"
++        if not _outputs_match(run.stdout, expected):
++            return passed, len(samples), f"sample {idx}: input:\n{inp}\nexpected:\n{expected}\nactual:\n{run.stdout}"
++        passed += 1
++    return passed, len(samples), None
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -305,8 +372,12 @@ class AgenticSystem:
+ 
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Bounded multi-attempt loop: each attempt is verified against the parsed samples,
++        feedback from failed attempts is carried into the next prompt, and the best
++        candidate (most samples passed) is restored at the end.
+         """
++        target = _target_file_name(self.problem_statement)
++        target_path = os.path.join(self.git_tempdir, target)
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -321,7 +392,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             "script (outside the target file) that plays the interactor, and test the solution against it."
+             if interactive else ""
+         )
+-        instruction = f"""{task}
++        workflow = f"""{task}
+ 
+ Follow this step-by-step workflow:
+ 1) Inspect the repository: use bash (e.g. `ls -la`, `cat`) and the editor tool to view existing files, and determine which file the solution must be written to (use the file named in the problem statement; if none is named, use the existing solution/entry file in the repo). Do this quickly.
+@@ -331,86 +402,103 @@ Follow this step-by-step workflow:
+ 5) For tricky or hard problems, also write a brute-force implementation (in a scratch file outside the target file) and stress-test the solution against it on many small random inputs; fix any differences, saving each fix to the target file.
+ 6) Keep reasoning short; do not spend a whole turn thinking without calling a tool. Never end your turn with only text. Replying without writing the solution file to disk counts as FAILURE. Only finish after the solution file has been written and verified.
+ """
+-        target = _target_file_name(self.problem_statement)
+-        history = []
+-        try:
+-            history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        except Exception as e:
+-            safe_log(f"[attempt 0] chat raised {type(e).__name__}: {e}")
+-        safe_log(f"[attempt 0] initial chat finished; empty={_is_empty_response(history)}; "
+-                 f"source patch present: {self._has_source_patch()}")
+-
+-        # Retry 1: continue the conversation with a nudge on the sanitized history.
+-        # If the history has no tool use at all, restart with a short concrete prompt instead.
+-        if not self._has_source_patch():
++        candidates = []  # list of dicts: code, passed, total, attempt
++        llm_calls = 0
++        prev_summary = ''
++        failure = None
++        stop_reason = 'max attempts reached'
++
++        for attempt in range(MAX_ATTEMPTS):
++            if llm_calls >= MAX_LLM_CALLS:
++                stop_reason = 'LLM call budget exhausted'
++                break
++            hint = STRATEGY_HINTS[attempt % len(STRATEGY_HINTS)]
++            plan = ''
++            if attempt == 0:
++                prompt = workflow
++            else:
++                prev_code = ''
++                if os.path.exists(target_path):
++                    with open(target_path) as f:
++                        prev_code = f.read()
++                plan_prompt = (
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                    f"Previous attempt's code:\n```python\n{prev_code}\n```\n\n"
++                    f"Failure:\n{failure}\n\n"
++                    "Give a SHORT derivation (under 15 lines) and the final algorithm in pseudocode. "
++                    "Do not write the full program."
++                )
++                try:
++                    llm_calls += 1
++                    plan = chat_no_tools(plan_prompt, model=self.code_model, logging=safe_log) or ''
++                except Exception as e:
++                    safe_log(f"[attempt {attempt}] planning raised {type(e).__name__}: {e}")
++                prompt = (
++                    f"{task}\n"
++                    f"This is attempt {attempt + 1} of {MAX_ATTEMPTS}. The previous attempt did NOT pass all samples.\n\n"
++                    f"Previous code (on disk at {target_path}):\n```python\n{prev_code}\n```\n\n"
++                    f"Failing case:\n{failure}\n\n"
++                    f"Previous attempt's final message:\n<previous_summary>\n{prev_summary}\n</previous_summary>\n"
++                    "If that message says it has not solved the problem or lists next steps, do NOT stop: "
++                    "carry out those next steps yourself now (write the brute force, find the formula, etc.).\n\n"
++                    f"Plan from a planning step:\n{plan.strip() or '(none)'}\n\n"
++                    f"Strategy for this attempt: {hint}\n"
++                    "Write the code to the target file immediately with the editor tool, then run every sample with bash "
++                    "and fix mismatches. Do not finish with only text; the file must be saved and verified."
++                )
++            history = []
+             try:
+-                clean = sanitize_history(history)
+-                has_tool_use, _ = _history_status(clean)
+-                if has_tool_use:
+-                    nudge = (f"Your last reply was empty. Use the editor tool now to create {target} "
+-                             "with your full solution, then run the samples.")
+-                    safe_log("[retry 1] no source change; continuing conversation with nudge.")
+-                    history = chat_with_agent(nudge, model=self.code_model, msg_history=clean, logging=safe_log)
+-                else:
+-                    short = (f"Use the editor tool to create {target} with the full solution, "
+-                             "then run the samples.\n\n"
+-                             f"<problem_description>\n{self.problem_statement}\n</problem_description>")
+-                    safe_log("[retry 1] history has no tool use; restarting with short prompt.")
+-                    history = chat_with_agent(short, model=self.code_model, msg_history=[], logging=safe_log)
+-                safe_log(f"[retry 1] chat finished; empty={_is_empty_response(history)}; "
+-                         f"source patch present: {self._has_source_patch()}")
++                llm_calls += 1
++                history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+             except Exception as e:
+-                safe_log(f"[retry 1] chat raised {type(e).__name__}: {e}")
++                safe_log(f"[attempt {attempt}] chat raised {type(e).__name__}: {e}")
++            _, prev_summary = _history_status(history)
++
++            code = ''
++            if os.path.exists(target_path):
++                with open(target_path) as f:
++                    code = f.read()
++            passed, total, failure = self._run_samples(target)
++            candidates.append({'code': code, 'passed': passed, 'total': total, 'attempt': attempt})
++            safe_log(f"[attempt {attempt}] score {passed}/{total}; empty={_is_empty_response(history)}; "
++                     f"failure={'none' if failure is None else 'yes'}")
++            if failure is None and total > 0 and passed == total:
++                stop_reason = 'all samples passed'
++                break
++            if failure is None and total == 0 and passed > 0:
++                stop_reason = 'no samples parsed; non-stub solution accepted'
++                break
+ 
+-        # Retry 2: restart with a minimal prompt containing only the problem statement
+-        if not self._has_source_patch():
+-            try:
+-                minimal = (f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                           f"Write the complete solution to {target} using the editor tool")
+-                safe_log("[retry 2] still no source change; restarting with minimal prompt.")
+-                history = chat_with_agent(minimal, model=self.code_model, msg_history=[], logging=safe_log)
+-                safe_log(f"[retry 2] chat finished; empty={_is_empty_response(history)}; "
+-                         f"source patch present: {self._has_source_patch()}")
+-            except Exception as e:
+-                safe_log(f"[retry 2] chat raised {type(e).__name__}: {e}")
++        # Pick best candidate: most samples passed, ties broken by later attempt.
++        best = None
++        for c in candidates:
++            if best is None or (c['passed'], c['attempt']) >= (best['passed'], best['attempt']):
++                best = c
++        if best is not None and best['code'].strip():
++            with open(target_path, 'w') as f:
++                f.write(best['code'])
++        best_passed = best['passed'] if best else 0
++        best_total = best['total'] if best else 0
+ 
+-        # Fallback: tool-free generation with sample verification. Always runs when no source change exists.
+-        if not self._has_source_patch():
+-            safe_log("[fallback] no source change after retries; running tool-free fallback.")
++        # Fallback: tool-free generation, kept only if it scores higher than the best candidate.
++        if best is None or (best_total > 0 and best_passed < best_total) or best_passed == 0:
++            prior_code = best['code'] if best else ''
+             try:
+-                ok = self._fallback_generate()
+-                safe_log(f"[fallback] outcome: samples_passed={ok}")
++                self._fallback_generate()
++                fb_passed, fb_total, _ = self._run_samples(target)
++                safe_log(f"[fallback] score {fb_passed}/{fb_total} vs best candidate {best_passed}/{best_total}")
++                if fb_passed > best_passed or best is None:
++                    best_passed, best_total = fb_passed, fb_total
++                else:
++                    with open(target_path, 'w') as f:
++                        f.write(prior_code)
+             except Exception as e:
+                 safe_log(f"[fallback] raised {type(e).__name__}: {e}")
+-            safe_log(f"[fallback] finished; source patch present: {self._has_source_patch()}")
+-
+-        # Final guard: if still no source patch, write the best code block found in assistant text.
+-        if not self._has_source_patch():
+-            try:
+-                code = None
+-                for msg in reversed(history or []):
+-                    if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+-                        continue
+-                    content = msg.get('content')
+-                    texts = [content] if isinstance(content, str) else [
+-                        (b.get('text') if isinstance(b, dict) else getattr(b, 'text', None))
+-                        for b in (content or [])
+-                    ]
+-                    for text in texts:
+-                        code = _extract_code_block(text or '')
+-                        if code and code.strip():
+-                            break
+-                    if code and code.strip():
+-                        break
+-                if code and code.strip():
+-                    target_path = os.path.join(self.git_tempdir, target)
++                if prior_code:
+                     with open(target_path, 'w') as f:
+-                        f.write(code)
+-                    safe_log(f"[final guard] no source patch; wrote code block from assistant text to {target_path} (unverified).")
+-                else:
+-                    safe_log("[final guard] no source patch and no code block found in assistant text.")
+-            except Exception as e:
+-                safe_log(f"[final guard] raised {type(e).__name__}: {e}")
++                        f.write(prior_code)
++
++        safe_log(f"[done] best score {best_passed}/{best_total}; stop reason: {stop_reason}; llm_calls={llm_calls}")
+ 
+     def _fallback_generate(self):
+         """
+@@ -487,6 +575,8 @@ Follow this step-by-step workflow:
+             code = new_code
+         return False
+ 
++AgenticSystem._run_samples = _run_samples
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

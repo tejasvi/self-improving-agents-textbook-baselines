@@ -1,0 +1,1243 @@
+diff -ru '--exclude=__pycache__' '--exclude=.git' '--exclude=tests' harness/seed_dgm/coding_agent.py exps/v2_A_dgm_s3/agents/g024_0/code/coding_agent.py
+--- harness/seed_dgm/coding_agent.py	2026-10-23 07:33:39.962273064 +0000
++++ exps/v2_A_dgm_s3/agents/g024_0/code/coding_agent.py	2026-10-23 22:15:28.315291277 +0000
+@@ -1,13 +1,20 @@
+ import argparse
++import ast
+ import subprocess
+ import logging
++import time
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
++# Explicit output budget for fallback calls (thinking models can exhaust small defaults).
++LARGE_MAX_TOKENS = 16384
++
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+ 
+@@ -137,6 +144,187 @@
+         ]
+         return new_msg_history
+ 
++    def _get_changed_files(self):
++        """
++        Return the list of files changed relative to base_commit, including untracked files.
++        """
++        changed = set()
++        commands = [
++            ["git", "-C", self.git_tempdir, "diff", "--name-only", self.base_commit],
++            ["git", "-C", self.git_tempdir, "ls-files", "--others", "--exclude-standard"],
++        ]
++        for cmd in commands:
++            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++            for line in result.stdout.decode(errors='replace').splitlines():
++                line = line.strip()
++                if line:
++                    changed.add(line)
++        return sorted(changed)
++
++    def _is_test_file(self, path):
++        """
++        Heuristically decide whether a path refers to a test file.
++        """
++        test_tokens = {'test', 'tests', 'spec', 'specs', 'conftest'}
++        normalized = path.replace('\\', '/')
++        parts = [p for p in normalized.split('/') if p]
++        if not parts:
++            return False
++        # Directory components must match exactly
++        for part in parts[:-1]:
++            if part.lower() in test_tokens:
++                return True
++        # Filename: split into words on non-alphanumeric characters
++        filename = parts[-1].lower()
++        words = re.split(r'[^a-z0-9]+', filename)
++        return any(w in test_tokens for w in words)
++
++    def _is_stub_patch(self):
++        """
++        True if the target file is unchanged from base_commit, or if it still contains only
++        stub bodies (`pass` or `NotImplementedError`).
++        """
++        target = self._target_file()
++        unchanged = subprocess.run(
++            ["git", "-C", self.git_tempdir, "diff", "--quiet", self.base_commit, "--", target],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        ).returncode == 0
++        if unchanged:
++            return True
++        path = os.path.join(self.git_tempdir, target)
++        if not os.path.isfile(path):
++            return True
++        try:
++            with open(path, 'r', errors='replace') as fh:
++                tree = ast.parse(fh.read())
++        except Exception:
++            return False  # Unparseable code is not a recognised stub; let it count as a patch.
++        bodies = []
++        for node in ast.walk(tree):
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                body = [s for s in node.body
++                        if not (isinstance(s, ast.Expr) and isinstance(getattr(s, 'value', None), ast.Constant)
++                                and isinstance(s.value.value, str))]  # skip docstrings
++                bodies.append(body)
++        if not bodies:
++            return False
++        def is_stub(body):
++            if not body:
++                return True
++            if len(body) != 1:
++                return False
++            stmt = body[0]
++            if isinstance(stmt, ast.Pass):
++                return True
++            if isinstance(stmt, ast.Raise) and stmt.exc is not None:
++                exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
++                return isinstance(exc, ast.Name) and exc.id == 'NotImplementedError'
++            return False
++        return all(is_stub(b) for b in bodies)
++
++    def _has_source_patch(self):
++        """
++        True if at least one changed file is not a test file, and the target is not just a stub.
++        """
++        changed_source = any(not self._is_test_file(f) for f in self._get_changed_files())
++        return changed_source and not self._is_stub_patch()
++
++    def _target_file(self):
++        """
++        Infer the primary source file to edit: first backticked *.py name in the problem
++        statement that exists in the repo (or is named there), falling back to solution.py.
++        """
++        candidates = re.findall(r'`([\w./-]+\.py)`', self.problem_statement or '')
++        for cand in candidates:
++            if not cand.startswith('test') and '/test' not in cand and not os.path.basename(cand).startswith('test_'):
++                return cand
++        return 'solution.py'
++
++    def _duplicates_problem(self, text):
++        """
++        True if the file's content is mostly contained in the problem statement (e.g. a README
++        that repeats the task), so including it would duplicate the problem in the prompt.
++        """
++        problem_lines = {l.strip() for l in (self.problem_statement or '').splitlines() if l.strip()}
++        file_lines = [l.strip() for l in text.splitlines() if l.strip()]
++        if not file_lines:
++            return False
++        overlap = sum(1 for l in file_lines if l in problem_lines)
++        return overlap / len(file_lines) >= 0.6
++
++    def _build_condensed_prompt(self, target, max_listing=50):
++        """
++        Compact version of the task prompt: the problem statement appears once, the repo snapshot
++        has a truncated listing and no README/problem-duplicate files.
++        """
++        target_path = os.path.join(self.git_tempdir, target)
++        snapshot = self._snapshot_repo(max_files=5, max_listing=max_listing)
++        return (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"{snapshot}\n\n"
++            f"The repository currently has no source patch. Your very first action must be an editor create/edit call "
++            f"on {target_path} (the primary source file) that implements the solution. Then run it via bash on the "
++            f"sample inputs, and finish with a short summary."
++        )
++
++    def _snapshot_repo(self, max_files=10, max_file_bytes=8 * 1024, max_listing=200):
++        """
++        Deterministically collect the repo file listing (git ls-files) and the contents of
++        small text files (solution.py, README, starter files), without involving the LLM.
++        """
++        try:
++            result = subprocess.run(
++                ["git", "-C", self.git_tempdir, "ls-files"],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++            )
++            files = [l.strip() for l in result.stdout.decode(errors='replace').splitlines() if l.strip()]
++        except Exception as e:
++            files = []
++            safe_log(f"Snapshot: git ls-files failed: {e}")
++        listing = files[:max_listing]
++        listing_text = "\n".join(listing)
++        if len(files) > max_listing:
++            listing_text += f"\n... ({len(files) - max_listing} more files not shown)"
++
++        # Priority: target file, README, then other small files that look like starters.
++        target = self._target_file()
++        def priority(f):
++            base = os.path.basename(f).lower()
++            if f == target:
++                return 0
++            if base.startswith('readme'):
++                return 1
++            if base == 'solution.py':
++                return 2
++            if base.endswith('.py') and not self._is_test_file(f):
++                return 3
++            return 4
++        ordered = sorted(files, key=lambda f: (priority(f), f))
++
++        contents = []
++        for f in ordered:
++            if len(contents) >= max_files:
++                break
++            if priority(f) >= 4 and f != target:
++                continue
++            path = os.path.join(self.git_tempdir, f)
++            try:
++                if not os.path.isfile(path) or os.path.getsize(path) >= max_file_bytes:
++                    continue
++                with open(path, 'rb') as fh:
++                    raw = fh.read()
++                if b'\0' in raw:
++                    continue
++                text = raw.decode('utf-8', errors='replace')
++            except Exception:
++                continue
++            if f != target and self._duplicates_problem(text):
++                continue  # the problem statement is already included verbatim in the prompt
++            contents.append(f"--- {f} ---\n{text}")
++
++        return f"Repository files (git ls-files):\n{listing_text}\n\n" + "\n\n".join(contents)
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -149,8 +337,248 @@
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        workflow = """
++Follow this workflow step by step:
++1. Explore the repository: list the files and read the relevant code, tests, and any README or specification.
++2. Identify the primary source file that must be changed. If the task names a file (e.g. solution.py) and it does not exist, create it. First derive an algorithm that fits the constraints (N up to 2e5 implies O(N log N) or better); a brute force is only for testing, never for solution.py.
++3. Implement the solution by actually calling the editor tool (command=create or command=edit) on the source file. Do not only describe the code in text. The final solution must meet the stated constraints; an exponential or brute-force baseline must not be the final answer.
++4. Test it: run the program via bash with the sample inputs from the problem statement and with your own edge cases. For interactive problems, write a small local judge/simulator and run your solution against it.
++5. Finally verify with `git status` and `git diff` that the source file has actually changed. Fix any problems you find.
++
++IMPORTANT RULES:
++- You MUST make changes using the editor tool. Do not just answer in text.
++- If the task names an output file such as solution.py, create it.
++- Responding with text only and no file edits counts as failure.
++- Modifying only test files does not solve the task; the primary source file must be changed.
++"""
++        target = self._target_file()
++        snapshot = self._snapshot_repo()
++        instruction = (
++            f"{task}\n{workflow}\n"
++            f"Current repository contents:\n{snapshot}\n\n"
++            f"Your first action must be an editor create/edit on {os.path.join(self.git_tempdir, target)} "
++            f"(the primary source file) that implements the solution."
++        )
++        msg_history = []
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
++
++        if self._has_source_patch():
++            safe_log("Source patch detected after initial attempt; skipping retries.")
++        else:
++            # Bounded escalation ladder. Each strategy starts a fresh conversation (never reuse a
++            # history that may end with an empty assistant turn) and stops once a source patch exists.
++            target = self._target_file()
++            full_prompt = (
++                f"{task}\n{self._snapshot_repo()}\n\n"
++                f"The repository currently has no source patch. Your very first action must be an editor "
++                f"create/edit call on {os.path.join(self.git_tempdir, target)} (the primary source file) "
++                f"that implements the solution. Then run it via bash on the sample inputs, and finish with a summary."
++            )
++            condensed_prompt = self._build_condensed_prompt(target)
++            alternate_model = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++            strategies = [
++                ("current model, full prompt", self.code_model, full_prompt, None),
++                ("current model, condensed prompt, temp=0.7", self.code_model, condensed_prompt, 0.7),
++                ("alternate model, condensed prompt", alternate_model, condensed_prompt, None),
++            ]
++            for idx, (name, model, prompt, temperature) in enumerate(strategies):
++                if idx == 1:
++                    time.sleep(5)  # brief pause before re-trying the same model
++                safe_log(f"Escalation strategy {idx + 1}/{len(strategies)}: {name} (model={model}); target: {target}")
++                try:
++                    msg_history = chat_with_agent(
++                        prompt, model=model, msg_history=[], logging=safe_log, temperature=temperature,
++                        max_tokens=LARGE_MAX_TOKENS,
++                    )
++                except Exception as e:
++                    safe_log(f"Strategy {idx + 1} raised {e!r}")
++                    continue
++                has_patch = self._has_source_patch()
++                safe_log(f"Strategy {idx + 1} finished. Changed files: {self._get_changed_files()}, "
++                         f"source patch: {has_patch}")
++                if has_patch:
++                    safe_log(f"Source patch produced by strategy {idx + 1} ({name}, model={model}).")
++                    break
++            else:
++                safe_log("All escalation strategies finished without a source patch.")
++
++        self._run_verification(msg_history)
++
++        if not self._has_source_patch():
++            safe_log("Last-resort attempt: requesting the complete solution as a code block (no tools).")
++            self._last_resort_write()
++            safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
++                     f"source patch: {self._has_source_patch()}")
++
++    def _last_message_text(self, msg_history):
++        """Return the text of the last assistant message in msg_history, or '' if none."""
++        for msg in reversed(msg_history or []):
++            if msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            if isinstance(content, str):
++                return content
++            for block in content or []:
++                text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
++                if text:
++                    return text
++            return ""
++        return ""
++
++    def _verification_prompt(self, round_idx, max_rounds):
++        """Build the mandatory stress-test verification prompt for one round."""
++        target = self._target_file()
++        target_path = os.path.join(self.git_tempdir, target)
++        retry_note = ""
++        if round_idx > 0:
++            retry_note = (
++                f"This is verification round {round_idx + 1} of {max_rounds}: the previous round did not finish "
++                f"with a clean stress test. Re-check the solution from scratch against the brute force.\n\n"
++            )
++        return f"""{retry_note}Verification phase (mandatory). Do not finish until this is done.
++
++The solution at {target_path} passing the sample tests is NOT enough; subtle modelling errors are common. Verify it against an independent brute-force reference.
++
++1. Create scratch files ONLY under /tmp/stress/ (never inside {self.git_tempdir}):
++   - /tmp/stress/brute.py: an EXHAUSTIVE search that follows the literal rules of the problem statement directly (e.g. enumerate all choices / all permutations / all subsets / BFS over states). Do NOT re-implement the same idea or formula as the solution; it must be an independent, obviously-correct method. Keep it fast enough for small inputs.
++   - /tmp/stress/gen.py: takes a seed as its last argument (sys.argv[-1]), seeds `random` with it, and prints ONE random small input that respects all the problem's constraints. Include edge cases (minimum sizes, all-equal values, duplicates, boundary values) with reasonable probability.
++2. Make sure the solution can be run on stdin/stdout (or, if the task is a `Solution` class method, write a small wrapper in /tmp/stress/ that imports it from {target_path} and calls the method on the parsed input, then prints the result).
++3. Run the differential stress test with the `stress_test` tool, e.g. solution_cmd="python3 {target_path}", brute_cmd="python3 /tmp/stress/brute.py", generator_cmd="python3 /tmp/stress/gen.py", num_tests=1000. Run at least 500 cases (up to 2000). If the tool is unavailable, write /tmp/stress/stress.py yourself that loops over seeds with subprocess timeouts and compares outputs.
++4. If there is ANY mismatch (or a timeout/crash):
++   a. Minimise the failing input by hand until it is tiny, and examine both outputs.
++   b. Reason explicitly about which modelling assumption of the solution is wrong (for example a wrong cost model, a missed case, an off-by-one, a greedy that is not optimal, or a misread rule). Do not guess blindly; check the brute force first if you suspect it.
++   c. Fix {target_path} with the editor tool (use str_replace for targeted edits).
++   d. Rerun the stress test until it reports no mismatches over the full number of cases.
++5. Timing (mandatory, before you may report success): generate a maximum-size input that respects the constraints (for example via a small script in /tmp/stress/) and time the solution with `time` via bash. If it takes more than about 1 second, or exceeds the constraints' intended complexity, optimise the algorithm (not just micro-optimise) and re-run the stress test to confirm it still agrees with the brute force. Never leave an exponential or brute-force solution as the final answer.
++6. Run the sample tests from the problem statement once more.
++7. Finally run `git -C {self.git_tempdir} status` and `git -C {self.git_tempdir} diff` to confirm that the only changes are to the source file(s) and that no scratch files (brute.py, gen.py, stress.py, timing inputs, __pycache__ or similar) were left in the repository. Delete any that were.
++
++When everything is done, end your reply with a short report that includes the stress test summary (number of cases, seeds, result) and the timing of the max-size input. If and only if the stress test passed with zero mismatches, include the exact marker line `STRESS TEST PASSED` in that final reply."""
++
++    def _history_ran_bash(self, msg_history):
++        """
++        True if any assistant turn in msg_history invoked the bash tool (Claude tool_use block).
++        Manual-tool histories record calls as text, so they are matched by the tool name too.
++        """
++        for msg in msg_history or []:
++            if msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            blocks = content if isinstance(content, list) else []
++            for block in blocks:
++                if isinstance(block, dict):
++                    btype, name = block.get("type"), block.get("name")
++                else:
++                    btype, name = getattr(block, "type", None), getattr(block, "name", None)
++                if btype == "tool_use" and name == "bash":
++                    return True
++                text = (block.get("text") if isinstance(block, dict) else getattr(block, "text", None)) or ""
++                if btype == "text" and "'tool_name': bash" in text:
++                    return True
++        return False
++
++    def _run_verification(self, msg_history, max_rounds=2):
++        """
++        Mandatory differential-testing phase: a bounded number of rounds (no unbounded loops),
++        each a chat_with_agent call that reuses the message history. A round counts as verified only
++        when the agent's final turn is non-empty, contains the STRESS TEST PASSED marker, and the
++        solution was actually executed (a bash run appears in the history). Empty turns and never-run
++        solutions are reported as unverified.
++        """
++        if not self._has_source_patch():
++            safe_log("Verification skipped: no source patch present.")
++            return msg_history
++        verified = False
++        for round_idx in range(max_rounds):
++            safe_log(f"Verification round {round_idx + 1}/{max_rounds} starting.")
++            prompt = self._verification_prompt(round_idx, max_rounds)
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            final_text = self._last_message_text(msg_history)
++            if not final_text.strip():
++                safe_log(f"Verification round {round_idx + 1}/{max_rounds}: last assistant turn is empty; "
++                         f"treating as NOT verified.")
++                continue
++            ran = self._history_ran_bash(msg_history)
++            if not ran:
++                safe_log(f"Verification round {round_idx + 1}/{max_rounds}: no bash run found in history; "
++                         f"solution was never executed, treating as NOT verified.")
++            passed = "STRESS TEST PASSED" in final_text and ran
++            safe_log(f"Verification round {round_idx + 1}/{max_rounds} finished. "
++                     f"Marker found: {passed}. Changed files: {self._get_changed_files()}")
++            if passed:
++                verified = True
++                break
++        if not verified:
++            safe_log(f"Verification: NOT verified after {max_rounds} rounds.")
++        return msg_history
++
++    def _last_resort_write(self):
++        """
++        Tool-free fallback: ask the LLM for the complete target file in a fenced code block,
++        then write it from Python so the patch is never empty. Tries the code model first,
++        then the alternate model. Never raises on empty or malformed responses.
++        """
++        target = self._target_file()
++        target_path = os.path.join(self.git_tempdir, target)
++        existing = ''
++        if os.path.isfile(target_path):
++            with open(target_path, 'r', errors='replace') as fh:
++                existing = fh.read()
++        prompt = (
++            f"Solve the following problem by writing the COMPLETE contents of the file `{target}`.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Current contents of {target}:\n```python\n{existing}\n```\n\n"
++            f"Reply with ONLY the complete file in a single ```python code block. No other text."
++        )
++        alternate_model = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++        code = None
++        for model in [self.code_model, alternate_model]:
++            try:
++                client, client_model = create_client(model)
++                content, _ = get_response_from_llm(
++                    msg=prompt,
++                    client=client,
++                    model=client_model,
++                    system_message="You are an expert competitive programmer. Output only code.",
++                    msg_history=[],
++                    max_tokens=LARGE_MAX_TOKENS,
++                )
++            except Exception as e:
++                safe_log(f"Last-resort LLM call failed (model={model}): {e!r}")
++                continue
++            content = content if isinstance(content, str) else ''
++            safe_log(f"Last-resort response (model={model}): raw content length {len(content)}")
++            code = self._extract_code(content)
++            if code is not None:
++                break
++            safe_log(f"Last-resort: no usable code found in response from model={model}.")
++        if code is None:
++            safe_log("Last-resort: giving up; no code could be extracted from any model.")
++            return
++        if 'from typing import List' in existing and 'from typing import List' not in code:
++            code = 'from typing import List\n\n' + code
++        os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
++        with open(target_path, 'w') as fh:
++            fh.write(code if code.endswith('\n') else code + '\n')
++        safe_log(f"Last-resort: wrote {target}.")
++
++    def _extract_code(self, content):
++        """
++        Return the first fenced code block in content, or the raw text if it parses as Python.
++        Returns None when neither is available.
++        """
++        match = re.search(r'```(?:python|py)?\s*\n(.*?)```', content or '', re.DOTALL)
++        if match and match.group(1).strip():
++            return match.group(1)
++        raw = (content or '').strip()
++        if raw:
++            try:
++                ast.parse(raw)
++                return raw
++            except SyntaxError:
++                pass
++        return None
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff -ru '--exclude=__pycache__' '--exclude=.git' '--exclude=tests' harness/seed_dgm/llm.py exps/v2_A_dgm_s3/agents/g024_0/code/llm.py
+--- harness/seed_dgm/llm.py	2026-10-23 07:33:39.963045733 +0000
++++ exps/v2_A_dgm_s3/agents/g024_0/code/llm.py	2026-10-23 15:23:17.453082186 +0000
+@@ -177,9 +177,12 @@
+         print_debug=False,
+         msg_history=None,
+         temperature=0.7,
++        max_tokens=None,
+ ):
+     if msg_history is None:
+         msg_history = []
++    if max_tokens is None:
++        max_tokens = MAX_OUTPUT_TOKENS
+ 
+     if "claude" in model:
+         new_msg_history = msg_history + [
+@@ -195,12 +198,18 @@
+         ]
+         response = client.messages.create(
+             model=model,
+-            max_tokens=MAX_OUTPUT_TOKENS,
++            max_tokens=max_tokens,
+             temperature=temperature,
+             system=system_message,
+             messages=new_msg_history,
+         )
+-        content = response.content[0].text
++        if not getattr(response, "content", None):
++            stop_reason = getattr(response, "stop_reason", None)
++            raise ValueError(f"LLM returned no content blocks (stop_reason={stop_reason}).")
++        content = next((b.text for b in response.content if getattr(b, "type", None) == "text"), None)
++        if content is None:
++            # No text block (e.g. only tool_use): return empty text rather than raising.
++            content = ""
+         new_msg_history = new_msg_history + [
+             {
+                 "role": "assistant",
+@@ -221,7 +230,7 @@
+                 *new_msg_history,
+             ],
+             temperature=temperature,
+-            max_tokens=MAX_OUTPUT_TOKENS,
++            max_tokens=max_tokens,
+             n=1,
+             stop=None,
+             seed=0,
+diff -ru '--exclude=__pycache__' '--exclude=.git' '--exclude=tests' harness/seed_dgm/llm_withtools.py exps/v2_A_dgm_s3/agents/g024_0/code/llm_withtools.py
+--- harness/seed_dgm/llm_withtools.py	2026-10-23 07:33:45.443026001 +0000
++++ exps/v2_A_dgm_s3/agents/g024_0/code/llm_withtools.py	2026-10-23 22:15:28.315291277 +0000
+@@ -13,12 +13,65 @@
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+ 
++# Output-token ladder for empty turns caused by max_tokens exhaustion (thinking consumed the budget).
++# Capped at what the API allows for the model.
++MAX_TOKENS_CAP = 64000
++TOKEN_LADDER = [16384, 32000, 64000]
++
++def safe_extract_text(response):
++    """
++    Return the text of a response (str, Claude message, or OpenAI response) without raising.
++    Returns '' when there is no text.
++    """
++    try:
++        if response is None:
++            return ''
++        if isinstance(response, str):
++            return response
++        content = getattr(response, 'content', None)
++        if isinstance(content, list):
++            parts = [getattr(b, 'text', None) or (b.get('text') if isinstance(b, dict) else None) for b in content]
++            return '\n'.join(p for p in parts if p)
++        output_text = getattr(response, 'output_text', None)
++        if isinstance(output_text, str):
++            return output_text
++        return ''
++    except Exception:
++        return ''
++
++def describe_response(response):
++    """
++    One-line diagnostic for a response: stop_reason, block types and usage. Never raises.
++    """
++    try:
++        stop_reason = getattr(response, 'stop_reason', None)
++        content = getattr(response, 'content', None)
++        if isinstance(content, list):
++            block_types = [str(getattr(b, 'type', None) or (b.get('type') if isinstance(b, dict) else type(b).__name__)) for b in content]
++        elif content is None:
++            block_types = None
++        else:
++            block_types = type(content).__name__
++        usage = getattr(response, 'usage', None)
++        return f"stop_reason={stop_reason} block_types={block_types} usage={usage}"
++    except Exception as e:
++        return f"describe_response failed: {e!r}"
++
+ def process_tool_call(tools_dict, tool_name, tool_input):
+     try:
+         if tool_name in tools_dict:
+             return tools_dict[tool_name]['function'](**tool_input)
+         else:
+             return f"Error: Tool '{tool_name}' not found"
++    except TypeError as e:
++        # Bad arguments (unknown or missing parameters): show the schema so the model can retry correctly.
++        schema = None
++        if tool_name in tools_dict:
++            schema = tools_dict[tool_name]['info'].get('input_schema')
++        return (
++            f"Error: invalid arguments for tool '{tool_name}': {str(e)}. "
++            f"Expected input_schema: {json.dumps(schema)}"
++        )
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
+@@ -30,16 +83,22 @@
+ )
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=None, max_retry=3, temperature=None, max_tokens=None, thinking=None,
+ ):
+     try:
+         if 'claude' in model:
++            kwargs = {}
++            if temperature is not None:
++                kwargs['temperature'] = temperature
++            if thinking is not None:
++                kwargs['thinking'] = thinking
+             response = client.messages.create(
+                 model=model,
+                 messages=messages,
+-                max_tokens=4096,
++                max_tokens=max_tokens or 16384,
+                 tool_choice=tool_choice,
+                 tools=tools,
++                **kwargs,
+             )
+         elif model.startswith('o3-'):
+             response = client.responses.create(
+@@ -56,7 +115,8 @@
+     except Exception as e:
+         logging(f"Error in get_response_withtools: {str(e)}")
+         if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
++            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1,
++                                          temperature=temperature, max_tokens=max_tokens, thinking=thinking)
+ 
+         # Hitting the context window limit
+         if 'Input is too long for requested model' in str(e):
+@@ -279,7 +339,7 @@
+     else:
+         return msg_history
+ 
+-def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
++def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print, temperature=None, max_tokens=None):
+     # Construct message
+     if msg_history is None:
+         msg_history = []
+@@ -303,43 +363,211 @@
+             system_message=system_message,
+             print_debug=False,
+             msg_history=new_msg_history,
++            **_sampling_kwargs(temperature, max_tokens),
+         )
+         logging(f"Output: {response}")
+ 
+-        # Tool use
+-        tool_use = check_for_tool_use(response, model=client_model)
+-        while tool_use:
+-            # Process tool call
+-            tool_name = tool_use['tool_name']
+-            tool_input = tool_use['tool_input']
+-            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++        # Tool use, with bounded recovery from empty turns
++        for attempt in range(3):
++            tool_use = check_for_tool_use(response, model=client_model)
++            while tool_use:
++                # Process tool call
++                tool_name = tool_use['tool_name']
++                tool_input = tool_use['tool_input']
++                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++
++                # Get tool response
++                tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
++                logging(tool_msg)
++                response, new_msg_history = get_response_from_llm(
++                    msg=tool_msg,
++                    client=client,
++                    model=client_model,
++                    system_message=system_message,
++                    print_debug=False,
++                    msg_history=new_msg_history,
++                    **_sampling_kwargs(temperature, max_tokens),
++                )
++                logging(f"Output: {response}")
+ 
+-            # Get tool response
+-            tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
+-            logging(tool_msg)
++                # Check for next tool use
++                tool_use = check_for_tool_use(response, model=client_model)
++
++            if not _is_empty_response(response, model=client_model):
++                break
++
++            logging(f"Empty turn diagnostic: {describe_response(response)}")
++            logging(f"Dropping empty assistant turn (attempt {attempt + 1}/3); nudging the model.")
++            if attempt >= len(EMPTY_NUDGES):
++                logging("Empty turn persisted after all nudges; giving up so the caller can restart.")
++                # Drop the empty turn so it is not stored in the history.
++                if len(new_msg_history) >= 2 and new_msg_history[-1].get('role') == 'assistant':
++                    new_msg_history = new_msg_history[:-1]
++                break
++
++            # Remove the empty assistant turn and the user message before it; resend that user
++            # message merged with the nudge so roles keep alternating.
++            base_history = new_msg_history
++            prev_text = ''
++            if len(new_msg_history) >= 2 and new_msg_history[-1].get('role') == 'assistant' \
++                    and new_msg_history[-2].get('role') == 'user':
++                base_history = new_msg_history[:-2]
++                prev = new_msg_history[-2].get('content')
++                if isinstance(prev, str):
++                    prev_text = prev
++                elif isinstance(prev, list):
++                    prev_text = '\n'.join(b.get('text', '') for b in prev if isinstance(b, dict) and b.get('text'))
++
++            # Claude: the empty turn may have stopped at max_tokens (thinking used the whole budget).
++            # Re-issue the same user turn with the next token-ladder rung before nudging. get_response_from_llm
++            # does not expose stop_reason, so this is attempted for Claude models only.
++            if 'claude' in client_model and prev_text:
++                recovered_text = None
++                last_rung = len(TOKEN_LADDER) - 1
++                failed_max = max_tokens or 4096  # the limit get_response_from_llm used for this turn
++                for rung, max_tok in enumerate(TOKEN_LADDER):
++                    if max_tok > MAX_TOKENS_CAP or max_tok <= failed_max:
++                        continue
++                    logging(f"max_tokens recovery (manual): rung {rung + 1}/{len(TOKEN_LADDER)} max_tokens={max_tok}")
++                    try:
++                        cand_text, cand_hist = get_response_from_llm(
++                            msg=prev_text,
++                            client=client,
++                            model=client_model,
++                            system_message=system_message,
++                            print_debug=False,
++                            msg_history=base_history,
++                            temperature=temperature if temperature is not None else 0.7,
++                            max_tokens=max_tok,
++                        )
++                    except Exception as e:
++                        logging(f"max_tokens recovery (manual) rung {rung + 1} failed: {e!r}")
++                        continue
++                    if isinstance(cand_text, str) and cand_text.strip():
++                        logging(f"max_tokens recovery (manual) succeeded on rung {rung + 1}.")
++                        recovered_text = (cand_text, cand_hist)
++                        break
++                    logging(f"max_tokens recovery (manual) rung {rung + 1} still empty.")
++                if recovered_text is not None:
++                    response, new_msg_history = recovered_text
++                    logging(f"Output: {response}")
++                    continue
++
++            resend = f"{prev_text}\n\n{EMPTY_NUDGES[attempt]}" if prev_text else EMPTY_NUDGES[attempt]
+             response, new_msg_history = get_response_from_llm(
+-                msg=tool_msg,
++                msg=resend,
+                 client=client,
+                 model=client_model,
+                 system_message=system_message,
+                 print_debug=False,
+-                msg_history=new_msg_history,
++                msg_history=base_history,
++                **_sampling_kwargs(temperature, max_tokens),
+             )
+             logging(f"Output: {response}")
+ 
+-            # Check for next tool use
+-            tool_use = check_for_tool_use(response, model=client_model)
+-
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f'chat_with_agent error: {e!r}')
+ 
+     return new_msg_history
+ 
++def _sampling_kwargs(temperature=None, max_tokens=None):
++    kwargs = {}
++    if temperature is not None:
++        kwargs['temperature'] = temperature
++    if max_tokens is not None:
++        kwargs['max_tokens'] = max_tokens
++    return kwargs
++
++EMPTY_NUDGES = [
++    (
++        "Continue: think briefly (under 500 words), then call a tool now to implement the solution."
++    ),
++    (
++        "Continue: think briefly (under 500 words), then call a tool now to implement the solution. "
++        "Use exactly this format:\n"
++        "<tool_use>\n{'tool_name': 'editor', 'tool_input': {'command': 'create', "
++        "'path': '<path of the target source file>', 'file_text': '<complete file contents>'}}\n</tool_use>"
++    ),
++]
++
++
++def _is_max_tokens_stop(response):
++    return getattr(response, 'stop_reason', None) == 'max_tokens'
++
++
++def _recover_max_tokens(client, model, messages, tools, tool_choice, logging, temperature=None, failed_max=None):
++    """
++    For an empty response that stopped at max_tokens, re-issue the SAME messages with the next rung
++    of TOKEN_LADDER above `failed_max` (the limit that produced the empty turn); the last rung also
++    disables thinking. Returns the first non-empty response, or None if the ladder is exhausted.
++    """
++    last = len(TOKEN_LADDER) - 1
++    rungs = [(i, m) for i, m in enumerate(TOKEN_LADDER)
++             if m <= MAX_TOKENS_CAP and (failed_max is None or m > failed_max)]
++    for rung, max_tok in rungs:
++        thinking = {'type': 'disabled'} if rung == last else None
++        logging(f"max_tokens recovery: rung {rung + 1}/{len(TOKEN_LADDER)} max_tokens={max_tok} "
++                f"thinking={'disabled' if thinking else 'default'}")
++        try:
++            candidate = get_response_withtools(
++                client=client, model=model, messages=messages, tool_choice=tool_choice, tools=tools,
++                logging=logging, temperature=temperature, max_tokens=max_tok, thinking=thinking,
++            )
++        except Exception as e:
++            logging(f"max_tokens recovery rung {rung + 1} failed: {e!r}")
++            continue
++        if not _is_empty_response(candidate, model=model):
++            logging(f"max_tokens recovery succeeded on rung {rung + 1} (max_tokens={max_tok}).")
++            return candidate
++        logging(f"max_tokens recovery rung {rung + 1} still empty: {describe_response(candidate)}")
++        if not _is_max_tokens_stop(candidate):
++            break
++    return None
++
++
++def _is_empty_response(response, model=''):
++    """
++    True when the response has no non-whitespace text and no tool call.
++    """
++    if isinstance(response, str):
++        has_text = bool(response.strip())
++    elif 'claude' in model:
++        has_text = any(
++            getattr(block, 'type', None) == 'text' and (getattr(block, 'text', '') or '').strip()
++            for block in (getattr(response, 'content', None) or [])
++        )
++    else:
++        has_text = bool((getattr(response, 'output_text', '') or '').strip())
++    has_tool = check_for_tool_use(response, model=model) is not None
++    return (not has_text) and (not has_tool)
++
++
++def _append_nudge(msg_history, text):
++    """
++    Add a nudge without stacking consecutive user messages: merge it into the last
++    message if that is a user message (tool_result or text), otherwise append a new user message.
++    """
++    if msg_history and msg_history[-1].get("role") == "user":
++        last = msg_history[-1]
++        content = last.get("content")
++        if isinstance(content, str):
++            last["content"] = content + "\n\n" + text
++        elif isinstance(content, list):
++            content.append({"type": "text", "text": text})
++        else:
++            last["content"] = [{"type": "text", "text": text}]
++    else:
++        msg_history.append({"role": "user", "content": [{"type": "text", "text": text}]})
++    return msg_history
++
++
+ def chat_with_agent_claude(
+         msg,
+         model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+         msg_history=None,
+         logging=print,
++        temperature=None,
++        max_tokens=None,
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -355,6 +583,7 @@
+             ],
+         }
+     ]
++    sampling = _sampling_kwargs(temperature, max_tokens)
+ 
+     try:
+         # Create client
+@@ -373,28 +602,72 @@
+             tool_choice={"type": "auto"},
+             tools=tools,
+             logging=logging,
++            **sampling,
+         )
+ 
+-        # Check for tool use
+-        tool_use = check_for_tool_use(response, model=client_model)
+-        while tool_use:
+-            # Process tool call
+-            tool_name = tool_use['tool_name']
+-            tool_input = tool_use['tool_input']
+-            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++        final_response = None
++        gave_up = False
++        # Bounded: up to 3 attempts to recover from empty responses (no text and no tool call).
++        for attempt in range(3):
++            # Check for tool use
++            tool_use = check_for_tool_use(response, model=client_model)
++            while tool_use:
++                # Process tool call
++                tool_name = tool_use['tool_name']
++                tool_input = tool_use['tool_input']
++                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++
++                # Get tool response
++                new_msg_history.append({"role": "assistant", "content": response.content})
++                new_msg_history.append({
++                    "role": "user",
++                    "content": [
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": tool_use['tool_id'],
++                            "content": tool_result,
++                        }
++                    ],
++                })
++                response = get_response_withtools(
++                    client=client,
++                    model=client_model,
++                    messages=msg_history + new_msg_history,
++                    tool_choice={"type": "auto"},
++                    tools=tools,
++                    logging=logging,
++                    **sampling,
++                )
++
++                # Check for next tool use
++                tool_use = check_for_tool_use(response, model=client_model)
++
++            # Get final response
++            final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
++            if not _is_empty_response(response, model=client_model):
++                break
++            logging(f"Empty turn diagnostic: {describe_response(response)}; safe text={safe_extract_text(response)!r}")
+ 
+-            # Get tool response
+-            new_msg_history.append({"role": "assistant", "content": response.content})
+-            new_msg_history.append({
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "tool_result",
+-                        "tool_use_id": tool_use['tool_id'],
+-                        "content": tool_result,
+-                    }
+-                ],
+-            })
++            # Empty turn caused by max_tokens exhaustion: re-issue the SAME messages with a larger budget
++            # before resorting to a textual nudge.
++            if _is_max_tokens_stop(response):
++                recovered = _recover_max_tokens(
++                    client, client_model, msg_history + new_msg_history, tools,
++                    {"type": "auto"}, logging, temperature=sampling.get('temperature'),
++                    failed_max=sampling.get('max_tokens') or 16384,
++                )
++                if recovered is not None:
++                    response = recovered
++                    continue  # re-evaluate the recovered response (tool use or text)
++
++            # Empty turn: drop it (never stored in history) and nudge with an escalating message.
++            logging(f"Dropping empty assistant turn (attempt {attempt + 1}/3); nudging the model.")
++            final_response = None
++            if attempt >= len(EMPTY_NUDGES):
++                logging("Empty turn persisted after all nudges; giving up so the caller can restart.")
++                gave_up = True
++                break
++            _append_nudge(new_msg_history, EMPTY_NUDGES[attempt])
+             response = get_response_withtools(
+                 client=client,
+                 model=client_model,
+@@ -402,25 +675,21 @@
+                 tool_choice={"type": "auto"},
+                 tools=tools,
+                 logging=logging,
++                **sampling,
+             )
++        if final_response is not None and not gave_up:
++            new_msg_history.append({
++                "role": "assistant",
++                "content": [
++                    {
++                        "type": "text",
++                        "text": final_response,
++                    }
++                ],
++            })
+ 
+-            # Check for next tool use
+-            tool_use = check_for_tool_use(response, model=client_model)
+-
+-        # Get final response
+-        final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
+-        new_msg_history.append({
+-            "role": "assistant",
+-            "content": [
+-                {
+-                    "type": "text",
+-                    "text": final_response,
+-                }
+-            ],
+-        })
+-
+-    except Exception:
+-        pass
++    except Exception as e:
++        logging(f'chat_with_agent error: {e!r}')
+ 
+     return new_msg_history
+ 
+@@ -517,13 +786,16 @@
+     msg_history=None,
+     logging=print,
+     convert=False,  # Convert the message history to a generic format, so that msg_history can be used across models
++    temperature=None,
++    max_tokens=None,
+ ):
+     if msg_history is None:
+         msg_history = []
+ 
+     if 'claude' in model:
+         # Claude models
+-        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging,
++                                                 temperature=temperature, max_tokens=max_tokens)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         logging(conv_msg_history)
+         if convert:
+@@ -539,7 +811,8 @@
+ 
+     else:
+         # Models without in-built tool calling
+-        new_msg_history = chat_with_agent_manualtools(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_manualtools(msg, model=model, msg_history=msg_history, logging=logging,
++                                                      temperature=temperature, max_tokens=max_tokens)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         if convert:
+             new_msg_history = conv_msg_history
+diff -ru '--exclude=__pycache__' '--exclude=.git' '--exclude=tests' harness/seed_dgm/tools/bash.py exps/v2_A_dgm_s3/agents/g024_0/code/tools/bash.py
+--- harness/seed_dgm/tools/bash.py	2026-10-23 07:33:39.966441506 +0000
++++ exps/v2_A_dgm_s3/agents/g024_0/code/tools/bash.py	2026-10-23 10:47:17.405767779 +0000
+@@ -1,5 +1,6 @@
+ import asyncio
+ import os
++import signal
+ 
+ def tool_info():
+     return {
+@@ -18,9 +19,13 @@
+                 "command": {
+                     "type": "string",
+                     "description": "The bash command to run."
++                },
++                "restart": {
++                    "type": "boolean",
++                    "description": "Optional. Set to true to restart the bash session. Each call already uses a fresh shell, so this only returns a confirmation when no command is given."
+                 }
+             },
+-            "required": ["command"]
++            "required": []
+         }
+     }
+ 
+@@ -37,8 +42,8 @@
+     async def start(self):
+         if self._started:
+             return
+-        self._process = await asyncio.create_subprocess_shell(
+-            "/bin/bash -i",
++        self._process = await asyncio.create_subprocess_exec(
++            "/bin/bash", "--noprofile", "--norc",
+             preexec_fn=os.setsid,
+             stdin=asyncio.subprocess.PIPE,
+             stdout=asyncio.subprocess.PIPE,
+@@ -47,11 +52,22 @@
+         )
+         self._started = True
+ 
++    def _kill_group(self):
++        """Kill the whole process group of the shell (including child commands)."""
++        if self._process is None or self._process.returncode is not None:
++            return
++        try:
++            os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
++        except (ProcessLookupError, PermissionError, OSError):
++            try:
++                self._process.kill()
++            except ProcessLookupError:
++                pass
++
+     def stop(self):
+         if not self._started:
+             return
+-        if self._process.returncode is None:
+-            self._process.terminate()
++        self._kill_group()
+         self._process = None
+         self._started = False
+ 
+@@ -65,9 +81,12 @@
+                 f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+             )
+         
+-        # Send command
++        # Send command. The command runs in a brace group (so cd/export persist in the
++        # shell) with stdin redirected from /dev/null, so it cannot swallow the
++        # pipe-driven input of this shell.
++        wrapped = "{\n" + command + "\n} < /dev/null"
+         self._process.stdin.write(
+-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
++            wrapped.encode() + f"; echo '{self._sentinel}'\n".encode()
+         )
+         await self._process.stdin.drain()
+ 
+@@ -76,21 +95,24 @@
+             output = ''
+             start_time = asyncio.get_event_loop().time()
+             
+-            while True:
+-                if asyncio.get_event_loop().time() - start_time > self._timeout:
+-                    self._timed_out = True
+-                    raise ValueError(
+-                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-                    )
+-                
++            found = False
++            while not found and asyncio.get_event_loop().time() - start_time <= self._timeout:
+                 await asyncio.sleep(self._output_delay)
+                 # Read from the internal buffer
+                 stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+                 stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
++
+                 if self._sentinel in stdout_data:
+                     output = stdout_data[: stdout_data.index(self._sentinel)]
+-                    break
++                    found = True
++
++            if not found:
++                self._timed_out = True
++                self._kill_group()
++                raise ValueError(
++                    f"Timed out: bash has not returned in {self._timeout} seconds. "
++                    "The shell was killed; the next call will use a fresh shell."
++                )
+ 
+             # Clear buffers
+             self._process.stdout._buffer.clear()
+@@ -130,9 +152,8 @@
+ 
+ async def tool_function_call(command):
+     """Execute a command in the bash shell."""
++    bash_session = BashSession()
+     try:
+-        bash_session = BashSession()
+-
+         if not bash_session._started:
+             await bash_session.start()
+ 
+@@ -146,8 +167,17 @@
+         return result.strip()
+     except Exception as e:
+         return f"Error: {str(e)}"
++    finally:
++        bash_session.stop()
+ 
+-def tool_function(command):
++def tool_function(command=None, restart=False, **kwargs):
++    if command is None:
++        if restart:
++            return "Bash restarted."
++        return "Error: no command provided. Pass a 'command' string to run."
++    if restart:
++        # Every call already uses a fresh shell, so restart only needs to run the command.
++        pass
+     return asyncio.run(tool_function_call(command))
+ 
+ if __name__ == "__main__":
+diff -ru '--exclude=__pycache__' '--exclude=.git' '--exclude=tests' harness/seed_dgm/tools/edit.py exps/v2_A_dgm_s3/agents/g024_0/code/tools/edit.py
+--- harness/seed_dgm/tools/edit.py	2026-10-23 07:33:39.966456589 +0000
++++ exps/v2_A_dgm_s3/agents/g024_0/code/tools/edit.py	2026-10-23 12:20:59.258450151 +0000
+@@ -10,14 +10,15 @@
+ * The `create` command cannot be used if the specified `path` already exists as a file.\n
+ * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+ * The `edit` command overwrites the entire file with the provided `file_text`.\n
++* The `str_replace` command replaces the unique occurrence of `old_str` with `new_str` in an existing file; use it for targeted edits. `old_str` must match exactly once.\n
+ * No partial/line-range edits or partial viewing are supported.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "command": {
+                     "type": "string",
+-                    "enum": ["view", "create", "edit"],
+-                    "description": "The command to run: `view`, `create`, or `edit`."
++                    "enum": ["view", "create", "edit", "str_replace"],
++                    "description": "The command to run: `view`, `create`, `edit`, or `str_replace`."
+                 },
+                 "path": {
+                     "description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.",
+@@ -26,6 +27,14 @@
+                 "file_text": {
+                     "description": "Required parameter of `create` or `edit` command, containing the content for the entire file.",
+                     "type": "string"
++                },
++                "old_str": {
++                    "description": "Required parameter of `str_replace` command: the exact text to replace. Must occur exactly once in the file.",
++                    "type": "string"
++                },
++                "new_str": {
++                    "description": "Required parameter of `str_replace` command: the replacement text.",
++                    "type": "string"
+                 }
+             },
+             "required": ["command", "path"]
+@@ -61,7 +70,7 @@
+         # Path must not exist
+         if path_obj.exists():
+             raise ValueError(f"Cannot create new file; {path} already exists.")
+-    elif command == "edit":
++    elif command in ("edit", "str_replace"):
+         # Path must exist and must be a file
+         if not path_obj.exists():
+             raise ValueError(f"The file {path} does not exist.")
+@@ -119,12 +128,13 @@
+     content = read_file(path_obj)
+     return format_output(content, str(path_obj))
+ 
+-def tool_function(command: str, path: str, file_text: str = None) -> str:
++def tool_function(command: str, path: str, file_text: str = None, old_str: str = None, new_str: str = None) -> str:
+     """
+     Main tool function that handles:
+-      - 'view'  : View the entire file or directory listing
+-      - 'create': Create a new file with the given file_text
+-      - 'edit'  : Overwrite an existing file with file_text
++      - 'view'        : View the entire file or directory listing
++      - 'create'      : Create a new file with the given file_text
++      - 'edit'        : Overwrite an existing file with file_text
++      - 'str_replace' : Replace the unique occurrence of old_str with new_str
+     """
+     try:
+         path_obj = validate_path(path, command)
+@@ -144,6 +154,20 @@
+             write_file(path_obj, file_text)
+             return f"File at {path} has been overwritten with new content."
+ 
++        elif command == "str_replace":
++            if old_str is None or new_str is None:
++                raise ValueError("Missing required `old_str` or `new_str` for 'str_replace' command.")
++            if old_str == "":
++                raise ValueError("`old_str` must not be empty.")
++            content = read_file(path_obj)
++            count = content.count(old_str)
++            if count == 0:
++                raise ValueError(f"`old_str` was not found in {path}.")
++            if count > 1:
++                raise ValueError(f"`old_str` occurs {count} times in {path}; make it unique by including more context.")
++            write_file(path_obj, content.replace(old_str, new_str, 1))
++            return f"The file {path} has been edited successfully."
++
+         else:
+             raise ValueError(f"Unknown command: {command}")
+ 
+Only in exps/v2_A_dgm_s3/agents/g024_0/code/tools: stress_test.py

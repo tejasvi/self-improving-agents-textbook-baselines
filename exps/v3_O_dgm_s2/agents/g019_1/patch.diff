@@ -1,0 +1,187 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d3dcc7c..e381601 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -181,10 +181,90 @@ class AgenticSystem:
+                 return True
+         return False
+ 
+-    def forward(self):
++    # ---------------------------------------------------------------------
++    # New helper: candidate source files
++    # ---------------------------------------------------------------------
++    def _candidate_source_files(self):
++        """Return a list of candidate source files sorted by preference.
++
++        The function runs ``git ls-files`` (including untracked files via
++        ``--others --exclude-standard``) inside ``self.git_tempdir`` and filters
++        out test files, documentation files, hidden/config files. Files that are
++        typical starter files (e.g., ``solution.py``) or that match the language
++        extension (``self.language``) are placed first.
+         """
+-        The forward function for the AgenticSystem.
++        # Gather tracked files
++        cmd_tracked = ["git", "-C", self.git_tempdir, "ls-files"]
++        result_tracked = subprocess.run(cmd_tracked, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        tracked = result_tracked.stdout.splitlines()
++        # Gather untracked files
++        cmd_untracked = ["git", "-C", self.git_tempdir, "ls-files", "--others", "--exclude-standard"]
++        result_untracked = subprocess.run(cmd_untracked, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        untracked = result_untracked.stdout.splitlines()
++        all_files = tracked + untracked
++        # Filter out unwanted patterns
++        def is_test(path):
++            lower = path.lower()
++            test_patterns = ['test', 'tests', 'test_', '_test.', '.spec.']
++            return any(p in lower for p in test_patterns)
++        def is_doc(path):
++            return path.lower().endswith(('.md', '.txt', '.rst'))
++        def is_hidden_or_config(path):
++            basename = os.path.basename(path)
++            if basename.startswith('.'):
++                return True
++            config_names = ['.gitignore', '.gitattributes', 'setup.cfg', 'pyproject.toml', 'requirements.txt']
++            return basename in config_names
++        candidates = [p for p in all_files if not (is_test(p) or is_doc(p) or is_hidden_or_config(p))]
++        # Preference ordering
++        ext = '.' + self.language
++        def score(path):
++            base = os.path.basename(path)
++            score = len(path)  # longer paths get higher score (less preferred)
++            if base.startswith('solution') and base.endswith(ext):
++                score -= 100
++            if base.endswith(ext):
++                score -= 10
++            return score
++        candidates.sort(key=score)
++        safe_log(f"Candidate source files: {candidates}")
++        return candidates
++
++    def _build_corrective_prompt(self, issue: str) -> str:
++        """Construct a corrective prompt based on the observed issue.
++
++        Includes problem reminder, issue description, candidate files, and the
++        truncated content of the top candidate. Directs the model to call the
++        ``edit`` tool and then run tests.
+         """
++        candidates = self._candidate_source_files()
++        top_candidate = candidates[0] if candidates else ''
++        top_content = ''
++        if top_candidate:
++            try:
++                with open(os.path.join(self.git_tempdir, top_candidate), 'r', encoding='utf-8') as f:
++                    top_content = f.read()
++            except Exception as e:
++                safe_log(f"Failed to read top candidate {top_candidate}: {e}")
++        if len(top_content) > 6000:
++            top_content = top_content[:6000] + "...\n[truncated]"
++        prompt = (
++            f"The previous attempt resulted in an {issue}.\n"
++            "Please revise your approach. Below is a list of candidate source files you may edit (excluding test and doc files):\n"
++            + "\n".join(candidates) + "\n\n"
++        )
++        if top_candidate:
++            prompt += f"Current content of the most likely source file `{top_candidate}` (truncated to ~6000 chars):\n```
++{top_content}
++```\n"
++        prompt += (
++            "You must now call the `editor` tool with `command=edit` (or `create` if the file does not exist) providing the full new `file_text` for the chosen source file. "
++            "After editing, run the appropriate tests using the `bash` tool. Do NOT finish the turn with empty text or without editing a source file."
++        )
++        return prompt
++
++    def forward(self):
++        """Main entry point for the agentic system."""
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -193,50 +273,41 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        # 1) Explore the repository and open the starter file(s).
+-        # 2) Implement the solution by calling the editor tool (edit/create) on the primary source file.
+-        # 3) Write and run small tests with bash, including the examples from the problem statement.
+-        # 4) Do not finish until the source file has been modified; never only describe the code in text.
++        # Initial instruction with strict workflow guidance
+         instruction = (
+             f"{task}\n"
+             "Please follow this numbered workflow:\n"
+-            "1) Explore the repo and view the starter file(s).\n"
+-            "2) Implement the solution by using the editor tool (`edit` or `create`) on the main source file.\n"
+-            "3) Write and run small tests via bash, incorporating the problem's examples.\n"
+-            "4) Ensure the source file is edited before finishing; do not merely describe the solution.\n"
++            "1) Explore the repo and view the starter file (use the `view` tool on the main source file, not just the directory).\n"
++            "2) Implement the solution by using the `editor` tool (`edit` or `create`) on a source file. Every turn must end with at least one such editor call.\n"
++            "3) Write and run small tests via the `bash` tool, incorporating the problem's examples.\n"
++            "4) Ensure the source file is edited before finishing; never reply with empty text.\n"
+         )
+-        # Initial interaction with the LLM
++        # Initial interaction
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # -----------------------------------------------------------------
+-        # Retry loop – up to three attempts to obtain a valid patch.
+-        # -----------------------------------------------------------------
++        prev_issue = None
+         for attempt in range(3):
++            # If this is not the first attempt, start with a fresh history using the corrective prompt
++            if attempt > 0:
++                corrective_prompt = self._build_corrective_prompt(prev_issue if prev_issue else "unknown issue")
++                # Include full task for context
++                msg_history = chat_with_agent(task + "\n" + corrective_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            # Retrieve current patch after any model actions
+             patch = self._get_patch()
+-            # Determine patch validity
+             if patch.strip() and self._patch_touches_source(patch):
+                 safe_log(f"Valid patch obtained on attempt {attempt+1}")
+                 break
+-            # Prepare corrective feedback
++            # Determine issue for next iteration
+             if not patch.strip():
+-                issue = "empty patch"
++                prev_issue = "empty patch"
+             elif not self._patch_touches_source(patch):
+-                issue = "patch only modifies test files"
++                prev_issue = "patch only modifies test files"
+             else:
+-                issue = "unknown issue"
+-            safe_log(f"Attempt {attempt+1} produced {issue}; constructing corrective message.")
+-            corrective = (
+-                f"The previous attempt resulted in an {issue}. "
+-                "Please ensure you first view the starter file (using the `view` tool) and then edit it (using `edit` or `create`). "
+-                "The tool call should be a valid JSON object, e.g.:\n"
+-                "{\"command\": \"edit\", \"path\": \"/path/to/file.py\", \"file_text\": \"# your code here\"}\n"
+-                "After editing, run the relevant tests via the `bash` tool."
+-            )
+-            # Append corrective message to history and invoke the agent again
++                prev_issue = "unknown issue"
++            safe_log(f"Attempt {attempt+1} produced {prev_issue}; will retry.")
++            # Send corrective prompt to get the model to act (its response will be in msg_history for next loop)
++            corrective = self._build_corrective_prompt(prev_issue)
+             msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            safe_log(f"Retry {attempt+1} completed.")
+         else:
+-            # Exhausted attempts – log a warning
+             safe_log("Failed to obtain a valid source‑modifying patch after 3 attempts.")
+ 
+ def main():
+@@ -251,7 +322,6 @@ def main():
+     parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+     args = parser.parse_args()
+ 
+-    # Process the repository
+     agentic_system = AgenticSystem(
+         problem_statement=args.problem_statement,
+         git_tempdir=args.git_dir,
+@@ -262,10 +332,8 @@ def main():
+         language=args.language,
+     )
+ 
+-    # Run the agentic system to try to solve the problem
+     agentic_system.forward()
+ 
+-    # Get code diff and save to model_patch.diff
+     model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+     model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+     with open(model_patch_outfile, 'w') as f:

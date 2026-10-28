@@ -1,0 +1,181 @@
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..fd049bb 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -13,15 +13,76 @@ from tools import load_all_tools
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+ 
++# Limits used to keep the context small
++MAX_TOOL_OUTPUT_CHARS = 8000   # max characters of a single fresh tool result
++MAX_OLD_TOOL_OUTPUT_CHARS = 500  # max characters kept for tool results in older turns
++KEEP_RECENT_TOOL_RESULTS = 2   # number of most recent tool results kept intact
++
++def truncate_text(text, max_chars=MAX_TOOL_OUTPUT_CHARS):
++    """
++    Truncate text to at most max_chars, keeping the head and tail and
++    inserting a marker in the middle so the agent knows content was removed.
++    """
++    if text is None:
++        return ""
++    text = str(text)
++    if len(text) <= max_chars:
++        return text
++    marker = f"\n<response truncated: {len(text) - max_chars} characters omitted>\n"
++    if len(marker) > max_chars:
++        # Limit too small for the full marker: hard cut without a marker
++        return text[:max(max_chars, 0)]
++    keep = max_chars - len(marker)
++    head = keep // 2
++    tail = keep - head
++    return text[:head] + marker + (text[-tail:] if tail > 0 else "")
++
+ def process_tool_call(tools_dict, tool_name, tool_input):
+     try:
+         if tool_name in tools_dict:
+-            return tools_dict[tool_name]['function'](**tool_input)
++            result = tools_dict[tool_name]['function'](**tool_input)
++            return truncate_text(result, MAX_TOOL_OUTPUT_CHARS)
+         else:
+             return f"Error: Tool '{tool_name}' not found"
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
++def compact_old_tool_results(messages, keep_recent=KEEP_RECENT_TOOL_RESULTS, max_chars=MAX_OLD_TOOL_OUTPUT_CHARS):
++    """
++    Return a copy of messages where tool_result blocks in older turns are
++    truncated to max_chars. The most recent keep_recent tool results are left
++    intact. The input list and its dicts are not modified.
++    """
++    # Locate every tool_result block (position in messages and index in content)
++    positions = []
++    for mi, msg in enumerate(messages):
++        content = msg.get('content') if isinstance(msg, dict) else None
++        if not isinstance(content, list):
++            continue
++        for bi, block in enumerate(content):
++            if isinstance(block, dict) and block.get('type') == 'tool_result':
++                positions.append((mi, bi))
++    old_positions = set(positions[:-keep_recent] if keep_recent > 0 else positions)
++
++    compacted = []
++    for mi, msg in enumerate(messages):
++        content = msg.get('content') if isinstance(msg, dict) else None
++        if not isinstance(content, list) or not any((mi, bi) in old_positions for bi in range(len(content))):
++            compacted.append(msg)
++            continue
++        new_content = []
++        for bi, block in enumerate(content):
++            if (mi, bi) in old_positions:
++                new_block = dict(block)
++                new_block['content'] = truncate_text(block.get('content'), max_chars)
++                new_content.append(new_block)
++            else:
++                new_content.append(block)
++        new_msg = dict(msg)
++        new_msg['content'] = new_content
++        compacted.append(new_msg)
++    return compacted
++
+ @backoff.on_exception(
+     backoff.expo,
+     (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+@@ -369,7 +430,7 @@ def chat_with_agent_claude(
+         response = get_response_withtools(
+             client=client,
+             model=client_model,
+-            messages=msg_history + new_msg_history,
++            messages=compact_old_tool_results(msg_history + new_msg_history),
+             tool_choice={"type": "auto"},
+             tools=tools,
+             logging=logging,
+@@ -398,7 +459,7 @@ def chat_with_agent_claude(
+             response = get_response_withtools(
+                 client=client,
+                 model=client_model,
+-                messages=msg_history + new_msg_history,
++                messages=compact_old_tool_results(msg_history + new_msg_history),
+                 tool_choice={"type": "auto"},
+                 tools=tools,
+                 logging=logging,
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..c29aca2 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -74,24 +74,27 @@ class BashSession:
+         # Read output until sentinel
+         try:
+             output = ''
+-            start_time = asyncio.get_event_loop().time()
+             
+-            while True:
+-                if asyncio.get_event_loop().time() - start_time > self._timeout:
+-                    self._timed_out = True
+-                    raise ValueError(
+-                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-                    )
+-                
++            # Bounded polling loop: at most _timeout / _output_delay polls
++            max_polls = int(self._timeout / self._output_delay) + 1
++            found = False
++            for _ in range(max_polls):
+                 await asyncio.sleep(self._output_delay)
+                 # Read from the internal buffer
+                 stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+                 stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
++
+                 if self._sentinel in stdout_data:
+                     output = stdout_data[: stdout_data.index(self._sentinel)]
++                    found = True
+                     break
+ 
++            if not found:
++                self._timed_out = True
++                raise ValueError(
++                    f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
++                )
++
+             # Clear buffers
+             self._process.stdout._buffer.clear()
+             self._process.stderr._buffer.clear()
+@@ -106,26 +109,22 @@ class BashSession:
+             raise ValueError(str(e))
+ 
+ def filter_error(error):
+-    # Filter out errors that we do not want to see
++    # Drop interactive-shell startup noise and the echoed sentinel command
++    noise = (
++        "Inappropriate ioctl for device",
++        "cannot set terminal process group",
++        "no job control in this shell",
++    )
+     filtered_lines = []
+-    i = 0
+-    error_lines = error.splitlines()
+-    while i < len(error_lines):
+-        line = error_lines[i]
+-
+-        # Skip the next lines if ioctl error, add relevant lines
+-        if "Inappropriate ioctl for device" in line:
+-            i += 3
+-            if '<<exit>>' in error_lines[i]:
+-                i += 1
+-            while i < len(error_lines) - 1:
+-                filtered_lines.append(error_lines[i])
+-                i += 1
+-            i += 1
++    for line in error.splitlines():
++        if any(n in line for n in noise):
++            continue
++        if "<<exit>>" in line:
++            continue
++        # Shell prompt echoes (e.g. "bash-5.3$ cmd; echo '...") are not errors
++        if line.startswith("bash-") and ("$ " in line or line.rstrip().endswith("$")):
+             continue
+-
+         filtered_lines.append(line)
+-        i += 1
+     return '\n'.join(filtered_lines).strip()
+ 
+ async def tool_function_call(command):

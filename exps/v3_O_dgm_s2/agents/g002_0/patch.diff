@@ -1,0 +1,222 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d3dcc7c..51c560a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import traceback
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -143,43 +144,56 @@ class AgenticSystem:
+         """Return a diff string representing changes made since the base commit."""
+         return str(diff_versus_commit(self.git_tempdir, self.base_commit))
+ 
+-    def _patch_touches_source(self, patch: str) -> bool:
+-        """Return True if the patch modifies any non-test source file.
+-
+-        The function parses lines starting with ``diff --git a/<path> b/<path>``
+-        and checks the target file name against common test file patterns.
+-        Patterns considered test files are case‑insensitive matches for:
+-
+-        * ``test`` or ``tests`` in the path
+-        * file names starting with ``test_``
+-        * file names containing ``_test.``
+-        * file names containing ``.spec.``
++    def _safe_chat(self, msg, msg_history):
++        """Wrap ``chat_with_agent`` with exception handling.
++        On exception, logs the traceback and returns the original ``msg_history``.
++        """
++        try:
++            return chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        except Exception as e:
++            safe_log("Exception during chat_with_agent:\n" + traceback.format_exc(), level=logging.ERROR)
++            return msg_history
+ 
+-        If any diff header does **not** match these patterns, the function
+-        returns ``True`` indicating that the patch touches source code.
++    def _classify_patch(self, patch):
++        """Classify changed files in a patch into source and test files.
++        Returns three lists: (changed_files, source_files, test_files).
+         """
++        import re
++        changed = []
++        source = []
++        test = []
++        # Regex to capture paths from diff header lines
++        pattern = re.compile(r'^diff --git a/(.+?) b/(.+?)$')
+         for line in patch.splitlines():
+-            if line.startswith('diff --git'):
+-                # Extract the b/ path (new file path)
+-                parts = line.split(' b/')
+-                if len(parts) < 2:
+-                    continue
+-                b_path = parts[1].strip()
+-                # Normalise to lower‑case for pattern checks
+-                lower = b_path.lower()
+-                test_patterns = [
+-                    'test',
+-                    'tests',
+-                    'test_',
+-                    '_test.',
+-                    '.spec.'
+-                ]
+-                if any(p in lower for p in test_patterns):
+-                    # This diff block is likely a test file – ignore it
+-                    continue
+-                # If we reach here, it's a non‑test file
+-                return True
+-        return False
++            m = pattern.match(line)
++            if not m:
++                continue
++            a_path, b_path = m.group(1), m.group(2)
++            # Use the b_path as the new file location
++            file_path = b_path
++            changed.append(file_path)
++            # Determine if test file
++            parts = file_path.split('/')
++            # Directory component check
++            if any(part.lower() in {'test', 'tests', '__tests__', 'spec'} for part in parts):
++                test.append(file_path)
++                continue
++            # Filename pattern checks (case‑insensitive)
++            basename = os.path.basename(file_path).lower()
++            test_patterns = [
++                r'^test_.*\\.py$',
++                r'^.*_test\\.py$',
++                r'^.*_test\\.go$',
++                r'^.*\\.test\\.js$',
++                r'^.*\\.spec\\.js$',
++                r'^.*test\\.java$',
++                r'^.*_test\\.cpp$',
++            ]
++            if any(re.match(pat, basename) for pat in test_patterns):
++                test.append(file_path)
++            else:
++                source.append(file_path)
++        return changed, source, test
+ 
+     def forward(self):
+         """
+@@ -193,10 +207,6 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        # 1) Explore the repository and open the starter file(s).
+-        # 2) Implement the solution by calling the editor tool (edit/create) on the primary source file.
+-        # 3) Write and run small tests with bash, including the examples from the problem statement.
+-        # 4) Do not finish until the source file has been modified; never only describe the code in text.
+         instruction = (
+             f"{task}\n"
+             "Please follow this numbered workflow:\n"
+@@ -206,53 +216,57 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+             "4) Ensure the source file is edited before finishing; do not merely describe the solution.\n"
+         )
+         # Initial interaction with the LLM
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = self._safe_chat(instruction, [])
+ 
+-        # -----------------------------------------------------------------
+-        # Retry loop – up to three attempts to obtain a valid patch.
+-        # -----------------------------------------------------------------
+-        for attempt in range(3):
++        max_attempts = 4  # three corrective attempts + a final minimal prompt
++        for attempt in range(max_attempts):
+             patch = self._get_patch()
+-            # Determine patch validity
+-            if patch.strip() and self._patch_touches_source(patch):
+-                safe_log(f"Valid patch obtained on attempt {attempt+1}")
++            changed, source_files, test_files = self._classify_patch(patch)
++            safe_log(f"Attempt {attempt+1}: changed={len(changed)} files, source={len(source_files)}, test={len(test_files)}")
++            if patch.strip() and source_files:
++                safe_log(f"Valid source‑modifying patch obtained on attempt {attempt+1}")
+                 break
+-            # Prepare corrective feedback
++            # Build corrective message based on issue type
+             if not patch.strip():
+-                issue = "empty patch"
+-            elif not self._patch_touches_source(patch):
+-                issue = "patch only modifies test files"
++                issue_msg = "No files have been modified."
++                corrective = (
++                    f"{issue_msg} You must call the `editor` tool with command `view` on the stub/source file, then command `edit` (or `create` if it does not exist) with the full new `file_text`."
++                )
++            elif not source_files and test_files:
++                issue_msg = f"Only test files were modified: {', '.join(test_files)}."
++                # List repo files (truncated) to aid selection
++                try:
++                    repo_list = subprocess.check_output(['git', '-C', self.git_tempdir, 'ls-files'], text=True)
++                    repo_list = '\n'.join(repo_list.splitlines()[:200])  # truncate
++                except Exception:
++                    repo_list = 'Unable to list repository files.'
++                corrective = (
++                    f"{issue_msg} Do not edit tests; implement the fix in the non‑test source files.\n"
++                    f"Repository file listing (truncated):\n{repo_list}\n"
++                    "Please use the `editor` tool to view and edit the appropriate source file."
++                )
+             else:
+-                issue = "unknown issue"
+-            safe_log(f"Attempt {attempt+1} produced {issue}; constructing corrective message.")
+-            corrective = (
+-                f"The previous attempt resulted in an {issue}. "
+-                "Please ensure you first view the starter file (using the `view` tool) and then edit it (using `edit` or `create`). "
+-                "The tool call should be a valid JSON object, e.g.:\n"
+-                "{\"command\": \"edit\", \"path\": \"/path/to/file.py\", \"file_text\": \"# your code here\"}\n"
+-                "After editing, run the relevant tests via the `bash` tool."
+-            )
+-            # Append corrective message to history and invoke the agent again
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            safe_log(f"Retry {attempt+1} completed.")
++                corrective = "The previous attempt did not produce a satisfactory patch. Please ensure you modify a source file using the editor tool."
++            # For the final attempt, use a minimal imperative prompt
++            if attempt == max_attempts - 1:
++                corrective = "Make a direct edit to a source file now using the `editor` tool."
++            msg_history = self._safe_chat(corrective, msg_history)
+         else:
+-            # Exhausted attempts – log a warning
+-            safe_log("Failed to obtain a valid source‑modifying patch after 3 attempts.")
++            # Loop exhausted without break
++            safe_log("Failed to obtain a valid source‑modifying patch after all attempts.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+     parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+     parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
++    parser.add_argument('--chat_history_file', required=True, help='Path to chat history log file')
++    parser.add_argument('--test_description', help='Optional test description')
++    parser.add_argument('--self_improve', action='store_true', help='Enable self‑improvement mode')
++    parser.add_argument('--language', default='python', help='Programming language of the task')
+     args = parser.parse_args()
+ 
+-    # Process the repository
+-    agentic_system = AgenticSystem(
++    agent = AgenticSystem(
+         problem_statement=args.problem_statement,
+         git_tempdir=args.git_dir,
+         base_commit=args.base_commit,
+@@ -261,15 +275,7 @@ def main():
+         self_improve=args.self_improve,
+         language=args.language,
+     )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
++    agent.forward()
+ 
+ if __name__ == "__main__":
+     main()

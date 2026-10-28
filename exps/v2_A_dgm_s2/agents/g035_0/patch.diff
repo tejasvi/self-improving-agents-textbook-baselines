@@ -1,0 +1,146 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f20be28..4380ea1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,5 @@
+ import argparse
++import hashlib
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -202,10 +203,27 @@ def _gather_repo_context(git_tempdir, max_chars=8000):
+ _SAMPLE_IN_RE = re.compile(r'Sample Input\s*(\d+)\s*:?\s*\n(.*?)(?=Sample Output\s*\1\b|\Z)', re.DOTALL | re.IGNORECASE)
+ _SAMPLE_OUT_RE = re.compile(r'Sample Output\s*(\d+)\s*:?\s*\n(.*?)(?=Sample Input\s*\d+|\Z|\n\s*(?:Explanation|Constraints|Note)\b)', re.DOTALL | re.IGNORECASE)
+ 
++_PROSE_MARKERS = ('Explanation', '##', 'Note', 'cost of')
++
++def _trim_expected(expected):
++    """
++    Keep only the first paragraph of an expected output (cut at the first blank line).
++    Return None if the result still looks unreliable (too long or contains prose markers).
++    """
++    trimmed = re.split(r'\n\s*\n', expected.strip())[0].strip()
++    if not trimmed:
++        return None
++    if len(trimmed.splitlines()) > 20:
++        return None
++    if any(marker in trimmed for marker in _PROSE_MARKERS):
++        return None
++    return trimmed
++
+ def _extract_samples(problem_statement):
+     """
+     Extract (input, expected_output) pairs from 'Sample Input N' / 'Sample Output N' blocks.
+-    Returns a list of tuples ordered by N. Missing outputs are skipped.
++    Returns a list of tuples ordered by N. Missing outputs are skipped, and so are
++    unreliable outputs (see _trim_expected).
+     """
+     text = problem_statement or ''
+     inputs = {int(m.group(1)): m.group(2) for m in _SAMPLE_IN_RE.finditer(text)}
+@@ -213,9 +231,22 @@ def _extract_samples(problem_statement):
+     samples = []
+     for n in sorted(inputs):
+         if n in outputs:
+-            samples.append((inputs[n].strip('\n') + '\n', outputs[n].strip()))
++            expected = _trim_expected(outputs[n])
++            if expected is None:
++                safe_log(f"Sample {n}: expected output looks unreliable; skipping it.")
++                continue
++            samples.append((inputs[n].strip('\n') + '\n', expected))
+     return samples
+ 
++def _count_code_lines(path):
++    """
++    Count non-blank, non-comment lines in an existing file (0 if it does not exist).
++    """
++    if not os.path.isfile(path):
++        return 0
++    with open(path, 'r', encoding='utf-8', errors='replace') as fh:
++        return sum(1 for line in fh if line.strip() and not line.strip().startswith('#'))
++
+ def _find_solution_file(git_tempdir):
+     """
+     Return the path of the solution file: 'solution.py' if present, else None.
+@@ -445,13 +476,36 @@ IMPORTANT: The task is incomplete until a source file has been created or edited
+         samples = _extract_samples(self.problem_statement)
+         safe_log(f"Extracted {len(samples)} sample(s) from the problem statement.")
+         max_rounds = 5
++        solution_path = _find_solution_file(self.git_tempdir)
++        best_content = None
++        best_failures = None
++        prev_hash = None
++        prev_failure_text = None
+         for round_idx in range(max_rounds):
+             failures = _run_samples(self.git_tempdir, samples, timeout=10)
+             diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+             reason = _needs_retry(diff)
++            if solution_path is None:
++                solution_path = _find_solution_file(self.git_tempdir)
++            cur_content = None
++            cur_hash = None
++            if solution_path is not None:
++                with open(solution_path, 'rb') as fh:
++                    cur_content = fh.read()
++                cur_hash = hashlib.md5(cur_content).hexdigest()
++            failure_text = "\n\n".join(failures)
++            if best_failures is None or len(failures) < best_failures:
++                best_failures = len(failures)
++                best_content = cur_content
+             if not failures and reason is None:
+                 safe_log(f"Samples passed and patch validation passed on round {round_idx}.")
+                 break
++            if (prev_hash is not None and cur_hash == prev_hash
++                    and failure_text == prev_failure_text):
++                safe_log(f"Round {round_idx}: repeated failures with unchanged solution.py; stopping the loop.")
++                break
++            prev_hash = cur_hash
++            prev_failure_text = failure_text
+             if failures:
+                 details = "\n\n".join(failures)
+                 feedback_msg = (
+@@ -475,11 +529,23 @@ IMPORTANT: The task is incomplete until a source file has been created or edited
+                 safe_log(f"Empty response on verification round {round_idx}; will resend feedback in the same history.")
+                 continue
+             msg_history = result if isinstance(result, list) else msg_history
++        # Restore the best snapshot if the current file is worse than one seen earlier.
++        solution_path = _find_solution_file(self.git_tempdir)
++        if solution_path is not None and best_content is not None:
++            with open(solution_path, 'rb') as fh:
++                final_content = fh.read()
++            if final_content != best_content:
++                final_failures = len(_run_samples(self.git_tempdir, samples, timeout=10))
++                if best_failures is not None and best_failures < final_failures:
++                    with open(solution_path, 'wb') as fh:
++                        fh.write(best_content)
++                    safe_log(f"Restored best solution snapshot ({best_failures} failing sample(s)).")
++
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         reason = _needs_retry(diff)
+-        if reason is None and not _run_samples(self.git_tempdir, samples, timeout=10):
++        if reason is None:
+             return
+-        safe_log(f"Final validation failed: {reason or 'sample tests still failing'}. Running deterministic fallback.")
++        safe_log(f"Final validation failed: {reason}. Running deterministic fallback.")
+         self._fallback_write_solution(task, repo_context)
+ 
+     def _fallback_write_solution(self, task, repo_context):
+@@ -508,6 +574,9 @@ Reply with ONLY the complete contents of `{target_rel}` (a full, working Python
+         elif text.strip() and any(k in text for k in ('def ', 'import', 'input(')):
+             code = text.strip() + "\n"
+         else:
++            if _count_code_lines(target_path) > 5:
++                safe_log("Fallback: no usable code in the model reply and an implementation already exists; keeping it.")
++                return
+             safe_log("Fallback: no usable code in the model reply; writing a minimal stub so the patch is not empty.")
+             code = (
+                 "import sys\n\n\n"
+@@ -517,6 +586,9 @@ Reply with ONLY the complete contents of `{target_rel}` (a full, working Python
+                 "if __name__ == '__main__':\n"
+                 "    main()\n"
+             )
++        if _count_code_lines(target_path) > 5:
++            safe_log("Fallback: an existing implementation is present; not overwriting it.")
++            return
+         os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
+         with open(target_path, 'w', encoding='utf-8') as f:
+             f.write(code)

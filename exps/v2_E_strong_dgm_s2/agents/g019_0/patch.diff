@@ -1,0 +1,884 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index c278303..076821f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,13 +1,24 @@
+ import argparse
+-import re
+-import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import shutil
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools import run_tests
++
++# Multi-attempt pipeline settings.
++N_ATTEMPTS = 3          # independent solver sessions
++REFLECTION_ROUNDS = 2   # extra reflection rounds per candidate
++NUM_RANDOM = 300        # random cases per harness run
++TIMEOUT = 5             # per-case seconds
++APPROACH_HINTS = [
++    "Start with the most direct algorithm that fits the constraints and prove its correctness on small cases.",
++    "Look for a greedy or constructive characterization; verify it against the brute force before trusting it.",
++    "Consider a different decomposition (e.g. DP over states, or case split on extremes) than the obvious one.",
++]
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -112,6 +123,9 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self._reports = {}
++        self._scores = {}
++        self._perfect = {}
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -138,123 +152,177 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def _solution_written(self):
++    # ------------------------------------------------------------------
++    # Pipeline helpers
++    # ------------------------------------------------------------------
++    def _paths(self):
++        tests_dir = os.path.join(self.git_tempdir, 'tests')
++        cand_dir = os.path.join(self.git_tempdir, 'candidates')
++        return tests_dir, cand_dir, os.path.join(self.git_tempdir, 'solution.py')
++
++    def _task_header(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++"""
++
++    def _canonical_protocol(self):
++        return """CANONICAL-ANSWER PROTOCOL (use whenever the statement allows several valid outputs, e.g. "if there are multiple solutions, print any"):
++   - brute.py's canonical(inp) must return the lexicographically smallest valid answer (smallest first element, then second, then third, comparing values numerically).
++   - The solution must print exactly that canonical answer, not just any valid answer. Final message must end with `canonical exact-match: N/N` when the run_tests report shows the matching count.
++"""
++
++    def _author_tests(self):
++        """Build the shared test harness once (samples, edge cases, brute, gen, optional driver)."""
++        tests_dir, _, _ = self._paths()
++        os.makedirs(tests_dir, exist_ok=True)
++        prompt = self._task_header() + f"""
++Your job now is ONLY to build the TEST HARNESS in {tests_dir}. Do NOT write solution.py or anything in candidates/.
++The harness will be shared by several independent solver attempts, so it must not depend on any particular solution.
++Create these files, each in its own tool call:
++
++1. {tests_dir}/brute.py: a short, straightforward exhaustive reference. Define canonical(inp) returning the exact output text for the raw input text inp. It must handle EVERY valid input, including inputs with no special elements.
++{self._canonical_protocol()}
++2. {tests_dir}/samples/NAME.in and {tests_dir}/samples/NAME.out for EACH example in the statement (sample1.in / sample1.out, ...), with the exact expected output copied from the statement.
++
++3. {tests_dir}/edge_cases.py defining EDGE_CASES = [(input_text, expected_output_text), ...]. Derive at least 8 cases from the constraints, covering: minimum size (min n), inputs with NO special elements (e.g. no missing/-1 values, no zeros, no answer-triggering values), inputs where ALL elements are special, special elements at the first and last positions, all values equal, strictly increasing and strictly decreasing values, and maximum values. Every expected output MUST be computed by calling brute.canonical, never written by hand. Keep the file short.
++
++4. {tests_dir}/gen.py defining generate(seed) -> raw input text string that is a random valid input. It must NEVER skip, filter out, or `continue` past any generated case (no `if ...: continue` filters). It must sweep the size, the value range, and the density of special elements, including density 0 and density 1 (the extremes), tiny value ranges (e.g. 1..3, 1..10) so duplicates and collisions are frequent, plus larger ranges (1..100 and beyond). Pick the parameters deterministically from seed.
++
++5. If the task is a method of a `Solution` class rather than a stdin program, also write {tests_dir}/driver.py: it reads the input from stdin, imports the candidate file given as sys.argv[1], calls the Solution method with the parsed arguments, and prints the result in the statement's output format. The driver must not contain task-specific answers.
++
++Self-validate before you finish:
++- brute.canonical(input of each sample) must equal that sample's output EXACTLY. If not, fix brute.py (not the expected output) until it does.
++- Import gen.py and call generate(s) for s in range(200); each result must be a valid input accepted by brute.canonical without error.
++- Import edge_cases.py and confirm it loads.
++Do not write solution.py. End with a short reply listing the files you created and the sample check result.
++"""
++        for attempt in range(2):
++            if os.path.isfile(os.path.join(tests_dir, 'brute.py')):
++                break
++            safe_log(f"harness brute.py missing; author session attempt {attempt + 1}/2")
++            chat_with_agent(prompt if attempt == 0 else
++                            f"brute.py is missing in {tests_dir}. Create it now with the editor tool (command=create) "
++                            f"so that it defines canonical(inp), then reply.",
++                            model=self.code_model, msg_history=[], logging=safe_log)
++        return os.path.isfile(os.path.join(tests_dir, 'brute.py'))
++
++    def _solve_attempt(self, tag, hint, prior_feedback=None, prior_path=None):
+         """
+-        Return True only if solution.py in git_tempdir contains real (non-comment, non-blank)
+-        code, differs from its version at base_commit, and the repo diff touches a non-tests file.
++        One solver session. Writes candidates/sol_<tag>.py and returns its path (or None if no file was written).
++        With prior_feedback, the session starts from prior_path's code plus the concrete failure report.
+         """
+-        sol_path = os.path.join(self.git_tempdir, 'solution.py')
+-        if not os.path.isfile(sol_path):
+-            return False
+-        with open(sol_path, 'r', encoding='utf-8', errors='replace') as f:
+-            content = f.read()
+-        code_lines = [
+-            line for line in content.splitlines()
+-            if line.strip() and not line.strip().startswith('#')
+-        ]
+-        if not code_lines:
+-            return False
++        tests_dir, cand_dir, _ = self._paths()
++        os.makedirs(cand_dir, exist_ok=True)
++        target = os.path.join(cand_dir, f"sol_{tag}.py")
++        if prior_feedback is None:
++            body = f"""Write a complete solution to {target} (create it with the editor tool, command=create).
++Approach hint for this attempt: {hint}
+ 
+-        base_result = subprocess.run(
+-            ["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:solution.py"],
+-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+-        )
+-        base_content = base_result.stdout.decode('utf-8', errors='replace') if base_result.returncode == 0 else ''
+-        if content == base_content:
+-            return False
++Work like a careful competitive programmer:
++1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
++2. Immediately write a first complete solution to {target}. For a `Solution` class method, add `from typing import *` and any imports you need at the top. If {tests_dir}/driver.py exists, the program is run through it.
++3. Run the harness with the run_tests tool: solution_path={target}, tests_dir={tests_dir}. Read the raw report. For each failing case, compare expected and actual output, trace your algorithm on that input, and fix the cause. Rerun until the report shows ALL PASS.
++4. Also run each sample by hand: python3 {target} < {tests_dir}/samples/NAME.in must equal NAME.out exactly. Sample and edge-case output must match exactly, including formatting.
++5. Generate one maximum-size input from the constraints and check (with bash `time`) that the solution finishes well under 2 seconds.
++6. If the statement allows several valid answers, print the canonical answer (see below).
++{self._canonical_protocol()}
++Do not modify files in {tests_dir} (the harness is shared by all attempts). Only write {target}; scratch files may go in /tmp. End with a short reply: your approach and the run_tests RESULT line."""
++        else:
++            prior_code = ""
++            if prior_path and os.path.isfile(prior_path):
++                with open(prior_path, 'r', encoding='utf-8', errors='replace') as f:
++                    prior_code = f.read()
++            body = f"""Your previous candidate is below. Scoring it with the harness gave this raw report:
+ 
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        if not diff.strip():
++<report>
++{prior_feedback}
++</report>
++
++Previous code ({prior_path}):
++```python
++{prior_code}
++```
++
++Reason concretely about each failing case in the report (expected vs actual; trace the algorithm on that input). Fix the actual cause, starting from the previous code and keeping what works. Write the revised full solution to {target} (editor tool, command=create). Then rerun the run_tests tool with solution_path={target} and tests_dir={tests_dir}. Keep fixing until the report shows ALL PASS. Do not modify files in {tests_dir}. End with a short reply: what you changed and the run_tests RESULT line."""
++        msg = self._task_header() + "\n" + body
++        chat_with_agent(msg, model=self.code_model, msg_history=[], logging=safe_log)
++        return target if os.path.isfile(target) else None
++
++    def _score_candidate(self, path):
++        """Score a candidate by running the harness. Returns (samples_passed, stress_pass_rate, -max_runtime)."""
++        tests_dir, _, _ = self._paths()
++        res = run_tests.evaluate(path, tests_dir, num_random=NUM_RANDOM, timeout=TIMEOUT, seed=0)
++        self._reports[path] = run_tests.format_report(res)
++        self._perfect[path] = run_tests.is_perfect(res)
++        total = res['edge_total'] + res['random_total']
++        passed = res['edge_passed'] + res['random_passed']
++        rate = passed / total if total else 0.0
++        score = (res['samples_passed'], round(rate, 6), -round(res['max_runtime'], 3))
++        self._scores[path] = score
++        safe_log(f"candidate {os.path.basename(path)} score={score} perfect={self._perfect[path]}")
++        return score
++
++    def _select_and_install(self):
++        """Copy the best-scoring candidate to solution.py and verify by execution that it passes the samples."""
++        tests_dir, _, sol_path = self._paths()
++        if not self._scores:
++            safe_log("no candidate produced; solution.py not installed")
+             return False
+-        changed_files = []
+-        for line in diff.splitlines():
+-            if line.startswith('diff --git '):
+-                parts = line.split()
+-                if len(parts) >= 4:
+-                    changed_files.append(parts[3][2:] if parts[3].startswith('b/') else parts[3])
+-        return any(not f.startswith('tests/') for f in changed_files)
++        best = max(self._scores, key=lambda p: self._scores[p])  # first of ties
++        shutil.copyfile(best, sol_path)
++        res = run_tests.evaluate(sol_path, tests_dir, num_random=0, timeout=TIMEOUT)
++        ok = (res['error'] is None and res['samples_total'] > 0
++              and res['samples_passed'] == res['samples_total'])
++        safe_log(f"installed {os.path.basename(best)} as solution.py score={self._scores[best]} samples_ok={ok}")
++        return ok
+ 
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Pipeline: (a) author the shared harness once; (b) N independent solver attempts, each with
++        bounded reflection rounds driven by the harness report; (c) deterministic scoring and selection;
++        (d) if nothing is perfect, one final reflection from the best candidate.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++        self._author_tests()
+ 
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-# CANONICAL-ANSWER PROTOCOL (use whenever the statement allows multiple valid outputs, e.g. "if there are multiple solutions, print any"):
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that. If multiple answers are allowed (e.g. "print any"), design the algorithm to return the lexicographically smallest answer (smallest first index, then second, then third), not the first one found by a convenient case split.
+-2. Immediately write a first complete solution.py; do not write test files or long analysis before this exists. Create each file in a separate tool call to avoid output truncation. For a `Solution` class method, add `from typing import *` and any imports you need at the top of solution.py.
+-3. Then list at least 8 edge cases derived from the constraints, covering: minimum size (min n), inputs with NO special elements (e.g. no missing/-1 values, no zeros, no answer-triggering values), inputs where ALL elements are special, special elements at the first and last positions, all values equal, strictly increasing and strictly decreasing (monotone) values, and maximum values. Write them to tests/edge_cases.py as a list of (input, expected_output) pairs, where each expected output is computed by the brute force (step 4), never by hand. Keep this file short.
+-4. Write tests/brute.py as a short, straightforward exhaustive reference that handles EVERY valid input, including inputs with no special elements. Write tests/gen.py that produces random valid inputs. The generator must NEVER skip, filter out, or `continue` past any generated case (do not write things like `if a.count(-1) == 0: continue`); it must sweep the size, the value range, and the density of special elements, including the extremes (density 0 and density 1) and tiny value ranges (e.g. 1..3, 1..10) so duplicates and collisions are frequent, plus larger ranges (1..100 and beyond). Write each in its own tool call.
+-   CANONICAL-ANSWER PROTOCOL (required when the statement allows several valid outputs, e.g. "if there are multiple solutions, print any"):
+-   (a) tests/brute.py must define `all_answers(inp)` returning the list of every valid output line for the raw input text `inp`, and `canonical(inp)` returning the single canonical output line. canonical() must be the lexicographically smallest valid answer in natural enumeration order (smallest first element, then second, then third, comparing values numerically).
+-   (b) Check that canonical() reproduces EVERY sample output exactly. If it does not, try alternative deterministic orderings (lex-max, by value, reversed enumeration) and adopt the one that reproduces all samples, updating canonical() accordingly. You may use the tool canonical_check (tools/canonical_check.py) to do this comparison; it takes the brute-force module path and the samples directory and reports which orderings match.
+-   (c) Design solution.py to print exactly the canonical answer (minimize first index, then second, then third) rather than the first answer found by a convenient case split.
+-   (d) Write tests/stress.py so that it compares solution output EXACTLY with canonical() on every random and edge case, and prints the exact-match count. Use the validator (membership in all_answers()) only as a secondary report: an answer that is valid but not canonical is a FAILURE, not a pass.
+-   (e) Fall back to "any valid answer" only if producing the canonical answer is infeasible within the time limits; if you do, say so explicitly in your final message and explain why.
+-5. Save EACH sample's input and expected output from the statement to files (e.g. tests/samples/sample1.in and tests/samples/sample1.out), and write tests/run_samples.sh that, for every sample, runs `diff <(python3 solution.py < tests/samples/sample1.in) tests/samples/sample1.out` and prints PASS or FAIL per sample. Run it. Any difference from the expected output is a failure to investigate, even if the answer is valid under your own checker. Then write a check that canonical() reproduces every sample output (see step 4(b)), run tests/stress.py, and fix every mismatch.
+-5b. If the statement says any valid answer is accepted (or gives several acceptable outputs), and any sample output is not matched exactly by solution.py, do NOT conclude that it is fine. The hidden grader may still compare against the reference output exactly. Try to infer the reference's canonical construction from the sample outputs: write a small script (e.g. tests/variants.py) that tries several deterministic variants of the construction (basis or iteration order, bit assignment direction high-to-low vs low-to-high, min vs max choice of values, pivot or free-variable choice, tie-breaking order) and reports which variants reproduce ALL sample outputs exactly. If a variant matches all samples, adopt it in solution.py, then confirm it still passes tests/stress.py (exact comparison with canonical()) and re-run tests/run_samples.sh. If no variant matches within a reasonable effort, say so explicitly in your final message and keep the valid answer.
+-6. If the solution relies on an unproven heuristic or candidate set, also test it against the brute force on larger random sizes (e.g. n up to 12) with a brute force that is still fast enough for that size.
+-7. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-8. Keep the tests/ directory until the very end. Re-run the complete harness (tests/edge_cases.py and tests/stress.py) after EVERY modification of solution.py, including full rewrites from scratch. Do not delete or re-create the harness between iterations in a way that drops earlier checks.
+-9. Before finishing, re-read solution.py line by line. For every early return and special-case branch, check it against the problem statement and against the edge cases from step 3. Then confirm that tests/stress.py passes on the final version of solution.py.
+-10. Final review: rerun tests/run_samples.sh and tests/stress.py. State explicitly, for EACH sample by name, whether solution.py's output matches the expected output exactly (MATCH or MISMATCH), and report the result of tests/stress.py. For a problem that allows multiple answers, your final message MUST include the line `canonical exact-match: N/N` where N is the number of stress cases (including edge cases) whose solution output equals canonical() exactly. Any MISMATCH must be investigated (see step 5b) before you finish; do not dismiss it as allowed because the answer is valid.
+-11. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # Post-run guard for multi-answer problems: the final message must report the canonical exact-match count.
+-        multi_answer = any(
+-            kw in self.problem_statement.lower()
+-            for kw in ("multiple solutions", "any valid", "print any", "any of them", "any answer", "several answers", "multiple answers", "any such")
+-        )
+-        if multi_answer:
+-            guard_re = re.compile(r"canonical exact-match:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+-            for attempt in range(1):
+-                last_text = ""
+-                if init_edit and init_edit[-1].get("content"):
+-                    content = init_edit[-1]["content"]
+-                    if isinstance(content, list) and content and isinstance(content[0], dict):
+-                        last_text = content[0].get("text", "") or ""
+-                    elif isinstance(content, str):
+-                        last_text = content
+-                if guard_re.search(last_text):
++        found_perfect = False
++        for k in range(N_ATTEMPTS):
++            hint = APPROACH_HINTS[k % len(APPROACH_HINTS)]
++            path = self._solve_attempt(str(k), hint)
++            for r in range(REFLECTION_ROUNDS + 1):
++                if path is None:
++                    break
++                self._score_candidate(path)
++                if self._perfect[path]:
++                    found_perfect = True
+                     break
+-                safe_log(f"final message lacks 'canonical exact-match: N/N'; re-prompt {attempt + 1}/1")
+-                recheck_text = (
+-                    "Your final message must report the canonical exact-match result. Run tests/stress.py now "
+-                    "(it must compare solution.py output exactly with canonical()), then end your reply with the line "
+-                    "`canonical exact-match: N/N` where N/N is the number of stress cases whose output equals canonical() exactly. "
+-                    "If it is not N/N with N equal to the total, fix solution.py first."
+-                )
+-                init_edit = chat_with_agent(recheck_text, model=self.code_model, msg_history=init_edit, logging=safe_log)
+-
+-        retry_text = (
+-            f"Your previous attempt left solution.py as the empty stub. Do not plan at length. "
+-            f"In your very next action, call the editor tool with command=create to write the complete Python solution "
+-            f"to {self.git_tempdir}/solution.py for this problem:\n\n{self.problem_statement}\n\n"
+-            f"Keep messages short. After the file exists, run the samples and fix any problems."
+-        )
+-        for attempt in range(3):
+-            if self._solution_written():
++                if r == REFLECTION_ROUNDS:
++                    break
++                path = self._solve_attempt(f"{k}_r{r + 1}", hint,
++                                           prior_feedback=self._reports[path], prior_path=path)
++            if found_perfect:
++                safe_log(f"early exit: attempt {k} is perfect")
+                 break
+-            safe_log(f"solution.py not written; retry attempt {attempt + 1}/3")
+-            init_edit = chat_with_agent(retry_text, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        if not self._solution_written():
+-            # Final fallback: ask only for a straightforward correct solution.
+-            fallback_text = (
+-                f"solution.py in {self.git_tempdir} is still missing a real solution. Write now, with the editor tool "
+-                f"(command=create), a straightforward correct Python solution to this problem and nothing else:\n\n"
+-                f"{self.problem_statement}"
+-            )
+-            init_edit = chat_with_agent(fallback_text, model=self.code_model, msg_history=[], logging=safe_log)
++
++        if not found_perfect and self._scores:
++            best = max(self._scores, key=lambda p: self._scores[p])
++            path = self._solve_attempt("final", None,
++                                       prior_feedback=self._reports[best], prior_path=best)
++            if path is not None:
++                self._score_candidate(path)
++
++        if not self._scores:
++            # Nothing was written by any attempt: one direct fallback session, then score it.
++            path = self._solve_attempt("fallback", APPROACH_HINTS[0])
++            if path is not None:
++                self._score_candidate(path)
++
++        self._select_and_install()
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/solution.py b/solution.py
+index d2e4c01..35cc66d 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,40 +1,335 @@
+-#!/usr/bin/env python3
+-"""Idempotent verifier for the canonical-answer protocol in /dgm/coding_agent.py.
++"""Multi-attempt solving pipeline with a shared, independently authored test harness.
+ 
+-The protocol is embedded in the `method` prompt of AgenticSystem.forward(),
+-and the bounded re-prompt guard is in forward() after the first agent run.
+-This script only checks that those pieces are present; it never edits files.
++Phases:
++  (a) test-author session builds and self-validates the harness (once);
++  (b) N independent solver sessions write candidates/sol_k.py and iterate
++      with bounded reflection rounds against run_tests;
++  (c) deterministic scoring ranks candidates (samples, stress pass rate, runtime),
++      optional cross-check on large random inputs, winner copied to solution.py;
++  (d) if nothing passes everything, one final reflection starts from the best candidate.
+ """
++
++import json
+ import os
++import shutil
++import subprocess
+ import sys
++import tempfile
++import time
++import glob
++import importlib.util
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++
++# ---------------------------------------------------------------------------
++# tools/run_tests.py (generic harness runner)
++# ---------------------------------------------------------------------------
++
++MAX_SHOW = 600  # characters per shown input/output
++
++
++def tool_info():
++    return {
++        "name": "run_tests",
++        "description": (
++            "Run a candidate solution against the harness in tests_dir: every samples/*.in "
++            "(compared with .out), every edge case, and num_random random cases generated by "
++            "gen.py whose expected output comes from brute.py. Reports pass/fail counts, the "
++            "first 3 failures (input, expected, actual) and the max runtime. Raw output only."
++        ),
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the candidate Python solution file."},
++                "tests_dir": {"type": "string", "description": "Path to the harness directory containing samples/, edge_cases.py, brute.py, gen.py."},
++                "num_random": {"type": "integer", "description": "Number of random cases from gen.py (default 500)."},
++                "timeout": {"type": "integer", "description": "Per-case time limit in seconds (default 5)."},
++                "seed": {"type": "integer", "description": "Seed offset for random cases (default 0)."},
++            },
++            "required": ["solution_path", "tests_dir"],
++        },
++    }
++
++
++def _load_module(path, name):
++    spec = importlib.util.spec_from_file_location(name, path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _run_candidate(solution_path, tests_dir, inp, timeout):
++    """Returns (ok, stdout, stderr, elapsed). ok False on crash/timeout."""
++    driver = os.path.join(tests_dir, "driver.py")
++    cmd = [sys.executable, driver, solution_path] if os.path.exists(driver) else [sys.executable, solution_path]
++    t0 = time.time()
++    try:
++        p = subprocess.run(cmd, input=inp, capture_output=True, text=True, timeout=timeout)
++    except subprocess.TimeoutExpired:
++        return False, "", "TIMEOUT", time.time() - t0
++    el = time.time() - t0
++    return p.returncode == 0, p.stdout, p.stderr, el
++
++
++def _same(a, b):
++    return a.split() == b.split()
++
++
++def evaluate(solution_path, tests_dir, num_random=500, timeout=5, seed=0):
++    """Structured evaluation. Returns dict with counts, failures and runtime."""
++    res = {"samples_total": 0, "samples_pass": 0, "edge_total": 0, "edge_pass": 0,
++           "stress_total": 0, "stress_pass": 0, "max_time": 0.0, "failures": [], "error": None}
++    try:
++        samples = sorted(glob.glob(os.path.join(tests_dir, "samples", "*.in")))
++        cases = []
++        for f in samples:
++            out = f[:-3] + ".out"
++            if os.path.exists(out):
++                cases.append(("sample", open(f).read(), open(out).read()))
++        ec_mod = os.path.join(tests_dir, "edge_cases.py")
++        if os.path.exists(ec_mod):
++            ec = _load_module(ec_mod, "edge_cases_mod").EDGE_CASES
++            for i, (a, b) in enumerate(ec):
++                cases.append(("edge", a, b))
++        brute = None
++        gen = None
++        if os.path.exists(os.path.join(tests_dir, "brute.py")):
++            brute = _load_module(os.path.join(tests_dir, "brute.py"), "brute_mod")
++        if os.path.exists(os.path.join(tests_dir, "gen.py")):
++            gen = _load_module(os.path.join(tests_dir, "gen.py"), "gen_mod")
++        if gen is not None and brute is not None:
++            for s in range(seed, seed + num_random):
++                inp = gen.generate(s)
++                cases.append(("stress", inp, brute.canonical(inp)))
++    except Exception as e:  # harness problem, reported raw
++        res["error"] = "harness load error: %r" % (e,)
++        return res
++
++    for kind, inp, expected in cases:
++        ok, out, err, el = _run_candidate(solution_path, tests_dir, inp, timeout)
++        res["max_time"] = max(res["max_time"], el)
++        passed = ok and _same(out, expected)
++        if kind == "sample":
++            res["samples_total"] += 1; res["samples_pass"] += passed
++        elif kind == "edge":
++            res["edge_total"] += 1; res["edge_pass"] += passed
++        else:
++            res["stress_total"] += 1; res["stress_pass"] += passed
++        if not passed:
++            res["failures"].append({"kind": kind, "input": inp, "expected": expected,
++                                    "actual": out if ok else (out + "\n" + err)})
++    return res
++
++
++def _clip(s):
++    s = s or ""
++    return s if len(s) <= MAX_SHOW else s[:MAX_SHOW] + "...[truncated]"
++
++
++def format_report(res):
++    lines = [
++        "samples: %d/%d passed" % (res["samples_pass"], res["samples_total"]),
++        "edge cases: %d/%d passed" % (res["edge_pass"], res["edge_total"]),
++        "random cases: %d/%d passed" % (res["stress_pass"], res["stress_total"]),
++        "max runtime: %.3fs" % res["max_time"],
++    ]
++    if res.get("error"):
++        lines.append("ERROR: " + res["error"])
++    for i, f in enumerate(res["failures"][:3]):
++        lines.append("--- failure %d (%s) ---" % (i + 1, f["kind"]))
++        lines.append("input:\n" + _clip(f["input"]))
++        lines.append("expected:\n" + _clip(f["expected"]))
++        lines.append("actual:\n" + _clip(f["actual"]))
++    total = res["samples_total"] + res["edge_total"] + res["stress_total"]
++    if total == 0 and not res.get("error"):
++        lines.append("NO TEST CASES FOUND: harness is missing or empty")
++    elif not res["failures"] and not res.get("error"):
++        lines.append("ALL TESTS PASSED")
++    return "\n".join(lines)
+ 
+-TARGET = sys.argv[1] if len(sys.argv) > 1 else "/dgm/coding_agent.py"
+-TOOL = os.path.join(os.path.dirname(TARGET), "tools", "canonical_check.py")
+ 
+-REQUIRED = [
+-    "CANONICAL-ANSWER PROTOCOL",
+-    "all_answers(inp)",
+-    "canonical(inp)",
+-    "canonical exact-match: N/N",
+-    "lexicographically smallest answer",
+-    "for attempt in range(1)",
++def tool_function(solution_path, tests_dir, num_random=500, timeout=5, seed=0):
++    return format_report(evaluate(solution_path, tests_dir, num_random, timeout, seed))
++
++
++# ---------------------------------------------------------------------------
++# Scoring (deterministic, in Python)
++# ---------------------------------------------------------------------------
++
++def score_of(res):
++    """Higher is better: samples passed, then stress pass rate, then faster runtime."""
++    stress_rate = res["stress_pass"] / res["stress_total"] if res["stress_total"] else 0.0
++    edge_rate = res["edge_pass"] / res["edge_total"] if res["edge_total"] else 0.0
++    return (res["samples_pass"] == res["samples_total"] and res["samples_total"] > 0,
++            res["samples_pass"], edge_rate, stress_rate, -res["max_time"])
++
++
++def _cross_check(paths, tests_dir, n_big=20, seed=10000):
++    """Compare candidates pairwise on random inputs; returns dict path -> agreement count."""
++    agree = {p: 0 for p in paths}
++    try:
++        gen = _load_module(os.path.join(tests_dir, "gen.py"), "gen_cross")
++    except Exception:
++        return agree
++    for s in range(seed, seed + n_big):
++        try:
++            inp = gen.generate(s)
++        except Exception:
++            continue
++        outs = {}
++        for p in paths:
++            ok, out, _, _ = _run_candidate(p, tests_dir, inp, 5)
++            outs[p] = out.split() if ok else None
++        for p in paths:
++            others = [outs[q] for q in paths if q != p and outs[q] is not None]
++            if outs[p] is not None and any(outs[p] == o for o in others):
++                agree[p] += 1
++    return agree
++
++
++# ---------------------------------------------------------------------------
++# Agent
++# ---------------------------------------------------------------------------
++
++APPROACH_HINTS = [
++    "Start from the most direct approach that follows the statement literally; prefer clarity.",
++    "Look for a known efficient algorithm or a mathematical characterization; verify it on small cases by hand.",
++    "Consider constraints first: pick an approach whose complexity clearly fits the limits, and guard edge cases explicitly.",
+ ]
+ 
++N_ATTEMPTS = 3
++R_REFLECTIONS = 2
++
++SAMPLE_EDGE_DISCIPLINE = (
++    "Sample and edge-case discipline: every statement sample must be reproduced exactly by the "
++    "brute force and by the solution. Keep edge cases (minimal sizes, equal values, maximal values, "
++    "empty-like inputs) in edge_cases.py. Never invent expected outputs; derive them from the "
++    "statement or the brute force."
++)
++
++
++class AgenticSystem:
++    def __init__(self, chat_with_agent):
++        # chat_with_agent(prompt: str) -> str ; runs one agent session with the repo tools.
++        self.chat_with_agent = chat_with_agent
++        self.tests_dir = os.path.join(HERE, "tests")
++        self.cand_dir = os.path.join(HERE, "candidates")
++        self.solution_path = os.path.join(HERE, "solution.py")
++
++    # -- phase (a) -----------------------------------------------------------
++    def _author_tests(self, problem_text):
++        os.makedirs(self.tests_dir, exist_ok=True)
++        prompt = (
++            "You are building a test harness only; do NOT write the final solution.\n"
++            f"Problem statement:\n{problem_text}\n\n"
++            f"Create in {self.tests_dir}: samples/NAME.in and samples/NAME.out for every statement sample; "
++            "edge_cases.py defining EDGE_CASES = [(input_text, expected_output_text), ...]; "
++            "brute.py defining canonical(inp) -> exact output text from a simple, obviously-correct brute force; "
++            "gen.py defining generate(seed) -> input text that never filters cases and covers extremes "
++            "and tiny value ranges.\n"
++            "Self-validate: the brute force must reproduce ALL statement samples exactly; run the brute on "
++            "several generated inputs to confirm it runs. Fix the harness until it validates. "
++            + SAMPLE_EDGE_DISCIPLINE
++        )
++        self.chat_with_agent(prompt)
++
++    # -- phase (b) -----------------------------------------------------------
++    def _solve_attempt(self, k, hint, prior_feedback=None):
++        os.makedirs(self.cand_dir, exist_ok=True)
++        path = os.path.join(self.cand_dir, f"sol_{k}.py")
++        msg = (
++            f"Solve the problem as a complete Python program reading stdin, writing stdout. "
++            f"Write it to {path}. Approach hint: {hint}\n"
++            f"Test it with the run_tests tool: solution_path={path}, tests_dir={self.tests_dir}. "
++            "Iterate until all samples and edge cases pass and the random cases pass. "
++            + SAMPLE_EDGE_DISCIPLINE
++        )
++        if prior_feedback:
++            msg += "\n\nPrevious attempt and failures:\n" + prior_feedback
++        self.chat_with_agent(msg)
++        return path if os.path.exists(path) else None
++
++    def _reflect(self, k, path, report):
++        code = ""
++        try:
++            code = open(path).read()
++        except Exception:
++            pass
++        msg = (
++            f"Your candidate {path} still fails. Concrete failure report:\n{report}\n\n"
++            f"Current code:\n{code}\n\n"
++            "Diagnose the root cause from the failing inputs (verify by hand or with a small trace), "
++            f"fix {path}, and re-run run_tests with tests_dir={self.tests_dir}."
++        )
++        self.chat_with_agent(msg)
++
++    def _score_candidate(self, path):
++        """Returns (score_tuple, result_dict) for a candidate path."""
++        res = evaluate(path, self.tests_dir)
++        return score_of(res), res
++
++    def _solve_candidate(self, k, hint):
++        path = self._solve_attempt(k, hint)
++        if path is None:
++            return None, None, None
++        score, res = self._score_candidate(path)
++        for _ in range(R_REFLECTIONS):
++            if res["samples_pass"] == res["samples_total"] and not res["failures"]:
++                break
++            self._reflect(k, path, format_report(res))
++            if not os.path.exists(path):
++                break
++            score, res = self._score_candidate(path)
++        return path, score, res
++
++    # -- phase (c) -----------------------------------------------------------
++    def _select_and_install(self, cands):
++        """cands: list of (path, score, res). Copies best to solution.py. Returns best or None."""
++        cands = [c for c in cands if c[0] and os.path.exists(c[0])]
++        if not cands:
++            return None
++        if len(cands) > 1:
++            agree = _cross_check([c[0] for c in cands], self.tests_dir)
++            cands = [(p, s + (agree.get(p, 0),), r) for p, s, r in cands]
++        best = max(cands, key=lambda c: c[1])
++        shutil.copyfile(best[0], self.solution_path)
++        return best
++
++    def _solution_passes_samples(self):
++        """Execution-based check: solution.py exists and passes the samples."""
++        if not os.path.exists(self.solution_path):
++            return False
++        res = evaluate(self.solution_path, self.tests_dir, num_random=0)
++        return res["samples_total"] > 0 and res["samples_pass"] == res["samples_total"]
+ 
+-def main():
+-    if not os.path.exists(TARGET):
+-        sys.exit("missing: " + TARGET)
+-    with open(TARGET) as f:
+-        src = f.read()
+-    missing = [m for m in REQUIRED if m not in src]
+-    if missing:
+-        sys.exit("missing markers in coding_agent.py: " + "; ".join(missing))
+-    if "while True" in src:
+-        sys.exit("forbidden 'while True' found in coding_agent.py")
+-    if not os.path.exists(TOOL):
+-        sys.exit("missing tool: " + TOOL)
+-    print("OK: canonical-answer protocol and guard present")
++    # -- entry point ---------------------------------------------------------
++    def forward(self, problem_text):
++        self._author_tests(problem_text)
++        cands = []
++        for k in range(N_ATTEMPTS):
++            hint = APPROACH_HINTS[k % len(APPROACH_HINTS)]
++            path, score, res = self._solve_candidate(k, hint)
++            if path is None:
++                continue
++            cands.append((path, score, res))
++            if res["samples_pass"] == res["samples_total"] and not res["failures"]:
++                break  # perfect candidate: early exit
++        best = self._select_and_install(cands)
++        if best is not None and not (best[2]["samples_pass"] == best[2]["samples_total"] and not best[2]["failures"]):
++            # (d) final reflection from best candidate with full failure report
++            self._reflect(-1, best[0], format_report(best[2]))
++            score, res = self._score_candidate(best[0])
++            cands.append((best[0], score, res))
++            self._select_and_install(cands)
++        if not self._solution_passes_samples():
++            # ensure the best available candidate is installed even if it is weak
++            self._select_and_install(cands)
++        return self.solution_path
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    # Standalone usage: python3 solution.py <problem_file> ; requires a chat_with_agent hook.
++    if len(sys.argv) < 2:
++        print("usage: solution.py <problem_file>  (chat_with_agent must be injected by the host)")
++        sys.exit(1)
++    print("Host must construct AgenticSystem(chat_with_agent) and call forward(problem_text).")
+diff --git a/tools/run_tests.py b/tools/run_tests.py
+new file mode 100644
+index 0000000..d3b3687
+--- /dev/null
++++ b/tools/run_tests.py
+@@ -0,0 +1,186 @@
++import importlib.util
++import os
++import subprocess
++import sys
++import time
++
++def tool_info():
++    return {
++        "name": "run_tests",
++        "description": """Run a candidate solution against the test harness and report raw results.\n
++* Harness layout (relative to tests_dir): samples/NAME.in with samples/NAME.out (expected output), edge_cases.py defining EDGE_CASES = [(input_text, expected_output_text), ...], brute.py defining canonical(inp) -> output text (the exact reference answer), and gen.py defining generate(seed) -> input text.\n
++* A stdin program is run as `python3 solution_path` with the input on stdin. If tests_dir/driver.py exists (for Solution-class tasks), it is run as `python3 tests_dir/driver.py solution_path` with the input on stdin instead.\n
++* Runs the candidate on every sample, every edge case, and num_random inputs from generate(seed..seed+num_random-1) whose expected output is brute's canonical(inp).\n
++* Reports pass/fail counts per group, the first 3 failing cases (input, expected output, actual output, including raw stderr when the program crashed), and the max runtime. Output is raw; read it yourself.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the candidate Python solution file to test."},
++                "tests_dir": {"type": "string", "description": "Path to the harness directory (e.g. <repo>/tests) containing samples/, edge_cases.py, brute.py, gen.py."},
++                "num_random": {"type": "integer", "description": "Number of random cases from gen.py compared against brute.py. Default 500."},
++                "timeout": {"type": "integer", "description": "Per-case time limit in seconds. Default 5."},
++                "seed": {"type": "integer", "description": "Seed offset for the random cases. Default 0."}
++            },
++            "required": ["solution_path", "tests_dir"]
++        }
++    }
++
++_CLIP = 400
++
++def _clip(s, n=_CLIP):
++    s = s or ""
++    if len(s) <= n:
++        return s
++    return s[:n] + f"...<{len(s) - n} more chars clipped>"
++
++def _norm(s):
++    return "\n".join(line.rstrip() for line in (s or "").strip().splitlines())
++
++def _load_module(path, name):
++    spec = importlib.util.spec_from_file_location(name, path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++def _run_candidate(solution_path, tests_dir, inp, timeout):
++    """Run the candidate on inp. Returns dict(stdout, stderr, returncode, seconds, timed_out)."""
++    driver = os.path.join(tests_dir, "driver.py")
++    if os.path.isfile(driver):
++        cmd = [sys.executable, driver, solution_path]
++    else:
++        cmd = [sys.executable, solution_path]
++    if not inp.endswith("\n"):
++        inp += "\n"
++    t0 = time.time()
++    try:
++        p = subprocess.run(cmd, input=inp, capture_output=True, text=True, timeout=timeout,
++                           cwd=os.path.dirname(os.path.abspath(tests_dir)), errors="replace")
++    except subprocess.TimeoutExpired:
++        return {"stdout": "", "stderr": "", "returncode": None, "seconds": float(timeout), "timed_out": True}
++    return {"stdout": p.stdout, "stderr": p.stderr, "returncode": p.returncode,
++            "seconds": time.time() - t0, "timed_out": False}
++
++def _actual_text(run):
++    if run["timed_out"]:
++        return f"(timed out after {run['seconds']:.1f}s)"
++    text = run["stdout"]
++    if run["returncode"] != 0:
++        text += f"\n(exit code {run['returncode']})\nSTDERR:\n{run['stderr']}"
++    return text
++
++def _check_case(group, idx, inp, expected, solution_path, tests_dir, timeout):
++    run = _run_candidate(solution_path, tests_dir, inp, timeout)
++    ok = (not run["timed_out"]) and run["returncode"] == 0 and _norm(run["stdout"]) == _norm(expected)
++    return {"group": group, "index": idx, "input": inp, "expected": expected,
++            "actual": _actual_text(run), "ok": ok, "seconds": run["seconds"]}
++
++def evaluate(solution_path, tests_dir, num_random=500, timeout=5, seed=0):
++    """Structured result of running the harness. Used by tool_function and by the agent's scoring."""
++    res = {"error": None, "samples_total": 0, "samples_passed": 0, "edge_total": 0, "edge_passed": 0,
++           "random_total": 0, "random_passed": 0, "harness_errors": 0, "max_runtime": 0.0, "failures": []}
++    if not os.path.isfile(solution_path):
++        res["error"] = f"candidate file not found: {solution_path}"
++        return res
++    brute_path = os.path.join(tests_dir, "brute.py")
++    if not os.path.isfile(brute_path):
++        res["error"] = f"harness missing: {brute_path} (must define canonical(inp))"
++        return res
++    try:
++        brute = _load_module(brute_path, "harness_brute")
++    except Exception as e:
++        res["error"] = f"could not load {brute_path}: {type(e).__name__}: {e}"
++        return res
++    if not hasattr(brute, "canonical"):
++        res["error"] = f"{brute_path} does not define canonical(inp)"
++        return res
++
++    def record(case):
++        res["max_runtime"] = max(res["max_runtime"], case["seconds"])
++        if not case["ok"]:
++            res["failures"].append(case)
++        return case["ok"]
++
++    # Samples: statement examples with exact expected output.
++    samples_dir = os.path.join(tests_dir, "samples")
++    names = sorted(f[:-3] for f in os.listdir(samples_dir) if f.endswith(".in")) if os.path.isdir(samples_dir) else []
++    for name in names:
++        out_path = os.path.join(samples_dir, name + ".out")
++        if not os.path.isfile(out_path):
++            continue
++        with open(os.path.join(samples_dir, name + ".in")) as f:
++            inp = f.read()
++        with open(out_path) as f:
++            expected = f.read()
++        res["samples_total"] += 1
++        if record(_check_case("sample " + name, 0, inp, expected, solution_path, tests_dir, timeout)):
++            res["samples_passed"] += 1
++
++    # Edge cases: expected outputs come from brute (stored in edge_cases.py).
++    edge_path = os.path.join(tests_dir, "edge_cases.py")
++    if os.path.isfile(edge_path):
++        try:
++            edge_mod = _load_module(edge_path, "harness_edge")
++            edge_cases = list(edge_mod.EDGE_CASES)
++        except Exception as e:
++            res["error"] = f"could not load EDGE_CASES from {edge_path}: {type(e).__name__}: {e}"
++            edge_cases = []
++        for i, (inp, expected) in enumerate(edge_cases):
++            res["edge_total"] += 1
++            if record(_check_case("edge case", i, inp, expected, solution_path, tests_dir, timeout)):
++                res["edge_passed"] += 1
++
++    # Random: generator inputs, expected from brute.canonical.
++    gen_path = os.path.join(tests_dir, "gen.py")
++    if num_random > 0:
++        if not os.path.isfile(gen_path):
++            res["error"] = f"harness missing: {gen_path} (must define generate(seed))"
++            return res
++        try:
++            gen = _load_module(gen_path, "harness_gen")
++        except Exception as e:
++            res["error"] = f"could not load {gen_path}: {type(e).__name__}: {e}"
++            return res
++        for i in range(num_random):
++            s = seed + i
++            res["random_total"] += 1
++            try:
++                inp = gen.generate(s)
++                expected = brute.canonical(inp)
++            except Exception as e:
++                res["harness_errors"] += 1
++                res["failures"].append({"group": "harness error", "index": s, "input": f"seed {s}",
++                                        "expected": "(none)", "actual": f"{type(e).__name__}: {e}",
++                                        "ok": False, "seconds": 0.0})
++                continue
++            if record(_check_case("random seed", s, inp, expected, solution_path, tests_dir, timeout)):
++                res["random_passed"] += 1
++
++    return res
++
++def is_perfect(res):
++    return (res["error"] is None and res["harness_errors"] == 0 and res["samples_total"] > 0
++            and res["samples_passed"] == res["samples_total"]
++            and res["edge_passed"] == res["edge_total"]
++            and res["random_passed"] == res["random_total"])
++
++def format_report(res, first_k=3):
++    if res["error"]:
++        return f"ERROR: {res['error']}"
++    lines = [
++        f"samples: {res['samples_passed']}/{res['samples_total']} passed",
++        f"edge cases: {res['edge_passed']}/{res['edge_total']} passed",
++        f"random: {res['random_passed']}/{res['random_total']} passed (harness errors: {res['harness_errors']})",
++        f"max runtime: {res['max_runtime']:.2f}s",
++        "RESULT: ALL PASS" if is_perfect(res) else "RESULT: FAILURES",
++    ]
++    if res["failures"]:
++        lines.append(f"first {min(first_k, len(res['failures']))} of {len(res['failures'])} failures:")
++        for n, c in enumerate(res["failures"][:first_k], 1):
++            lines.append(f"--- failure {n}: {c['group']} {c['index']}")
++            lines.append("input:\n" + _clip(c["input"], 300))
++            lines.append("expected:\n" + _clip(c["expected"], 300))
++            lines.append("actual:\n" + _clip(c["actual"], 300))
++    return "\n".join(lines)
++
++def tool_function(solution_path, tests_dir, num_random=500, timeout=5, seed=0):
++    return format_report(evaluate(solution_path, tests_dir, num_random=num_random, timeout=timeout, seed=seed))

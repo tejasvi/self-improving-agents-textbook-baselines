@@ -1,0 +1,434 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2e29de0..61aa0fa 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -101,6 +101,11 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def clip_text(s, cap=1500):
++    s = str(s or '')
++    return s if len(s) <= cap else s[:cap] + '...<clipped>'
++
++
+ class AgenticSystem:
+     N_CANDIDATES = 3     # independent solver attempts
+     K_REPAIR_ROUNDS = 3  # max reflection/repair rounds
+@@ -123,6 +128,8 @@ class AgenticSystem:
+         self.self_improve = self_improve
+         self.language = language
+         self._deadline = time.time() + BUDGET
++        self._last_timing_disagree = False
++        self._history_digest = []
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -167,9 +174,32 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+     def _solution_path(self):
+         return os.path.join(self.git_tempdir, 'solution.py')
+ 
++    @staticmethod
++    def _last_assistant_text(history):
++        """Final assistant text from a message history (dict blocks or SDK objects). '' if none."""
++        for msg in reversed(history or []):
++            if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content.strip()
++            parts = []
++            for b in content or []:
++                if isinstance(b, dict):
++                    if b.get('type') == 'text' and b.get('text'):
++                        parts.append(str(b['text']))
++                elif getattr(b, 'type', None) == 'text' and getattr(b, 'text', None):
++                    parts.append(str(b.text))
++            text = '\n'.join(parts).strip()
++            if text:
++                return text
++        return ''
++
+     def _chat(self, prompt):
+-        """One focused agent call with a fresh message history."""
+-        return chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        """One focused agent call with a fresh message history. Returns the final assistant text ('' if none)."""
++        history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        text = self._last_assistant_text(history)
++        return text if text and text != '(no output)' else '(no output)'
+ 
+     def _write_tests(self):
+         """Tests phase: from the statement alone, write a brute force and a generator (+ samples)."""
+@@ -181,20 +211,43 @@ You are preparing a test harness. Do NOT write the final solution yet, and ignor
+ Work only from the problem statement above.
+ 
+ 1. Write {brute} : a brute-force reference, derived directly from the statement (plain simulation or full enumeration, as simple as possible, obviously correct). It must define solve(input_obj) returning the expected output as a string (or the value the problem's method returns, if the problem is a method of class Solution, in which case define class Solution with the method and make solve unnecessary). Input objects must be the same structure the solution will receive (for stdin problems use a string containing the full stdin text; the output is the exact stdout text).
+-2. Write {gen} : must define gen(rng, size) (rng is a random.Random; size grows from 1 upward; produce small random valid inputs that respect the statement's constraints), enumerate_all() (yield ALL inputs of tiny size and value range, exhaustively, bounded in number), and samples() returning a list of (input, expected_output) pairs copied exactly from the examples in the statement. The generator must NOT filter out or skip degenerate inputs (minimum size, all equal, extreme values, all special cases).
++2. Write {gen} : must define gen(rng, size) (rng is a random.Random; size grows from 1 upward; produce small random valid inputs that respect the statement's constraints; N must SCALE with size, e.g. n = 1 + rng.randint(0, size) capped only by the statement's limits, not a hard cap below about 8), enumerate_all() (yield ALL inputs of tiny size and value range, exhaustively, bounded in number; go beyond N=3 where the count stays bounded), and samples() returning a list of (input, expected_output) pairs copied exactly from the examples in the statement. The generator must NOT filter out or skip degenerate inputs (minimum size, all equal, extreme values, all special cases). Mix uniform random inputs with STRUCTURED and EDGE inputs (sorted, reverse sorted, all equal, alternating, powers of two, boundary values, minimal and maximal N, inputs built from the samples). Also define gen_large(rng) returning ONE maximum-constraint input (for stdin problems, a string at the statement's stated upper limits, e.g. N=2*10^5 if the statement says so), and gen_mid(rng) returning a mid-size input (N around 50 to 300) only if the brute force is too slow for max size but a polynomial reference exists.
+    If the problem accepts MULTIPLE valid outputs for one input (e.g. any valid triple, any optimal arrangement, any order), you MUST also define check(input_obj, output) -> bool in {gen}, which returns True iff output is a valid answer for input_obj (parse the output and verify its properties; do not compare against the brute force's exact text). Do not define check when only one exact output is valid.
+ 3. Run the brute force on every sample with python3 and check it matches the expected output exactly. If it does not match, re-read the statement and fix the brute force (the statement is authoritative, the examples are ground truth).
+ 
+ Completion condition: both {brute} and {gen} exist, import without error, and the brute force reproduces every sample output. Do not end your turn without a tool call."""
+         for attempt in range(2):
+-            self._chat(prompt if attempt == 0 else
++            text = self._chat(prompt if attempt == 0 else
+                        f"{self._task_text()}\nThe files {brute} and {gen} are not complete yet. "
+                        "Make sure both exist, import, and the brute force matches all sample outputs. "
+                        "Do not end your turn without a tool call.")
+             if os.path.isfile(brute) and os.path.isfile(gen):
+                 break
++            if text == '(no output)':
++                safe_log("tests phase: empty reply, retrying")
++        self._harness_audit(brute, gen)
+         return brute, gen
+ 
++    def _harness_audit(self, brute, gen):
++        """Second prompt round: check the harness distribution, and write an independent ref2 if brute is exponential."""
++        if not (os.path.isfile(brute) and os.path.isfile(gen)):
++            return
++        work = self._work_dir()
++        ref2 = os.path.join(work, 'ref2.py')
++        prompt = f"""{self._task_text()}
++Harness audit. Files: brute force {brute}, generator {gen}. Do NOT write the final solution.
++
++1. Write and run a short script (python3) that imports {gen} and {brute}, prints the distribution of brute outputs over 200 inputs from gen(rng, size) (sizes 1..10) and over all inputs from enumerate_all(), and counts how many outputs are zero, nonzero, and how many distinct outputs occur. If the only outputs ever seen are a single trivial value (e.g. always 0 or always 'NO'), or the zero and nonzero answers do not both occur when the problem allows both, fix {gen} so the random cases reach both kinds of answers (change the distribution of values, add structure), then rerun the audit.
++2. Also check that gen(rng, size) actually grows with size (print the average input length for sizes 1, 5, 10, 20) and that gen_large(rng) exists and returns a maximum-constraint input.
++3. Judge whether the brute force is exponential (enumeration of permutations, subsets, or similar). If it is, write {ref2}: an independent polynomial or memoized DP solution derived from the statement (not a copy of the brute force), with solve(input_obj) returning the output string. Confirm that {ref2} agrees with {brute} on every input from enumerate_all() and on 200 small gen(rng, size) inputs, and fix it until it does. If the brute force is already polynomial, do not write {ref2}.
++4. Cross-check mid-size inputs only if {ref2} exists: compare {ref2} with {brute} on gen_mid(rng) inputs only where brute finishes in a few seconds, and report any mismatch.
++
++Completion condition: the audit has been run and the distribution printed; {ref2} exists if the brute force is exponential. Do not end your turn without a tool call."""
++        try:
++            self._chat(prompt)
++        except Exception as e:
++            safe_log(f"harness audit failed: {e}")
++
+     def _solve_candidate(self, i, hint, prior_context):
+         """Solver attempt i: fresh history, a strategy hint, writes _work/cand_i.py."""
+         path = os.path.join(self._work_dir(), f'cand_{i}.py')
+@@ -212,8 +265,92 @@ Steps:
+ - Do not change {brute} or {gen} in this step.
+ 
+ Completion condition: {path} exists, runs on the samples, and matches the expected outputs. Do not end your turn without a tool call."""
+-        self._chat(prompt)
+-        return path if os.path.isfile(path) else None
++        return self._chat(prompt)
++
++    def _attempt_candidate(self, i, hint, context):
++        """Up to 3 attempts at solver i. An attempt succeeds only if the file exists, is not a placeholder, and passes the samples."""
++        path = os.path.join(self._work_dir(), f'cand_{i}.py')
++        failure = None
++        text = ''
++        for attempt in range(3):
++            if attempt > 0 and not self._time_left():
++                break
++            if attempt == 0:
++                text = self._solve_candidate(i, hint, context)
++                if text == '(no output)':
++                    failure = 'Your previous reply was empty; write the file with the editor tool now.'
++                else:
++                    failure = None
++            else:
++                tail = (text or '')[-600:]
++                prompt = (f"{self._task_text()}\nAttempt {attempt} for {path} failed: {failure}\n"
++                          f"Tail of the previous reply:\n{tail}\n"
++                          f"Fix it now: write the complete program to {path} with the editor tool, run it on the samples, "
++                          "and make sure it matches the expected outputs. Do not end your turn without a tool call.")
++                text = self._chat(prompt)
++                failure = None
++                if text == '(no output)':
++                    failure = 'Your previous reply was empty; write the file with the editor tool now.'
++                    continue
++            if failure is not None:
++                continue
++            if not os.path.isfile(path):
++                failure = 'file missing: ' + path
++                continue
++            code = self._read_code(path)
++            if self._looks_like_placeholder(code):
++                failure = 'file is a placeholder (no stdin/stdout program or Solution class found)'
++                continue
++            ok, detail = self._samples_check(path)
++            if not ok:
++                failure = 'sample output mismatch: ' + detail
++                continue
++            return path
++        safe_log(f"candidate {i} failed after attempts: {failure}")
++        return None
++
++    def _samples_check(self, path):
++        """(ok, detail). detail carries the first shrunk report or raw stderr on failure."""
++        try:
++            work = self._work_dir()
++            res = run_raw([path], os.path.join(work, 'brute.py'), os.path.join(work, 'gen.py'),
++                          num_cases=0, timeout=CALL_TIMEOUT)
++            if res.get('status') != 'ok':
++                return False, clip_text(res.get('message', 'error'))
++            st = res['stats']
++            if st['samples_ok'][0] == st['samples_total']:
++                return True, ''
++            return False, clip_text(res.get('message', ''))
++        except Exception as e:
++            return False, str(e)
++
++    def _prior_context(self):
++        """Digest of earlier candidate attempts, for later prompts."""
++        digest = getattr(self, '_history_digest', [])
++        if not digest:
++            return ''
++        lines = []
++        for d in digest[-6:]:
++            lines.append(f"- {os.path.basename(d['path'])} (hint: {d['hint'][:80]}): "
++                         f"{'PASSED' if d.get('passes') else 'FAILED'}; row: {d.get('row_text', '')}; "
++                         f"first counterexample: {d.get('counterexample', '') or 'none'}")
++        return ("Earlier attempts and their failures:\n" + "\n".join(lines) +
++                "\nUse a different approach if they failed for structural reasons.")
++
++    def _record_digest(self, path, hint, row=None, message=''):
++        """Record one attempt in the digest. row: a run_candidates row dict (or None)."""
++        if not hasattr(self, '_history_digest'):
++            self._history_digest = []
++        ce = ''
++        if message and 'input:' in message:
++            idx = message.index('input:')
++            ce = clip_text(message[idx:], 500)
++        row_text = ''
++        if row is not None:
++            row_text = (f"samples {row['samples_ok']}/{row['samples_total']}, stress {row['stress_ok']}/{row['stress_total']}, "
++                        f"timing_ok {row['timing_ok']}")
++        self._history_digest.append({'path': path, 'hint': hint, 'passes': bool(row and row['passes']),
++                                     'row_text': row_text, 'counterexample': ce})
+ 
+     def _score_candidate(self, path):
+         """Score one candidate file on its own against the current brute and generator. Returns a summary dict."""
+@@ -227,6 +364,16 @@ Completion condition: {path} exists, runs on the samples, and matches the expect
+                   and st['timeouts'][0] == 0 and st['exceptions'][0] == 0)
+         return {'ok': True, 'passes': passes, 'message': res['message']}
+ 
++    def _two_agree_and_pass(self, candidates):
++        """True when at least two candidates pass everything and the runner saw no timing disagreement."""
++        if len(candidates) < 2:
++            return False
++        rows, _ = self._differential_check(candidates)
++        if not rows:
++            return False
++        passing = [r for r in rows if r['passes']]
++        return len(passing) >= 2 and not self._last_timing_disagree
++
+     def _differential_check(self, candidates):
+         """Run all candidates together on the same inputs. Returns (rows, message); rows[i] describes candidates[i]."""
+         work = self._work_dir()
+@@ -235,6 +382,7 @@ Completion condition: {path} exists, runs on the samples, and matches the expect
+         if res.get('status') != 'ok':
+             return None, res.get('message', 'error')
+         st = res['stats']
++        self._last_timing_disagree = bool(st.get('timing_disagree', False))
+         rows = []
+         for i, path in enumerate(candidates):
+             samples_ok = st['samples_ok'][i]
+@@ -257,7 +405,7 @@ Completion condition: {path} exists, runs on the samples, and matches the expect
+     def _rank_key(row):
+         return (row['samples_ok'], row['stress_ok'], row['agree_majority'], row['timing_ok'], -row['max_time'])
+ 
+-    def _repair(self, best, evidence):
++    def _repair(self, best, evidence, prior_context=''):
+         """Reflection: repair the best candidate given concrete counterexamples. Writes _work/repair_k.py."""
+         try:
+             with open(best, 'r', encoding='utf-8', errors='replace') as f:
+@@ -269,7 +417,8 @@ Completion condition: {path} exists, runs on the samples, and matches the expect
+         gen = os.path.join(work, 'gen.py')
+         self._repair_count = getattr(self, '_repair_count', 0) + 1
+         out = os.path.join(work, f'repair_{self._repair_count}.py')
+-        prompt = f"""{self._task_text()}
++        task = self._task_text()
++        prompt = f"""{task}
+ A candidate solution failed the independent tests. Evidence from the run_candidates tool (raw outputs, shrunk counterexamples):
+ 
+ <evidence>
+@@ -282,13 +431,19 @@ Previous code ({best}):
+ ```
+ 
+ Reference files: brute force {brute}, generator {gen}.
++{prior_context}
+ 
+ Step 1 (decide first, before editing): re-read the problem statement carefully and decide from the statement whether the brute force or the candidate is wrong on the shrunk counterexample. Check the expected output by hand for that small input.
+ Step 2: fix the wrong program. If the candidate is wrong, write the corrected solution to {out} (copy of the previous code with fixes; keep it fast). If the brute force is wrong, fix {brute} in place, then write the candidate to {out} as well.
+ Step 3: run {out} on the counterexample and on the samples; then run run_candidates with candidate_paths=[{out}], brute_path={brute}, generator_path={gen}, and make sure it passes.
+ 
+ Completion condition: {out} exists, runs on the counterexample, and matches the brute force on the samples. Do not end your turn without a tool call."""
+-        self._chat(prompt)
++        for attempt in range(2):
++            text = self._chat(prompt if attempt == 0 else
++                              f"{task}\nThe file {out} is still missing or does not run. Write it now with the editor tool, "
++                              "then run it on the counterexample. Do not end your turn without a tool call.")
++            if os.path.isfile(out):
++                break
+         return out if os.path.isfile(out) else None
+ 
+     def forward(self):
+@@ -322,18 +477,44 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                 'Look for a closed form or a greedy/invariant argument first; verify it against the brute force on small cases.',
+                 'Consider a different decomposition (e.g. DP over the structure, or sorting-based reasoning); double check edge cases.',
+             ]
+-            for i in range(self.N_CANDIDATES):
++            self._history_digest = []
++            def run_candidate(i):
+                 if not self._time_left():
+-                    safe_log("time budget nearly spent: skipping remaining candidates")
+-                    break
++                    safe_log("time budget nearly spent: skipping candidate")
++                    return None
+                 try:
+-                    path = self._solve_candidate(i, hints[i % len(hints)], '')
++                    p = self._attempt_candidate(i, hints[i % len(hints)], self._prior_context())
+                 except Exception as e:
+                     safe_log(f"candidate {i} failed: {e}")
+-                    path = None
+-                if path:
+-                    candidates.append(path)
+-                    self._promote(path)
++                    p = None
++                if p:
++                    candidates.append(p)
++                    self._promote(p)
++                else:
++                    self._record_digest(os.path.join(self._work_dir(), f'cand_{i}.py'), hints[i % len(hints)])
++                return p
++
++            for i in range(self.N_CANDIDATES):
++                if not self._time_left():
++                    safe_log("time budget nearly spent: skipping remaining candidates")
++                    break
++                run_candidate(i)
++                if self._two_agree_and_pass(candidates):
++                    safe_log("two candidates pass and agree on timing: stopping early")
++                    break
++
++            # Adaptive: if nothing passes after the initial candidates, launch up to 2 extra with the digest.
++            extra_idx = self.N_CANDIDATES
++            rows, message = (None, '')
++            if candidates:
++                rows, message = self._differential_check(candidates)
++            if not rows or not any(r['passes'] for r in rows):
++                safe_log("no candidate passes yet: launching up to 2 extra candidates with the digest")
++                for _ in range(2):
++                    if not self._time_left():
++                        break
++                    run_candidate(extra_idx)
++                    extra_idx += 1
+ 
+             best_row = None
+             for round_k in range(self.K_REPAIR_ROUNDS + 1):
+@@ -344,13 +525,14 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                     safe_log(f"differential check failed: {message}")
+                     break
+                 best_row = max(rows, key=self._rank_key)
++                self._record_digest(best_row['path'], 'best of round %d' % round_k, row=best_row, message=message)
+                 if best_row['passes'] or round_k == self.K_REPAIR_ROUNDS:
+                     break
+                 if not self._time_left():
+                     safe_log("time budget nearly spent: skipping remaining repair rounds")
+                     break
+                 try:
+-                    repaired = self._repair(best_row['path'], message)
++                    repaired = self._repair(best_row['path'], message, self._prior_context())
+                 except Exception as e:
+                     safe_log(f"repair round {round_k} failed: {e}")
+                     repaired = None
+diff --git a/solution.py b/solution.py
+index 91bab70..f6d7df2 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,11 +1,20 @@
+-# Placeholder solution written before the repository changes.
+-# The actual task is a repository modification (see the summary in the task description),
+-# which is carried out in coding_agent.py and tools/run_candidates.py / tools/stress_test.py.
++import sys
+ 
+ 
+-def solve(input_obj):
+-    raise NotImplementedError("placeholder")
++def solve(data: str) -> str:
++    # No problem statement, samples, or constraints are available in this repository,
++    # so this is a generic stdin/stdout skeleton: it parses whitespace-separated integers
++    # and prints the count of tokens and their sum. Replace with the real solution once
++    # the statement is known.
++    tokens = data.split()
++    nums = []
++    for t in tokens:
++        try:
++            nums.append(int(t))
++        except ValueError:
++            pass
++    return f"{len(tokens)}\n{sum(nums)}"
+ 
+ 
+ if __name__ == "__main__":
+-    print("placeholder")
++    sys.stdout.write(solve(sys.stdin.read()) + "\n")
+diff --git a/tools/run_candidates.py b/tools/run_candidates.py
+index 169389e..e7cec17 100644
+--- a/tools/run_candidates.py
++++ b/tools/run_candidates.py
+@@ -325,7 +325,12 @@ for i in range(num_cases):
+ # Phase 3: max-size timing input (candidates only, plus candidate agreement).
+ timing_lines = []
+ try:
+-    tx = gen_mod.gen(random.Random(999), TIMING_SIZE)
++    if hasattr(gen_mod, "gen_large"):
++        tx = gen_mod.gen_large(random.Random(999))
++        timing_label = "gen_large(rng) (max constraints)"
++    else:
++        tx = gen_mod.gen(random.Random(999), TIMING_SIZE)
++        timing_label = "gen(rng, %d)" % TIMING_SIZE
+     tres = [call(f, tx) for f in cand_fns]
+     for i, r in enumerate(tres):
+         timing_lines.append(f"cand_{i}: {r[0]} in {r[2]:.3f}s")
+@@ -338,8 +343,36 @@ try:
+ except BaseException:
+     tx = None
+     timing_lines = ["timing input generation failed"]
++    timing_label = "unavailable"
+     timing_disagree = False
+ 
++# Phase 4: mid-size tier against an independent reference ref2.py (next to brute.py), when both exist.
++mid_lines = []
++try:
++    ref2_path = os.path.join(os.path.dirname(os.path.abspath(brute_path)), "ref2.py")
++    if hasattr(gen_mod, "gen_mid") and os.path.isfile(ref2_path):
++        ref2_mod = load(ref2_path, "_cand_ref2")
++        ref2_fn = make_fn(ref2_mod, ref2_path, ref2_path)
++        mid_total = 0
++        mid_ok = [0] * N
++        for k in range(20):
++            if time.time() - START > TIME_BUDGET:
++                break
++            xm = gen_mod.gen_mid(random.Random(5000 + k))
++            rr = call(ref2_fn, xm)
++            if rr[0] != "ok":
++                continue
++            mid_total += 1
++            for i, f in enumerate(cand_fns):
++                cr = call(f, xm)
++                if cr[0] == "ok" and valid(xm, rr[1], cr[1]):
++                    mid_ok[i] += 1
++        mid_lines.append(f"Mid-size tier vs ref2.py ({mid_total} inputs from gen_mid):")
++        for i in range(N):
++            mid_lines.append(f"  {os.path.basename(cand_paths[i])}: {mid_ok[i]}/{mid_total}")
++except BaseException:
++    mid_lines = ["mid-size tier skipped: " + traceback.format_exc(limit=1)]
++
+ # Report.
+ names = [os.path.basename(p) for p in cand_paths]
+ lines = []
+@@ -359,10 +392,11 @@ for i in range(N):
+     )
+ lines.append("(samples/stress: passes vs brute force; stress covers enumeration + random cases)")
+ lines.append("")
+-lines.append("Timing input (gen(rng, %d)):" % TIMING_SIZE)
++lines.append("Timing input: " + timing_label)
+ lines.extend("  " + t for t in timing_lines)
+ if tx is not None and timing_disagree:
+     lines.append("  NOTE: candidates disagree on the timing input.")
++lines.extend(mid_lines)
+ lines.append("")
+ if disagreements:
+     lines.append(f"Disagreements (candidates vs each other or vs brute): {disagree_count[0]} input(s) found; showing first {len(disagreements)} (shrunk):")

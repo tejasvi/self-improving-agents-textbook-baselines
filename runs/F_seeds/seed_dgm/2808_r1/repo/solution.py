@@ -1,0 +1,21 @@
+from typing import List
+
+
+class Solution:
+    def paintWalls(self, cost: List[int], time: List[int]) -> int:
+        n = len(cost)
+        INF = float("inf")
+        # dp[j] = minimum cost so that j walls are covered (capped at n)
+        dp = [INF] * (n + 1)
+        dp[0] = 0
+        for c, t in zip(cost, time):
+            gain = t + 1
+            new = dp[:]
+            for j in range(n + 1):
+                if dp[j] == INF:
+                    continue
+                k = min(n, j + gain)
+                if dp[j] + c < new[k]:
+                    new[k] = dp[j] + c
+            dp = new
+        return int(dp[n])

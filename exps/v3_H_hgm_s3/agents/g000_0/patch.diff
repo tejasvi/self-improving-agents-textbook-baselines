@@ -1,0 +1,143 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 39bfae0..5d99b5f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -93,6 +93,32 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++TEST_DIR_NAMES = {'test', 'tests', 'spec', 'specs', '__tests__'}
++
++def _is_test_file(path):
++    """
++    Heuristically decide whether a repo-relative path is a test file.
++    """
++    parts = [p for p in path.replace('\\', '/').split('/') if p]
++    if not parts:
++        return False
++    if any(p.lower() in TEST_DIR_NAMES for p in parts[:-1]):
++        return True
++    name = parts[-1].lower()
++    return (
++        name.startswith('test_')
++        or name.startswith('tests_')
++        or name.startswith('conftest')
++        or name.endswith('_test.py')
++        or name.endswith('_test.go')
++        or name.endswith('_test.rs')
++        or name.endswith('_test.cpp')
++        or name.endswith('_test.js')
++        or name.endswith('_test.ts')
++        or any(name.endswith(f'.{kind}.{ext}') for kind in ('test', 'spec')
++               for ext in ('js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'py', 'rb'))
++    )
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -137,6 +163,44 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _get_changed_files(self):
++        """
++        Return the list of repo-relative paths modified, added, deleted or untracked
++        relative to base_commit (including untracked files).
++        """
++        files = []
++        try:
++            diff_cmd = ["git", "-C", self.git_tempdir, "diff", "--name-only", self.base_commit]
++            result = subprocess.run(diff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++            files.extend(result.stdout.decode(errors='replace').splitlines())
++
++            status_cmd = ["git", "-C", self.git_tempdir, "status", "--porcelain", "--untracked-files=all"]
++            result = subprocess.run(status_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++            for line in result.stdout.decode(errors='replace').splitlines():
++                if len(line) < 4:
++                    continue
++                path = line[3:]
++                if ' -> ' in path:  # rename: keep the new path
++                    path = path.split(' -> ', 1)[1]
++                files.append(path)
++        except Exception as e:
++            safe_log(f"Error while listing changed files: {e}", level=logging.WARNING)
++
++        cleaned = []
++        for f in files:
++            f = f.strip()
++            if len(f) >= 2 and f[0] == '"' and f[-1] == '"':
++                f = f[1:-1]
++            if f and f not in cleaned:
++                cleaned.append(f)
++        return cleaned
++
++    def _has_source_edits(self):
++        """
++        True if at least one changed file is not a test file.
++        """
++        return any(not _is_test_file(f) for f in self._get_changed_files())
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -149,8 +213,58 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        instruction = f"""{task}
++
++Follow this workflow:
++1. Explore the repository (use the editor and bash tools) to understand its layout and any existing code related to the problem.
++2. Locate the file the task refers to. If the task asks for a new file (e.g. `solution.py`) or no target file exists, create it.
++3. Implement the solution by calling the editor tool to write the code to disk. The task is NOT finished until the file has been written; text-only answers are not acceptable.
++4. Run the sample inputs and any existing tests with bash, and fix any failures.
++5. Consider efficiency for large inputs (e.g. use fast I/O such as sys.stdin.buffer or sys.stdin.readline, avoid quadratic algorithms).
++6. Do not finish without having written the solution file. Only modify the primary source code; you may add tests but the solution must live in the source file.
++"""
++        msg_history = self._run_agent(instruction, msg_history=[])
++
++        retry_prompts = [
++            "No changes to the source code were detected (the patch is empty or only touches tests). "
++            "You MUST use the editor tool now to create or edit the primary source file implementing the solution. "
++            "Do not reply with text only.",
++            "Still no changes to the source code. This is attempt {attempt} of 3 and the task is NOT complete. "
++            "Immediately call the editor tool to write the solution file to disk with the full implementation. "
++            "Do not reply with any text without a tool call.",
++            "FINAL ATTEMPT: you have still not modified any source file. Call the editor tool RIGHT NOW to create or "
++            "edit the solution source file (not tests) with a complete implementation.",
++        ]
++        for attempt in range(3):
++            if self._has_source_edits():
++                break
++            safe_log(f"[forward] Retry {attempt + 1}/3: no source edits detected; re-prompting agent.", level=logging.WARNING)
++            prompt = retry_prompts[attempt].format(attempt=attempt + 1)
++            msg_history = self._run_agent(prompt, msg_history=msg_history)
++
++        if not self._has_source_edits():
++            safe_log("[forward] Fallback: still no source edits; asking agent to create solution.py.", level=logging.WARNING)
++            prompt = (
++                f"There are still no source changes in {self.git_tempdir}. Create a file named `solution.py` in "
++                f"{self.git_tempdir} (unless the task specifies another file) that implements the solution to the problem, "
++                "reads from standard input and writes to standard output if the task is a stdin/stdout program, "
++                "using the editor tool. Then run it on the sample inputs with bash."
++            )
++            msg_history = self._run_agent(prompt, msg_history=msg_history)
++
++        if not self._has_source_edits():
++            safe_log("[forward] WARNING: agent finished without any source edits.", level=logging.WARNING)
++
++    def _run_agent(self, msg, msg_history):
++        """
++        Call the agent once and return the updated full message history.
++        """
++        try:
++            new_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        except Exception as e:
++            safe_log(f"[forward] chat_with_agent failed: {e}", level=logging.ERROR)
++            return msg_history
++        return new_history if new_history is not None else msg_history
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

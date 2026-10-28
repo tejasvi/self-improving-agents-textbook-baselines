@@ -1,0 +1,321 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1fe931e..616982e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,9 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import sys
++import ast
++import importlib.util
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -163,6 +166,99 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+     def _solution_path(self):
+         return os.path.join(self.git_tempdir, 'solution.py')
+ 
++    @staticmethod
++    def _strip_comments(text):
++        """Non-blank, non-comment lines, stripped and joined: the 'real' content of a Python file."""
++        lines = [line.strip() for line in text.splitlines()]
++        return '\n'.join(line for line in lines if line and not line.startswith('#'))
++
++    def _base_solution_stub(self):
++        """Base-commit solution.py with comments removed ('' if the base commit has no solution.py)."""
++        res = subprocess.run(["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:solution.py"],
++                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++        if res.returncode != 0:
++            return ''
++        return self._strip_comments(res.stdout.decode('utf-8', errors='replace'))
++
++    def _solution_is_stub(self):
++        """True if solution.py is missing, empty, comment-only, or equal to the base stub (ignoring comments)."""
++        try:
++            with open(self._solution_path(), 'r', encoding='utf-8', errors='replace') as f:
++                content = self._strip_comments(f.read())
++        except OSError:
++            return True
++        return (not content) or content == self._base_solution_stub()
++
++    def _promote(self, path):
++        """Copy a candidate file over solution.py. Returns True on success."""
++        try:
++            with open(path, 'r', encoding='utf-8', errors='replace') as f:
++                code = f.read()
++            if not code.strip():
++                return False
++            with open(self._solution_path(), 'w', encoding='utf-8') as f:
++                f.write(code)
++            return True
++        except OSError as e:
++            safe_log(f"promote {path} failed: {e}")
++            return False
++
++    def _samples_pass(self, path):
++        """
++        True if the stdin/stdout program at `path` runs on every sample of _work/gen.py with exit code 0 and
++        non-empty output, and each output matches the expected sample output (whitespace-insensitive), or is
++        accepted by gen.check(input, output) when gen.py defines it (multi-answer problems).
++        """
++        gen_path = os.path.join(self._work_dir(), 'gen.py')
++        if not os.path.isfile(path) or not os.path.isfile(gen_path):
++            return False
++        try:
++            spec = importlib.util.spec_from_file_location('_promote_gen', gen_path)
++            mod = importlib.util.module_from_spec(spec)
++            spec.loader.exec_module(mod)
++            samples = list(mod.samples()) if hasattr(mod, 'samples') else []
++        except Exception as e:
++            safe_log(f"could not load samples from {gen_path}: {e}")
++            return False
++        if not samples:
++            return False
++        check = getattr(mod, 'check', None)
++        for item in samples:
++            try:
++                inp, expected = item
++            except (TypeError, ValueError):
++                return False
++            try:
++                proc = subprocess.run([sys.executable, path], input=str(inp), capture_output=True,
++                                      text=True, timeout=CALL_TIMEOUT)
++            except (subprocess.TimeoutExpired, OSError):
++                return False
++            if proc.returncode != 0 or not proc.stdout.strip():
++                return False
++            if proc.stdout.strip() == str(expected).strip():
++                continue
++            if check is not None:
++                try:
++                    if check(inp, proc.stdout):
++                        continue
++                except Exception:
++                    pass
++            return False
++        return True
++
++    def _promote_newest_working_candidate(self):
++        """Promote the newest _work/cand_*.py or repair_*.py that passes the samples. Returns its path or None."""
++        work = self._work_dir()
++        names = [n for n in os.listdir(work)
++                 if n.endswith('.py') and (n.startswith('cand_') or n.startswith('repair_'))]
++        paths = [os.path.join(work, n) for n in names]
++        paths = [p for p in paths if os.path.isfile(p)]
++        paths.sort(key=os.path.getmtime, reverse=True)
++        for p in paths:
++            if self._samples_pass(p) and self._promote(p):
++                return p
++        return None
++
+     def _chat(self, prompt):
+         """One focused agent call with a fresh message history."""
+         return chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+@@ -205,9 +301,14 @@ Steps:
+ - Run the solution on every sample from the statement and compare exactly.
+ - Use the run_candidates tool (or stress_test) with candidate_paths=[{path}], brute_path={brute}, generator_path={gen} to compare against the brute force; fix every mismatch.
+ - Do not change {brute} or {gen} in this step.
++- Before relying on any third-party library (e.g. numpy), check it is installed with `python3 -c 'import numpy'`; if it is not, use the standard library only.
++- If the problem accepts any valid answer (multiple correct outputs), write a validity checker instead of comparing exact text, and use it in the comparison.
+ 
+ Completion condition: {path} exists, runs on the samples, and matches the expected outputs. Do not end your turn without a tool call."""
+         self._chat(prompt)
++        if os.path.isfile(path) and self._solution_is_stub() and self._samples_pass(path):
++            if self._promote(path):
++                safe_log(f"promoted {path} to solution.py after solver {i}")
+         return path if os.path.isfile(path) else None
+ 
+     def _score_candidate(self, path):
+@@ -284,13 +385,23 @@ Step 3: run {out} on the counterexample and on the samples; then run run_candida
+ 
+ Completion condition: {out} exists, runs on the counterexample, and matches the brute force on the samples. Do not end your turn without a tool call."""
+         self._chat(prompt)
++        if os.path.isfile(out) and self._solution_is_stub() and self._samples_pass(out):
++            if self._promote(out):
++                safe_log(f"promoted {out} to solution.py after repair {self._repair_count}")
+         return out if os.path.isfile(out) else None
+ 
+     def forward(self):
+         """
+         Multi-candidate pipeline:
+         tests -> N independent candidates -> differential scoring -> up to K repair rounds -> rank -> solution.py.
++        _ensure_solution() always runs afterwards so that solution.py ends up non-stub whenever possible.
+         """
++        try:
++            self._run_pipeline()
++        finally:
++            self._ensure_solution()
++
++    def _run_pipeline(self):
+         task = self._task_text()
+         try:
+             brute, gen = self._write_tests()
+@@ -356,19 +467,33 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                     except OSError as e:
+                         safe_log(f"could not copy winner to solution.py: {e}")
+ 
+-        # Final safety net: only when the pipeline produced no winner, make the agent write solution.py.
+-        if winner_copied:
+-            return
+-        fallback_prompt = (f"{task}\nsolution.py has not been modified yet, so the task is still unsolved. "
+-                           "Using the editor tool, write a complete candidate solution to solution.py immediately "
+-                           "(a simple correct-but-slow approach is acceptable), run it on the samples, then refine it. "
+-                           "Do not end your turn without a tool call.")
+-        if not self._solution_nonempty():
+-            self._chat(fallback_prompt)
+-        for attempt in range(3):
+-            if self._primary_file_edited():
+-                break
+-            self._chat(fallback_prompt)
++
++    def _ensure_solution(self):
++        """
++        Always-run safety net. (a) If solution.py is still the stub, promote the newest candidate that passes
++        the samples. (b) Otherwise, if nothing was produced, ask the agent to write solution.py directly.
++        """
++        try:
++            if not self._solution_is_stub():
++                return
++            if self._promote_newest_working_candidate():
++                safe_log("ensure_solution: promoted newest working candidate to solution.py")
++                return
++            task = self._task_text()
++            fallback_prompt = (f"{task}\nsolution.py has not been modified yet, so the task is still unsolved. "
++                               "Using the editor tool, write a complete candidate solution directly to solution.py "
++                               "immediately (a simple correct-but-slow approach is acceptable). Run it with bash on "
++                               "the samples from the statement and compare exactly. Then refine it if needed. "
++                               "Do not end your turn without a tool call.")
++            for attempt in range(3):
++                self._chat(fallback_prompt if attempt == 0 else
++                           f"{task}\nsolution.py is still the stub. Write the solution with the editor tool to "
++                           "solution.py now (not to _work/), run it on the samples, and do not end your turn without a tool call.")
++                if not self._solution_is_stub() and self._primary_file_edited():
++                    safe_log("ensure_solution: solution.py written by fallback prompt")
++                    break
++        except Exception as e:
++            safe_log(f"ensure_solution failed: {e}")
+ 
+     def _solution_nonempty(self):
+         try:
+@@ -389,12 +514,15 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+             return False
+ 
+         # Paths touched by the diff, from 'diff --git a/<path> b/<path>' headers.
++        # Helper files under _work/ never count as edits.
+         touched = []
+         for line in diff.splitlines():
+             if line.startswith('diff --git '):
+                 parts = line.split(' ')
+                 if len(parts) >= 3 and parts[2].startswith('a/'):
+-                    touched.append(parts[2][2:])
++                    path = parts[2][2:]
++                    if not path.startswith('_work/'):
++                        touched.append(path)
+ 
+         solution_path = os.path.join(self.git_tempdir, 'solution.py')
+         base_has_solution = subprocess.run(
+@@ -415,17 +543,17 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                 return False
+             if all(not line.strip() or line.strip().startswith('#') for line in content.splitlines()):
+                 return False
++            try:
++                ast.parse(content)
++            except SyntaxError:
++                return False
+             if 'solution.py' not in touched:
+                 return False
+-            base = subprocess.run(
+-                ["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:solution.py"],
+-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-            )
+-            if base.returncode == 0 and base.stdout.decode('utf-8', errors='replace').strip() == content:
++            if self._strip_comments(content) == self._base_solution_stub():
+                 return False
+             return True
+ 
+-        # Generalized: any non-test file touched by the diff.
++        # Generalized: any non-test file touched by the diff (test files and _work/ helpers excluded).
+         return any('test' not in path.lower() for path in touched)
+ 
+ def main():
+diff --git a/tools/run_candidates.py b/tools/run_candidates.py
+index accebf5..d8367aa 100644
+--- a/tools/run_candidates.py
++++ b/tools/run_candidates.py
+@@ -128,7 +128,15 @@ def call(fn, x):
+     finally:
+         signal.setitimer(signal.ITIMER_REAL, 0)
+ 
+-def same(a, b):
++CHECK = getattr(gen_mod, "check", None)  # optional check(input, output) -> bool for multi-answer problems
++
++def same(a, b, x=None):
++    """Equality of two outputs. If gen.check exists, `a` is judged valid for input x instead of compared exactly."""
++    if CHECK is not None and x is not None:
++        try:
++            return bool(CHECK(x, a))
++        except Exception:
++            return False
+     if isinstance(a, str) and isinstance(b, str):
+         return a.strip() == b.strip()
+     try:
+@@ -208,7 +216,7 @@ def evaluate(x):
+     bad = len(set(keys)) > 1
+     if bres[0] == "ok":
+         for r in cres:
+-            if r[0] != "ok" or not same(r[1], bres[1]):
++            if r[0] != "ok" or not same(r[1], bres[1], x):
+                 bad = True
+                 break
+     return bres, cres, bad, maj
+@@ -253,7 +261,7 @@ def run_input(x, phase, is_sample=None):
+         if key_of(r) == maj:
+             stats["agree_majority"][i] += 1
+         stats["max_time"][i] = max(stats["max_time"][i], r[2])
+-    ok_flags = [r[0] == "ok" and same(r[1], bres[1]) for r in cres]
++    ok_flags = [r[0] == "ok" and same(r[1], bres[1], x) for r in cres]
+     if is_sample is None:
+         stats["stress_total"][0] += 1
+         for i, f in enumerate(ok_flags):
+@@ -280,7 +288,7 @@ for k, item in enumerate(samples):
+     except BaseException:
+         continue
+     bres = call(brute_fn, x)
+-    if bres[0] != "ok" or not same(bres[1], expected):
++    if bres[0] != "ok" or not (same(bres[1], expected) or (CHECK is not None and same(bres[1], expected, x))):
+         sample_fail_brute.append(k)
+     run_input(x, f"sample {k}", is_sample=True)
+ 
+diff --git a/_work/brute.py b/_work/brute.py
+new file mode 100644
+index 0000000..517f5ac
+--- /dev/null
++++ b/_work/brute.py
+@@ -0,0 +1,5 @@
++# PLACEHOLDER: no problem statement was provided, so there is no real brute force yet.
++# Replace solve() with a brute force derived from the statement, and fill samples() in gen.py.
++
++def solve(input_obj):
++    raise NotImplementedError("placeholder brute force: no problem statement provided")
+diff --git a/_work/gen.py b/_work/gen.py
+new file mode 100644
+index 0000000..f4c1b13
+--- /dev/null
++++ b/_work/gen.py
+@@ -0,0 +1,15 @@
++# PLACEHOLDER: no problem statement was provided, so there are no samples or generated inputs yet.
++import random
++
++
++def gen(rng: random.Random, size: int):
++    return ""
++
++
++def enumerate_all():
++    return iter([])
++
++
++def samples():
++    # Copy (input, expected_output) pairs from the statement's examples here.
++    return []

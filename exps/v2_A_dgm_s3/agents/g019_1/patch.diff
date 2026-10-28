@@ -1,0 +1,387 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7930b83..e9066d8 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,7 +5,9 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import re
++import shutil
+ import threading
++import time
+ import traceback
+ 
+ from llm import create_client, get_response_from_llm
+@@ -332,11 +334,10 @@ IMPORTANT RULES:
+         instruction = (
+             f"{task}\n{workflow}\n"
+             f"Current repository contents:\n{snapshot}\n\n"
+-            f"Your first action must be an editor create/edit on {os.path.join(self.git_tempdir, target)} "
+-            f"(the primary source file) that implements the solution."
+         )
+         msg_history = []
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        msg_history = chat_with_agent(self._design_prompt(instruction), model=self.code_model,
++                                      msg_history=msg_history, logging=safe_log)
+         safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
+ 
+         if self._has_source_patch():
+@@ -347,6 +348,7 @@ IMPORTANT RULES:
+             safe_log("No source patch after initial attempt; escalating with a compact prompt.")
+             msg_history = self._attempt_with_models(self._compact_prompt(), msg_history)
+ 
++        msg_history = self._complexity_gate(msg_history)
+         self._run_verification(msg_history)
+ 
+         if not self._has_source_patch():
+@@ -431,6 +433,82 @@ IMPORTANT RULES:
+             return ""
+         return ""
+ 
++    def _design_prompt(self, instruction):
++        """Design-first prompt: constraints -> complexity budget -> algorithm -> slow reference."""
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        return instruction + f"""Design phase (do this BEFORE writing the solution).
++
++1. Constraints: list every input size and value limit from the problem statement (maximum n, maximum values, time limit if given).
++2. Complexity budget: from the maximum constraints, derive the affordable cost. Plain Python does roughly 1e7-1e8 basic operations in a few seconds; numpy vector operations and precomputed factorials/inverses mod p are allowed.
++3. Algorithm: state the intended algorithm and its complexity in one or two sentences. If a naive method (e.g. O(W*H) or O(n^2) over large values) exceeds the budget, choose a different method (closed form, prefix sums, two pointers, sorting, DP with a smaller state, combinatorics, convolution) BEFORE coding.
++4. Slow reference: write an obviously-correct but slow solution to /tmp/ref/ref.py (scratch, NOT inside {self.git_tempdir}). It may be exponential or O(n^3); its only purpose is to validate the efficient solution on small inputs.
++
++Only after steps 1-4 are done, write the efficient solution to {target_path} with the editor tool, then test it on the samples and against /tmp/ref/ref.py on small inputs."""
++
++    def _run_timing(self, target_path, limit=1.0):
++        """Deterministically time the solution on /tmp/stress/max_input.txt if the agent wrote it.
++        Returns (ran, too_slow_or_failed, detail)."""
++        max_input = '/tmp/stress/max_input.txt'
++        if not os.path.isfile(max_input) or not os.path.isfile(target_path):
++            return False, False, 'no max-size input or target file'
++        try:
++            with open(max_input, 'rb') as fh:
++                data = fh.read()
++            start = time.monotonic()
++            proc = subprocess.run(['python3', target_path], input=data, stdout=subprocess.PIPE,
++                                  stderr=subprocess.PIPE, timeout=limit * 5)
++            elapsed = time.monotonic() - start
++        except subprocess.TimeoutExpired:
++            return True, True, f'timed out (> {limit * 5:.0f}s)'
++        except Exception as e:
++            return True, True, f'could not run: {e}'
++        if proc.returncode != 0:
++            return True, True, f'runtime error (exit {proc.returncode}): {proc.stderr.decode(errors="replace")[-300:]}'
++        return True, elapsed > limit, f'{elapsed:.2f}s'
++
++    SLOW_PATTERN = re.compile(r'\b(not efficient|too slow|time[ -]?out|timed out|tle)\b', re.IGNORECASE)
++
++    def _complexity_gate(self, msg_history, max_rounds=3):
++        """
++        Timing gate before verification. Asks the agent to time a max-size input; also checks the
++        agent-written /tmp/stress/max_input.txt deterministically. Runs a bounded redesign round when the
++        solution is too slow or the agent's last text says so. Keeps /tmp/stress/best_solution.py updated.
++        """
++        target_path = os.path.join(self.git_tempdir, self._target_file())
++        os.makedirs('/tmp/stress', exist_ok=True)
++        for round_idx in range(max_rounds):
++            ran, failed, detail = self._run_timing(target_path)
++            text = self._last_message_text(msg_history)
++            says_slow = bool(self.SLOW_PATTERN.search(text))
++            safe_log(f"Complexity gate round {round_idx + 1}/{max_rounds}: timing={detail}, "
++                     f"says_slow={says_slow}, timing_failed={failed}")
++            if not failed and not says_slow:
++                if os.path.isfile(target_path):
++                    shutil.copyfile(target_path, '/tmp/stress/best_solution.py')
++                return msg_history
++            prompt = (
++                "Complexity check failed: " + (f"the timing test reported: {detail}. " if ran else "")
++                + ("Your last message says the solution is too slow or not efficient. " if says_slow else "")
++                + f"\n\nRedesign round (bounded, keep reasoning brief). Target: {target_path}\n"
++                "1. Tabulate the slow reference (/tmp/ref/ref.py) on small inputs and look for patterns.\n"
++                "2. Look for closed forms, inclusion-exclusion, prefix sums, two pointers, convolution, "
++                "or combinatorics with precomputed factorials mod p.\n"
++                "3. Implement the faster algorithm in the target file with the editor tool.\n"
++                "4. Validate it against /tmp/ref/ref.py on small and medium inputs, then regenerate a max-size "
++                "input at /tmp/stress/max_input.txt and time it with the time_check tool.\n"
++                "Do not stop until the max-size run is OK."
++            )
++            backup = '/tmp/stress/best_solution.py'
++            if os.path.isfile(target_path) and not failed:
++                shutil.copyfile(target_path, backup)
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        # Final check: restore the last verified solution if the redesign never got fast enough.
++        ran, failed, detail = self._run_timing(target_path)
++        if failed and os.path.isfile('/tmp/stress/best_solution.py'):
++            safe_log(f"Complexity gate: still failing ({detail}); restoring /tmp/stress/best_solution.py.")
++            shutil.copyfile('/tmp/stress/best_solution.py', target_path)
++        return msg_history
++
+     def _verification_prompt(self, round_idx, max_rounds):
+         """Build the mandatory stress-test verification prompt for one round."""
+         target = self._target_file()
+@@ -464,7 +542,7 @@ Keep your reasoning brief; run code first and reason only about concrete failure
+    b. Reason explicitly about which modelling assumption of the solution is wrong (for example a wrong cost model, a missed case, an off-by-one, a greedy that is not optimal, or a misread rule). Do not guess blindly; check the brute force first if you suspect it.
+    c. Fix {target_path} with the editor tool (use str_replace for targeted edits).
+    d. Rerun the stress test until it reports no mismatches over the full number of cases. After each fix, copy the verified solution again to /tmp/stress/best_solution.py.
+-6. Timing: generate a maximum-size input that respects the constraints (for example via a small script in /tmp/stress/) and time the solution with `time`. If it takes more than about 1 second, optimise the algorithm (not just micro-optimise). Any optimisation must be re-verified with the full stress test (all levels). If the optimised version is not fully verified, restore it with `cp /tmp/stress/best_solution.py {target_path}`.
++6. Timing: generate a maximum-size input that respects the constraints (for example via a small script in /tmp/stress/) and time the solution with `time`. If it takes more than about 1 second or times out, do NOT just micro-optimise: stop and redesign the algorithm (tabulate the slow reference, look for closed forms / prefix sums / combinatorics), then re-verify. Any optimisation must be re-verified with the full stress test (all levels). If the optimised version is not fully verified, restore it with `cp /tmp/stress/best_solution.py {target_path}`.
+ 7. Run the sample tests from the problem statement once more.
+ 8. Finally run `git -C {self.git_tempdir} status` and `git -C {self.git_tempdir} diff` to confirm that the only changes are to the source file(s) and that no scratch files (brute.py, gen.py, stress.py, timing inputs, __pycache__ or similar) were left in the repository. Delete any that were.
+ 
+diff --git a/llm.py b/llm.py
+index 1767524..70f3399 100644
+--- a/llm.py
++++ b/llm.py
+@@ -79,29 +79,55 @@ def _log_response(response, max_tokens, log=print):
+     )
+ 
+ 
++def _thinking_enabled(kwargs) -> bool:
++    thinking = kwargs.get("thinking")
++    return isinstance(thinking, dict) and thinking.get("type") == "enabled"
++
++
++def _capped_thinking(thinking, max_tokens):
++    """Thinking config with budget_tokens <= 50% of max_tokens (never below the floor)."""
++    budget = thinking.get("budget_tokens", max_tokens // 2)
++    budget = min(budget, max_tokens // 2)
++    budget = max(THINKING_BUDGET_FLOOR, budget)
++    # The floor must never push the budget to or above max_tokens.
++    budget = min(budget, max(1, max_tokens - 1))
++    return {"type": "enabled", "budget_tokens": budget}
++
++
+ def _call_with_token_escalation(create_fn, max_tokens_list=(4096, 8192, 16384, 32000), log=print, **kwargs):
+     """
+     Call create_fn(max_tokens=..., **kwargs) (kwargs include model=...). If the response was cut
+-    off at max_tokens with no text/tool_use content, retry the same request with the next larger
+-    max_tokens (bounded by the model cap). When extended thinking is enabled, the thinking budget
+-    is reduced on each retry so that it stays below max_tokens. Never loops unboundedly.
++    off at max_tokens with no text/tool_use content:
++      * with extended thinking enabled, retry once at the same max_tokens with thinking disabled
++        (the thinking-only output exhausted the budget, so a smaller budget will not help);
++      * otherwise retry with the next larger max_tokens (bounded by the model cap).
++    The thinking budget is always kept at <= 50% of max_tokens. Never loops unboundedly.
+     """
+     cap = _max_tokens_cap(str(kwargs.get("model", "")))
+     budgets = [t for t in max_tokens_list if t <= cap] or [min(max_tokens_list[0], cap)]
+     response = None
+-    for idx, max_tokens in enumerate(budgets):
++    thinking_on = _thinking_enabled(kwargs)
++    idx = 0
++    tried_without_thinking = False
++    while idx < len(budgets):
++        max_tokens = budgets[idx]
+         call_kwargs = dict(kwargs)
+-        thinking = call_kwargs.get("thinking")
+-        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+-            # Keep thinking strictly below max_tokens; halve it on each escalation.
+-            budget = max(THINKING_BUDGET_FLOOR, min(thinking.get("budget_tokens", max_tokens // 2), max_tokens // 2))
+-            call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
++        if thinking_on:
++            call_kwargs["thinking"] = _capped_thinking(kwargs["thinking"], max_tokens)
++        else:
++            call_kwargs.pop("thinking", None)
+         response = create_fn(max_tokens=max_tokens, **call_kwargs)
+         _log_response(response, max_tokens, log=log)
+         if getattr(response, "stop_reason", None) != "max_tokens" or _has_text_or_tool_block(response):
+             return response
+-        if idx + 1 < len(budgets):
+-            log(f"Empty response at max_tokens={max_tokens}; retrying with max_tokens={budgets[idx + 1]}.")
++        if thinking_on and not tried_without_thinking:
++            tried_without_thinking = True
++            thinking_on = False
++            log(f"Empty response at max_tokens={max_tokens} with thinking; retrying once with thinking disabled.")
++            continue
++        idx += 1
++        if idx < len(budgets):
++            log(f"Empty response at max_tokens={max_tokens}; retrying with max_tokens={budgets[idx]}.")
+         else:
+             log(f"Empty response at max_tokens={max_tokens}; token budget exhausted.")
+     return response
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 164fb53..7434fed 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -386,14 +386,15 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+     return new_msg_history
+ 
+ TOKEN_EXHAUSTED_NUDGE = (
+-    "Be concise: skip lengthy reasoning. Write a first straightforward solution with the editor tool "
+-    "right away (command=create or command=edit on the target source file), then test it afterwards."
++    "Your previous reply ran out of output tokens before producing any text or tool call. "
++    "Keep reasoning brief: write the code for your current best algorithm now with the editor tool "
++    "(command=create or command=edit on the target source file), then test it afterwards."
+ )
+ 
+ EMPTY_NUDGES = [
+-    "Continue: call the editor tool now to implement the solution.",
++    "Continue: write the code for your current best algorithm now, using the editor tool.",
+     (
+-        "Continue: call the editor tool now to implement the solution. Use exactly this format:\n"
++        "Continue: write the code for your current best algorithm now, using the editor tool. Use exactly this format:\n"
+         "<tool_use>\n{'tool_name': 'editor', 'tool_input': {'command': 'create', "
+         "'path': '<path of the target source file>', 'file_text': '<complete file contents>'}}\n</tool_use>"
+     ),
+@@ -444,13 +445,29 @@ def _is_empty_response(response, model=''):
+     return (not has_text) and (not has_tool)
+ 
+ 
++def _message_contains_text(msg, text):
++    """True if the text is already present in the message content (string or block list)."""
++    content = msg.get("content")
++    if isinstance(content, str):
++        return text in content
++    if isinstance(content, list):
++        for block in content:
++            block_text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
++            if block_text and text in block_text:
++                return True
++    return False
++
++
+ def _append_nudge(msg_history, text):
+     """
+     Add a nudge without stacking consecutive user messages: merge it into the last
+     message if that is a user message (tool_result or text), otherwise append a new user message.
++    An identical nudge already present in that user message is not added again.
+     """
+     if msg_history and msg_history[-1].get("role") == "user":
+         last = msg_history[-1]
++        if _message_contains_text(last, text):
++            return msg_history
+         content = last.get("content")
+         if isinstance(content, str):
+             last["content"] = content + "\n\n" + text
+diff --git a/tools/time_check.py b/tools/time_check.py
+new file mode 100644
+index 0000000..4d02c90
+--- /dev/null
++++ b/tools/time_check.py
+@@ -0,0 +1,128 @@
++import os
++import signal
++import subprocess
++import time
++
++
++def _run_killable(cmd, data, timeout):
++    """Run a shell command in its own process group; kill the whole group on timeout."""
++    proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE, start_new_session=True)
++    try:
++        out, err = proc.communicate(data, timeout=timeout)
++        return proc.returncode, out, err
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except OSError:
++            pass
++        proc.communicate()
++        raise
++
++MAX_OUTPUT_CHARS = 2000
++
++
++def tool_info():
++    return {
++        "name": "time_check",
++        "description": """Time a solution program on a large input with a hard time limit and report a verdict.
++* Provide the input either as `input_text` (short inputs) or as `generator_cmd` (a shell command that prints the input to stdout, e.g. `python3 /tmp/stress/max_gen.py`). Prefer `generator_cmd` for max-size inputs.
++* The solution command is run through the shell and receives the input on stdin.
++* Returns the wall time of each run, the exit code, a truncated stdout, and a verdict: 'OK' or 'TOO SLOW (> limit)' (also 'TIMEOUT', 'RUNTIME ERROR').
++* Use it to check that the solution fits the time limit on maximum-size inputs.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_cmd": {
++                    "type": "string",
++                    "description": "Shell command that runs the solution, e.g. 'python3 /dgm/solution.py'. It reads the input on stdin."
++                },
++                "generator_cmd": {
++                    "type": "string",
++                    "description": "Optional. Shell command that prints a (max-size) test input to stdout. The generator output is regenerated for each run."
++                },
++                "input_text": {
++                    "type": "string",
++                    "description": "Optional. The test input as literal text. Used only when generator_cmd is not given."
++                },
++                "time_limit_seconds": {
++                    "type": "number",
++                    "description": "Optional. Time limit in seconds for each run. Defaults to 2."
++                },
++                "runs": {
++                    "type": "integer",
++                    "description": "Optional. Number of timed runs (the worst time is reported). Defaults to 1."
++                }
++            },
++            "required": ["solution_cmd"]
++        }
++    }
++
++
++def _truncate(text, limit=MAX_OUTPUT_CHARS):
++    if len(text) <= limit:
++        return text
++    return text[:limit] + f"\n... (truncated, {len(text) - limit} more characters)"
++
++
++def tool_function(solution_cmd, generator_cmd=None, input_text=None, time_limit_seconds=2, runs=1):
++    try:
++        limit = float(time_limit_seconds) if time_limit_seconds is not None else 2.0
++    except (TypeError, ValueError):
++        limit = 2.0
++    try:
++        runs = int(runs) if runs is not None else 1
++    except (TypeError, ValueError):
++        runs = 1
++    runs = max(1, min(runs, 5))
++
++    # The generator is re-run for each timed run so every run gets a fresh input.
++    lines = []
++    worst = 0.0
++    verdict = 'OK'
++    last_code = None
++    last_out = ''
++    last_err = ''
++    for i in range(runs):
++        if generator_cmd:
++            try:
++                gcode, gout, gerr = _run_killable(generator_cmd, None, max(limit * 5, 60))
++            except subprocess.TimeoutExpired:
++                return f"Verdict: GENERATOR TIMEOUT. The generator command did not finish: {generator_cmd}"
++            if gcode != 0:
++                return (f"Verdict: GENERATOR FAILED (exit {gcode}).\n"
++                        f"stderr: {_truncate(gerr.decode(errors='replace'))}")
++            data = gout
++        else:
++            data = (input_text or '').encode()
++        start = time.monotonic()
++        try:
++            code, out, err = _run_killable(solution_cmd, data, limit)
++            elapsed = time.monotonic() - start
++            last_code = code
++            last_out = out.decode(errors='replace')
++            last_err = err.decode(errors='replace')
++        except subprocess.TimeoutExpired:
++            elapsed = time.monotonic() - start
++            last_code = None
++            last_out = ''
++            last_err = ''
++            worst = max(worst, elapsed)
++            verdict = f'TIMEOUT (> {limit:g}s limit)'
++            lines.append(f"run {i + 1}: killed after {elapsed:.2f}s")
++            break
++        worst = max(worst, elapsed)
++        lines.append(f"run {i + 1}: {elapsed:.2f}s, exit code {last_code}")
++        if last_code != 0:
++            verdict = 'RUNTIME ERROR'
++            break
++        if elapsed > limit:
++            verdict = f'TOO SLOW (> {limit:g}s limit)'
++            break
++
++    report = [f"Verdict: {verdict}", f"Time limit: {limit:g}s", f"Worst wall time: {worst:.2f}s"]
++    report.extend(lines)
++    report.append(f"stdout (truncated):\n{_truncate(last_out)}")
++    if last_err:
++        report.append(f"stderr (truncated):\n{_truncate(last_err)}")
++    return "\n".join(report)

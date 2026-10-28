@@ -1,0 +1,277 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7f242a1..6b38864 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ import re
++import ast
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -155,15 +156,70 @@ def _message_text(msg):
+ 
+ def _extract_last_python_block(msg_history):
+     """
+-    Return the content of the last ```python fenced block in the history, or None.
++    Return the source code from the latest assistant-style message that contains
++    a parseable Python program, or None. Fenced blocks (```python, ```py or an
++    untagged ```) are tried first, last block first. If none parses, the whole
++    message text is tried. Every candidate is validated with ast.parse.
+     """
+-    pattern = re.compile(r'```python[ \t]*\n(.*?)```', re.DOTALL)
++    pattern = re.compile(r'```(?:python|py)?[ \t]*\n(.*?)```', re.DOTALL)
+     for msg in reversed(msg_history):
+-        matches = pattern.findall(_message_text(msg))
+-        if matches:
+-            return matches[-1]
++        text = _message_text(msg)
++        candidates = list(reversed(pattern.findall(text)))
++        candidates.append(text.strip())
++        for code in candidates:
++            if not code.strip():
++                continue
++            try:
++                ast.parse(code)
++            except (SyntaxError, ValueError):
++                continue
++            return code
+     return None
+ 
++def _last_assistant_is_empty(msg_history):
++    """
++    Return True if the most recent assistant turn has no text (and therefore no
++    final answer), or if there is no assistant turn at all.
++    """
++    for msg in reversed(msg_history):
++        if isinstance(msg, dict) and msg.get('role') == 'assistant':
++            return not _message_text(msg).strip()
++    return True
++
++def _detect_problem_type(problem_statement):
++    """
++    Classify the task as 'interactive', 'solution_class' or 'stdin'.
++    """
++    text = problem_statement.lower()
++    if 'interactive problem' in text:
++        return 'interactive'
++    if 'class solution' in text:
++        return 'solution_class'
++    return 'stdin'
++
++INTERACTIVE_TESTING_GUIDANCE = (
++    "This is an INTERACTIVE problem, so the examples cannot be checked with plain stdin runs. "
++    "Write a local judge script at /tmp/judge.py that: (1) launches `python solution.py` (use the target file path) "
++    "with subprocess.Popen using stdin=PIPE and stdout=PIPE, text mode, bufsize=1 (line-buffered); "
++    "(2) generates a random hidden array consistent with the problem constraints, and reads the first input line(s) "
++    "exactly as the problem specifies; (3) answers every query the solution sends by reading its request line and writing "
++    "the response line; (4) counts the queries and enforces the query limit from the problem, comparing against the "
++    "theoretical minimum number of queries when relevant; (5) checks the final answer line against the hidden data; "
++    "(6) reports failure on wrong answers, exceeding the query limit, or the process exiting early. "
++    "Run the judge on many random hidden arrays, including small and edge cases. "
++    "Inside solution.py, make sure every query and the final answer is printed with print(..., flush=True) "
++    "so the judge does not deadlock. Then run the judge and fix any failures."
++)
++
++def _type_specific_guidance(problem_type):
++    if problem_type == 'interactive':
++        return "\n\n" + INTERACTIVE_TESTING_GUIDANCE
++    if problem_type == 'solution_class':
++        return ("\n\nThis task asks for a method of a `Solution` class: test the method directly by importing the "
++                "class from the target file and calling it with the example inputs.")
++    return ("\n\nThis task reads standard input and writes standard output: run the program with the example inputs "
++            "piped to stdin and compare its stdout with the expected output.")
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -208,11 +264,8 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++    def _task_instruction(self):
++        return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -220,8 +273,22 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"""{task}
+ 
++    def _draft_phase(self, problem_type):
++        """
++        Get a non-empty first draft onto disk. Tries up to 3 prompt variants in order,
++        each time checking that the repository changed and that the last assistant turn
++        is not empty. Returns the chat history of the last conversation.
++        """
++        target_rel = _find_target_file(self.git_tempdir)
++        target_path = os.path.join(self.git_tempdir, target_rel)
++        try:
++            with open(target_path, 'r', encoding='utf-8', errors='replace') as fh:
++                current_contents = fh.read()
++        except OSError:
++            current_contents = ""
++
++        full_instruction = self._task_instruction() + f"""
+ Follow this workflow carefully and do not stop until the solution is implemented and tested:
+ 
+ 1. Inspect the repository and the starter code. Look at the files in {self.git_tempdir} to find the file(s) you need to modify. If the task asks you to implement a method of a `Solution` class, implement it in the existing file, keep the given class and method signature, and add any needed imports (e.g. `from typing import List`). Do NOT read from stdin in this case. If the task asks for a complete program, it must read standard input and write standard output.
+@@ -239,56 +306,80 @@ Important rules:
+ - Write a first-draft solution to disk early, before extensive analysis, then refine it.
+ - numpy or other third-party packages may not be installed. Prefer pure Python, or verify availability first.
+ """
+-        history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Ensure that some code was actually written, escalating recovery if needed
++        short_prompt = (
++            "Solve the following programming problem by editing the target file below.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Target file: {target_path}\n"
++            f"Current contents:\n<file_contents>\n{current_contents}\n</file_contents>\n\n"
++            "Immediately write a complete first-draft solution to the target file using the editor tool. "
++            "Keep the existing class and method signatures, and make sure the file is saved to disk. "
++            "Do not just describe the solution."
++        )
++        simpler_prompt = (
++            f"Write the solution to {target_path} now using the editor tool. "
++            "Do not explain first; write the full code to the file, then reply with a one-line confirmation.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        prompts = [full_instruction, short_prompt, simpler_prompt]
++        continuation = (
++            "Continue: use the editor tool to write the solution now."
++        )
++
++        history = []
++        for attempt in range(len(prompts)):
++            history = chat_with_agent(prompts[attempt], model=self.code_model, msg_history=[], logging=safe_log)
++
++            if _has_changes(self.git_tempdir, self.base_commit):
++                return history, target_path
++
++            # Empty turn with no tool use: nudge within the same conversation once
++            if _last_assistant_is_empty(history):
++                history = chat_with_agent(continuation, model=self.code_model, msg_history=history, logging=safe_log)
++                if _has_changes(self.git_tempdir, self.base_commit):
++                    return history, target_path
++
++        return history, target_path
++
++    def _code_only_fallback(self, target_path, problem_type):
++        """
++        Last resort: ask for only the source code, validate it with ast.parse, and write it.
++        """
++        code_prompt = (
++            "Reply with only the complete Python source in a ```python block, no tools. "
++            f"The problem type is: {problem_type}. "
++            "The source must solve the following problem and be a full, runnable file. "
++            "If the problem is interactive, flush stdout after every query with print(..., flush=True).\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        history = chat_with_agent(code_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        code = _extract_last_python_block(history)
++        if code is not None:
++            os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
++            with open(target_path, 'w', encoding='utf-8') as fh:
++                fh.write(code)
++        return history
++
++    def forward(self):
++        """
++        The forward function for the AgenticSystem: a short draft phase that must produce
++        on-disk changes, followed by a verify phase.
++        """
++        problem_type = _detect_problem_type(self.problem_statement)
++
++        history, target_path = self._draft_phase(problem_type)
++
++        # Last resort if the draft phase still produced no changes
+         if not _has_changes(self.git_tempdir, self.base_commit):
+-            target_rel = _find_target_file(self.git_tempdir)
+-            target_path = os.path.join(self.git_tempdir, target_rel)
+-
+-            # Rung 1: continue the existing conversation with a forceful nudge
+-            followup = (
+-                "No changes were detected in the repository, so no files were modified. "
+-                "Write the implementation to disk immediately, in "
+-                f"{target_path}, using the editor tool. Write a complete first-draft solution now, "
+-                "then test it (run the examples and a brute-force stress test). "
+-                "Do not just describe the solution, and do not end your turn without a tool call or a final summary."
+-            )
+-            history = chat_with_agent(followup, model=self.code_model, msg_history=history, logging=safe_log)
+-
+-            # Rung 2: fresh conversation with a concise prompt including the current file contents
+-            if not _has_changes(self.git_tempdir, self.base_commit):
+-                try:
+-                    with open(target_path, 'r', encoding='utf-8', errors='replace') as fh:
+-                        current_contents = fh.read()
+-                except OSError:
+-                    current_contents = ""
+-                fresh_prompt = (
+-                    "Solve the following programming problem by editing the file below.\n\n"
+-                    f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                    f"Target file: {target_path}\n"
+-                    f"Current contents:\n<file_contents>\n{current_contents}\n</file_contents>\n\n"
+-                    "First, write a complete first-draft solution to the target file right away using the editor tool. "
+-                    "Then test it against the examples and a brute-force stress test, and refine it. "
+-                    "Keep the existing class and method signatures, and make sure the file is saved to disk."
+-                )
+-                history = chat_with_agent(fresh_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-            # Rung 3: last resort, ask for only the source code and write it directly
+-            if not _has_changes(self.git_tempdir, self.base_commit):
+-                code_prompt = (
+-                    "Reply with only the complete Python source in a ```python block, no tools. "
+-                    "The source must solve the following problem and be a full, runnable file.\n\n"
+-                    f"<problem_description>\n{self.problem_statement}\n</problem_description>"
+-                )
+-                history = chat_with_agent(code_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+-                code = _extract_last_python_block(history)
+-                if code is not None:
+-                    os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
+-                    with open(target_path, 'w', encoding='utf-8') as fh:
+-                        fh.write(code)
+-
+-        # Bounded verification rounds once a non-empty diff exists
++            history = self._code_only_fallback(target_path, problem_type)
++
++        self._verify_phase(problem_type, history)
++
++    def _verify_phase(self, problem_type, history):
++        """
++        Bounded verification rounds once a non-empty diff exists.
++        """
++        guidance = _type_specific_guidance(problem_type)
+         verification_prompts = [
+             (
+                 "Now verify your solution. Run all the examples from the problem statement and check that the outputs "
+@@ -296,11 +387,13 @@ Important rules:
+                 "solution against it on many small inputs. Also run the worst-case input size from the constraints to "
+                 "check the runtime. If anything fails, fix the code and re-run the tests. When everything passes, "
+                 "confirm that the task is complete."
++                + guidance
+             ),
+             (
+                 "Do one final check: re-run the examples from the problem statement and the stress test on the current "
+                 "code in the repository. Fix any remaining failures. Make sure all changes are saved to disk, then "
+                 "confirm completion with a short summary."
++                + guidance
+             ),
+         ]
+         for prompt in verification_prompts:
+@@ -308,6 +401,7 @@ Important rules:
+                 break
+             history = chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

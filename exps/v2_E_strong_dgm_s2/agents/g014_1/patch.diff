@@ -1,0 +1,499 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a33c6a1..517bd72 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,7 @@
+ import argparse
++import importlib.util
+ import subprocess
++import sys
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -12,6 +14,31 @@ from tools.run_candidates import run_raw
+ STRESS_CASES = 300
+ CALL_TIMEOUT = 5
+ TIMING_LIMIT = 1.0  # seconds per call on the max-size timing input
++VALIDATE_TIMEOUT = 10  # seconds per sample run when validating a file as a real subprocess
++CUTOFF_MARKERS = ("(no output)", "cut off by the output limit")
++
++# Standalone fallback: the brute force source is inlined as a string and executed, so this file needs nothing else.
++BRUTE_WRAPPER_TEMPLATE = r'''# Fallback solution: a correct but slow reference (the brute force), inlined so this file is standalone.
++import sys
++
++_BRUTE_SRC = __BRUTE_SRC__
++
++
++def _load_solve():
++    ns = {"__name__": "_brute_reference"}
++    exec(compile(_BRUTE_SRC, "brute.py", "exec"), ns)
++    return ns["solve"]
++
++
++def main():
++    data = sys.stdin.read()
++    out = str(_load_solve()(data))
++    sys.stdout.write(out if out.endswith("\n") else out + "\n")
++
++
++if __name__ == "__main__":
++    main()
++'''
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -122,6 +149,7 @@ class AgenticSystem:
+ 
+         # Rank of the candidate currently installed in solution.py (None = nothing installed yet).
+         self._best_installed_rank = None
++        self._repair_count = 0
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -166,18 +194,131 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+     def _solution_path(self):
+         return os.path.join(self.git_tempdir, 'solution.py')
+ 
++    @staticmethod
++    def _last_assistant_text(history):
++        """Concatenated text of the last assistant message in a message history ('' if none)."""
++        for msg in reversed(history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            parts = []
++            for block in content or []:
++                if isinstance(block, dict):
++                    parts.append(str(block.get('text', '')))
++                else:
++                    parts.append(str(getattr(block, 'text', '') or ''))
++            return '\n'.join(parts)
++        return ''
++
+     def _chat(self, prompt):
+-        """One focused agent call with a fresh message history."""
+-        return chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        """One focused agent call with a fresh message history. If the reply is empty or was cut off by the
++        output limit, retry once with a compact prompt that includes the current file state."""
++        history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        last = self._last_assistant_text(history)
++        if last.strip() and not any(m in last for m in CUTOFF_MARKERS):
++            return history
++        safe_log("chat: reply was empty or cut off; retrying once with a compact prompt")
++        state = self._file_state_summary()
++        compact = (f"{self._task_text()}\nYour previous reply was empty or cut off by the output limit. "
++                   f"Keep replies short. Current file state:\n{state}\n"
++                   "Continue the task from this state: use the tools, make small edits, and do not end your turn "
++                   "without a tool call.")
++        return chat_with_agent(compact, model=self.code_model, msg_history=[], logging=safe_log)
++
++    def _file_state_summary(self):
++        """Short listing of _work/ files and solution.py (name, size), used in compact retry prompts."""
++        lines = []
++        try:
++            for name in sorted(os.listdir(self._work_dir())):
++                full = os.path.join(self._work_dir(), name)
++                if os.path.isfile(full):
++                    lines.append(f"  _work/{name} ({os.path.getsize(full)} bytes)")
++        except OSError:
++            pass
++        sol = self._solution_path()
++        lines.append(f"  solution.py ({os.path.getsize(sol) if os.path.isfile(sol) else 'missing'} bytes)")
++        return "\n".join(lines)
+ 
+     @staticmethod
+     def _is_trivial_code(code):
+         """True if the code is empty or contains only blank lines and comments."""
+         return all(not line.strip() or line.strip().startswith('#') for line in code.splitlines())
+ 
+-    def _install(self, path, rank=None):
+-        """Copy candidate `path` to solution.py if it is non-trivial and does not rank below the installed one.
+-        `rank` is a tuple comparable to _rank_key; without a rank the copy is unconditional (used by the fallbacks).
++    def _load_gen(self):
++        """Import _work/gen.py as a module. Returns (module, None) or (None, traceback text)."""
++        gen_path = os.path.join(self._work_dir(), 'gen.py')
++        try:
++            spec = importlib.util.spec_from_file_location('_validate_gen', gen_path)
++            mod = importlib.util.module_from_spec(spec)
++            spec.loader.exec_module(mod)
++            return mod, None
++        except BaseException:
++            import traceback
++            return None, traceback.format_exc(limit=5)
++
++    def _sample_results(self, path):
++        """Run `python3 path` as a real subprocess on every sample from gen.samples() (stdin = sample input).
++        Returns a dict: passed, total, crashed (a run exited non-zero or timed out), and reports (one line per sample)."""
++        res = {'passed': 0, 'total': 0, 'crashed': False, 'reports': []}
++        gen, err = self._load_gen()
++        if gen is None:
++            res['reports'].append(f"gen.py does not import, so no samples can be checked:\n{err}")
++            return res
++        try:
++            samples = list(gen.samples())
++        except BaseException:
++            import traceback
++            res['reports'].append("gen.samples() failed:\n" + traceback.format_exc(limit=5))
++            return res
++        res['total'] = len(samples)
++        for k, item in enumerate(samples):
++            try:
++                x, expected = item
++            except (TypeError, ValueError):
++                res['reports'].append(f"sample {k}: malformed (expected an (input, output) pair)")
++                continue
++            try:
++                p = subprocess.run([sys.executable, os.path.abspath(path)], input=str(x), capture_output=True, text=True,
++                                   timeout=VALIDATE_TIMEOUT, cwd=self.git_tempdir)
++            except subprocess.TimeoutExpired:
++                res['crashed'] = True
++                res['reports'].append(f"sample {k}: timed out after {VALIDATE_TIMEOUT}s")
++                continue
++            if p.returncode != 0:
++                res['crashed'] = True
++                tail = (p.stderr or '').strip()[-1500:] or '(no stderr)'
++                res['reports'].append(f"sample {k}: exited with code {p.returncode}; stderr:\n{tail}")
++                continue
++            got = (p.stdout or '').strip()
++            if got == str(expected).strip():
++                res['passed'] += 1
++            else:
++                res['reports'].append(f"sample {k}: wrong output\n  expected: {str(expected).strip()[:400]!r}\n"
++                                      f"  got: {got[:400]!r}")
++        return res
++
++    def _validate_solution(self, path):
++        """Validate a stdin/stdout program against the samples. Returns (ok, report).
++        ok means: it runs without crashing and matches every sample. The report includes stderr tracebacks."""
++        res = self._sample_results(path)
++        ok = res['total'] > 0 and res['passed'] == res['total'] and not res['crashed']
++        head = f"{os.path.basename(path)}: {res['passed']}/{res['total']} samples pass" + (
++            ", crashed on at least one sample" if res['crashed'] else "")
++        report = "\n".join([head] + res['reports'])
++        return ok, report
++
++    def _rank_from_results(self, res):
++        """Rank tuple shaped like _rank_key; unknown stress/agreement fields are set below any real value.
++        Returns None for a candidate with zero sample passes (never installed)."""
++        if res['passed'] == 0 or res['total'] == 0:
++            return None
++        return (res['passed'], -1, -1, False, float('-inf'))
++
++    def _install(self, path, rank=None, results=None):
++        """Copy candidate `path` to solution.py if it is non-trivial, passes at least one sample, does not crash,
++        and does not rank below the installed one. `results` may carry a precomputed _sample_results(path).
+         Returns True if solution.py was written."""
+         try:
+             with open(path, 'r', encoding='utf-8', errors='replace') as f:
+@@ -188,6 +329,14 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         if not code.strip() or self._is_trivial_code(code):
+             safe_log(f"install: skipped {path} (empty or comments only)")
+             return False
++        if results is None:
++            results = self._sample_results(path)
++        if results['crashed'] or results['passed'] == 0:
++            safe_log(f"install: refused {path}: {results['passed']}/{results['total']} samples, "
++                     f"crashed={results['crashed']}")
++            return False
++        if rank is None:
++            rank = self._rank_from_results(results)
+         if rank is not None and self._best_installed_rank is not None and rank < self._best_installed_rank:
+             safe_log(f"install: kept the installed solution, {path} ranks worse ({rank} < {self._best_installed_rank})")
+             return False
+@@ -203,30 +352,25 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         return True
+ 
+     def _quick_check(self, path):
+-        """Sample-only check of one candidate. Returns (rank_tuple, passes_samples) or (None, False) on error.
+-        The rank is shaped like _rank_key, with unknown stress/agreement fields set below any real value."""
+-        work = self._work_dir()
++        """Sample-only check of one candidate. Returns (rank, passes) where rank is None when the candidate
++        has zero sample passes or crashes, so it must not be installed."""
+         try:
+-            res = run_raw([path], os.path.join(work, 'brute.py'), os.path.join(work, 'gen.py'),
+-                          num_cases=0, timeout=CALL_TIMEOUT)
++            results = self._sample_results(path)
+         except Exception as e:
+             safe_log(f"quick check failed for {path}: {e}")
+-            return None, False
+-        if res.get('status') != 'ok':
+-            return None, False
+-        st = res['stats']
+-        samples_ok = st['samples_ok'][0]
+-        samples_total = st['samples_total']
+-        passes = samples_total > 0 and samples_ok == samples_total
+-        return (samples_ok, -1, -1, False, float('-inf')), passes
++            return None, False, None
++        rank = None if results['crashed'] else self._rank_from_results(results)
++        passes = results['total'] > 0 and results['passed'] == results['total'] and not results['crashed']
++        return rank, passes, results
+ 
+     def _try_install(self, path):
+         """Install a freshly produced candidate/repair if it passes the samples or beats the installed one."""
+-        rank, passes = self._quick_check(path)
++        rank, passes, results = self._quick_check(path)
+         if rank is None:
++            safe_log(f"try_install: {path} has zero sample passes or crashes; not installed")
+             return False
+         if passes or self._best_installed_rank is None or rank > self._best_installed_rank:
+-            return self._install(path, rank)
++            return self._install(path, rank, results=results)
+         return False  # does not pass the samples and does not beat the installed candidate
+ 
+     def _newest_work_candidate(self):
+@@ -273,13 +417,16 @@ You are one of several independent solvers. Write a complete correct solution to
+ Test harness already exists: a reference brute force at {brute} and a generator at {gen} (with samples()).
+ Strategy hint for this attempt: {hint}
+ {prior_context}
++Environment: only the Python standard library is available (numpy etc. are NOT installed).
+ Steps:
++- First, run `python3 {path} < sample` on a sample input before anything else, to catch import errors and crashes.
+ - Derive the algorithm from the constraints; keep it fast enough for max-size input (well under 2 seconds in Python).
+ - Run the solution on every sample from the statement and compare exactly.
+ - Use the run_candidates tool (or stress_test) with candidate_paths=[{path}], brute_path={brute}, generator_path={gen} to compare against the brute force; fix every mismatch.
+ - Do not change {brute} or {gen} in this step.
+ - As soon as the candidate passes the samples, also copy it to {self._solution_path()} (the repo's solution.py).
+ 
++Keep replies brief: long replies get cut off by the output limit, so write files in small steps.
+ Completion condition: {path} exists, runs on the samples, and matches the expected outputs. Do not end your turn without a tool call."""
+         self._chat(prompt)
+         return path if os.path.isfile(path) else None
+@@ -406,7 +553,11 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                 if best_row['passes'] or round_k == self.K_REPAIR_ROUNDS:
+                     break
+                 try:
+-                    repaired = self._repair(best_row['path'], message)
++                    evidence = message
++                    if best_row['samples_ok'] == 0:
++                        _, sample_report = self._validate_solution(best_row['path'])
++                        evidence = f"The candidate passes 0 of the samples.\n{sample_report}\n\n{message}"
++                    repaired = self._repair(best_row['path'], evidence)
+                     if repaired:
+                         candidates.append(repaired)
+                         self._try_install(repaired)
+@@ -437,6 +588,98 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+         except Exception as e:
+             safe_log(f"ensure_patch failed: {e}")
+ 
++        # Final gate, after every install step: never leave a solution.py that fails its samples or crashes.
++        try:
++            self._ensure_valid_solution()
++        except Exception as e:
++            safe_log(f"validation fallback failed: {e}")
++
++    def _write_solution(self, code):
++        with open(self._solution_path(), 'w', encoding='utf-8') as f:
++            f.write(code)
++
++    def _install_brute_fallback(self):
++        """Write solution.py as a standalone wrapper around the brute force (its source is inlined), validate it,
++        then run a bounded optimize chat. Every optimized version must pass run_candidates against _work/baseline.py
++        and the samples; only validated versions are kept. Returns True if a validated solution.py is in place."""
++        work = self._work_dir()
++        brute = os.path.join(work, 'brute.py')
++        gen = os.path.join(work, 'gen.py')
++        baseline = os.path.join(work, 'baseline.py')
++        try:
++            with open(brute, 'r', encoding='utf-8', errors='replace') as f:
++                brute_src = f.read()
++        except OSError:
++            safe_log("brute fallback: _work/brute.py is missing")
++            return False
++        if not os.path.isfile(gen):
++            safe_log("brute fallback: _work/gen.py is missing")
++            return False
++        if 'def solve' not in brute_src:
++            safe_log("brute fallback: brute.py defines no solve(); only stdin-style brute forces can be wrapped")
++            return False
++        wrapper = BRUTE_WRAPPER_TEMPLATE.replace('__BRUTE_SRC__', repr(brute_src))
++        with open(baseline, 'w', encoding='utf-8') as f:
++            f.write(wrapper)
++        ok, report = self._validate_solution(baseline)
++        if not ok:
++            safe_log(f"brute fallback: wrapper does not validate; not installed\n{report}")
++            return False
++        self._write_solution(wrapper)
++        self._best_installed_rank = None
++        safe_log(f"brute fallback: installed validated baseline wrapper\n{report}")
++
++        for attempt in range(2):
++            prompt = f"""{self._task_text()}
++solution.py currently holds a correct but slow standalone wrapper around the brute force (the reference is also kept at {baseline}; the brute force is {brute}, the generator is {gen}).
++Optimize this correct but slow solution.py; keep a copy as {baseline} (it is already there; do not modify it).
++Steps:
++- Write the optimized program to {os.path.join(work, f'opt_{attempt}.py')} (standalone, stdin to stdout, standard library only), keeping the same I/O format as the statement.
++- After each change, verify it against the baseline with the run_candidates tool: candidate_paths=[the optimized file], brute_path={baseline}, generator_path={gen}. Fix every mismatch; the baseline is the ground truth.
++- Only keep changes that pass. Do not modify {baseline}, {brute}, or {gen}.
++- Keep replies short. Do not end your turn without a tool call.
++Completion condition: the optimized file exists and passes run_candidates against the baseline."""
++            try:
++                self._chat(prompt)
++            except Exception as e:
++                safe_log(f"brute fallback: optimize chat {attempt} failed: {e}")
++                continue
++            opt = os.path.join(work, f'opt_{attempt}.py')
++            if not os.path.isfile(opt):
++                continue
++            try:
++                res = run_raw([opt], baseline, gen, num_cases=STRESS_CASES // 3, timeout=CALL_TIMEOUT)
++            except Exception as e:
++                safe_log(f"brute fallback: verify of {opt} failed: {e}")
++                continue
++            if res.get('status') != 'ok':
++                safe_log(f"brute fallback: verify of {opt} failed: {res.get('message', '')}")
++                continue
++            st = res['stats']
++            if st['samples_ok'][0] != st['samples_total'] or st['stress_ok'][0] != st['stress_total'] or \
++                    st['timeouts'][0] or st['exceptions'][0]:
++                safe_log(f"brute fallback: {opt} does not match the baseline; rejected")
++                continue
++            ok, report = self._validate_solution(opt)
++            if not ok:
++                safe_log(f"brute fallback: {opt} fails validation; rejected\n{report}")
++                continue
++            with open(opt, 'r', encoding='utf-8', errors='replace') as f:
++                self._write_solution(f.read())
++            safe_log(f"brute fallback: installed verified optimization {opt}")
++        ok, _ = self._validate_solution(self._solution_path())
++        return ok
++
++    def _ensure_valid_solution(self):
++        """Final gate: if solution.py fails validation (crash or sample mismatch), fall back to the brute force."""
++        if not os.path.isfile(self._solution_path()):
++            return False
++        ok, report = self._validate_solution(self._solution_path())
++        if ok:
++            return True
++        safe_log(f"final validation of solution.py failed; falling back to the brute force\n{report}")
++        return self._install_brute_fallback()
++
+     def _ensure_patch(self):
+         """
+         Always runs at the end. If solution.py is unchanged from the base commit, empty/comments-only, or the
+diff --git a/solution.py b/solution.py
+index bcf1fa8..0ee636c 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,5 +1,7 @@
+-# Placeholder: no competitive programming problem is present in this repository,
+-# so this file only echoes its stdin. It is not a solution to any specific task.
++# Standalone stdin/stdout program (standard library only).
++# NOTE: the repository contains no competitive-programming problem statement or samples, so the
++# problem this solves is unknown. This is a simple, correct-but-slow baseline: it reads all of stdin
++# and writes it back unchanged. Replace the body of main() once the real problem is provided.
+ import sys
+ 
+ 
+diff --git a/tools/run_candidates.py b/tools/run_candidates.py
+index 2c31678..e354cda 100644
+--- a/tools/run_candidates.py
++++ b/tools/run_candidates.py
+@@ -63,13 +63,25 @@ def is_callable_module(path):
+             return True
+     return bool(method)
+ 
++# A candidate that fails to import is reported per candidate (its calls raise, so it counts as exceptions);
++# only a broken brute force or generator is an overall error.
++cand_load_errors = {}
++cand_mods = []
++cand_is_fn = []
++for i, p in enumerate(cand_paths):
++    try:
++        is_fn = is_callable_module(p)
++        cand_is_fn.append(is_fn)
++        cand_mods.append(load(p, f"_cand_{i}") if is_fn else None)
++    except BaseException:
++        cand_is_fn.append(True)
++        cand_mods.append(None)
++        cand_load_errors[i] = traceback.format_exc(limit=5)
+ try:
+-    cand_is_fn = [is_callable_module(p) for p in cand_paths]
+-    cand_mods = [load(p, f"_cand_{i}") if cand_is_fn[i] else None for i, p in enumerate(cand_paths)]
+     brute_mod = load(brute_path, "_cand_brute") if is_callable_module(brute_path) else None
+     gen_mod = load(gen_path, "_cand_gen")
+ except BaseException:
+-    finish({"status": "error", "message": "Failed to import a file:\n" + traceback.format_exc(limit=5)})
++    finish({"status": "error", "message": "Failed to import the brute force or the generator:\n" + traceback.format_exc(limit=5)})
+ 
+ if not hasattr(gen_mod, "gen"):
+     finish({"status": "error", "message": "generator file must define gen(rng, size)"})
+@@ -98,8 +110,21 @@ def make_fn(mod, label, path):
+         raise AttributeError(f"{label} must define solve(input_obj)")
+     return mod.solve
+ 
++def _broken(msg):
++    def fn(x):
++        raise RuntimeError(msg)
++    return fn
++
++cand_fns = []
++for i, m in enumerate(cand_mods):
++    if i in cand_load_errors:
++        cand_fns.append(_broken("candidate failed to import:\n" + cand_load_errors[i]))
++        continue
++    try:
++        cand_fns.append(make_fn(m, cand_paths[i], cand_paths[i]))
++    except BaseException:
++        cand_fns.append(_broken("candidate setup failed:\n" + traceback.format_exc(limit=5)))
+ try:
+-    cand_fns = [make_fn(m, cand_paths[i], cand_paths[i]) for i, m in enumerate(cand_mods)]
+     brute_fn = make_fn(brute_mod, brute_path, brute_path)
+ except BaseException:
+     finish({"status": "error", "message": "Setup failed:\n" + traceback.format_exc(limit=5)})
+@@ -389,6 +414,40 @@ finish({"status": "ok", "message": "\n".join(lines), "stats": {
+ '''
+ 
+ 
++def nonstdlib_imports(path):
++    """Top-level module names imported by the file that are not in the standard library (static check, no execution)."""
++    try:
++        import ast
++        with open(path, encoding="utf-8", errors="replace") as f:
++            tree = ast.parse(f.read())
++    except (OSError, SyntaxError, ValueError):
++        return []
++    stdlib = set(getattr(sys, "stdlib_module_names", ()))
++    found = []
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Import):
++            names = [a.name for a in node.names]
++        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
++            names = [node.module]
++        else:
++            continue
++        for name in names:
++            top = name.split(".")[0]
++            if top and top not in stdlib and top not in found:
++                found.append(top)
++    return found
++
++
++def stdlib_warnings(candidate_paths):
++    lines = []
++    for p in candidate_paths:
++        mods = nonstdlib_imports(p)
++        if mods:
++            lines.append(f"WARNING: {os.path.basename(p)} imports non-standard-library module(s) {', '.join(mods)}; "
++                         "only the Python standard library is available, so it will fail with ModuleNotFoundError.")
++    return lines
++
++
+ def tool_info():
+     return {
+         "name": "run_candidates",
+@@ -468,7 +527,12 @@ def run_raw(candidate_paths, brute_path, generator_path, method=None, num_cases=
+         if not content.strip():
+             err = (p.stderr or "").strip()[-3000:]
+             return {"status": "error", "message": "candidate runner produced no result.\n" + (err or "(no stderr)")}
+-        return json.loads(content)
++        res = json.loads(content)
++        if res.get("status") == "ok":
++            warnings = stdlib_warnings(candidate_paths)
++            if warnings:
++                res["message"] = "\n".join(warnings + [res.get("message", "")])
++        return res
+     finally:
+         try:
+             os.remove(result_path)

@@ -1,0 +1,582 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ac3a213..2dce866 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,6 @@
+ import argparse
++import glob
++import shutil
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -7,6 +9,22 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools import run_tests
++
++MAX_ATTEMPTS = 3
++MAX_NUDGES = 2
++STRESS_CASES = 200
++RUN_TIMEOUT = 10
++STUB_SOLUTION = """import sys
++
++
++def main():
++    sys.stdin.read()
++    print(0)
++
++
++main()
++"""
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -164,49 +182,251 @@ class AgenticSystem:
+         ]
+         return len(meaningful) > 0
+ 
++    # ------------------------------------------------------------------
++    # Pipeline helpers
++    # ------------------------------------------------------------------
++    def _path(self, *parts):
++        return os.path.join(self.git_tempdir, *parts)
++
++    def _chat(self, msg, history):
++        return chat_with_agent(msg, model=self.code_model, msg_history=history, logging=safe_log)
++
++    def _ensure_stub(self):
++        """Guarantee solution.py exists so there is always something to grade."""
++        path = self._path('solution.py')
++        if not os.path.exists(path):
++            os.makedirs(self.git_tempdir, exist_ok=True)
++            with open(path, 'w') as f:
++                f.write(STUB_SOLUTION)
++
++    @staticmethod
++    def _snapshot(paths):
++        snap = {}
++        for p in paths:
++            try:
++                with open(p, 'r', errors='replace') as f:
++                    snap[p] = f.read()
++            except OSError:
++                snap[p] = None
++        return snap
++
++    @staticmethod
++    def _all_ready(paths, before):
++        """Every path exists, is non-empty and changed compared with the snapshot `before`."""
++        for p in paths:
++            try:
++                with open(p, 'r', errors='replace') as f:
++                    content = f.read()
++            except OSError:
++                return False
++            if not content.strip() or content == before.get(p):
++                return False
++        return True
++
++    def _call_until_written(self, paths, prompt, history, before, label):
++        """Send `prompt`; if the expected files are still missing or unchanged afterwards
++        (e.g. output cut off), send a short targeted nudge up to MAX_NUDGES times."""
++        history = self._chat(prompt, history)
++        for n in range(MAX_NUDGES):
++            if self._all_ready(paths, before):
++                return history
++            safe_log(f"[nudge] {label}: expected file(s) missing or unchanged. Nudge {n + 1}/{MAX_NUDGES}.")
++            nudge = (
++                f"The file(s) {', '.join(paths)} were not written. Write the file immediately "
++                "with the editor tool (create). Use minimal reasoning. A simple correct solution first is fine."
++            )
++            history = self._chat(nudge, history)
++        return history
++
++    def _plan(self):
++        """Phase 0: short analysis of the problem, saved to plan.md for later attempts."""
++        plan_path = self._path('plan.md')
++        prompt = (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++            f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Do NOT write any code yet. Read the statement and constraints, decide the algorithm and its "
++            f"complexity, list edge cases and the exact input/output format. Keep it short. "
++            f"Save the plan with the editor tool to {plan_path} (create)."
++        )
++        before = self._snapshot([plan_path])
++        self._call_until_written([plan_path], prompt, [], before, 'plan')
++
++    def _build_oracle(self):
++        """Independent oracle: fresh conversation that never sees a candidate solution."""
++        brute = self._path('tests', 'brute.py')
++        gen = self._path('tests', 'gen.py')
++        samples = self._path('tests', 'samples')
++        os.makedirs(samples, exist_ok=True)
++        prompt = (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++            f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            "Your job is to build an independent TEST ORACLE for this problem. Do not write a solution to the problem.\n"
++            f"1. Write {brute}: an obviously correct brute-force reference (exhaustive search, BFS/DP over small cases, or direct simulation). "
++            "Read stdin and print the answer to stdout exactly in the required output format. Favour clarity over speed.\n"
++            f"2. Write {gen}: a random generator of SMALL valid inputs that follows the input format and constraints. "
++            "It must take one integer argument SEED (sys.argv[1]), call random.seed(SEED), and print exactly one test input to stdout. "
++            "Include edge cases regularly: minimum sizes, duplicates, equal values, extreme values allowed by the statement.\n"
++            f"3. Write sample tests from the statement into {samples}/1.in, {samples}/1.out, {samples}/2.in, {samples}/2.out, etc. "
++            "Copy the examples from the statement exactly. Do not invent outputs that are not in the statement.\n"
++            "4. Run the brute force on the samples to check it reproduces the expected outputs; fix it if not. "
++            "Run the generator with a few seeds to check it works. Keep reasoning short."
++        )
++        before = self._snapshot([brute, gen])
++        self._call_until_written([brute, gen], prompt, [], before, 'oracle')
++
++    def _attempt(self, i, prev_code, prev_report):
++        """One fresh conversation that writes attempts/attempt{i}.py and tests it with run_tests."""
++        attempt_path = self._path('attempts', f'attempt{i}.py')
++        os.makedirs(self._path('attempts'), exist_ok=True)
++        brute = self._path('tests', 'brute.py')
++        gen = self._path('tests', 'gen.py')
++        samples = self._path('tests', 'samples')
++        plan = self._path('plan.md')
++        prompt = (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            "Work like a careful competitive programmer. Keep reasoning concise to avoid hitting the output limit.\n"
++            f"- A plan may exist in {plan}. Available test oracle: brute force {brute}, generator {gen} (run as `python3 {gen} SEED`), samples in {samples}/*.in and *.out. "
++            "These were written independently of any solution; trust them over your own assumptions about the problem, but if the brute force disagrees with a sample, fix the brute force.\n"
++            "- Stdin/stdout program: read input with sys.stdin, write the answer with print. Use only the standard library.\n"
++        )
++        if prev_code is not None:
++            prompt += (
++                "\nA previous attempt failed. Fix it or rewrite it if it is fundamentally wrong.\n"
++                f"<previous_code>\n{prev_code}\n</previous_code>\n"
++                f"<previous_test_report>\n{prev_report}\n</previous_test_report>\n"
++            )
++        prompt += (
++            f"\nSteps:\n"
++            f"1. Write your complete solution with the editor tool (create) to exactly {attempt_path}. Write it early, then refine.\n"
++            f"2. Test it with the run_tests tool: solution_path={attempt_path}, brute_path={brute}, gen_path={gen}, "
++            f"sample_dir={samples}, num_cases=200, timeout=10. Read the raw report and fix every failure in {attempt_path}.\n"
++            "3. Check the maximum-size input runs well under 2 seconds.\n"
++            f"4. Finish by running run_tests once more on {attempt_path} and stop. Do not edit solution.py."
++        )
++        before = self._snapshot([attempt_path])
++        self._call_until_written([attempt_path], prompt, [], before, f'attempt{i}')
++        return attempt_path
++
++    def _score(self, path):
++        """Score a candidate with the independent harness. Returns (tuple, perfect, report)."""
++        r = run_tests.evaluate(
++            path,
++            brute_path=self._path('tests', 'brute.py'),
++            gen_path=self._path('tests', 'gen.py'),
++            sample_dir=self._path('tests', 'samples'),
++            num_cases=STRESS_CASES,
++            timeout=RUN_TIMEOUT,
++        )
++        score = (r['samples_passed'], r['stress_passed'], -r['timeouts'], -r['crashes'])
++        perfect = (
++            r['error'] is None
++            and r['samples_total'] > 0
++            and r['samples_passed'] == r['samples_total']
++            and r['stress_passed'] == r['stress_total']
++            and r['timeouts'] == 0 and r['crashes'] == 0
++        )
++        return score, perfect, run_tests.format_report(r)
++
++    def _read(self, path):
++        with open(path, 'r', errors='replace') as f:
++            return f.read()
++
++    def _final_robust_check(self, chosen):
++        """Final step on the chosen solution: _primary_file_changed plus robust_check."""
++        if not self._primary_file_changed():
++            safe_log("[final] chosen solution.py has no meaningful content; asking for a write.")
++            self._chat(
++                f"solution.py in {self.git_tempdir} is empty or unchanged. Write a complete best-effort solution "
++                "to solution.py now with the editor tool (create).",
++                [],
++            )
++        samples = self._path('tests', 'samples')
++        inputs = sorted(glob.glob(os.path.join(samples, '*.in')))
++        input_str = ", ".join(f'"{p}"' for p in inputs) if inputs else "(none; run with empty stdin)"
++        before_score = self._score(self._path('solution.py'))[0]
++        self._chat(
++            f"Use the robust_check tool on {self._path('solution.py')} with input_files=[{input_str}]. "
++            "If any variant fails or differs from the baseline, fix solution.py minimally "
++            "(e.g. builtins.pow instead of pow, avoid names shadowed by star-imports). Re-run until all variants pass. Keep reasoning short.",
++            [],
++        )
++        after_score = self._score(self._path('solution.py'))[0]
++        if after_score < before_score:
++            safe_log(f"[final] robust fix made the solution worse {before_score} -> {after_score}; restoring {chosen}.")
++            shutil.copyfile(chosen, self._path('solution.py'))
++
++    def _cleanup_scratch(self):
++        """Remove scratch files that are untracked in the base commit so they do not leak into the patch."""
++        scratch = ['tests', 'attempts', 'plan.md']
++        result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "ls-tree", "-r", "--name-only", self.base_commit],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        tracked = result.stdout.decode(errors='replace').splitlines() if result.returncode == 0 else []
++        for name in scratch:
++            if any(t == name or t.startswith(name + '/') for t in tracked):
++                continue
++            p = self._path(name)
++            if os.path.isdir(p):
++                shutil.rmtree(p, ignore_errors=True)
++            elif os.path.isfile(p):
++                os.remove(p)
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Pipeline: stub -> plan -> independent oracle -> up to MAX_ATTEMPTS attempts scored by
++        run_tests -> repair round if none perfect -> copy best to solution.py -> robust_check.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++        self._ensure_stub()
++        self._plan()
++        self._build_oracle()
+ 
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        method = """Work like a careful competitive programmer:
+-0. FIRST ACTION: within your first few steps, write a complete best-effort solution to solution.py using the editor tool (create). Never end your turn without having edited solution.py. A reply with no tool call is a failure. Keep the reasoning concise to avoid hitting the output limit.
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass.
+-7. Before finishing, write all sample inputs to files and run the `robust_check` tool on solution.py (pass the sample input files as input_files). The grader may inject star-imports (e.g. `from math import *`, which makes `pow` the 2-argument math.pow) or use a different Python version. If any variant fails or differs from the baseline, fix the code, e.g. by using `import builtins` and `builtins.pow` for modular exponentiation (or hand-written modular inverses), and by avoiding names that star-imports can shadow (pow, sum, min, max, abs, etc.). Re-run robust_check until every variant passes with identical output.
+-8. Prefer simple, standard algorithms over exotic tricks unless the complexity requires them. The final answer must depend only on the Python standard library.
+-The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-        # Verify that the primary file was actually edited; retry a bounded number of times if not.
+-        for attempt in range(3):
+-            if self._primary_file_changed():
++        candidates = []  # (score, perfect, path, report)
++        prev_code, prev_report = None, None
++        for i in range(1, MAX_ATTEMPTS + 1):
++            path = self._attempt(i, prev_code, prev_report)
++            if not os.path.isfile(path) or not self._read(path).strip():
++                safe_log(f"[attempt {i}] no candidate file produced; skipping.")
++                continue
++            score, perfect, report = self._score(path)
++            safe_log(f"[attempt {i}] score={score} perfect={perfect}")
++            candidates.append((score, perfect, path, report))
++            prev_code, prev_report = self._read(path), report
++            if perfect:
+                 break
+-            safe_log(f"[retry] No meaningful edit to solution.py detected (attempt {attempt + 1}/3). Retrying.")
+-            if attempt < 2:
+-                retry_msg = (
+-                    "No edits to solution.py were detected. Use the editor tool now to create solution.py "
+-                    "with a complete best-effort solution, then test it."
+-                )
+-            else:
+-                retry_msg = (
+-                    f"I have a programming problem. Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                    f"Write a complete solution as a Python program to solution.py in the directory {self.git_tempdir} "
+-                    "using the editor tool. Do not run any tests; just write the file."
+-                )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        if candidates and not any(c[1] for c in candidates):
++            best = max(candidates, key=lambda c: c[0])
++            repair_path = self._path('attempts', 'repair.py')
++            prompt = (
++                f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"This is the best candidate so far, but it still fails the tests.\n<code>\n{self._read(best[2])}\n</code>\n"
++                f"<test_report>\n{best[3]}\n</test_report>\n\n"
++                f"Repair it with the editor tool (create) at {repair_path}, then run run_tests on it "
++                f"(brute_path={self._path('tests', 'brute.py')}, gen_path={self._path('tests', 'gen.py')}, "
++                f"sample_dir={self._path('tests', 'samples')}). Keep reasoning short."
++            )
++            before = self._snapshot([repair_path])
++            self._call_until_written([repair_path], prompt, [], before, 'repair')
++            if os.path.isfile(repair_path) and self._read(repair_path).strip():
++                score, perfect, report = self._score(repair_path)
++                safe_log(f"[repair] score={score} perfect={perfect}")
++                candidates.append((score, perfect, repair_path, report))
++
++        if candidates:
++            best = max(candidates, key=lambda c: c[0])
++            shutil.copyfile(best[2], self._path('solution.py'))
++            chosen = best[2]
++            safe_log(f"[select] chose {chosen} with score {best[0]}")
++        else:
++            chosen = self._path('solution.py')
++            safe_log("[select] no candidates; keeping current solution.py")
++
++        self._final_robust_check(chosen if os.path.isfile(chosen) else self._path('solution.py'))
++        self._cleanup_scratch()
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tests/test_tools.py b/tests/test_tools.py
+index 889d300..88649c9 100644
+--- a/tests/test_tools.py
++++ b/tests/test_tools.py
+@@ -22,3 +22,19 @@ def test_editor_create_view_replace_insert(tmp_path):
+     assert "Inserted" in edit.tool_function("insert", f, new_str="z = 0", insert_line=0)
+     assert open(f).read().startswith("z = 0")
+     assert "Error" in edit.tool_function("str_replace", f, old_str="missing", new_str="q")
++
++def test_run_tests_schema_and_basic_run(tmp_path):
++    from tools import run_tests
++    info = run_tests.tool_info()
++    assert info["name"] == "run_tests"
++    schema = info["input_schema"]
++    assert set(schema["required"]) == {"solution_path"}
++    for name, prop in schema["properties"].items():
++        assert "type" in prop and "description" in prop, name
++    (tmp_path / "s.py").write_text("print(int(input()) * 2)\n")
++    (tmp_path / "samples").mkdir()
++    (tmp_path / "samples" / "1.in").write_text("3\n")
++    (tmp_path / "samples" / "1.out").write_text("6\n")
++    out = run_tests.tool_function(str(tmp_path / "s.py"), sample_dir=str(tmp_path / "samples"))
++    assert "Samples: 1/1 passed" in out
++    assert "All checks passed" in out
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..50212cb
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,9 @@
++import sys
++
++
++def main():
++    sys.stdin.read()
++    print(0)
++
++
++main()
+diff --git a/tools/run_tests.py b/tools/run_tests.py
+new file mode 100644
+index 0000000..2c1caee
+--- /dev/null
++++ b/tools/run_tests.py
+@@ -0,0 +1,214 @@
++import glob
++import os
++import subprocess
++import sys
++
++MAX_SHOWN_FAILURES = 3
++MAX_TEXT = 1500
++
++
++def tool_info():
++    return {
++        "name": "run_tests",
++        "description": """Run a solution against sample tests and against a brute-force reference on random generated inputs, and return a raw report.
++
++* Sample tests: every `*.in` file in `sample_dir` is fed to the solution on stdin and its stdout is compared with the matching `*.out` file (whitespace-normalised).
++* Stress tests: the generator `gen_path` is run as `python3 gen_path SEED` for SEED = 0..num_cases-1; the same generated input is fed to both `brute_path` and `solution_path`, and the outputs are compared (whitespace-normalised).
++* If `brute_path` is omitted, stress tests only check that the solution runs without crashing or timing out.
++* Each run has its own time limit `timeout` (seconds).
++* The report gives pass/fail counts, the first 3 failing inputs with expected and actual output and stderr, and the maximum runtime of the solution. Errors are NOT parsed; read the raw text and fix the code accordingly.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the Python solution file to test (reads stdin, writes stdout)."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Optional path to a trusted brute-force Python reference program (reads stdin, writes stdout)."
++                },
++                "gen_path": {
++                    "type": "string",
++                    "description": "Optional path to a random input generator. It is run as `python3 gen_path SEED` and must print one test input to stdout."
++                },
++                "sample_dir": {
++                    "type": "string",
++                    "description": "Optional directory containing sample pairs `*.in` and `*.out`."
++                },
++                "num_cases": {
++                    "type": "integer",
++                    "description": "Number of random stress cases (seeds 0..num_cases-1). Default 200."
++                },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Per-run time limit in seconds. Default 10."
++                }
++            },
++            "required": ["solution_path"]
++        }
++    }
++
++
++def _clip(s, n=MAX_TEXT):
++    s = s or ""
++    if len(s) <= n:
++        return s
++    return s[:n] + f"...<{len(s) - n} more chars>"
++
++
++def _run(cmd, stdin_text, timeout, cwd):
++    """Run a command. Returns (status, stdout, stderr, elapsed) where status is
++    'ok', 'timeout', 'crash' (nonzero exit) or 'error' (could not start)."""
++    import time
++    start = time.time()
++    try:
++        p = subprocess.run(cmd, input=stdin_text.encode("utf-8"), capture_output=True,
++                           timeout=timeout, cwd=cwd)
++    except subprocess.TimeoutExpired as e:
++        el = time.time() - start
++        out = e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else ""
++        err = e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else ""
++        return "timeout", out, err, el
++    except OSError as e:
++        return "error", "", str(e), 0.0
++    el = time.time() - start
++    out = p.stdout.decode("utf-8", errors="replace")
++    err = p.stderr.decode("utf-8", errors="replace")
++    if p.returncode != 0:
++        return "crash", out, err, el
++    return "ok", out, err, el
++
++
++def _same(a, b):
++    return a.split() == b.split()
++
++
++def _clamp_int(v, lo, hi, default):
++    try:
++        v = int(v)
++    except (TypeError, ValueError):
++        return default
++    return max(lo, min(hi, v))
++
++
++def evaluate(solution_path, brute_path=None, gen_path=None, sample_dir=None,
++             num_cases=200, timeout=10):
++    """Run all checks and return a structured dict (used for scoring as well as reporting)."""
++    solution_path = os.path.abspath(solution_path)
++    num_cases = _clamp_int(num_cases, 0, 2000, 200)
++    timeout = _clamp_int(timeout, 1, 60, 10)
++    cwd = os.path.dirname(solution_path) or None
++    result = {
++        "error": None,
++        "samples_total": 0, "samples_passed": 0, "sample_failures": [],
++        "stress_total": 0, "stress_passed": 0, "stress_failures": [],
++        "timeouts": 0, "crashes": 0, "max_time": 0.0,
++    }
++    if not os.path.isfile(solution_path):
++        result["error"] = f"solution file not found: {solution_path}"
++        return result
++
++    def sol(inp):
++        status, out, err, el = _run([sys.executable, solution_path], inp, timeout, cwd)
++        result["max_time"] = max(result["max_time"], el)
++        if status == "timeout":
++            result["timeouts"] += 1
++        elif status == "crash":
++            result["crashes"] += 1
++        return status, out, err
++
++    # 1. Samples
++    if sample_dir:
++        if not os.path.isdir(sample_dir):
++            result["error"] = f"sample_dir not found: {sample_dir}"
++        for in_path in sorted(glob.glob(os.path.join(sample_dir, "*.in"))):
++            out_path = in_path[:-3] + ".out"
++            if not os.path.isfile(out_path):
++                continue
++            with open(in_path, "r", encoding="utf-8", errors="replace") as f:
++                inp = f.read()
++            with open(out_path, "r", encoding="utf-8", errors="replace") as f:
++                expected = f.read()
++            result["samples_total"] += 1
++            status, out, err = sol(inp)
++            if status == "ok" and _same(out, expected):
++                result["samples_passed"] += 1
++            else:
++                result["sample_failures"].append({
++                    "label": os.path.basename(in_path), "input": inp, "expected": expected,
++                    "actual": out, "stderr": err, "status": status,
++                })
++
++    # 2. Stress tests
++    if gen_path and os.path.isfile(gen_path) and num_cases > 0:
++        gen_abs = os.path.abspath(gen_path)
++        brute_abs = os.path.abspath(brute_path) if brute_path else None
++        for seed in range(num_cases):
++            gstat, inp, gerr, _ = _run([sys.executable, gen_abs, str(seed)], "", timeout, cwd)
++            if gstat != "ok":
++                result["error"] = (result["error"] or "") + f"generator failed on seed {seed}: {gstat} {gerr[-300:]}\n"
++                break
++            result["stress_total"] += 1
++            if brute_abs and os.path.isfile(brute_abs):
++                bstat, expected, berr, _ = _run([sys.executable, brute_abs], inp, timeout, cwd)
++                if bstat != "ok":
++                    result["error"] = (result["error"] or "") + (
++                        f"brute_path failed on seed {seed} ({bstat}): {berr[-300:]}\n")
++                    break
++                status, out, err = sol(inp)
++                if status == "ok" and _same(out, expected):
++                    result["stress_passed"] += 1
++                else:
++                    result["stress_failures"].append({
++                        "label": f"seed {seed}", "input": inp, "expected": expected,
++                        "actual": out, "stderr": err, "status": status,
++                    })
++            else:
++                status, out, err = sol(inp)
++                if status == "ok":
++                    result["stress_passed"] += 1
++                else:
++                    result["stress_failures"].append({
++                        "label": f"seed {seed}", "input": inp, "expected": None,
++                        "actual": out, "stderr": err, "status": status,
++                    })
++    return result
++
++
++def _format_failure(f):
++    head = f"--- failing case {f['label']} (status: {f['status']}) ---\n"
++    parts = [head, f"input:\n{_clip(f['input'], 600)}\n"]
++    if f["expected"] is not None:
++        parts.append(f"expected output:\n{_clip(f['expected'], 400)}\n")
++    parts.append(f"actual output:\n{_clip(f['actual'], 400)}\n")
++    if f["stderr"]:
++        parts.append(f"stderr:\n{_clip(f['stderr'][-600:], 600)}\n")
++    return "".join(parts)
++
++
++def format_report(r):
++    lines = []
++    if r["error"]:
++        lines.append(f"Error: {r['error'].strip()}")
++    lines.append(f"Samples: {r['samples_passed']}/{r['samples_total']} passed")
++    lines.append(f"Stress: {r['stress_passed']}/{r['stress_total']} passed")
++    lines.append(f"Timeouts: {r['timeouts']}, crashes: {r['crashes']}")
++    lines.append(f"Max runtime: {r['max_time']:.3f}s")
++    failures = r["sample_failures"] + r["stress_failures"]
++    if failures:
++        lines.append(f"\nFirst {min(MAX_SHOWN_FAILURES, len(failures))} of {len(failures)} failing cases:")
++        for f in failures[:MAX_SHOWN_FAILURES]:
++            lines.append(_format_failure(f))
++    elif r["samples_total"] + r["stress_total"] == 0:
++        lines.append("\nNothing was tested (no samples or stress cases ran).")
++    else:
++        lines.append("\nAll checks passed.")
++    return "\n".join(lines)
++
++
++def tool_function(solution_path, brute_path=None, gen_path=None, sample_dir=None,
++                  num_cases=200, timeout=10):
++    r = evaluate(solution_path, brute_path=brute_path, gen_path=gen_path,
++                 sample_dir=sample_dir, num_cases=num_cases, timeout=timeout)
++    return format_report(r)

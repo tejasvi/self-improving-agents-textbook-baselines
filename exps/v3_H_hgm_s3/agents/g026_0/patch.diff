@@ -1,0 +1,561 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 788953b..2341d54 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ import ast
++import hashlib
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from llm import create_client
+@@ -45,6 +46,9 @@ TEST_COMMANDS = {
+ # Scratch directory where the agent writes maximum-size performance inputs
+ _PERF_DIR = '/tmp/perf_inputs'
+ 
++# Scratch directory where the agent writes the brute-force reference and generator for method_stress
++_STRESS_DIR = '/tmp/stress'
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -99,6 +103,21 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _file_hash(path):
++    """
++    SHA-256 hex digest of the file at path, or None if path is empty, missing or unreadable.
++    """
++    if not path or not os.path.isfile(path):
++        return None
++    digest = hashlib.sha256()
++    try:
++        with open(path, 'rb') as f:
++            for chunk in iter(lambda: f.read(65536), b''):
++                digest.update(chunk)
++    except OSError:
++        return None
++    return digest.hexdigest()
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -486,7 +505,8 @@ class AgenticSystem:
+                     r"command['\"]?\s*:\s*['\"](create|edit)['\"]", text):
+                 last_edit = i
+         if last_edit is None:
+-            return False, ''
++            # No recorded editor call proves nothing: the file may have been written with bash.
++            return True, 'no editor call and no run_samples result in the history; unverified'
+ 
+         later_results = [text for kind, name, text in events[last_edit + 1:]
+                          if kind == 'result' and name == 'run_samples']
+@@ -533,9 +553,31 @@ class AgenticSystem:
+         except Exception as e:
+             safe_log(f"[forward] direct example check failed: {type(e).__name__}: {e}", level=logging.WARNING)
+             return None
+-        if 'No "Input:"' in report:
++        # Fail-closed: zero parsed examples, load errors, and mismatches are all failures.
++        if 'No "Input:"' in report or 'PARSED 0 EXAMPLES' in report:
++            return True, report
++        failed = 'DIFFER' in report or 'MISMATCH' in report or 'ERROR' in report or 'ALL EXAMPLES EXACT MATCH' not in report
++        return failed, report
++
++    def _method_stress_check(self):
++        """
++        For method-style targets: run tools/method_stress against a brute-force reference and generator
++        the agent wrote under _STRESS_DIR. Returns (failed, report) or None if those files are absent.
++        """
++        path = self._target_path()
++        if not path or not os.path.isfile(path) or not self._is_method_task(self._output_filename()):
+             return None
+-        failed = 'DIFFER' in report or 'MISMATCH' in report or 'ERROR' in report
++        brute = os.path.join(_STRESS_DIR, 'brute.py')
++        gen = os.path.join(_STRESS_DIR, 'gen.py')
++        if not (os.path.isfile(brute) and os.path.isfile(gen)):
++            return True, f'no brute/generator found at {_STRESS_DIR}/brute.py and {_STRESS_DIR}/gen.py; unverified'
++        try:
++            from tools.method_stress import tool_function as method_stress
++            report = method_stress(path, brute, gen, iterations=200, timeout=5)
++        except Exception as e:
++            safe_log(f"[forward] method stress failed: {type(e).__name__}: {e}", level=logging.WARNING)
++            return True, f'method_stress raised {type(e).__name__}: {e}'
++        failed = not report.startswith('ALL OK')
+         return failed, report
+ 
+     def _perf_input_files(self):
+@@ -569,26 +611,43 @@ class AgenticSystem:
+ 
+     def _current_verification(self, msg_history):
+         """
+-        Authoritative state: the direct sample run on the file if possible, otherwise the
+-        run_samples result in the history. Returns (failed, excerpt).
++        Authoritative state, fail-closed. Returns (failed, excerpt).
++        - Method-style targets: the file must validate, run_examples must report every example as PASS
++          with at least one parsed, and method_stress must report ALL OK. Anything else is failed.
++        - Program-style targets: the direct sample run on the file, then the perf check.
++        The message history is never used to declare a pass.
+         """
++        if self._is_method_task(self._output_filename() or ''):
++            return self._method_verification()
+         direct = self._direct_sample_check()
+-        if direct is not None:
+-            failed, report = direct
+-            if failed:
+-                return failed, report[-1500:]
+-            perf = self._direct_perf_check()
+-            if perf is not None and perf[0]:
+-                return True, perf[1][-1500:]
+-            return failed, report[-1500:]
++        if direct is None:
++            return True, 'unverified: no sample report could be produced for the target file'
++        failed, report = direct
++        if failed:
++            return True, report[-1500:]
++        perf = self._direct_perf_check()
++        if perf is not None and perf[0]:
++            return True, perf[1][-1500:]
++        return False, report[-1500:]
++
++    def _method_verification(self):
++        """Fail-closed verification for method-style targets. Returns (failed, excerpt)."""
+         ok, reason = self._validate_target()
+         if not ok:
+             return True, reason
+         example = self._direct_example_check()
+-        if example is not None:
+-            failed, report = example
+-            return failed, report[-1500:]
+-        return self._last_verification_failed(msg_history)
++        if example is None:
++            return True, 'unverified: write your own test cases and brute force'
++        ex_failed, ex_report = example
++        if ex_failed:
++            return True, ex_report[-1500:]
++        stress = self._method_stress_check()
++        if stress is None:
++            return True, 'unverified: write your own test cases and brute force'
++        st_failed, st_report = stress
++        if st_failed:
++            return True, st_report[-1500:]
++        return False, (ex_report + '\n' + st_report)[-1500:]
+ 
+     def _output_filename(self):
+         """
+@@ -754,6 +813,40 @@ class AgenticSystem:
+         safe_log(f"[placeholder] {filename} was trivial; wrote {reason}")
+         return True
+ 
++    def _forced_repair_nudge(self):
++        """Short, forceful re-prompt that quotes the latest failing example (if any)."""
++        _, excerpt = self._current_verification([])
++        quote = excerpt[:600] if excerpt else 'no report available'
++        return ("You have not edited the solution file, and the verification still fails. Do not reply with text. "
++                "Call the editor tool now to change the solution file so the failing example passes.\n"
++                f"Latest failing report:\n<report>\n{quote}\n</report>\n"
++                "Quote the failing example's input, expected output and got value in your reasoning, then edit the file.")
++
++    def _tracked_chat(self, msg, history, label):
++        """
++        Call _safe_chat and record the target file hash before and after. If the file did not change,
++        log it and re-prompt once asking for an actual edit. Returns (new_history, edited).
++        """
++        target = self._target_path()
++        before = _file_hash(target)
++        new_history = self._safe_chat(msg, history)
++        after = _file_hash(target)
++        if before is None and after is None:
++            safe_log(f"[tracked] {label}: target file unknown or missing; edit check skipped")
++            return new_history, True
++        safe_log(f"[tracked] {label}: hash before={before} after={after}")
++        if before != after:
++            return new_history, True
++        safe_log(f"[tracked] {label}: target file unchanged; re-prompting once for an edit", level=logging.WARNING)
++        nudge = self._forced_repair_nudge()
++        before2 = after
++        new_history = self._safe_chat(nudge, self._sanitize_history(new_history))
++        after2 = _file_hash(target)
++        edited = before2 != after2
++        safe_log(f"[tracked] {label}: re-prompt hash before={before2} after={after2} edited={edited}",
++                 level=logging.INFO if edited else logging.WARNING)
++        return new_history, edited
++
+     def _verify_and_repair(self, msg_history, task, max_rounds=5):
+         """
+         Bounded verify-and-repair loop. While the last verification failed or is missing,
+@@ -785,7 +878,7 @@ class AgenticSystem:
+                     "decision is never wrong, especially on inputs whose answer is Yes.\n\n"
+                     f"Original task:\n{task}"
+                 )
+-                msg_history = self._safe_chat(multi_prompt, self._sanitize_history(msg_history))
++                msg_history, _ = self._tracked_chat(multi_prompt, self._sanitize_history(msg_history), f'round {rnd} multi')
+                 continue
+             safe_log(f"[forward] verify round {rnd}: verification failed/missing: {excerpt[:200]!r}")
+             if 'TIMEOUT' in excerpt or 'PERF FAIL' in excerpt:
+@@ -805,13 +898,14 @@ class AgenticSystem:
+                     "Always make the tool call rather than announcing a next step.\n\n"
+                     f"Original task:\n{task}"
+                 )
+-                msg_history = self._safe_chat(perf_prompt, self._sanitize_history(msg_history))
++                msg_history, _ = self._tracked_chat(perf_prompt, self._sanitize_history(msg_history), f'round {rnd} perf')
+                 final_failed, final_excerpt = True, excerpt
+                 continue
+             repair_prompt = (
+                 "The solution fails the sample tests or has not been verified against them.\n"
+                 f"Latest sample-test report (run_samples):\n<verification>\n{excerpt[:1500]}\n</verification>\n\n"
+-                "Each MISMATCH shows the expected and actual output. A mismatch is a failure even if your "
++                "Quote the first failing example's input, expected and got values, then make the tool call that edits "
++                "the solution file now (do not reply with text only). Each MISMATCH shows the expected and actual output. A mismatch is a failure even if your "
+                 "output is a different valid answer, because the grader may compare exactly. Find which "
+                 "choice (ordering, tie-breaking, free-variable/basis choice, bit order, scaling) makes your "
+                 "output differ, and change the construction so that every sample output is reproduced exactly. "
+@@ -820,7 +914,7 @@ class AgenticSystem:
+                 "ALL SAMPLES EXACT MATCH. Always make the tool call rather than announcing a next step.\n\n"
+                 f"Original task:\n{task}"
+             )
+-            msg_history = self._safe_chat(repair_prompt, self._sanitize_history(msg_history))
++            msg_history, _ = self._tracked_chat(repair_prompt, self._sanitize_history(msg_history), f'round {rnd} repair')
+             final_failed, final_excerpt = True, excerpt
+         else:
+             final_failed, final_excerpt = self._current_verification(msg_history)
+@@ -899,6 +993,21 @@ Keep the required output file complete: a program file must read stdin and write
+                     "If it does not, optimize it and re-run perf_check."
+                 )
+                 msg_history = self._safe_chat(perf_request, self._sanitize_history(msg_history))
++            if self._is_method_task(self._output_filename() or ''):
++                stress_request = (
++                    "Before finishing, verify the Solution method with a randomized stress test. Do the following "
++                    "with the editor tool (write files, do not use long heredocs):\n"
++                    f"(1) Write {_STRESS_DIR}/brute.py defining `brute(*args)` (or `brute(**kwargs)`): a simple, obviously "
++                    "correct reference that takes the same arguments as the method and returns the expected result.\n"
++                    f"(2) Write {_STRESS_DIR}/gen.py: it takes a seed as sys.argv[1], uses random.Random(seed), and prints "
++                    "one JSON list of positional arguments for the method (for example [[1, -2, 3], 2]). Keep sizes small "
++                    "enough for brute, and bias toward edge cases (empty-like minimal input, all negative, duplicates).\n"
++                    f"(3) Call the method_stress tool with module_path={self._target_path()}, brute_path={_STRESS_DIR}/brute.py, "
++                    f"generator_path={_STRESS_DIR}/gen.py.\n"
++                    "(4) If it reports a MISMATCH, fix the solution file with the editor tool and re-run method_stress until "
++                    "it reports ALL OK. Also run run_examples on the statement's examples."
++                )
++                msg_history = self._safe_chat(stress_request, self._sanitize_history(msg_history))
+             self._verify_and_repair(msg_history, task)
+             return
+ 
+diff --git a/tools/bash.py b/tools/bash.py
+index 144bc7e..5ce7c13 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -18,6 +18,10 @@ def tool_info():
+                 "command": {
+                     "type": "string",
+                     "description": "The bash command to run."
++                },
++                "restart": {
++                    "type": "boolean",
++                    "description": "Optional. Accepted for compatibility; the shell is started fresh for every call, so this flag is ignored."
+                 }
+             },
+             "required": ["command"]
+@@ -143,7 +147,9 @@ async def tool_function_call(command):
+     except Exception as e:
+         return f"Error: {str(e)}"
+ 
+-def tool_function(command):
++def tool_function(command, restart=False):
++    # Each call already starts a fresh shell, so `restart` needs no action; it is accepted so that
++    # calls which pass it do not fail with an unexpected-keyword error.
+     return asyncio.run(tool_function_call(command))
+ 
+ if __name__ == "__main__":
+diff --git a/tools/run_examples.py b/tools/run_examples.py
+index 0f7b8b2..feda201 100644
+--- a/tools/run_examples.py
++++ b/tools/run_examples.py
+@@ -4,11 +4,13 @@ import inspect
+ import re
+ import traceback
+ 
+-# Matches "Input: ..." followed by "Output: ..." (both may span lines until the next keyword).
+-EXAMPLE_RE = re.compile(
+-    r'Input:\s*(.*?)\s*\n\s*Output:\s*(.*?)(?=\n\s*(?:Input:|Explanation:|Constraints:|Follow[- ]?up:)|\Z)',
+-    re.DOTALL,
+-)
++# Keywords that start a new block in a problem statement. An example's Output value ends where one of
++# these starts on a later line, or where it is followed by an inline "Explanation:" / "Constraints:" label.
++_BLOCK_KEYWORDS = r'(?:Input|Output|Explanation|Constraints|Follow[- ]?up|Note)'
++_INLINE_LABEL_RE = re.compile(r'\s+(?=(?:Explanation|Constraints|Follow[- ]?up|Note)\s*:)')
++_INPUT_START_RE = re.compile(r'^\s*Input:\s*(.*)$')
++_OUTPUT_START_RE = re.compile(r'^\s*Output:\s*(.*)$')
++_BLOCK_START_RE = re.compile(rf'^\s*{_BLOCK_KEYWORDS}\s*:')
+ 
+ 
+ def tool_info():
+@@ -18,7 +20,8 @@ def tool_info():
+             'Check a method-style solution (a `Solution` class method) against the examples written as '
+             '"Input: a = ..., b = ..." / "Output: ..." pairs in the problem statement. The module is imported, '
+             'Solution().<method>(**kwargs) is called for each example, and PASS or MISMATCH is reported per '
+-            'example with a final summary. Any mismatch is a failure.'
++            'example with a final summary. Any mismatch is a failure. Use list_only=true to only report how '
++            'many examples were parsed from the statement, without importing the solution.'
+         ),
+         'input_schema': {
+             'type': 'object',
+@@ -39,6 +42,10 @@ def tool_info():
+                     'type': 'string',
+                     'description': 'Name of the method to call. If omitted, the single public method of the class is used.',
+                 },
++                'list_only': {
++                    'type': 'boolean',
++                    'description': 'If true, only report how many Input/Output examples were parsed from problem_text.',
++                },
+             },
+             'required': ['module_path', 'problem_text'],
+         },
+@@ -46,14 +53,64 @@ def tool_info():
+ 
+ 
+ def _parse_examples(problem_text):
+-    """Return a list of (input_text, output_text) pairs found in the problem statement."""
+-    return [(i.strip(), o.strip()) for i, o in EXAMPLE_RE.findall(problem_text or '')]
++    """
++    Return a list of (input_text, output_text) pairs found in the problem statement.
++
++    Line-based: an 'Input:' line starts an example. Its value continues over following lines until the
++    'Output:' line. The 'Output:' value continues until the next block keyword line (Input, Output,
++    Explanation, Constraints, Follow-up, Note) or an inline 'Explanation:' / 'Constraints:' label.
++    Handles 'Input: nums = [-1, 2]' with trailing text, and multi-line values.
++    """
++    examples = []
++    state = None  # None | 'input' | 'output'
++    cur_in, cur_out = [], []
++
++    def flush():
++        if state == 'output':
++            inp = ' '.join(cur_in).strip()
++            out = ' '.join(cur_out).strip()
++            if inp and out:
++                examples.append((inp, out))
++
++    for line in (problem_text or '').splitlines():
++        m_in = _INPUT_START_RE.match(line)
++        m_out = _OUTPUT_START_RE.match(line)
++        if m_in:
++            flush()
++            state = 'input'
++            cur_in, cur_out = [m_in.group(1)], []
++            continue
++        if m_out and state in ('input', 'output'):
++            state = 'output'
++            cur_out = [m_out.group(1)]
++            continue
++        if _BLOCK_START_RE.match(line):
++            # Explanation/Constraints/Note etc. end the current example's output.
++            if state == 'output':
++                flush()
++                state = None
++            continue
++        if state == 'input':
++            # Multi-line input continues until the Output line.
++            if line.strip():
++                cur_in.append(line.strip())
++        elif state == 'output':
++            if line.strip():
++                cur_out.append(line.strip())
++    flush()
++
++    cleaned = []
++    for inp, out in examples:
++        out = _INLINE_LABEL_RE.split(out, maxsplit=1)[0].strip()
++        if inp and out:
++            cleaned.append((inp, out))
++    return cleaned
+ 
+ 
+ def _parse_kwargs(input_text):
+     """
+-    Parse 'a = 1, b = [2, 3]' into ({'a': 1, 'b': [2, 3]}, []).
+-    Arguments are evaluated with ast.literal_eval. Positional args are returned separately.
++    Parse 'a = 1, b = [2, 3]' into (kwargs, args). Values are evaluated with ast.literal_eval, which
++    handles negative numbers. Positional arguments are returned separately.
+     """
+     call = ast.parse(f"_f({input_text})", mode='eval').body
+     kwargs = {}
+@@ -90,11 +147,24 @@ def _same(got, expected_text):
+     return got == expected
+ 
+ 
+-def tool_function(module_path, problem_text, class_name=None, method_name=None):
++def list_report(problem_text):
++    """Report how many examples were parsed. Zero is reported distinctly from a pass."""
++    examples = _parse_examples(problem_text)
++    if not examples:
++        return 'PARSED 0 EXAMPLES: no "Input:" / "Output:" pairs found in problem_text.'
++    lines = [f'PARSED {len(examples)} EXAMPLES']
++    for idx, (inp, expected) in enumerate(examples, 1):
++        lines.append(f'Example {idx}: input: {inp} | expected: {expected}')
++    return '\n'.join(lines)
++
++
++def tool_function(module_path=None, problem_text=None, class_name=None, method_name=None, list_only=False):
++    if list_only:
++        return list_report(problem_text)
+     class_name = class_name or 'Solution'
+     examples = _parse_examples(problem_text)
+     if not examples:
+-        return 'No "Input:" / "Output:" example pairs found in problem_text.'
++        return 'ERROR: No "Input:" / "Output:" example pairs found in problem_text (PARSED 0 EXAMPLES).'
+ 
+     try:
+         cls = _load_class(module_path, class_name)
+@@ -102,7 +172,7 @@ def tool_function(module_path, problem_text, class_name=None, method_name=None):
+     except Exception as e:
+         return f'ERROR: could not load {class_name} from {module_path}: {type(e).__name__}: {e}'
+ 
+-    lines = []
++    lines = [f'PARSED {len(examples)} EXAMPLES']
+     failures = 0
+     for idx, (inp, expected) in enumerate(examples, 1):
+         try:
+diff --git a/tools/method_stress.py b/tools/method_stress.py
+new file mode 100644
+index 0000000..a02c118
+--- /dev/null
++++ b/tools/method_stress.py
+@@ -0,0 +1,136 @@
++import importlib.util
++import inspect
++import json
++import subprocess
++import sys
++
++
++def tool_info():
++    return {
++        'name': 'method_stress',
++        'description': (
++            'Randomized comparison of a method-style solution (a `Solution` class method) against a brute-force '
++            'reference function. For seed = 1..iterations, runs generator_path with the seed as its argument; it '
++            'must print a JSON list of positional arguments for the method (for example [[1, -2, 3], 2]), or a '
++            'JSON object of keyword arguments. The tool then calls Solution().<method> and brute(...) with those '
++            'arguments and compares the results. brute_path must define `brute(*args)` taking the same arguments '
++            '(or `brute(**kwargs)` when the generator prints an object). Returns the first failing seed with the '
++            'args and both outputs, or "ALL OK".'
++        ),
++        'input_schema': {
++            'type': 'object',
++            'properties': {
++                'module_path': {
++                    'type': 'string',
++                    'description': 'Absolute path to the Python file that defines the Solution class.',
++                },
++                'brute_path': {
++                    'type': 'string',
++                    'description': 'Absolute path to a Python file defining brute(*args) or brute(**kwargs), the simple obviously-correct reference.',
++                },
++                'generator_path': {
++                    'type': 'string',
++                    'description': 'Absolute path to a Python generator. It is called as `python3 generator.py SEED` and prints one JSON list of args (or a JSON object of kwargs) to stdout.',
++                },
++                'iterations': {
++                    'type': 'integer',
++                    'description': 'Number of seeds to test (seeds 1..iterations). Defaults to 200.',
++                },
++                'timeout': {
++                    'type': 'number',
++                    'description': 'Timeout in seconds for each generator run and each method/brute call. Defaults to 5.',
++                },
++                'class_name': {
++                    'type': 'string',
++                    'description': 'Name of the class to instantiate. Defaults to "Solution".',
++                },
++                'method_name': {
++                    'type': 'string',
++                    'description': 'Name of the method to call. If omitted, the single public method of the class is used.',
++                },
++            },
++            'required': ['module_path', 'brute_path', 'generator_path'],
++        },
++    }
++
++
++def _load_module(path, name):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _pick_method(cls, method_name):
++    if method_name:
++        return method_name
++    methods = [
++        name for name, _ in inspect.getmembers(cls, predicate=inspect.isfunction)
++        if not name.startswith('_')
++    ]
++    if len(methods) == 1:
++        return methods[0]
++    raise ValueError(f'cannot infer method name, candidates: {methods}')
++
++
++def _call_with(fn, payload):
++    """Call fn with a JSON payload: a list is positional args, a dict is keyword args."""
++    if isinstance(payload, dict):
++        return fn(**payload)
++    return fn(*payload)
++
++
++def _run_generator(generator_path, seed, timeout):
++    proc = subprocess.run(
++        [sys.executable, generator_path, str(seed)],
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
++    )
++    if proc.returncode != 0:
++        raise RuntimeError(f'generator exited {proc.returncode}: {proc.stderr.decode(errors="replace")[-300:]}')
++    return json.loads(proc.stdout.decode(errors='replace').strip())
++
++
++def tool_function(module_path, brute_path, generator_path, iterations=200, timeout=5,
++                  class_name=None, method_name=None):
++    iterations = int(iterations or 200)
++    timeout = float(timeout or 5)
++    class_name = class_name or 'Solution'
++
++    try:
++        cls = getattr(_load_module(module_path, 'candidate_solution_module'), class_name)
++        method_name = _pick_method(cls, method_name)
++        method = getattr(cls(), method_name)
++    except Exception as e:
++        return f'ERROR: could not load {class_name} from {module_path}: {type(e).__name__}: {e}'
++
++    try:
++        brute = getattr(_load_module(brute_path, 'brute_reference_module'), 'brute')
++    except Exception as e:
++        return f'ERROR: could not load brute(...) from {brute_path}: {type(e).__name__}: {e}'
++
++    for seed in range(1, iterations + 1):
++        try:
++            payload = _run_generator(generator_path, seed, timeout)
++        except subprocess.TimeoutExpired:
++            return f'seed {seed}: ERROR generator timed out after {timeout}s'
++        except Exception as e:
++            return f'seed {seed}: ERROR generator failed: {type(e).__name__}: {e}'
++
++        try:
++            got = _call_with(method, payload)
++        except Exception as e:
++            return (f'seed {seed}: MISMATCH (runtime error in {class_name}.{method_name})\n'
++                    f'args: {json.dumps(payload)}\n'
++                    f'error: {type(e).__name__}: {e}')
++        try:
++            expected = _call_with(brute, payload)
++        except Exception as e:
++            return f'seed {seed}: ERROR brute raised {type(e).__name__}: {e} on args {json.dumps(payload)}'
++
++        if got != expected:
++            return (f'seed {seed}: MISMATCH\n'
++                    f'args: {json.dumps(payload)}\n'
++                    f'solution output: {got!r}\n'
++                    f'brute output: {expected!r}')
++
++    return f'ALL OK ({iterations} seeds)'

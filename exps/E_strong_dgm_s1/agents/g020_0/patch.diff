@@ -1,0 +1,575 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 08e030c..0575ad7 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -18,7 +18,9 @@ from tools import solution_check
+ K_CANDIDATES = 3          # independent solver sessions
+ R_REFLECTIONS = 3         # repair rounds on the best candidate
+ DESIGN_ATTEMPTS = 2       # test-design sessions (validated by the harness)
+-BUDGET_SECONDS = 3000     # wall-clock budget for the whole pipeline
++BUDGET_SECONDS = 2400     # wall-clock budget for the whole pipeline (keep below the external kill limit)
++RESERVE_FRACTION = 0.15   # fraction of the budget kept free for finalization (no new candidates/reflections then)
++CONTINUATION_ROUNDS = 2   # max continuation re-prompts per solver/repair session
+ TIME_LIMIT = 4            # per-run limit (s) for samples / stress / max-size runs
+ STRESS_SEEDS = 150        # seeds per stress mode (2 modes -> 300 cases)
+ STRESS_MODES = ['small', 'edge']
+@@ -253,10 +255,32 @@ class AgenticSystem:
+         self.checker_path = os.path.join(self.git_tempdir, 'tests', 'checker.py')
+         self.cands_dir = os.path.join(self.git_tempdir, 'cands')
+         self.solution_path = os.path.join(self.git_tempdir, 'solution.py')
++        self.best_checkpoint_score = None
++        self.scores = {}
+ 
+     def _time_left(self):
+         return self.deadline - time.monotonic()
+ 
++    def _has_time_for_work(self):
++        """True while enough of the budget remains to start new candidates/reflections (finalization reserved)."""
++        return self._time_left() > RESERVE_FRACTION * self.budget_seconds
++
++    def _checkpoint(self, path, score):
++        """
++        Copy the candidate at path to solution.py if score is strictly better than the best checkpoint so far.
++        No LLM call. Keeps solution.py holding the best real code at all times.
++        """
++        if not hasattr(self, 'best_checkpoint_score'):
++            self.best_checkpoint_score = None
++        if not path or not os.path.isfile(path):
++            return False
++        if self.best_checkpoint_score is not None and not (score > self.best_checkpoint_score):
++            return False
++        shutil.copyfile(path, self.solution_path)
++        self.best_checkpoint_score = score
++        safe_log(f"checkpoint: copied {path} to solution.py (score={score})")
++        return True
++
+     def _task_text(self):
+         return f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -322,6 +346,27 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+                 res = solution_check.run_plain(self.brute_path, inputs, None, timeout=TIME_LIMIT)
+                 if res['crashed']:
+                     problems.append(f"tests/brute.py fails or is too slow on small '{mode}' inputs:\n{res['report']}")
++        # The checker must always produce a verdict (never crash, never refuse): brute outputs for small/edge
++        # seeds, and a trivial dummy output for medium/max inputs.
++        for mode in ('small', 'edge'):
++            for seed in range(3):
++                text, _ = solution_check.generate_input(self.gen_path, seed, mode, timeout=TIME_LIMIT)
++                if text is None:
++                    continue
++                bouts = solution_check.collect_outputs(self.brute_path, [text], timeout=TIME_LIMIT, strict=False)
++                if bouts[0] is None:
++                    continue  # brute crash is reported above
++                verdict, msg = solution_check.check_verdict_pair(self.checker_path, text, bouts[0], timeout=TIME_LIMIT)
++                if verdict != 'ok':
++                    problems.append(f"tests/checker.py does not accept brute's output on {mode} seed {seed} "
++                                    f"(verdict {verdict}):\n{msg}")
++        for mode in ('medium', 'max'):
++            text, _ = solution_check.generate_input(self.gen_path, 0, mode, timeout=TIME_LIMIT)
++            if text is None:
++                continue
++            verdict, msg = solution_check.check_verdict_pair(self.checker_path, text, "0\n", timeout=TIME_LIMIT)
++            if 'traceback' in msg.lower():
++                problems.append(f"tests/checker.py crashes on {mode} input (dummy output):\n{msg}")
+         if problems:
+             return False, "\n\n".join(problems)
+         return True, f"tests valid: {len(samples)} samples checked by checker; generator modes {GEN_MODES} run"
+@@ -364,6 +409,7 @@ Work from the problem statement alone. Create these files with the editor tool:
+    - If several answers may be valid (e.g. "print any", construction tasks, or any optimal arrangement), verify EVERY constraint stated in the problem on the output (e.g. recompute the claimed value, check each rule), not just the printed verdict.
+    - If the answer is unique, compare the output with the reference answer computed by brute.py for that input (normalise trailing whitespace and line endings) and exit nonzero on mismatch. Make the checker itself independent of the solution's algorithm.
+    - Use only the standard library. The checker must accept every sample expected output in samples.json.
++   - checker.py must never refuse an input: for large inputs (too big for brute.py) it must verify the output structurally (recompute the claimed values, check every constraint), or print OK_UNVERIFIED and exit 0. Never print 'too large to verify' or 'cannot verify' and never crash on any input.
+ 
+ Check that: the generator runs for seeds 0..4 in every mode; brute.py runs on the sample inputs; checker.py accepts each sample expected output and rejects a corrupted one. Do not write anything else under tests/ except these files.
+ Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins.
+@@ -418,6 +464,7 @@ Fix the files so that every check passes.
+         checked_passed = cres['passed']
+         report.append(f"medium/max-size (checked): {cres['passed']}/{cres['total']} passed, "
+                       f"max time {cres['max_time']:.3f} s"
++                      + (f", unverified: {cres['unverified']}" if cres.get('unverified') else "")
+                       + (" (budget reached)" if cres['budget_hit'] else ""))
+ 
+         stress_budget = min(STRESS_BUDGET, max(10.0, self._time_left() / 4))
+@@ -427,12 +474,13 @@ Fix the files so that every check passes.
+         if st['first_failure']:
+             report.append(st['first_failure'])
+         report.append(f"stress vs brute (verdict + checker): {st['passed']}/{st['total']} passed"
++                      + (f", unverified: {st['unverified']}" if st.get('unverified') else "")
+                       + (" (budget reached)" if st['budget_hit'] else ""))
+ 
+         no_crash = int(sres['crashed'] == 0 and max_ok and st['crashed'] == 0 and not lint)
+-        checked_total = cres['total']
++        checked_total = cres['total']   # effective totals: inconclusive (unverified) cases are excluded
+         score = (sres['passed'], st['passed'], checked_passed, no_crash)
+-        perfect = (score == (n, st['total'], checked_total, 1) and not st['budget_hit']
++        perfect = (score == (sres['total'], st['total'], checked_total, 1) and not st['budget_hit']
+                    and not cres['budget_hit'] and not lint)
+         report.append("RESULT: OK" if perfect else "RESULT: FAILED")
+         return score, "\n\n".join(report)
+@@ -464,6 +512,7 @@ Steps:
+ 2. Write the draft to {out_path} immediately, then run it on every sample and compare exactly.
+ 3. Stress test against {self.brute_path} with {self.gen_path} on a few hundred seeds (write your own driver under /tmp, not in the repo). Fix every mismatch, crash or timeout.
+ 4. Test on a max-size input from the generator (mode max); it must finish well under 2 seconds.
++Do not run any single command longer than 60 seconds.
+ Avoid shadowing Python builtins. Keep replies concise.
+ Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins.
+ """
+@@ -471,21 +520,32 @@ Standard library only. Never call pow with three arguments; write `modpow(b, e,
+             prompt += f"\nPrevious attempt feedback (raw harness report):\n{feedback}\n"
+         return self._run_to_completion(prompt, out_path)
+ 
+-    def _run_to_completion(self, make_prompt, out_path, max_rounds=3):
++    def _run_to_completion(self, make_prompt, out_path, max_rounds=CONTINUATION_ROUNDS):
+         """
+         Run a solver/repair session, then keep re-prompting (bounded by max_rounds and the time budget)
+         until out_path scores RESULT: OK. make_prompt is the first prompt (str); continuation prompts
+-        include the current file contents and the raw harness report. Returns (out_path, score, report).
++        include the current file contents and the raw harness report. Stops early when the file or the
++        report is unchanged from the previous round, or the score did not strictly improve.
++        Every scored candidate is checkpointed to solution.py. Returns (out_path, score, report).
+         """
+         chat_with_agent(make_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+         score, rep = self._score_candidate(out_path)
++        self._checkpoint(out_path, score)
++        prev_code, prev_rep = None, None
+         for rnd in range(max_rounds):
+             if os.path.isfile(out_path) and self._is_perfect_report(rep):
+                 break
+             if self._time_left() <= 0:
+                 break
+-            safe_log(f"continuation round {rnd + 1}/{max_rounds} for {out_path}: score={score}")
+             code = self._read_file(out_path) if os.path.isfile(out_path) else '(file missing)'
++            if prev_code is not None and code == prev_code:
++                safe_log(f"stall: {out_path} unchanged since last round; stopping continuation")
++                break
++            if prev_rep is not None and rep == prev_rep:
++                safe_log(f"stall: harness report unchanged for {out_path}; stopping continuation")
++                break
++            prev_code, prev_rep = code, rep
++            safe_log(f"continuation round {rnd + 1}/{max_rounds} for {out_path}: score={score}")
+             prompt = f"""{make_prompt}
+ 
+ Your previous session ended, but the candidate at {out_path} is not yet correct (or the file is missing).
+@@ -497,10 +557,17 @@ Current code in {out_path}:
+ Raw harness report:
+ {rep}
+ 
+-Do not stop or write a summary until RESULT: OK; edit the file with the editor tool (command=create or str_replace on {out_path}) to fix every failure in the report, then re-run the samples and the stress test. Keep replies concise.
++Do not stop or write a summary until RESULT: OK; edit the file with the editor tool (command=create or str_replace on {out_path}) to fix every failure in the report, then re-run the samples and the stress test. Do not run any single command longer than 60 seconds. Keep replies concise.
+ """
+             chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+-            score, rep = self._score_candidate(out_path)
++            new_score, new_rep = self._score_candidate(out_path)
++            self._checkpoint(out_path, new_score)
++            if not (new_score > score):
++                # no strict improvement this round: do not spend another round on it
++                score, rep = new_score, new_rep
++                safe_log(f"no score improvement in round {rnd + 1} for {out_path}; stopping continuation")
++                break
++            score, rep = new_score, new_rep
+         return out_path, score, rep
+ 
+     def _read_file(self, path):
+@@ -539,7 +606,7 @@ Raw harness report for this code (inputs, actual output, expected output, stderr
+ Summary of earlier attempts:
+ {hist}
+ 
+-Write the full repaired solution to {out_path} using the editor tool (command=create). Do NOT edit {self.solution_path}. Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins. Re-check against the samples in {self.samples_path} and the stress test with {self.brute_path} and {self.gen_path} (run `python3 gen.py <seed> [small|edge|max]`). Keep replies concise.
++Write the full repaired solution to {out_path} using the editor tool (command=create). Do NOT edit {self.solution_path}. Standard library only. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins. Re-check against the samples in {self.samples_path} and the stress test with {self.brute_path} and {self.gen_path} (run `python3 gen.py <seed> [small|edge|max]`). Do not run any single command longer than 60 seconds. Keep replies concise.
+ """
+         return self._run_to_completion(prompt, out_path)
+ 
+@@ -563,7 +630,7 @@ Current code:
+ Raw harness report (lint findings, tracebacks, and mismatches):
+ {report}
+ 
+-Fix every reported problem by editing {self.solution_path} in place with the editor tool. Do not change the algorithm unless it is the cause of a failure. Use only the Python standard library. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins. Re-run the samples in {self.samples_path} and {self.brute_path} stress checks before finishing. Keep replies concise.
++Fix every reported problem by editing {self.solution_path} in place with the editor tool. Do not change the algorithm unless it is the cause of a failure. Use only the Python standard library. Never call pow with three arguments; write `modpow(b, e, m)` with a loop. Do not shadow builtins. Re-run the samples in {self.samples_path} and {self.brute_path} stress checks before finishing. Do not run any single command longer than 60 seconds. Keep replies concise.
+ """
+             chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+             score, report = self._score_candidate(self.solution_path)
+@@ -599,8 +666,8 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+         self.scores = {}
+         feedback = None
+         for i in range(self.num_candidates):
+-            if self._time_left() <= 0:
+-                safe_log("budget exhausted; stopping candidate generation")
++            if not self._has_time_for_work():
++                safe_log("time reserve reached; stopping candidate generation (finalization reserved)")
+                 break
+             hint = CANDIDATE_HINTS[i % len(CANDIDATE_HINTS)]
+             path, score, rep = self._solve_candidate(i + 1, hint, feedback=feedback)
+@@ -608,6 +675,7 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+                 history.append(f"candidate {i + 1} ({hint}): wrote no file")
+                 continue
+             self.scores[path] = (score, rep)
++            self._checkpoint(path, score)
+             entries.append((score, path, rep))
+             history.append(f"candidate {i + 1} ({hint}): score {score}")
+             safe_log(f"candidate {i + 1} score={score}")
+@@ -632,6 +700,7 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+                     self.scores.pop(path, None)
+                     score_rep = self._score_candidate(path)
+                     self.scores[path] = score_rep
++                    self._checkpoint(path, score_rep[0])
+                 entries = [(self.scores[p][0], p, self.scores[p][1]) for _, p, _ in entries]
+ 
+         best = self._pick_best(entries) if entries else None
+@@ -640,7 +709,7 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+         # 3. Reflection: repair the best candidate, keep best-so-far
+         wrong_streak = 0
+         for r in range(self.num_reflections):
+-            if best_path is None or self._is_perfect_report(best_report) or self._time_left() <= 0:
++            if best_path is None or self._is_perfect_report(best_report) or not self._has_time_for_work():
+                 break
+             if 'WRONG ANSWER' in best_report:
+                 wrong_streak += 1
+@@ -655,6 +724,7 @@ Fix every reported problem by editing {self.solution_path} in place with the edi
+                 history.append(f"repair {r + 1}: wrote no file")
+                 continue
+             self.scores[out_path] = (score, rep)
++            self._checkpoint(out_path, score)
+             if score > best_score:
+                 history.append(f"repair {r + 1}: score {score} (kept)")
+                 best_score, best_path, best_report = score, out_path, rep
+@@ -732,6 +802,7 @@ In your very next reply call the editor tool (command=create or str_replace) to
+                 continue
+             if path not in self.scores:
+                 self.scores[path] = self._score_candidate(path)
++                self._checkpoint(path, self.scores[path][0])
+             score, rep = self.scores[path]
+             entries.append((score, path, rep))
+         return self._pick_best(entries) if entries else None
+diff --git a/tests/test_checkpoint_stall.py b/tests/test_checkpoint_stall.py
+new file mode 100644
+index 0000000..4872bc8
+--- /dev/null
++++ b/tests/test_checkpoint_stall.py
+@@ -0,0 +1,124 @@
++import json
++import os
++import subprocess
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++from tools import solution_check
++from tests.test_scoring_selection import _agent, BRUTE, GEN, CHECKER, SAMPLES
++
++CORRECT = "a, b = map(int, input().split())\nprint(a + b)\n"
++WRONG = "a, b = map(int, input().split())\nprint(a - b)\n"
++
++
++def _ag(tmp_path):
++    agent, root = _agent(tmp_path)
++    agent.code_model = "test-model"
++    return agent, root
++
++
++def _git(repo, *args):
++    subprocess.run(["git", "-C", str(repo), *args], check=True,
++                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def test_checkpoint_copies_only_on_improvement(tmp_path):
++    agent, root = _agent(tmp_path)
++    cand = root / "cands" / "cand_1.py"
++    cand.write_text(WRONG)
++    assert agent._checkpoint(str(cand), (1, 0, 0, 0)) is True
++    assert (root / "solution.py").read_text() == WRONG
++    cand.write_text(CORRECT)
++    assert agent._checkpoint(str(cand), (1, 0, 0, 0)) is False  # equal: not copied
++    assert (root / "solution.py").read_text() == WRONG
++    assert agent._checkpoint(str(cand), (0, 0, 0, 0)) is False  # worse: not copied
++    assert (root / "solution.py").read_text() == WRONG
++    assert agent._checkpoint(str(cand), (2, 0, 0, 0)) is True  # better: copied
++    assert (root / "solution.py").read_text() == CORRECT
++
++
++def test_has_primary_edit_true_after_first_scored_candidate(tmp_path):
++    agent, root = _agent(tmp_path)
++    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
++    _git(root, "config", "user.email", "t@example.com")
++    _git(root, "config", "user.name", "t")
++    (root / "solution.py").write_text("# placeholder\n")
++    _git(root, "add", "-A")
++    _git(root, "commit", "-qm", "base")
++    commit = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
++                            stdout=subprocess.PIPE, check=True).stdout.decode().strip()
++    agent.base_commit = commit
++    assert agent._has_primary_edit() is False
++    cand = root / "cands" / "cand_1.py"
++    cand.write_text(WRONG)  # imperfect candidate, scored below
++    score, _ = agent._score_candidate(str(cand))
++    agent._checkpoint(str(cand), score)
++    assert agent._has_primary_edit() is True
++
++
++def test_continuation_stops_on_unchanged_file(tmp_path, monkeypatch):
++    agent, root = _ag(tmp_path)
++    out = root / "cands" / "cand_1.py"
++    out.write_text(WRONG)
++    calls = []
++    monkeypatch.setattr(coding_agent, "chat_with_agent", lambda *a, **k: calls.append(1))
++    # score never changes and the file is never edited -> the loop must stop after the first identical round
++    monkeypatch.setattr(agent, "_score_candidate", lambda p: ((0, 0, 0, 0), "same report"))
++    agent._run_to_completion("task", str(out), max_rounds=5)
++    assert len(calls) == 2  # initial session + one continuation; then stall detected
++
++
++def test_continuation_stops_on_identical_report(tmp_path, monkeypatch):
++    agent, root = _ag(tmp_path)
++    out = root / "cands" / "cand_1.py"
++    out.write_text(WRONG)
++    calls = []
++
++    def fake_chat(prompt, **k):
++        calls.append(1)
++        out.write_text(WRONG + f"# edit {len(calls)}\n")  # file changes every round
++
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake_chat)
++    monkeypatch.setattr(agent, "_score_candidate", lambda p: ((0, 0, 0, 0), "identical report"))
++    agent._run_to_completion("task", str(out), max_rounds=5)
++    assert len(calls) == 2
++
++
++def test_continuation_stops_when_score_does_not_improve(tmp_path, monkeypatch):
++    agent, root = _ag(tmp_path)
++    out = root / "cands" / "cand_1.py"
++    out.write_text(WRONG)
++    calls = []
++
++    def fake_chat(prompt, **k):
++        calls.append(1)
++        out.write_text(WRONG + f"# edit {len(calls)}\n")
++
++    monkeypatch.setattr(coding_agent, "chat_with_agent", fake_chat)
++    scores = iter([((1, 0, 0, 0), "r1"), ((1, 0, 0, 0), "r2"), ((2, 0, 0, 0), "r3")])
++    monkeypatch.setattr(agent, "_score_candidate", lambda p: next(scores))
++    agent._run_to_completion("task", str(out), max_rounds=5)
++    assert len(calls) == 2  # round 1 did not improve on the initial score -> stop
++
++
++def test_too_large_to_verify_is_inconclusive_and_does_not_lower_score(tmp_path):
++    checker = tmp_path / "checker.py"
++    checker.write_text("import sys\nprint('case 1: N=438 too large to verify')\nsys.exit(1)\n")
++    verdict, msg = solution_check.check_verdict_pair(str(checker), "438\n", "1\n")
++    assert verdict == 'inconclusive'
++    assert "unverified" in msg
++    assert solution_check.classify_checker(1, "cannot verify this") == 'inconclusive'
++    assert solution_check.classify_checker(1, "expected 3 got 4") == 'wrong'
++
++    root = tmp_path / "r"
++    root.mkdir()
++    (root / "good.py").write_text(CORRECT)
++    (root / "brute.py").write_text(BRUTE)
++    (root / "gen.py").write_text(GEN)
++    (root / "checker.py").write_text(checker.read_text())
++    res = solution_check.run_stress(str(root / "good.py"), str(root / "brute.py"), str(root / "gen.py"),
++                                    range(3), modes=['small'], timeout=10, checker_path=str(root / "checker.py"))
++    assert res['passed'] == 0 and res['unverified'] == 3 and res['first_failure'] is None
++    assert res['total'] == 0  # all unverified: excluded from the planned total, so no failure either
+diff --git a/tools/solution_check.py b/tools/solution_check.py
+index 6c4f377..128a68d 100644
+--- a/tools/solution_check.py
++++ b/tools/solution_check.py
+@@ -190,10 +190,37 @@ def generate_input(gen_path, seed=0, mode=None, timeout=10):
+         shutil.rmtree(tmpdir, ignore_errors=True)
+ 
+ 
++_INCONCLUSIVE_MARKERS = ('too large to verify', 'cannot verify', 'no reference', 'ok_unverified')
++
++
++def classify_checker(rc, text):
++    """
++    Classify a checker run. Returns 'ok', 'wrong' or 'inconclusive'.
++    'inconclusive' = harness limitation (checker cannot verify this input, or crashed with a traceback),
++    not a solution fault. Genuine rejections (nonzero exit with a normal message) stay 'wrong'.
++    """
++    low = (text or '').lower()
++    if rc == 0:
++        return 'ok'
++    if any(m in low for m in _INCONCLUSIVE_MARKERS):
++        return 'inconclusive'
++    if 'traceback (most recent call last)' in low:
++        return 'inconclusive'
++    return 'wrong'
++
++
+ def _check_output(tmpdir, input_text, output_text, timeout=10):
+     """
+     Judge one output with the checker copied into tmpdir as _checker.py (`python _checker.py _in.txt _out.txt`).
+-    Returns (ok, message). ok is True only when the checker exits 0.
++    Returns (ok, message). ok is True only when the checker exits 0. Use _check_verdict for the 3-way verdict.
++    """
++    verdict, msg = _check_verdict(tmpdir, input_text, output_text, timeout)
++    return verdict == 'ok', msg
++
++
++def _check_verdict(tmpdir, input_text, output_text, timeout=10):
++    """
++    Like _check_output but returns (verdict, message) with verdict in ok | wrong | inconclusive.
+     """
+     with open(os.path.join(tmpdir, '_in.txt'), 'w') as f:
+         f.write(input_text)
+@@ -201,11 +228,15 @@ def _check_output(tmpdir, input_text, output_text, timeout=10):
+         f.write(output_text)
+     st, out, err, rc, _ = _run([sys.executable, '-I', '_checker.py', '_in.txt', '_out.txt'], tmpdir, '', timeout)
+     if st == 'ok' and rc == 0:
+-        return True, ''
++        return 'ok', ''
+     msg = (out + err).strip()
+     if st == 'timeout':
+         msg = 'checker timed out'
+-    return False, f"checker rejected the output (exit={rc}): {_clip(msg) or '(no message)'}"
++        return 'inconclusive', f"checker timed out (unverified): {msg}"
++    verdict = classify_checker(rc, out + err)
++    if verdict == 'inconclusive':
++        return verdict, f"checker could not verify this input (unverified, exit={rc}): {_clip(msg) or '(no message)'}"
++    return verdict, f"checker rejected the output (exit={rc}): {_clip(msg) or '(no message)'}"
+ 
+ 
+ def collect_outputs(solution_path, inputs, timeout=10, strict=True):
+@@ -233,6 +264,17 @@ def check_pair(checker_path, input_text, output_text, timeout=10):
+         shutil.rmtree(tmpdir, ignore_errors=True)
+ 
+ 
++def check_verdict_pair(checker_path, input_text, output_text, timeout=10):
++    """Judge one (input, output) pair; returns (verdict, msg) with verdict ok | wrong | inconclusive."""
++    if not checker_path or not os.path.isfile(checker_path):
++        return 'wrong', f"checker not found: {checker_path}"
++    tmpdir = _tmp_with({'_checker.py': checker_path})
++    try:
++        return _check_verdict(tmpdir, input_text, output_text, timeout)
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
+ def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=False, checker_path=None):
+     """
+     Run the solution on fixed inputs. strict=True runs it through the portable-runner bootstrap
+@@ -245,7 +287,7 @@ def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=F
+     tmpdir = _tmp_with(files)
+     try:
+         cmd = _portable_runner(tmpdir) if strict else [sys.executable, '-I', '_sol.py']
+-        passed, max_t, crashed = 0, 0.0, 0
++        passed, max_t, crashed, unverified = 0, 0.0, 0, 0
+         blocks = []
+         for i, inp in enumerate(inputs):
+             status, out, err, rc, el = _run(cmd, tmpdir, inp, timeout)
+@@ -259,15 +301,16 @@ def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=F
+                 problems.append("stderr is not empty")
+             if _solution_crashed(status, rc, err):
+                 crashed += 1
++            checker_msg = None
+             if checker_path and status == 'ok' and rc == 0:
+-                ok, msg = _check_output(tmpdir, inp, out, timeout)
+-                if not ok:
++                verdict, msg = _check_verdict(tmpdir, inp, out, timeout)
++                if verdict == 'inconclusive':
++                    unverified += 1   # excluded from total; neither passed nor failed
++                    max_t = max(max_t, el)
++                    continue
++                if verdict == 'wrong':
+                     problems.append("output rejected by checker")
+                     checker_msg = msg
+-                else:
+-                    checker_msg = None
+-            else:
+-                checker_msg = None
+             if not checker_path and expected_outputs is not None and i < len(expected_outputs) and status == 'ok':
+                 if _normalise(out) != _normalise(expected_outputs[i]):
+                     problems.append("output differs from expected")
+@@ -282,7 +325,7 @@ def run_plain(solution_path, inputs, expected_outputs=None, timeout=10, strict=F
+                 blocks.append(block)
+             else:
+                 passed += 1
+-        return {'passed': passed, 'total': len(inputs), 'max_time': max_t,
++        return {'passed': passed, 'total': len(inputs) - unverified, 'max_time': max_t, 'unverified': unverified,
+                 'crashed': crashed, 'report': "\n\n".join(blocks)}
+     finally:
+         shutil.rmtree(tmpdir, ignore_errors=True)
+@@ -313,8 +356,10 @@ def _one_case(tmpdir, seed, mode, timeout, sol_cmd=None, has_checker=False):
+                          + _fmt_run("solution", sst, sout, serr, src_rc, el)
+                          + "\n" + _fmt_run("brute (expected)", bst, bout, berr, brc, 0.0)), el
+     if has_checker:
+-        ok, msg = _check_output(tmpdir, test_in, sout, timeout)
+-        if not ok:
++        verdict, msg = _check_verdict(tmpdir, test_in, sout, timeout)
++        if verdict == 'inconclusive':
++            return 'inconclusive', msg, el
++        if verdict == 'wrong':
+             return 'wrong', (f"WRONG ANSWER on {label} (checker rejected the solution's output)\n"
+                              f"input:\n{_clip(test_in).rstrip()}\n"
+                              + _fmt_run("solution", sst, sout, serr, src_rc, el)
+@@ -347,7 +392,7 @@ def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=1
+     seeds = list(seeds)
+     modes = [None] if not modes else list(modes)
+     cases = [(m, s) for m in modes for s in seeds]
+-    result = {'total': len(cases), 'ran': 0, 'passed': 0, 'crashed': 0, 'max_time': 0.0,
++    result = {'total': len(cases), 'ran': 0, 'passed': 0, 'crashed': 0, 'max_time': 0.0, 'unverified': 0,
+               'budget_hit': False, 'first_failure': None, 'first_failure_kind': None}
+     if not cases:
+         return result
+@@ -368,11 +413,16 @@ def run_stress(solution_path, brute_path, gen_path, seeds, modes=None, timeout=1
+             if kind == 'ok':
+                 result['passed'] += 1
+                 continue
++            if kind == 'inconclusive':
++                # Harness limitation (checker cannot verify this input): neither a pass nor a solution failure.
++                result['unverified'] += 1
++                continue
+             if kind == 'crash':
+                 result['crashed'] += 1
+             if result['first_failure'] is None:
+                 result['first_failure'] = detail
+                 result['first_failure_kind'] = kind
++        result['total'] -= result['unverified']
+         return result
+     finally:
+         shutil.rmtree(tmpdir, ignore_errors=True)
+@@ -388,7 +438,7 @@ def run_checked(solution_path, gen_path, checker_path, seeds, modes=('medium', '
+     seeds = list(seeds)
+     modes = [None] if not modes else list(modes)
+     cases = [(m, s) for m in modes for s in seeds]
+-    result = {'total': len(cases), 'ran': 0, 'passed': 0, 'crashed': 0, 'max_time': 0.0,
++    result = {'total': len(cases), 'ran': 0, 'passed': 0, 'crashed': 0, 'max_time': 0.0, 'unverified': 0,
+               'budget_hit': False, 'first_failure': None}
+     if not cases:
+         return result
+@@ -416,18 +466,21 @@ def run_checked(solution_path, gen_path, checker_path, seeds, modes=('medium', '
+                     detail = (f"solution FAILED on {label}: {why}\ninput:\n{_clip(gout).rstrip()}\n"
+                               + _fmt_run("solution", sst, sout, serr, src_rc, el))
+                 else:
+-                    ok, msg = _check_output(tmpdir, gout, sout, timeout)
+-                    kind = 'ok' if ok else 'wrong'
+-                    detail = ('' if ok else
++                    kind, msg = _check_verdict(tmpdir, gout, sout, timeout)
++                    detail = ('' if kind == 'ok' else
+                               f"CHECKER REJECTED on {label}\ninput:\n{_clip(gout).rstrip()}\n"
+                               + _fmt_run("solution", sst, sout, serr, src_rc, el) + "\n" + msg)
+             if kind == 'ok':
+                 result['passed'] += 1
+                 continue
++            if kind == 'inconclusive':
++                result['unverified'] += 1
++                continue
+             if kind == 'crash':
+                 result['crashed'] += 1
+             if result['first_failure'] is None:
+                 result['first_failure'] = detail
++        result['total'] -= result['unverified']
+         return result
+     finally:
+         shutil.rmtree(tmpdir, ignore_errors=True)
+@@ -466,7 +519,8 @@ def tool_function(solution_path, inputs=None, expected_outputs=None, brute_path=
+         res = run_plain(solution_path, inputs, expected_outputs, timeout, strict=True, checker_path=checker_path)
+         if res['report']:
+             report.append(res['report'])
+-        report.append(f"{res['passed']}/{res['total']} passed, max time {res['max_time']:.3f} s")
++        report.append(f"{res['passed']}/{res['total']} passed, max time {res['max_time']:.3f} s"
++                      + (f", unverified: {res['unverified']}" if res.get('unverified') else ""))
+         failed = failed or res['passed'] != res['total']
+ 
+     # ---- stress mode: brute vs solution on generated inputs ----

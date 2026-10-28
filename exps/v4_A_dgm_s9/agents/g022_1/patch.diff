@@ -1,0 +1,251 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 65aadfb..8d7e636 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,8 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import time
++import traceback
+ 
+ from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -158,6 +160,22 @@ def _last_assistant_text(msg_history):
+         return text.strip()
+     return ""
+ 
++def _is_empty_turn(msg_history):
++    """True if the history has no tool use and the last assistant turn has no text."""
++    return not _history_has_tool_use(msg_history) and not _last_assistant_text(msg_history)
++
++def _last_assistant_block_count(msg_history):
++    """Number of content blocks in the final assistant message (diagnostics only)."""
++    for msg in reversed(msg_history or []):
++        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
++        if role != "assistant":
++            continue
++        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
++        if isinstance(content, str):
++            return 1
++        return len(content or [])
++    return 0
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -301,7 +319,7 @@ IMPORTANT RULES:
+ """
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.\n{workflow}"
+ 
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = self._chat_with_recovery(instruction, [])
+ 
+         max_retries = 3
+         failure_class = None
+@@ -342,9 +360,7 @@ IMPORTANT RULES:
+             safe_log(f"[retry] attempt={attempt} class={failure_class} retry={retries_used}")
+             if failure_class == "empty_reply":
+                 # Broken history: start fresh with the task text plus the nudge.
+-                msg_history = chat_with_agent(
+-                    f"{task}\n{corrective}", model=self.code_model, msg_history=[], logging=safe_log
+-                )
++                msg_history = self._chat_with_recovery(f"{task}\n{corrective}", [])
+             else:
+                 msg_history = chat_with_agent(
+                     corrective, model=self.code_model, msg_history=msg_history, logging=safe_log
+@@ -362,6 +378,58 @@ IMPORTANT RULES:
+             f"retries={retries_used} failure_class={failure_class} changed_files={self._changed_files()}"
+         )
+ 
++    def _alt_model(self):
++        """The alternate model to fall back to when the code model keeps failing."""
++        return OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++
++    def _compact_instruction(self):
++        """Short prompt variant: problem statement plus a one-line create/run directive."""
++        file_hint = self._extract_solution_filename() or DEFAULT_SOLUTION_FILES.get(self.language, "solution.py")
++        return (
++            f"I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Use the editor tool now to create {self.git_tempdir}/{file_hint} with the full solution, "
++            f"then run the samples with bash."
++        )
++
++    def _chat_with_recovery(self, instruction, msg_history):
++        """
++        Call the agent with a bounded list of strategies, returning the first history whose
++        last assistant turn is non-empty. Falls back to the last history if all strategies fail.
++        """
++        compact_instruction = self._compact_instruction()
++        alt_model = self._alt_model()
++        strategies = [
++            ("original", self.code_model, instruction, msg_history),
++            ("compact", self.code_model, compact_instruction, []),
++            ("compact-alt", alt_model, compact_instruction, []),
++        ]
++        last_history = None
++        for i, (variant, model, prompt, history) in enumerate(strategies):
++            try:
++                new_history = chat_with_agent(prompt, model=model, msg_history=history, logging=safe_log)
++            except Exception:
++                safe_log(
++                    f"[recovery] attempt={i} model={model} variant={variant} exception:\n{traceback.format_exc()}",
++                    level=logging.WARNING,
++                )
++                new_history = None
++            if new_history is not None:
++                last_history = new_history
++                if not _is_empty_turn(new_history):
++                    safe_log(f"[recovery] attempt={i} model={model} variant={variant} succeeded")
++                    return new_history
++                safe_log(
++                    f"[recovery] attempt={i} model={model} variant={variant} empty turn "
++                    f"(assistant_blocks={_last_assistant_block_count(new_history)}, "
++                    f"tool_use={_history_has_tool_use(new_history)})",
++                    level=logging.WARNING,
++                )
++            if i < len(strategies) - 1:
++                time.sleep(2 * (i + 1))
++        safe_log("[recovery] all strategies failed or returned empty turns", level=logging.WARNING)
++        return last_history if last_history is not None else []
++
+     def _classify_failure(self, msg_history):
+         """
+         Classify why the last turn produced no source edit:
+@@ -379,7 +447,7 @@ IMPORTANT RULES:
+     def _write_fallback_solution(self, solution_file):
+         """
+         Last resort: ask for the complete solution as a single fenced code block (no tools)
+-        and write it to the target file.
++        and write it to the target file. Tries the code model, then the alternate model.
+         """
+         target_name = solution_file or DEFAULT_SOLUTION_FILES.get(self.language, "solution.py")
+         target_path = os.path.join(self.git_tempdir, target_name)
+@@ -388,29 +456,47 @@ IMPORTANT RULES:
+             f"in a single ```{self.language} code block, no tools, no explanation.\n\n"
+             f"<problem_description>\n{self.problem_statement}\n</problem_description>"
+         )
+-        try:
+-            client, client_model = create_client(self.code_model)
+-            response, _ = get_response_from_llm(
+-                msg=prompt,
+-                client=client,
+-                model=client_model,
+-                system_message="You are a competitive programming expert. Reply with code only.",
+-                msg_history=[],
+-            )
+-        except Exception as e:
+-            safe_log(f"[fallback] LLM call failed: {e}", level=logging.WARNING)
+-            return False
++        for model in [self.code_model, self._alt_model()]:
++            try:
++                client, client_model = create_client(model)
++                response, _ = get_response_from_llm(
++                    msg=prompt,
++                    client=client,
++                    model=client_model,
++                    system_message="You are a competitive programming expert. Reply with code only.",
++                    msg_history=[],
++                )
++            except Exception:
++                safe_log(
++                    f"[fallback] LLM call failed model={model}:\n{traceback.format_exc()}",
++                    level=logging.WARNING,
++                )
++                continue
+ 
+-        match = re.search(r"```(?:python|cpp|java|go|rust|javascript)?\n(.*?)```", response or "", re.DOTALL)
+-        if not match or not match.group(1).strip():
+-            safe_log("[fallback] no code block found in reply", level=logging.WARNING)
+-            return False
++            if not response or not response.strip():
++                safe_log(f"[fallback] empty reply from model={model}", level=logging.WARNING)
++                continue
++
++            match = re.search(r"```[\w+-]*[ \t]*\n(.*?)```", response, re.DOTALL)
++            if match and match.group(1).strip():
++                code = match.group(1)
++            elif "input(" in response or "sys.stdin" in response:
++                code = response
++            else:
++                safe_log(
++                    f"[fallback] no code block found in reply from model={model}",
++                    level=logging.WARNING,
++                )
++                continue
++
++            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
++            with open(target_path, "w") as f:
++                f.write(code)
++            safe_log(f"[fallback] wrote {target_path} ({len(code)} chars) using model={model}")
++            return True
+ 
+-        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+-        with open(target_path, "w") as f:
+-            f.write(match.group(1))
+-        safe_log(f"[fallback] wrote {target_path} ({len(match.group(1))} chars)")
+-        return True
++        safe_log("[fallback] no usable solution from any model", level=logging.WARNING)
++        return False
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/llm.py b/llm.py
+index d6b4da1..efc49a5 100644
+--- a/llm.py
++++ b/llm.py
+@@ -200,7 +200,7 @@ def get_response_from_llm(
+             system=system_message,
+             messages=new_msg_history,
+         )
+-        content = response.content[0].text
++        content = response.content[0].text if response.content else ""
+         new_msg_history = new_msg_history + [
+             {
+                 "role": "assistant",
+@@ -226,7 +226,7 @@ def get_response_from_llm(
+             stop=None,
+             seed=0,
+         )
+-        content = response.choices[0].message.content
++        content = response.choices[0].message.content if response.choices else ""
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+     elif model.startswith("o1-") or model.startswith("o3-"):
+         new_msg_history = msg_history + [{"role": "user", "content": system_message + msg}]
+@@ -242,7 +242,7 @@ def get_response_from_llm(
+             # stop=None,
+             seed=0,
+         )
+-        content = response.choices[0].message.content
++        content = response.choices[0].message.content if response.choices else ""
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+     elif model in ["deepseek-chat", "deepseek-coder"]:
+         new_msg_history = msg_history + [{"role": "user", "content": msg}]
+@@ -257,7 +257,7 @@ def get_response_from_llm(
+             n=1,
+             stop=None,
+         )
+-        content = response.choices[0].message.content
++        content = response.choices[0].message.content if response.choices else ""
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+     elif model in ["deepseek-reasoner"]:
+         new_msg_history = msg_history + [{"role": "user", "content": msg}]
+@@ -270,7 +270,7 @@ def get_response_from_llm(
+             n=1,
+             stop=None,
+         )
+-        content = response.choices[0].message.content
++        content = response.choices[0].message.content if response.choices else ""
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+         reasoning_content = response.choices[0].message.reasoning_content
+     elif model.startswith("llama3.1-"):
+@@ -288,7 +288,7 @@ def get_response_from_llm(
+             n=1,
+             stop=None,
+         )
+-        content = response.choices[0].message.content
++        content = response.choices[0].message.content if response.choices else ""
+         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+         resoning_content = response.choices[0].message.reasoning_content
+     else:

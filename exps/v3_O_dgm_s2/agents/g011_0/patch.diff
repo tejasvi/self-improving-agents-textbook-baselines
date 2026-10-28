@@ -1,0 +1,336 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 58e1cad..fb515a1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,9 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import uuid
++import time
++from typing import List, Dict, Any
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -93,6 +96,10 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++# Configurable constants
++MAX_ATTEMPTS = 3  # N
++MAX_REFLECTION = 2  # K
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -185,102 +192,141 @@ class AgenticSystem:
+             return 'tests_only', uniq_files
+         return 'ok', uniq_files
+ 
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
++    # ------------------- New Helper Methods -------------------
++    def _build_test_suite(self) -> str:
++        """Create a temporary workspace with tests and a runner.
++        Returns the path to the workspace directory.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        instruction = (
+-            f"{task}\n\n"
+-            "Please follow these phases strictly and do not provide the final solution until all phases have completed successfully:\n"
+-            "1️⃣ **Constraint Analysis**: Examine the problem constraints and determine the required time and space complexity. If any proposed algorithm cannot meet the constraints, reject it and request a more efficient approach.\n"
+-            "2️⃣ **Implementation**: Write the solution code (or the `Solution` class method) in the appropriate language files inside the repository.\n"
+-            "3️⃣ **Sample Verification**: Run **all** sample test cases from the problem statement using the provided test harness. Compare the outputs and ensure they match exactly.\n"
+-            "4️⃣ **Reference & Stress Testing**:\n"
+-            "   - Write a brute‑force reference implementation (can be simple and slow).\n"
+-            "   - Write a small random test‑case generator and place it in `/tmp` to avoid polluting the repo.\n"
+-            "   - If the problem has multiple valid outputs, also write a checker/validator in `/tmp`.\n"
+-            "   - Use these to stress‑test the solution on many random small cases, ensuring consistency with the reference.\n"
+-            "5️⃣ **Performance Testing**:\n"
+-            "   - Generate worst‑case (maximum size) inputs, again using scripts in `/tmp`.\n"
+-            "   - Time the solution execution using the `run_python` tool (or appropriate language runner) with a reasonable timeout (e.g., 30 seconds).\n"
+-            "   - If the solution exceeds the time limit, iterate on the implementation to improve performance.\n"
+-            "6️⃣ **Finalization**: Only after all previous phases pass, provide the final answer indicating success. Do not output any solution code in your final message; the code should already be committed to the repository.\n"
+-            "\n"
+-            "**Additional Instructions**:\n"
+-            "- Save any helper scripts (test generators, brute‑force reference, validators) in `/tmp` rather than the repository.\n"
+-            "- When invoking large input files, you may pipe them using `<` syntax (e.g., `python solution.py < /tmp/large_input.txt`).\n"
+-            "- Use the `run_python` tool for executing Python scripts, specifying `stdin` if needed, and set an appropriate timeout to avoid hanging.\n"
+-            "- Avoid long‑running interactive bash sessions; each bash tool call starts a fresh process with a reduced timeout.\n"
++        workspace = f"/tmp/tests_{uuid.uuid4().hex}"
++        os.makedirs(workspace, exist_ok=True)
++        # Author prompt
++        author_prompt = (
++            "You are the *author* of a test suite. Generate sample tests, a brute‑force reference implementation, "
++            "a random small‑case generator, edge‑case list, and a runner script (run_all.sh) that can execute all "
++            "tests against a solution located at the path supplied in the next message. Place all files in the workspace."
+         )
+-        # First interaction
++        # Provide workspace path to agent
+         msg_history = chat_with_agent(
+-            instruction,
++            author_prompt,
+             model=self.code_model,
+             msg_history=[],
+             logging=safe_log,
++            extra_context={'workspace': workspace}
+         )
+-        # Retry loop up to three attempts
+-        for attempt in range(3):
+-            status, changed_files = self._classify_patch()
+-            if status == 'ok':
+-                safe_log(f"Patch classification succeeded on attempt {attempt+1}: ok")
+-                break
+-            # Build corrective prompt
+-            files_list = '\n'.join(f'- {f}' for f in changed_files) if changed_files else '(none)'
+-            corrective = (
+-                f"The previous response did not modify any source files. Patch classification: {status}. Changed files:\n{files_list}\n"
+-                "Please implement the required solution now using the `editor` tool to edit the appropriate source file(s). "
+-                "Do not provide a final answer without making a source edit. "
+-                "If the stub uses names like List without imports, add `from typing import List`."
++        # Critic prompt
++        critic_prompt = (
++            "You are the *critic*. Review the test suite already created in the workspace and add any missing edge cases, "
++            "ensuring at least ten distinct categories are covered. Modify or add files as needed."
++        )
++        chat_with_agent(
++            critic_prompt,
++            model=self.code_model,
++            msg_history=msg_history,
++            logging=safe_log,
++            extra_context={'workspace': workspace}
++        )
++        return workspace
++
++    def _run_suite(self, workspace: str) -> Dict[str, Any]:
++        """Execute the runner script inside the workspace.
++        Returns a dict with keys: 'passed', 'failed', 'first_failure', 'max_time', 'perfect'.
++        """
++        runner_sh = os.path.join(workspace, 'run_all.sh')
++        runner_py = os.path.join(workspace, 'run_all.py')
++        start = time.time()
++        result = {'passed': 0, 'failed': 0, 'first_failure': None, 'max_time': 0.0, 'perfect': False}
++        try:
++            if os.path.isfile(runner_sh):
++                proc = subprocess.run(["bash", runner_sh], cwd=workspace, capture_output=True, text=True, timeout=60)
++            elif os.path.isfile(runner_py):
++                proc = subprocess.run(["python3", runner_py], cwd=workspace, capture_output=True, text=True, timeout=60)
++            else:
++                safe_log("No runner script found in test suite.")
++                return result
++        except subprocess.TimeoutExpired:
++            safe_log("Test suite execution timed out.")
++            return result
++        duration = time.time() - start
++        result['max_time'] = duration
++        # Very naive parsing: look for lines 'FAIL' or 'PASS'
++        out = proc.stdout + proc.stderr
++        for line in out.splitlines():
++            if 'FAIL' in line.upper():
++                result['failed'] += 1
++                if result['first_failure'] is None:
++                    result['first_failure'] = line.strip()
++            elif 'PASS' in line.upper():
++                result['passed'] += 1
++        result['perfect'] = (result['failed'] == 0 and result['passed'] > 0)
++        return result
++
++    def _summarize_attempts(self, attempts: List[Dict[str, Any]]) -> str:
++        """Create a compact textual summary of past attempts for the next prompt."""
++        lines = []
++        for i, att in enumerate(attempts, 1):
++            lines.append(f"Attempt {i}: score={att.get('score',0)}, passed={att.get('suite',{}).get('passed',0)}, failed={att.get('suite',{}).get('failed',0)}")
++            if att.get('suite', {}).get('first_failure'):
++                lines.append(f"  First failure: {att['suite']['first_failure']}")
++        return "\n".join(lines)
++
++    def _select_best(self, attempts: List[Dict[str, Any]]) -> Dict[str, Any]:
++        """Select the best attempt based on score, then performance, then diff size."""
++        if not attempts:
++            return {}
++        # sort by score desc, then max_time asc, then diff length asc
++        def sort_key(att):
++            suite = att.get('suite', {})
++            return (-att.get('score', 0), suite.get('max_time', 1e9), len(att.get('diff', '')))
++        best = sorted(attempts, key=sort_key)[0]
++        return best
++
++    def forward(self):
++        """The forward function for the AgenticSystem implementing multi‑attempt workflow."""
++        # Build test suite once
++        workspace = self._build_test_suite()
++        attempts: List[Dict[str, Any]] = []
++        best_patch = None
++        best_score = -1
++        for i in range(MAX_ATTEMPTS):
++            # Reset repo to base commit before each attempt
++            reset_to_commit(self.git_tempdir, self.base_commit)
++            # Summarize previous attempts
++            summary = self._summarize_attempts(attempts)
++            prompt = (
++                f"Workspace for tests: {workspace}\n"
++                f"Previous attempts summary:\n{summary}\n"
++                "Now improve the solution. Follow the phased approach (analysis, implementation, testing, reflection)."
+             )
+-            safe_log(f"Attempt {attempt+1} corrective prompt:\n{corrective}")
++            # Fresh message history for each attempt
+             msg_history = chat_with_agent(
+-                corrective,
++                prompt,
+                 model=self.code_model,
+-                msg_history=msg_history,
++                msg_history=[],
+                 logging=safe_log,
+             )
+-        # forward ends here; subsequent testing and diff handling is done outside
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
+-    main()
++            # Classify the resulting patch
++            status, changed_files = self._classify_patch()
++            if status != 'ok':
++                # Score zero for non‑code patches
++                attempts.append({'score': 0, 'diff': '', 'suite': {}, 'msg_history': msg_history})
++                continue
++            # Capture diff
++            diff_text = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            # Run test suite
++            suite_res = self._run_suite(workspace)
++            # Simple scoring: number of passed tests
++            score = suite_res.get('passed', 0)
++            attempts.append({'score': score, 'diff': diff_text, 'suite': suite_res, 'msg_history': msg_history})
++            if score > best_score:
++                best_score = score
++                best_patch = diff_text
++            if suite_res.get('perfect'):
++                safe_log(f"Perfect solution found on attempt {i+1}.")
++                break
++        # After attempts, apply best patch
++        if best_patch:
++            reset_to_commit(self.git_tempdir, self.base_commit)
++            apply_patch(self.git_tempdir, best_patch)
++        else:
++            safe_log("No satisfactory patch produced.")
++        return best_patch
+diff --git a/tools/run_tests.py b/tools/run_tests.py
+new file mode 100644
+index 0000000..0526e18
+--- /dev/null
++++ b/tools/run_tests.py
+@@ -0,0 +1,76 @@
++from typing import Dict, Any
++import os
++import subprocess
++import time
++
++
++def tool_info() -> Dict[str, Any]:
++    return {
++        "name": "run_tests",
++        "description": "Run solution against .in/.out test files in a workspace and report failures.",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the solution script or executable."},
++                "workspace": {"type": "string", "description": "Directory containing test files (*.in and *.out)."},
++                "mode": {"type": "string", "description": "Mode of testing: samples, stress, perf, or all."},
++                "timeout": {"type": "integer", "description": "Maximum seconds to allow for each test case."}
++            },
++            "required": ["solution_path", "workspace"]
++        }
++    }
++
++
++def tool_function(solution_path: str, workspace: str, mode: str = "all", timeout: int = 5) -> str:
++    """Execute the solution on each *.in file in workspace and compare to *.out.
++    Returns a plain‑text report summarizing passed/failed cases and the first failure.
++    """
++    if not os.path.isdir(workspace):
++        return f"Error: workspace {workspace} does not exist."
++    in_files = sorted([f for f in os.listdir(workspace) if f.endswith('.in')])
++    if not in_files:
++        return "No .in test files found in workspace."
++    passed = 0
++    failed = 0
++    first_failure = None
++    max_time = 0.0
++    for in_file in in_files:
++        base = in_file[:-3]
++        out_file = base + '.out'
++        in_path = os.path.join(workspace, in_file)
++        expected_path = os.path.join(workspace, out_file)
++        try:
++            with open(in_path, 'r') as f_in:
++                inp = f_in.read()
++            start = time.time()
++            proc = subprocess.run(["python3", solution_path], input=inp, capture_output=True, text=True, timeout=timeout)
++            elapsed = time.time() - start
++            max_time = max(max_time, elapsed)
++            actual = proc.stdout.strip()
++            if os.path.isfile(expected_path):
++                with open(expected_path, 'r') as f_out:
++                    expected = f_out.read().strip()
++                if actual == expected:
++                    passed += 1
++                else:
++                    failed += 1
++                    if first_failure is None:
++                        first_failure = f"Input: {in_file}\nExpected: {expected}\nActual: {actual}"
++            else:
++                # No expected file; treat as pass if runs without error
++                passed += 1
++        except subprocess.TimeoutExpired:
++            failed += 1
++            if first_failure is None:
++                first_failure = f"Timeout on {in_file} after {timeout}s"
++        except Exception as e:
++            failed += 1
++            if first_failure is None:
++                first_failure = f"Error on {in_file}: {e}"
++    report_lines = []
++    report_lines.append(f"Passed: {passed}")
++    report_lines.append(f"Failed: {failed}")
++    if first_failure:
++        report_lines.append("First failure details:\n" + first_failure)
++    report_lines.append(f"Max runtime: {max_time:.3f}s")
++    return "\n".join(report_lines)

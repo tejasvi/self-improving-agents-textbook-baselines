@@ -1,0 +1,361 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index cdbf368..13294ff 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,6 +8,7 @@ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from tools.run_samples import tool_function as run_samples_tool
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -224,6 +225,66 @@ class AgenticSystem:
+         """
+         return any(not self._is_test_path(f) for f in self._changed_files())
+ 
++    @staticmethod
++    def _last_assistant_is_empty(msg_history):
++        """True if the last assistant message has no text and no tool use."""
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return not content.strip()
++            for block in content or []:
++                btype, text = AgenticSystem._block_text(block)
++                if btype == 'tool_use' or (btype == 'text' and (text or '').strip()):
++                    return False
++                if btype not in (None, 'text'):
++                    return False
++            return True
++        return True
++
++    def _run_sample_gate(self):
++        """
++        Objective check (no LLM): run the target file on the problem's samples.
++        Returns (all_passed, report).
++        """
++        target_path = os.path.join(self.git_tempdir, self._target_filename())
++        report = run_samples_tool(target_path, self.problem_statement or '')
++        all_passed = (
++            'ALL SAMPLES PASSED.' in report
++            and 'SOME SAMPLES FAILED.' not in report
++            and not report.startswith('Error:')
++        )
++        return all_passed, report
++
++    @staticmethod
++    def _ends_with_verified(text):
++        lines = [l.strip() for l in (text or '').splitlines() if l.strip()]
++        return bool(lines) and lines[-1] == 'VERIFIED'
++
++    def _chat(self, prompt, msg_history, fresh_prefix, max_nudges=2):
++        """
++        Send prompt within the existing conversation (or a fresh one if the history is empty).
++        If the assistant returns an empty turn, send a 'continue' nudge instead of
++        treating it as a completed round.
++        """
++        sanitized = self._sanitize_history(msg_history)
++        if sanitized:
++            new_history = chat_with_agent(prompt, model=self.code_model, msg_history=sanitized, logging=safe_log)
++        else:
++            new_history = chat_with_agent(f"{fresh_prefix}\n\n{prompt}", model=self.code_model, msg_history=[], logging=safe_log)
++        for nudge in range(1, max_nudges + 1):
++            if not self._last_assistant_is_empty(new_history):
++                break
++            safe_log(f"Empty assistant turn; sending continue nudge {nudge}/{max_nudges}")
++            new_history = chat_with_agent(
++                "Your last reply was empty. Continue working on the task now, and use your tools.",
++                model=self.code_model,
++                msg_history=self._sanitize_history(new_history) or new_history,
++                logging=safe_log,
++            )
++        return new_history
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -243,7 +304,7 @@ Please follow this workflow:
+ 2. Before coding, write a short complexity analysis: state the input constraints (maximum N, value ranges) and the time complexity your algorithm needs to meet them in Python. If a naive approach would be too slow, choose a better algorithm now.
+ 3. Create or edit the target file with the editor tool (create/edit). Implement the full, complete solution, not a stub.
+ 4. Run the solution via bash on all sample inputs in the problem statement and compare the output with the expected outputs. Fix any mismatch.
+-5. Consider edge cases (empty input, minimum/maximum values, duplicates, large inputs) and check that the time complexity is acceptable for the maximum constraints.
++5. Consider edge cases (empty input, minimum/maximum values, duplicates, large inputs) and check that the time complexity is acceptable for the maximum constraints. Any brute-force reference you use for testing must be independent code written from scratch (do not import or copy from the solution under test). A solution that times out on the provided samples is NOT an acceptable final answer; keep analyzing brute-force output (print compact tables, hypothesize formulas, test them against brute force) until the efficient solution matches.
+ 6. Only finish once the source file is written and verified. A reply without file edits counts as failure."""
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.{workflow}"
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+@@ -323,46 +384,67 @@ Please follow this workflow:
+             except Exception as e:
+                 safe_log(f"Exception during fallback: {e}", level=logging.ERROR)
+ 
+-        # Verify-and-harden phase: bounded rounds, no while loop.
+-        verification_prompt = (
+-            "Verification phase: "
+-            "(a) state the worst-case time complexity of your solution against the maximum constraints; "
+-            "if it is not clearly fast enough for Python, redesign now. "
+-            "(b) Write brute.py, gen.py (takes a seed argument, prints small random inputs, include edge cases "
+-            "like duplicates, minimum N, and answer-absent cases) and, if multiple answers are valid, check.py. "
+-            "Put these files in a scratch directory such as /tmp/verify, NOT inside the repository. "
+-            "Use the stress_test tool for at least 300 cases, with brute_cmd pointing at brute.py and "
+-            "generator_cmd pointing at gen.py (and checker_cmd at check.py if needed). "
+-            "(c) Generate max-size worst-case inputs, including adversarial ones, and time the solution with the "
+-            "time_run tool; it must run in under ~2s. "
+-            "(d) Fix any failure in the solution and re-run the checks. Do not stop until all pass. "
+-            "End your final message with the line VERIFIED only if everything passes."
++        # Verify-and-harden phase: objective sample gate drives redesign; bounded rounds, no while loop.
++        fresh_prefix = instruction
++        stress_prompt = (
++            "Samples pass. Now harden the solution: "
++            "(a) state the worst-case time complexity against the maximum constraints; "
++            "(b) write an independent brute.py (written from scratch, NOT imported from the solution) and gen.py "
++            "(takes a seed argument, prints small random inputs, including edge cases like duplicates, minimum N, "
++            "and answer-absent cases) in a scratch directory such as /tmp/verify, NOT inside the repository; "
++            "(c) use the stress_test tool for at least 300 cases with brute_cmd and generator_cmd (checker_cmd if multiple answers are valid); "
++            "(d) generate max-size worst-case inputs and time the solution with the time_run tool; it must run in under ~2s. "
++            "Fix any failure and re-run the checks. "
++            "When everything passes, end your final message with the line VERIFIED on its own as the last line."
+         )
+-        verify_rounds = 3
++        verify_rounds = 4
++        stress_done = False
+         for verify_round in range(verify_rounds):
+             if not self._has_source_edit():
+                 safe_log("Verification skipped: no source edit present")
+                 break
+-            safe_log(f"Verification round {verify_round + 1}/{verify_rounds}")
+             try:
+-                sanitized = self._sanitize_history(msg_history)
+-                if sanitized:
+-                    msg_history = chat_with_agent(verification_prompt, model=self.code_model, msg_history=sanitized, logging=safe_log)
+-                else:
+-                    msg_history = chat_with_agent(
+-                        f"{instruction}\n\n{verification_prompt}",
+-                        model=self.code_model,
+-                        msg_history=[],
+-                        logging=safe_log,
++                passed, report = self._run_sample_gate()
++            except Exception as e:
++                safe_log(f"Sample gate exception: {e}", level=logging.ERROR)
++                break
++            safe_log(f"Sample gate round {verify_round + 1}/{verify_rounds}: {'PASS' if passed else 'FAIL'}\n{report}")
++
++            try:
++                if not passed:
++                    prompt = (
++                        "The solution fails these samples/time limits:\n\n"
++                        f"{report}\n\n"
++                        "The approach is likely algorithmically insufficient (especially if there is a TIMEOUT). "
++                        "Do not just patch constants. Analyze the brute-force output for structure, find a closed form "
++                        "or a faster algorithm that meets the maximum constraints, rewrite the solution file "
++                        f"{target}, and re-run the samples with the run_samples tool. "
++                        "Use an independent brute force only for checking small cases."
+                     )
++                    msg_history = self._chat(prompt, msg_history, fresh_prefix)
++                    continue
++
++                if not stress_done:
++                    stress_done = True
++                    msg_history = self._chat(stress_prompt, msg_history, fresh_prefix)
++                    continue
++
++                # Gate passed and the agent has hardened it: require final VERIFIED line AND gate pass.
++                msg_history = self._chat(
++                    "Re-check the solution. If everything passes, reply with the line VERIFIED as the last line of your message.",
++                    msg_history, fresh_prefix,
++                )
++                break
+             except Exception as e:
+                 safe_log(f"Exception during verification round {verify_round + 1}/{verify_rounds}: {e}", level=logging.ERROR)
+                 break
+-            if 'VERIFIED' in self._last_assistant_text(msg_history):
+-                safe_log(f"Verified in round {verify_round + 1}")
+-                break
+-            else:
+-                safe_log(f"Verification not confirmed after round {verify_round + 1}/{verify_rounds}")
++
++        passed, report = self._run_sample_gate()
++        final_text = self._last_assistant_text(msg_history)
++        if passed and self._ends_with_verified(final_text):
++            safe_log("Verified: sample gate passed and final line is VERIFIED")
++        else:
++            safe_log(f"Not verified: gate passed={passed}, final VERIFIED line={self._ends_with_verified(final_text)}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/run_samples.py b/tools/run_samples.py
+new file mode 100644
+index 0000000..15453e0
+--- /dev/null
++++ b/tools/run_samples.py
+@@ -0,0 +1,169 @@
++import os
++import re
++import subprocess
++import time
++
++
++def tool_info():
++    return {
++        "name": "run_samples",
++        "description": """Run a Python solution against the sample input/output pairs found in a problem statement.
++
++* Parses 'Sample Input N' / 'Sample Output N' blocks (and 'Input:' / 'Output:' blocks) from the problem text.
++* Runs `python3 <solution_path>` on each sample input (fed via stdin) with a per-run timeout.
++* Compares whitespace-normalized output with the expected output.
++* Returns a plain-text report with one entry per sample: PASS, WRONG ANSWER (expected vs actual),
++  TIMEOUT, or RUNTIME ERROR (with stderr). The raw results are returned for you to analyze.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the Python solution file to run, e.g. '/repo/solution.py'."
++                },
++                "problem_text": {
++                    "type": "string",
++                    "description": "The problem statement text containing the samples (or a path to a file containing it)."
++                },
++                "timeout_sec": {
++                    "type": "number",
++                    "description": "Per-sample timeout in seconds. Defaults to 10."
++                }
++            },
++            "required": ["solution_path", "problem_text"]
++        }
++    }
++
++
++_HEADER_RE = re.compile(
++    r'^\s*(?:(sample)\s+)?(input|output)\s*(\d*)\s*(:)?\s*(.*?)\s*$',
++    re.IGNORECASE,
++)
++_FENCE_RE = re.compile(r'^\s*```')
++
++
++def parse_samples(text):
++    """
++    Return a list of (input_text, expected_output_text) tuples in order of appearance.
++    Recognizes headers like 'Sample Input 1', 'Sample Output 1', 'Input:', 'Output:',
++    and 'Input 2:' / 'Output 2:'. Markdown code fences are ignored.
++    """
++    samples = []
++    cur_in = None
++    cur_out = None
++    mode = None  # 'in' or 'out' or None
++
++    def flush():
++        nonlocal cur_in, cur_out, mode
++        if cur_in is not None and cur_out is not None:
++            samples.append((_clean(cur_in), _clean(cur_out)))
++        cur_in, cur_out, mode = None, None, None
++
++    for line in (text or '').splitlines():
++        if _FENCE_RE.match(line):
++            continue
++        m = _HEADER_RE.match(line)
++        is_header = False
++        if m:
++            has_sample, kind, _num, colon, rest = m.groups()
++            # Only treat as a header if it is clearly a sample header.
++            if has_sample or colon or _num:
++                is_header = True
++                kind = kind.lower()
++                if kind == 'input':
++                    if cur_out is not None:
++                        flush()
++                    cur_in = [rest] if rest else []
++                    cur_out = None
++                    mode = 'in'
++                else:
++                    if cur_in is None:
++                        continue
++                    cur_out = [rest] if rest else []
++                    mode = 'out'
++        if is_header:
++            continue
++        if mode == 'in':
++            cur_in.append(line)
++        elif mode == 'out':
++            if line.strip().lower().startswith('explanation'):
++                flush()
++                continue
++            if not line.strip() and cur_out and any(l.strip() for l in cur_out):
++                flush()
++                continue
++            cur_out.append(line)
++    flush()
++    return samples
++
++
++def _clean(lines):
++    text = "\n".join(lines).strip("\n")
++    return text.strip()
++
++
++def _normalize_tokens(text):
++    return text.split()
++
++
++def _load_problem_text(problem_text):
++    if problem_text and len(problem_text) < 4096 and '\n' not in problem_text and os.path.isfile(problem_text):
++        try:
++            with open(problem_text, 'r') as f:
++                return f.read()
++        except OSError:
++            pass
++    return problem_text or ''
++
++
++def tool_function(solution_path, problem_text, timeout_sec=None):
++    timeout = float(timeout_sec) if timeout_sec else 10.0
++    if not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++
++    samples = parse_samples(_load_problem_text(problem_text))
++    if not samples:
++        return "Error: no sample input/output pairs found in the problem text."
++
++    abs_path = os.path.abspath(solution_path)
++    cwd = os.path.dirname(abs_path)
++    lines = [f"Found {len(samples)} sample(s). Solution: {abs_path}"]
++    all_passed = True
++    for idx, (inp, expected) in enumerate(samples, start=1):
++        input_text = inp + "\n"
++        start = time.time()
++        try:
++            proc = subprocess.run(
++                ["python3", abs_path],
++                input=input_text,
++                capture_output=True,
++                text=True,
++                timeout=timeout,
++                cwd=cwd,
++            )
++        except subprocess.TimeoutExpired:
++            all_passed = False
++            lines.append(f"Sample {idx}: TIMEOUT (exceeded {timeout}s)\nInput:\n{inp}")
++            continue
++        elapsed = time.time() - start
++
++        if proc.returncode != 0:
++            all_passed = False
++            lines.append(
++                f"Sample {idx}: RUNTIME ERROR (exit {proc.returncode}, {elapsed:.3f}s)\n"
++                f"Input:\n{inp}\nstderr:\n{proc.stderr[-2000:]}"
++            )
++            continue
++
++        if _normalize_tokens(proc.stdout) == _normalize_tokens(expected):
++            lines.append(f"Sample {idx}: PASS ({elapsed:.3f}s)")
++        else:
++            all_passed = False
++            lines.append(
++                f"Sample {idx}: WRONG ANSWER ({elapsed:.3f}s)\n"
++                f"Input:\n{inp}\nExpected output:\n{expected}\nActual output:\n{proc.stdout.strip()}"
++                + (f"\nstderr:\n{proc.stderr[-1000:]}" if proc.stderr.strip() else "")
++            )
++
++    lines.append("ALL SAMPLES PASSED." if all_passed else "SOME SAMPLES FAILED.")
++    return "\n".join(lines)

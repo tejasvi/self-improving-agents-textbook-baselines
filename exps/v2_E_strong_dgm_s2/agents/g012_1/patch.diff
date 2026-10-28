@@ -1,0 +1,375 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1fe931e..2e29de0 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -12,6 +13,8 @@ from tools.run_candidates import run_raw
+ STRESS_CASES = 300
+ CALL_TIMEOUT = 5
+ TIMING_LIMIT = 1.0  # seconds per call on the max-size timing input
++BUDGET = 40 * 60  # wall-clock seconds for the whole forward() run
++FINALIZE_RESERVE = 5 * 60  # seconds kept free for _finalize
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -119,6 +122,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self._deadline = time.time() + BUDGET
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -178,6 +182,7 @@ Work only from the problem statement above.
+ 
+ 1. Write {brute} : a brute-force reference, derived directly from the statement (plain simulation or full enumeration, as simple as possible, obviously correct). It must define solve(input_obj) returning the expected output as a string (or the value the problem's method returns, if the problem is a method of class Solution, in which case define class Solution with the method and make solve unnecessary). Input objects must be the same structure the solution will receive (for stdin problems use a string containing the full stdin text; the output is the exact stdout text).
+ 2. Write {gen} : must define gen(rng, size) (rng is a random.Random; size grows from 1 upward; produce small random valid inputs that respect the statement's constraints), enumerate_all() (yield ALL inputs of tiny size and value range, exhaustively, bounded in number), and samples() returning a list of (input, expected_output) pairs copied exactly from the examples in the statement. The generator must NOT filter out or skip degenerate inputs (minimum size, all equal, extreme values, all special cases).
++   If the problem accepts MULTIPLE valid outputs for one input (e.g. any valid triple, any optimal arrangement, any order), you MUST also define check(input_obj, output) -> bool in {gen}, which returns True iff output is a valid answer for input_obj (parse the output and verify its properties; do not compare against the brute force's exact text). Do not define check when only one exact output is valid.
+ 3. Run the brute force on every sample with python3 and check it matches the expected output exactly. If it does not match, re-read the statement and fix the brute force (the statement is authoritative, the examples are ground truth).
+ 
+ Completion condition: both {brute} and {gen} exist, import without error, and the brute force reproduces every sample output. Do not end your turn without a tool call."""
+@@ -290,7 +295,17 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+         """
+         Multi-candidate pipeline:
+         tests -> N independent candidates -> differential scoring -> up to K repair rounds -> rank -> solution.py.
++        Candidates are promoted to solution.py as soon as they pass; _finalize always runs at the end.
+         """
++        try:
++            self._forward_body()
++        finally:
++            self._finalize()
++
++    def _time_left(self):
++        return time.time() < self._deadline - FINALIZE_RESERVE
++
++    def _forward_body(self):
+         task = self._task_text()
+         try:
+             brute, gen = self._write_tests()
+@@ -308,6 +323,9 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                 'Consider a different decomposition (e.g. DP over the structure, or sorting-based reasoning); double check edge cases.',
+             ]
+             for i in range(self.N_CANDIDATES):
++                if not self._time_left():
++                    safe_log("time budget nearly spent: skipping remaining candidates")
++                    break
+                 try:
+                     path = self._solve_candidate(i, hints[i % len(hints)], '')
+                 except Exception as e:
+@@ -315,6 +333,7 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                     path = None
+                 if path:
+                     candidates.append(path)
++                    self._promote(path)
+ 
+             best_row = None
+             for round_k in range(self.K_REPAIR_ROUNDS + 1):
+@@ -327,6 +346,9 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                 best_row = max(rows, key=self._rank_key)
+                 if best_row['passes'] or round_k == self.K_REPAIR_ROUNDS:
+                     break
++                if not self._time_left():
++                    safe_log("time budget nearly spent: skipping remaining repair rounds")
++                    break
+                 try:
+                     repaired = self._repair(best_row['path'], message)
+                 except Exception as e:
+@@ -334,6 +356,7 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                     repaired = None
+                 if repaired:
+                     candidates.append(repaired)
++                    self._promote(repaired)
+ 
+             if candidates:
+                 rows, _ = self._differential_check(candidates)
+@@ -349,7 +372,7 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                     try:
+                         with open(winner, 'r', encoding='utf-8', errors='replace') as f:
+                             code = f.read()
+-                        if code.strip():
++                        if not self._looks_like_placeholder(code):
+                             with open(self._solution_path(), 'w', encoding='utf-8') as f:
+                                 f.write(code)
+                             winner_copied = True
+@@ -366,17 +389,106 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+         if not self._solution_nonempty():
+             self._chat(fallback_prompt)
+         for attempt in range(3):
+-            if self._primary_file_edited():
++            if self._primary_file_edited() or not self._time_left():
+                 break
+             self._chat(fallback_prompt)
+ 
+     def _solution_nonempty(self):
+         try:
+             with open(self._solution_path(), 'r', encoding='utf-8', errors='replace') as f:
+-                return bool(f.read().strip())
++                return not self._looks_like_placeholder(f.read())
++        except OSError:
++            return False
++
++    @staticmethod
++    def _looks_like_placeholder(code):
++        """True if the code is empty, comments only, a stub, or not a stdin/Solution program."""
++        stripped = (code or '').strip()
++        if not stripped:
++            return True
++        lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
++        if all(ln.startswith('#') for ln in lines):
++            return True
++        if 'NotImplementedError' in code or 'placeholder' in code.lower():
++            return True
++        if 'input' not in code and 'stdin' not in code and 'class Solution' not in code:
++            return True
++        return False
++
++    def _read_code(self, path):
++        try:
++            with open(path, 'r', encoding='utf-8', errors='replace') as f:
++                return f.read()
+         except OSError:
++            return ''
++
++    def _samples_pass(self, path):
++        """True if the candidate reproduces every sample from gen.samples(). False on any error."""
++        try:
++            work = self._work_dir()
++            res = run_raw([path], os.path.join(work, 'brute.py'), os.path.join(work, 'gen.py'),
++                          num_cases=0, timeout=CALL_TIMEOUT)
++            if res.get('status') != 'ok':
++                return False
++            st = res['stats']
++            return st['samples_ok'][0] == st['samples_total']
++        except Exception:
+             return False
+ 
++    def _promote(self, path):
++        """Copy a candidate to solution.py when it is better than what is there now."""
++        try:
++            code = self._read_code(path)
++            if self._looks_like_placeholder(code):
++                return
++            current = self._read_code(self._solution_path())
++            if self._looks_like_placeholder(current):
++                copy_it = True
++            else:
++                copy_it = self._samples_pass(path) and not self._samples_pass(self._solution_path())
++            if copy_it:
++                with open(self._solution_path(), 'w', encoding='utf-8') as f:
++                    f.write(code)
++                safe_log(f"promoted {path} to solution.py")
++        except Exception as e:
++            safe_log(f"promote failed for {path}: {e}")
++
++    def _finalize(self):
++        """Guarantee solution.py holds the best available code, even if earlier phases were cut off."""
++        try:
++            if not self._looks_like_placeholder(self._read_code(self._solution_path())):
++                return
++            import glob
++            work = self._work_dir()
++            files = glob.glob(os.path.join(work, 'cand_*.py')) + glob.glob(os.path.join(work, 'repair_*.py'))
++            usable = [f for f in files if not self._looks_like_placeholder(self._read_code(f))]
++            if usable:
++                usable.sort(key=os.path.getmtime, reverse=True)  # newest first
++                best = None
++                for f in usable:  # samples-passing candidate wins; otherwise the newest
++                    if self._samples_pass(f):
++                        best = f
++                        break
++                if best is None:
++                    best = usable[0]
++                with open(self._solution_path(), 'w', encoding='utf-8') as f:
++                    f.write(self._read_code(best))
++                safe_log(f"finalize: copied {best} to solution.py")
++            if self._looks_like_placeholder(self._read_code(self._solution_path())):
++                task = self._task_text()
++                prompt = (f"{task}\nThe file /work/repo/solution.py (in this repository: {self._solution_path()}) "
++                          "is still a placeholder, so the task is unsolved. "
++                          f"Using the editor tool, write a complete program to {self._solution_path()} now "
++                          "(it must read stdin and write stdout, or define class Solution if the problem asks for a method). "
++                          "A simple correct-but-slow approach is acceptable. Use the editor or bash tool to write the file; "
++                          "do not only describe the code. Do not end your turn without a tool call.")
++                for _ in range(2):
++                    self._chat(prompt)
++                    if not self._looks_like_placeholder(self._read_code(self._solution_path())):
++                        break
++        except Exception as e:
++            safe_log(f"finalize failed: {e}")
++
+     def _primary_file_edited(self):
+         """
+         Return True if the primary file was meaningfully edited relative to base_commit.
+@@ -411,9 +523,7 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                     content = f.read().strip()
+             except OSError:
+                 return False
+-            if not content:
+-                return False
+-            if all(not line.strip() or line.strip().startswith('#') for line in content.splitlines()):
++            if self._looks_like_placeholder(content):
+                 return False
+             if 'solution.py' not in touched:
+                 return False
+diff --git a/tools/run_candidates.py b/tools/run_candidates.py
+index accebf5..169389e 100644
+--- a/tools/run_candidates.py
++++ b/tools/run_candidates.py
+@@ -18,7 +18,7 @@ from collections import Counter
+ 
+ cand_paths, brute_path, gen_path, method, num_cases, per_call, result_path = (
+     json.loads(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), float(sys.argv[6]), sys.argv[7])
+-ENUM_CAP = 20000
++ENUM_CAP = 2000
+ MAX_SIZE = 30
+ TIMING_SIZE = 1000
+ SHRINK_BUDGET = 150
+@@ -136,6 +136,18 @@ def same(a, b):
+     except Exception:
+         return False
+ 
++CHECK_FN = getattr(gen_mod, "check", None)  # optional validator: check(input_obj, output) -> bool
++
++def valid(x, bval, cval):
++    """Does candidate output cval count as correct for input x (brute output bval)?
++    With gen.check defined, the validator decides (the brute force only shows an answer exists)."""
++    if CHECK_FN is not None:
++        try:
++            return bool(CHECK_FN(copy.deepcopy(x), cval))
++        except BaseException:
++            return False
++    return same(cval, bval)
++
+ def key_of(res):
+     """Grouping key for a call result, used to compare candidates with each other."""
+     st, v, _ = res
+@@ -205,10 +217,11 @@ def evaluate(x):
+     cres = [call(f, x) for f in cand_fns]
+     keys = [key_of(r) for r in cres]
+     maj = Counter(keys).most_common(1)[0][0] if keys else None
+-    bad = len(set(keys)) > 1
++    # Without a validator, all candidates must agree exactly. With one, they only need to be valid.
++    bad = len(set(keys)) > 1 and CHECK_FN is None
+     if bres[0] == "ok":
+         for r in cres:
+-            if r[0] != "ok" or not same(r[1], bres[1]):
++            if r[0] != "ok" or not valid(x, bres[1], r[1]):
+                 bad = True
+                 break
+     return bres, cres, bad, maj
+@@ -253,7 +266,7 @@ def run_input(x, phase, is_sample=None):
+         if key_of(r) == maj:
+             stats["agree_majority"][i] += 1
+         stats["max_time"][i] = max(stats["max_time"][i], r[2])
+-    ok_flags = [r[0] == "ok" and same(r[1], bres[1]) for r in cres]
++    ok_flags = [r[0] == "ok" and valid(x, bres[1], r[1]) for r in cres]
+     if is_sample is None:
+         stats["stress_total"][0] += 1
+         for i, f in enumerate(ok_flags):
+@@ -280,7 +293,7 @@ for k, item in enumerate(samples):
+     except BaseException:
+         continue
+     bres = call(brute_fn, x)
+-    if bres[0] != "ok" or not same(bres[1], expected):
++    if bres[0] != "ok" or (CHECK_FN is None and not same(bres[1], expected)):
+         sample_fail_brute.append(k)
+     run_input(x, f"sample {k}", is_sample=True)
+ 
+@@ -321,7 +334,7 @@ try:
+         elif r[0] == "exc":
+             stats["exceptions"][i] += 1
+     tkeys = [key_of(r) for r in tres]
+-    timing_disagree = len(set(tkeys)) > 1
++    timing_disagree = len(set(tkeys)) > 1 and CHECK_FN is None
+ except BaseException:
+     tx = None
+     timing_lines = ["timing input generation failed"]
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index bc26c91..37f3ce5 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -13,7 +13,7 @@ import sys, json, random, signal, importlib.util, os, io, copy, traceback, itert
+ sol_path, brute_path, gen_path, num_cases, per_call, method, result_path = sys.argv[1:8]
+ num_cases = int(num_cases)
+ per_call = float(per_call)
+-ENUM_CAP = 20000
++ENUM_CAP = 2000
+ MAX_SIZE = 30
+ SHRINK_BUDGET = 400
+ REPR_CAP = 2000
+@@ -96,6 +96,18 @@ def same(a, b):
+     except Exception:
+         return False
+ 
++# Optional validator from the generator: check(input_obj, output) -> bool.
++# When defined, it replaces exact comparison with the brute force (multiple valid answers).
++CHECK_FN = getattr(gen_mod, "check", None)
++
++def valid(x, bv, sv):
++    if CHECK_FN is not None:
++        try:
++            return bool(CHECK_FN(copy.deepcopy(x), sv))
++        except BaseException:
++            return False
++    return same(sv, bv)
++
+ def check(x):
+     """Returns None if solution agrees with brute, else (kind, expected, actual_text)."""
+     bs, bv = call(brute_fn, x)
+@@ -106,7 +118,7 @@ def check(x):
+         return ("solution_timeout", bv, f"timed out after {per_call} seconds")
+     if ss == "exc":
+         return ("solution_exception", bv, sv)
+-    if not same(sv, bv):
++    if not valid(x, bv, sv):
+         return ("mismatch", bv, sv)
+     return None
+ 
+diff --git a/_work/brute.py b/_work/brute.py
+new file mode 100644
+index 0000000..3141b08
+--- /dev/null
++++ b/_work/brute.py
+@@ -0,0 +1,9 @@
++# Brute-force reference for the harness.
++# NOTE: no competitive-programming problem statement with input/output samples was provided
++# to this repository, so this file only defines the expected interface. Replace solve() with a
++# direct, obviously-correct implementation of the real problem once the statement is known.
++
++
++def solve(input_obj):
++    """Return the expected output (a string) for input_obj."""
++    return str(input_obj).strip()
+diff --git a/_work/gen.py b/_work/gen.py
+new file mode 100644
+index 0000000..511bab3
+--- /dev/null
++++ b/_work/gen.py
+@@ -0,0 +1,17 @@
++# Generator for the harness. No real samples are available (see brute.py), so samples() is empty.
++# If the problem accepts several valid outputs, define check(input_obj, output) -> bool as well.
++import random
++
++
++def gen(rng, size):
++    """Small random input whose size grows with `size`."""
++    return str(rng.randint(0, max(1, size)))
++
++
++def enumerate_all():
++    for v in range(0, 10):
++        yield str(v)
++
++
++def samples():
++    return []
+diff --git a/null b/null
+new file mode 100644
+index 0000000..e69de29

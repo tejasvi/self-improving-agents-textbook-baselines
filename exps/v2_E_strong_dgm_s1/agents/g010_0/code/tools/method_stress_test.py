@@ -1,0 +1,379 @@
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+DEFAULT_SCALES = [1, 2, 3, 5, 8]
+MAX_SHOW = 1500  # max characters shown for an argument / output in the report
+MAX_CASES = 100000
+
+
+def tool_info():
+    return {
+        "name": "method_stress_test",
+        "description": """Stress-test a `Solution` class method (LeetCode-style task) against an exact slow reference, in-process via importlib, without writing wrappers.\n
+* `solution_file` is a Python file defining class `class_name` (default Solution) with method `method_name`. The class is instantiated with no arguments.\n
+* `reference_file` is a Python file defining an exact, slow reference. It may use the same class/method name, or a different one given by `reference_method_name`. Use a reference with heuristics removed (e.g. no caps, no pruning), even if slower.\n
+* `generator_file` is a Python file defining `gen(seed, scale)` that returns a list/tuple of positional arguments for the method. Arguments are deep-copied for every call, so in-place mutation is safe.\n
+* For every scale in `scales` and seed in range(`seeds_per_scale`), both methods are called and their return values are compared with `==` (or with an absolute/relative float tolerance `float_tol` if > 0).\n
+* Each call has a `timeout` in seconds (enforced per case). Crashes and hangs of the solution are caught and reported.\n
+* Returns a per-scale pass/fail summary, the max solution runtime per scale, and for the first mismatch/failure the arguments (truncated), the solution output, the reference output and any traceback.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "solution_file": {
+                    "type": "string",
+                    "description": "Path to the Python file containing the solution class. Default 'solution.py'."
+                },
+                "class_name": {
+                    "type": "string",
+                    "description": "Name of the class to test. Default 'Solution'."
+                },
+                "method_name": {
+                    "type": "string",
+                    "description": "Name of the method of the solution class to test."
+                },
+                "reference_file": {
+                    "type": "string",
+                    "description": "Path to the Python file containing the exact slow reference class."
+                },
+                "reference_method_name": {
+                    "type": "string",
+                    "description": "Optional name of the reference method, if different from method_name. The reference class uses class_name as well."
+                },
+                "generator_file": {
+                    "type": "string",
+                    "description": "Path to a Python file defining gen(seed, scale) that returns a list of positional arguments for the method."
+                },
+                "scales": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "List of integer scales passed to gen(). Default [1, 2, 3, 5, 8]."
+                },
+                "seeds_per_scale": {
+                    "type": "integer",
+                    "description": "Number of seeds (0 .. seeds_per_scale-1) to run for each scale. Default 100."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Time limit in seconds for each single call of the solution or the reference. Default 5."
+                },
+                "float_tol": {
+                    "type": "number",
+                    "description": "Optional tolerance for comparing float results (absolute and relative). Default 0 means exact equality."
+                }
+            },
+            "required": ["method_name", "reference_file", "generator_file"]
+        }
+    }
+
+
+# Code executed in a separate Python process. It loads the modules, runs every case,
+# and rewrites a JSON summary file after each case so that a crash or hang of the
+# solution still leaves a report behind.
+_RUNNER = r'''
+import copy, importlib.util, json, os, signal, sys, time, traceback
+
+cfg = json.load(open(sys.argv[1]))
+RESULT = cfg["result_path"]
+MAX_SHOW = cfg["max_show"]
+
+def clip(s, n=MAX_SHOW):
+    s = str(s)
+    if len(s) <= n:
+        return s
+    return s[: n // 2] + "\n... <%d characters truncated> ...\n" % (len(s) - n) + s[-(n // 2):]
+
+def load(path, tag):
+    d = os.path.dirname(os.path.abspath(path))
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    spec = importlib.util.spec_from_file_location("mst_" + tag, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+class CaseTimeout(Exception):
+    pass
+
+def _alarm(signum, frame):
+    raise CaseTimeout()
+
+HAS_ALARM = hasattr(signal, "SIGALRM")
+if HAS_ALARM:
+    signal.signal(signal.SIGALRM, _alarm)
+
+def run_call(fn, args, timeout):
+    """Returns (status, value, elapsed, info). status in ok/timeout/exception."""
+    t0 = time.time()
+    if HAS_ALARM:
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        val = fn(*copy.deepcopy(args))
+        status = "ok"
+        info = ""
+    except CaseTimeout:
+        val, status, info = None, "timeout", "timed out after %s seconds" % timeout
+    except RecursionError:
+        val, status, info = None, "exception", "RecursionError\n" + traceback.format_exc()
+    except Exception:
+        val, status, info = None, "exception", traceback.format_exc()
+    finally:
+        if HAS_ALARM:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    return status, val, time.time() - t0, info
+
+def equal(a, b, tol):
+    if tol and isinstance(a, float) and isinstance(b, float):
+        return abs(a - b) <= max(tol, tol * abs(b))
+    if tol and isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return type(a) == type(b) and len(a) == len(b) and all(equal(x, y, tol) for x, y in zip(a, b))
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+def main():
+    tol = float(cfg.get("float_tol") or 0)
+    timeout = cfg["timeout"]
+    try:
+        sol_mod = load(cfg["solution_file"], "sol")
+        ref_mod = load(cfg["reference_file"], "ref")
+        gen_mod = load(cfg["generator_file"], "gen")
+    except Exception:
+        write({"setup_error": traceback.format_exc()})
+        return
+    cls_name = cfg["class_name"]
+    try:
+        sol_obj = getattr(sol_mod, cls_name)()
+        sol_fn = getattr(sol_obj, cfg["method_name"])
+    except Exception:
+        write({"setup_error": "solution: " + traceback.format_exc()})
+        return
+    try:
+        ref_obj = getattr(ref_mod, cls_name)()
+        ref_fn = getattr(ref_obj, cfg["reference_method_name"] or cfg["method_name"])
+    except Exception:
+        write({"setup_error": "reference: " + traceback.format_exc()})
+        return
+    gen = getattr(gen_mod, "gen", None)
+    if gen is None:
+        write({"setup_error": "generator file does not define gen(seed, scale)"})
+        return
+
+    per_scale = {}
+    first_fail = None
+    total = passed = 0
+    start = time.time()
+    stop = False
+    for scale in cfg["scales"]:
+        st = per_scale.setdefault(str(scale), {"ran": 0, "passed": 0, "max_time": 0.0, "fails": 0})
+        for seed in range(cfg["seeds_per_scale"]):
+            if stop or time.time() - start > cfg["wall_budget"]:
+                stop = True
+                break
+            total += 1
+            st["ran"] += 1
+            try:
+                args = gen(seed, scale)
+                if not isinstance(args, (list, tuple)):
+                    raise TypeError("gen must return a list or tuple of positional arguments, got %s" % type(args).__name__)
+                args = list(args)
+            except Exception:
+                args = None
+                gen_err = traceback.format_exc()
+            if args is None:
+                st["fails"] += 1
+                if first_fail is None:
+                    first_fail = {"kind": "generator error", "scale": scale, "seed": seed,
+                                  "args": "", "sol": "", "ref": "", "info": gen_err}
+                write_state(per_scale, first_fail, total, passed, None)
+                continue
+            s_status, s_val, s_time, s_info = run_call(sol_fn, args, timeout)
+            st["max_time"] = max(st["max_time"], s_time)
+            r_status, r_val, r_time, r_info = run_call(ref_fn, args, max(timeout, 60))
+            args_txt = clip(repr(args))
+            if r_status != "ok":
+                # the reference is not trusted; report as a setup problem for this case
+                st["fails"] += 1
+                if first_fail is None:
+                    first_fail = {"kind": "reference " + r_status, "scale": scale, "seed": seed,
+                                  "args": args_txt, "sol": clip(repr(s_val)) if s_status == "ok" else "",
+                                  "ref": "", "info": r_info}
+            elif s_status != "ok":
+                st["fails"] += 1
+                if first_fail is None:
+                    first_fail = {"kind": "solution " + s_status, "scale": scale, "seed": seed,
+                                  "args": args_txt, "sol": "", "ref": clip(repr(r_val)), "info": s_info}
+                if s_status == "timeout":
+                    # a hanging solution makes every further case slow; stop here
+                    stop = True
+            elif equal(s_val, r_val, tol):
+                st["passed"] += 1
+                passed += 1
+            else:
+                st["fails"] += 1
+                if first_fail is None:
+                    first_fail = {"kind": "mismatch", "scale": scale, "seed": seed,
+                                  "args": args_txt, "sol": clip(repr(s_val)), "ref": clip(repr(r_val)),
+                                  "info": ""}
+            write_state(per_scale, first_fail, total, passed, None)
+        if stop:
+            break
+    write_state(per_scale, first_fail, total, passed, None if stop else "done")
+
+def write_state(per_scale, first_fail, total, passed, done):
+    write({"per_scale": per_scale, "first_fail": first_fail, "total": total, "passed": passed,
+           "done": done})
+
+def write(obj):
+    tmp = RESULT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, RESULT)
+
+main()
+'''
+
+
+def _clip(s, n=MAX_SHOW):
+    if s is None:
+        return ""
+    if len(s) <= n:
+        return s
+    return s[: n // 2] + f"\n... <{len(s) - n} characters truncated> ...\n" + s[-n // 2:]
+
+
+def _cwd():
+    try:
+        from tools import bash as _bash
+        cwd = _bash._STATE.get('cwd')
+        if cwd and os.path.isdir(cwd):
+            return cwd
+    except Exception:
+        pass
+    return os.getcwd()
+
+
+def _abs(path, cwd):
+    return path if os.path.isabs(path) else os.path.join(cwd, path)
+
+
+def tool_function(method_name, reference_file, generator_file, solution_file="solution.py",
+                  class_name="Solution", reference_method_name=None, scales=None,
+                  seeds_per_scale=100, timeout=5, float_tol=0):
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="mstress_")
+    except Exception as e:
+        return f"Error: could not create temp dir: {e}"
+    try:
+        return _run_all(method_name, reference_file, generator_file, solution_file, class_name,
+                        reference_method_name, scales, seeds_per_scale, timeout, float_tol, tmpdir)
+    except Exception as e:
+        return f"Error: method_stress_test failed internally: {type(e).__name__}: {e}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _run_all(method_name, reference_file, generator_file, solution_file, class_name,
+             reference_method_name, scales, seeds_per_scale, timeout, float_tol, tmpdir):
+    if not method_name or not reference_file or not generator_file:
+        return "Error: method_name, reference_file and generator_file are required."
+    cwd = _cwd()
+    solution_file = _abs(solution_file or "solution.py", cwd)
+    reference_file = _abs(reference_file, cwd)
+    generator_file = _abs(generator_file, cwd)
+    for p in (solution_file, reference_file, generator_file):
+        if not os.path.isfile(p):
+            return f"Error: file not found: {p}"
+    if not scales:
+        scales = list(DEFAULT_SCALES)
+    scales = [int(s) for s in scales][:50]
+    seeds_per_scale = int(seeds_per_scale) if seeds_per_scale else 100
+    seeds_per_scale = max(1, min(seeds_per_scale, MAX_CASES))
+    timeout = int(timeout) if timeout else 5
+    timeout = max(1, min(timeout, 300))
+    try:
+        float_tol = float(float_tol or 0)
+    except Exception:
+        float_tol = 0.0
+
+    result_path = os.path.join(tmpdir, "result.json")
+    cfg_path = os.path.join(tmpdir, "config.json")
+    runner_path = os.path.join(tmpdir, "runner.py")
+    cfg = dict(solution_file=solution_file, reference_file=reference_file, generator_file=generator_file,
+               class_name=class_name or "Solution", method_name=method_name,
+               reference_method_name=reference_method_name or None, scales=scales,
+               seeds_per_scale=seeds_per_scale, timeout=timeout, float_tol=float_tol,
+               result_path=result_path, max_show=MAX_SHOW, wall_budget=200)
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f)
+    with open(runner_path, "w") as f:
+        f.write(_RUNNER)
+
+    # Overall budget: every case may use the timeout (plus the reference's allowance).
+    total_budget = 240  # the runner stops itself after ~200s; keep one call well under the bash limit
+    try:
+        p = subprocess.run([sys.executable, runner_path, cfg_path], cwd=cwd, capture_output=True,
+                           timeout=total_budget)
+        exit_note = None if p.returncode == 0 else f"runner exited with code {p.returncode}"
+        stderr_txt = p.stderr.decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        exit_note = f"overall time budget of {total_budget} seconds exceeded"
+        stderr_txt = ""
+
+    state = None
+    if os.path.exists(result_path):
+        try:
+            with open(result_path) as f:
+                state = json.load(f)
+        except Exception:
+            state = None
+    if state is None:
+        return f"Error: method_stress_test runner produced no result. {exit_note or ''}\n{_clip(stderr_txt)}"
+    if "setup_error" in state:
+        return "Error: setup failed.\n" + _clip(state["setup_error"])
+
+    return _format_report(state, exit_note, stderr_txt, scales, seeds_per_scale, timeout)
+
+
+def _format_report(state, exit_note, stderr_txt, scales, seeds_per_scale, timeout):
+    lines = []
+    per_scale = state.get("per_scale", {})
+    total = state.get("total", 0)
+    passed = state.get("passed", 0)
+    done = state.get("done") == "done"
+    lines.append(f"method_stress_test: {passed}/{total} cases passed"
+                 + ("" if done else " (INCOMPLETE: process stopped early)"))
+    lines.append("Per scale (passed/ran, max solution time in s):")
+    for scale in scales:
+        st = per_scale.get(str(scale))
+        if st is None:
+            lines.append(f"  scale {scale}: not run")
+            continue
+        lines.append(f"  scale {scale}: {st['passed']}/{st['ran']} passed, max time {st['max_time']:.3f}s")
+    ff = state.get("first_fail")
+    if ff is None and done:
+        lines.append("ALL PASSED. Max solution time overall: "
+                     f"{max((s['max_time'] for s in per_scale.values()), default=0.0):.3f}s")
+    if ff is not None:
+        lines.append("")
+        lines.append(f"FIRST FAILURE: {ff['kind']} at scale={ff['scale']} seed={ff['seed']}")
+        lines.append(f"args: {ff.get('args', '')}")
+        if ff.get("sol"):
+            lines.append(f"solution output:\n{ff['sol']}")
+        if ff.get("ref"):
+            lines.append(f"reference output:\n{ff['ref']}")
+        if ff.get("info"):
+            lines.append(f"traceback / info:\n{_clip(ff['info'])}")
+    if not done:
+        lines.append("")
+        lines.append("NOTE: run stopped early (solution timeout or wall-clock budget); "
+                     "the summary covers only the cases run so far.")
+        if exit_note:
+            lines.append(exit_note)
+        if ff is None and stderr_txt:
+            lines.append(_clip(stderr_txt))
+    return "\n".join(lines)

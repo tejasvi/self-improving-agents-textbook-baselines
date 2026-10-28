@@ -1,0 +1,210 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0d48649..2502158 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -163,6 +163,47 @@ def _sanitize_history(msg_history):
+         sanitized.pop()
+     return sanitized
+ 
++def _has_agent_action(msg_history):
++    """
++    Return True if any assistant message contains a tool-use block (tool_use / function_call)
++    or a text block with non-whitespace content.
++    """
++    for msg in msg_history or []:
++        if _get_field(msg, 'role') != 'assistant':
++            continue
++        content = _get_field(msg, 'content')
++        if isinstance(content, str):
++            if content.strip():
++                return True
++            continue
++        if isinstance(content, list):
++            for block in content:
++                block_type = _get_field(block, 'type')
++                if block_type in ('tool_use', 'function_call'):
++                    return True
++                if block_type == 'text':
++                    text = _get_field(block, 'text', '')
++                    if isinstance(text, str) and text.strip():
++                        return True
++    return False
++
++def _extract_assistant_text(msg_history):
++    """Collect the text of all assistant text blocks in the history (in order)."""
++    texts = []
++    for msg in msg_history or []:
++        if _get_field(msg, 'role') != 'assistant':
++            continue
++        content = _get_field(msg, 'content')
++        if isinstance(content, str):
++            texts.append(content)
++        elif isinstance(content, list):
++            for block in content:
++                if _get_field(block, 'type') == 'text':
++                    text = _get_field(block, 'text', '')
++                    if isinstance(text, str):
++                        texts.append(text)
++    return "\n".join(texts)
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -240,24 +281,86 @@ class AgenticSystem:
+             return 'test_only'
+         return 'ok'
+ 
+-    def _run_chat(self, instruction, msg_history):
++    def _alternate_model(self):
++        """Return the other code model (CLAUDE_MODEL <-> OPENAI_MODEL)."""
++        return OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++
++    def _run_chat(self, instruction, msg_history, model=None):
+         """
+         Call chat_with_agent safely. Returns the sanitized resulting history,
+         or the previous sanitized history if the call fails.
+         """
++        if model is None:
++            model = self.code_model
+         previous = _sanitize_history(msg_history)
+         try:
+             new_history = chat_with_agent(
+                 instruction,
+-                model=self.code_model,
++                model=model,
+                 msg_history=previous,
+                 logging=safe_log,
+             )
+-            return _sanitize_history(new_history)
++            result = _sanitize_history(new_history)
++            if not _has_agent_action(result):
++                safe_log(f"Model {model} produced neither a tool call nor non-blank text.", level=logging.WARNING)
++            return result
+         except Exception as e:
+             safe_log(f"Error during retry chat call: {repr(e)}", level=logging.ERROR)
+             return previous
+ 
++    def _infer_target_filename(self):
++        """Infer the target file name from a backticked filename in the problem statement, default solution.py."""
++        default = 'solution.py'
++        matches = re.findall(r'`([\w./-]+\.(?:py|js|cpp|java|go|rs))`', self.problem_statement or '')
++        for name in matches:
++            normalized = name.replace('\\', '/')
++            basename = normalized.split('/')[-1]
++            if normalized.startswith('/') or '..' in normalized.split('/'):
++                continue
++            if basename.startswith('test_') or re.search(r'_test\.[^.]+$', basename) or 'tests/' in normalized:
++                continue
++            return normalized
++        return default
++
++    def _direct_file_generation(self, task):
++        """
++        Last-resort fallback: ask the model (no tool use required) for the full contents of the
++        target file in one fenced code block, then write it under git_tempdir.
++        Returns the written path or None.
++        """
++        target = self._infer_target_filename()
++        safe_log(f"Direct file generation: target file is {target}")
++        prompt = (
++            f"{task}\n\nReply only with the full contents of {target} in one ```python block "
++            f"(or the appropriate language block). Do not use any tools. Do not include any other text."
++        )
++        try:
++            history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception as e:
++            safe_log(f"Error during direct file generation: {repr(e)}", level=logging.ERROR)
++            return None
++
++        reply = _extract_assistant_text(history)
++        match = re.search(r'```[\w+-]*\n(.*?)```', reply, re.DOTALL)
++        if not match:
++            safe_log("Direct file generation: no fenced code block found in reply.", level=logging.WARNING)
++            return None
++        code = match.group(1)
++        if not code.strip():
++            safe_log("Direct file generation: fenced code block was empty.", level=logging.WARNING)
++            return None
++
++        path = os.path.join(self.git_tempdir, target)
++        try:
++            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++            with open(path, 'w') as f:
++                f.write(code if code.endswith('\n') else code + '\n')
++            safe_log(f"Direct file generation: wrote {path}")
++            return path
++        except Exception as e:
++            safe_log(f"Error writing direct-generated file: {repr(e)}", level=logging.ERROR)
++            return None
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -287,7 +390,7 @@ The first assistant action must be a tool call; empty or text-only replies count
+         )
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        for attempt in range(3):
++        for attempt in range(2):
+             status = self._get_patch_status()
+             if status == 'ok':
+                 safe_log(f"Patch status before attempt {attempt}: {status}")
+@@ -299,43 +402,32 @@ The first assistant action must be a tool call; empty or text-only replies count
+                 note = "You made no file edits."
+ 
+             if attempt == 0:
++                safe_log(f"Retry {attempt}: status={status}, same model with short corrective message.")
+                 corrective = (
+-                    f"{note} Your next action MUST be an editor tool call that creates/edits the solution file."
++                    f"{note} Create or edit the solution file now with the editor tool, "
++                    "then reply with a short status update."
+                     if status != 'test_only' else
+-                    f"{note} Your next action MUST be an editor tool call that edits the main source files."
+-                )
+-                msg_history = self._run_chat(
+-                    f"{corrective}\n\nOriginal task:\n{task}",
+-                    msg_history,
+-                )
+-            elif attempt == 1:
+-                corrective = (
+-                    "First write a simple correct solution to the file with the editor tool right now, "
+-                    "even if it is slow; then test it; then optimize."
+-                )
+-                if status == 'test_only':
+-                    corrective = "Only test files were modified. Implement the fix in the main source files. " + corrective
+-                msg_history = self._run_chat(
+-                    f"{corrective}\n\nOriginal task:\n{task}",
+-                    [],
++                    f"{note} Edit the main source files now with the editor tool."
+                 )
++                msg_history = self._run_chat(corrective, msg_history)
+             else:
+-                corrective = (
+-                    "Reply by immediately calling the editor tool with the complete file contents. "
+-                    "Do not write any analysis."
+-                )
++                alt_model = self._alternate_model()
++                safe_log(f"Retry {attempt}: status={status}, switching to model {alt_model} with fresh minimal prompt.")
++                minimal = f"{task}\n\nCreate the solution file now using the editor tool."
+                 if status == 'test_only':
+-                    corrective = "Only test files were modified. Edit the main source files. " + corrective
+-                msg_history = self._run_chat(
+-                    f"{corrective}\n\nOriginal task:\n{task}",
+-                    [],
+-                )
++                    minimal = f"{task}\n\nOnly test files were modified. Create the solution file now using the editor tool."
++                msg_history = self._run_chat(minimal, [], model=alt_model)
+ 
+             status_after = self._get_patch_status()
+             safe_log(f"Patch status after attempt {attempt}: {status_after}; history length: {len(msg_history)}")
+             if status_after == 'ok':
+                 break
+ 
++        if self._get_patch_status() in ('empty', 'test_only'):
++            safe_log("Patch still empty or test-only after retries; falling back to direct file generation.")
++            written = self._direct_file_generation(task)
++            safe_log(f"Direct file generation result: {written}")
++
+         final_status = self._get_patch_status()
+         safe_log(f"Final patch status: {final_status}")
+         return final_status

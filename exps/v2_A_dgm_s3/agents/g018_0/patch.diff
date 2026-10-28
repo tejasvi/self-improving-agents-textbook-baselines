@@ -1,0 +1,259 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ee0d84f..1a9e46c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -357,8 +357,23 @@ IMPORTANT RULES:
+                      f"source patch: {self._has_source_patch()}")
+ 
+     def _alternate_model(self):
+-        """The model on the other API path from self.code_model (Claude <-> OpenAI)."""
+-        return OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
++        """
++        A model that genuinely differs from self.code_model. Prefers the other configured model
++        (OPENAI_MODEL) if distinct; otherwise falls back to another Claude model id.
++        """
++        if OPENAI_MODEL != self.code_model:
++            return OPENAI_MODEL
++        return 'claude-3-5-sonnet-20240620' if self.code_model != 'claude-3-5-sonnet-20240620' \
++            else 'claude-3-5-sonnet-20241022'
++
++    def _candidate_models(self):
++        """Ordered, de-duplicated list of models to try."""
++        seen, out = set(), []
++        for m in [self.code_model, self._alternate_model()]:
++            if m not in seen:
++                seen.add(m)
++                out.append(m)
++        return out
+ 
+     def _compact_prompt(self):
+         """Short prompt: task, target path and current target file contents only."""
+@@ -383,8 +398,13 @@ IMPORTANT RULES:
+         a real source patch exists. Each attempt uses a fresh message history. Returns the history
+         of the attempt that produced the patch, or fallback_history if none did.
+         """
+-        models = [self.code_model, self._alternate_model()]
+-        for model in models:
++        attempted = set()
++        for model in self._candidate_models():
++            key = (model, prompt)
++            if key in attempted:
++                safe_log(f"Skipping duplicate attempt with {model}.")
++                continue
++            attempted.add(key)
+             safe_log(f"Escalation attempt with model {model}.")
+             history = None
+             try:
+@@ -485,7 +505,7 @@ When everything is done, end your reply with a short report that includes the st
+                 f"Current contents of {target}:\n```python\n{existing}\n```\n\n"
+                 f"Reply with ONLY the complete file in a single ```python code block. No other text."
+             )
+-            for model in [self.code_model, self._alternate_model()]:
++            for model in self._candidate_models():
+                 try:
+                     client, client_model = create_client(model)
+                     content, _ = get_response_from_llm(
+@@ -514,20 +534,67 @@ When everything is done, end your reply with a short report that includes the st
+                 safe_log(f"Last-resort: wrote {target} from {model}.")
+                 return
+ 
+-            # Every model failed: clearly logged stub so the patch is at least non-empty.
+-            safe_log("Last-resort: ALL models failed; writing a placeholder stub (reads stdin, prints 0).")
+-            stub = (
+-                "import sys\n\n"
+-                "# PLACEHOLDER written by the last-resort fallback: no model produced a solution.\n"
+-                "_ = sys.stdin.read()\n"
+-                "print(0)\n"
+-            )
++            # Every model failed: preserve the existing skeleton rather than destroying it.
++            safe_log("Last-resort: ALL models failed; preserving the existing skeleton with trivial bodies.")
++            fallback = self._skeleton_fallback(existing)
++            if fallback is None:
++                safe_log("Last-resort: no class/function skeleton found; writing a stdin-style stub.")
++                fallback = (
++                    "import sys\n\n"
++                    "# PLACEHOLDER written by the last-resort fallback: no model produced a solution.\n"
++                    "_ = sys.stdin.read()\n"
++                    "print(0)\n"
++                )
+             os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
+             with open(target_path, 'w') as fh:
+-                fh.write(stub)
++                fh.write(fallback)
+         except Exception as e:
+             safe_log(f"Last-resort failed unexpectedly: {e}\n{traceback.format_exc()}")
+ 
++    def _skeleton_fallback(self, existing):
++        """
++        Given the existing file text, return a version where bare `pass` bodies are replaced by
++        `return 0` (or `return None`), with `from typing import List` ensured. Returns None if the
++        text has no class/function skeleton or cannot be parsed.
++        """
++        if not existing or not existing.strip():
++            return None
++        try:
++            tree = ast.parse(existing)
++        except SyntaxError:
++            return None
++        has_skeleton = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
++                           for n in ast.walk(tree))
++        if not has_skeleton:
++            return None
++        for node in ast.walk(tree):
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                new_body = []
++                for stmt in node.body:
++                    if isinstance(stmt, ast.Pass):
++                        returns_none = node.returns is None or (
++                            isinstance(node.returns, ast.Constant) and node.returns.value is None)
++                        value = ast.Constant(value=None) if returns_none else ast.Constant(value=0)
++                        new_body.append(ast.copy_location(ast.Return(value=value), stmt))
++                    else:
++                        new_body.append(stmt)
++                node.body = new_body
++        # Ensure `from typing import List` is present when List is used.
++        has_list_import = any(
++            isinstance(n, ast.ImportFrom) and n.module == 'typing' and any(a.name == 'List' for a in n.names)
++            for n in tree.body
++        )
++        if not has_list_import:
++            uses_list = any(isinstance(n, ast.Name) and n.id == 'List' for n in ast.walk(tree))
++            if uses_list:
++                tree.body.insert(0, ast.ImportFrom(module='typing', names=[ast.alias(name='List', asname=None)], level=0))
++        ast.fix_missing_locations(tree)
++        try:
++            code = ast.unparse(tree)
++        except Exception:
++            return None
++        return code + '\n'
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/llm.py b/llm.py
+index d6b4da1..e4235d6 100644
+--- a/llm.py
++++ b/llm.py
+@@ -200,7 +200,12 @@ def get_response_from_llm(
+             system=system_message,
+             messages=new_msg_history,
+         )
+-        content = response.content[0].text
++        # Guard against empty content (e.g. stop_reason=max_tokens with no blocks): return '' instead of IndexError.
++        text_blocks = [b for b in (response.content or []) if getattr(b, "text", None) is not None]
++        if not text_blocks:
++            stop_reason = getattr(response, "stop_reason", None)
++            print(f"Warning: empty content from {model} (stop_reason={stop_reason}); returning ''.")
++        content = text_blocks[0].text if text_blocks else ''
+         new_msg_history = new_msg_history + [
+             {
+                 "role": "assistant",
+diff --git a/llm_withtools.py b/llm_withtools.py
+index da65c41..ff7bdb7 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -12,6 +12,7 @@ from prompts.tooluse_prompt import get_tooluse_prompt
+ from tools import load_all_tools
+ 
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
++MAX_TOKENS_LIMIT = 8192
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+ 
+ def process_tool_call(tools_dict, tool_name, tool_input):
+@@ -42,15 +43,26 @@ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+     logging=None, max_retry=3
+ ):
++    if logging is None:
++        logging = print
+     try:
+         if 'claude' in model:
+-            response = client.messages.create(
+-                model=model,
+-                messages=messages,
+-                max_tokens=4096,
+-                tool_choice=tool_choice,
+-                tools=tools,
+-            )
++            # Bounded retries (no unbounded loop): if the model hit max_tokens and produced no content
++            # blocks, re-issue the request with a doubled max_tokens (capped at the model limit).
++            response = None
++            for attempt in range(3):
++                max_tokens = min(MAX_TOKENS_LIMIT, 4096 * (2 ** attempt))
++                logging(f"Claude request attempt {attempt + 1}/3: max_tokens={max_tokens}, thinking=disabled")
++                response = client.messages.create(
++                    model=model,
++                    messages=messages,
++                    max_tokens=max_tokens,
++                    tool_choice=tool_choice,
++                    tools=tools,
++                )
++                if response.content or getattr(response, 'stop_reason', None) != 'max_tokens':
++                    break
++                logging(f"Empty response with stop_reason=max_tokens at max_tokens={max_tokens}; retrying with a larger limit.")
+         elif model.startswith('o3-'):
+             response = client.responses.create(
+                 model=model,
+@@ -433,6 +445,9 @@ def _is_empty_response(response, model=''):
+     return (not has_text) and (not has_tool)
+ 
+ 
++NUDGE_MARKER = '[Nudge]'
++
++
+ def _append_nudge(msg_history, text):
+     """
+     Add a nudge without stacking consecutive user messages: merge it into the last
+@@ -442,11 +457,16 @@ def _append_nudge(msg_history, text):
+         last = msg_history[-1]
+         content = last.get("content")
+         if isinstance(content, str):
+-            last["content"] = content + "\n\n" + text
++            # Replace any previous nudge rather than accumulating.
++            base = content.split(f"\n\n{NUDGE_MARKER}")[0].rstrip()
++            last["content"] = f"{base}\n\n{NUDGE_MARKER} {text}"
+         elif isinstance(content, list):
+-            content.append({"type": "text", "text": text})
++            # Drop previously added nudge blocks, then add the new one.
++            kept = [b for b in content if not (isinstance(b, dict) and str(b.get("text", "")).startswith(NUDGE_MARKER))]
++            kept.append({"type": "text", "text": f"{NUDGE_MARKER} {text}"})
++            last["content"] = kept
+         else:
+-            last["content"] = [{"type": "text", "text": text}]
++            last["content"] = [{"type": "text", "text": f"{NUDGE_MARKER} {text}"}]
+     else:
+         msg_history.append({"role": "user", "content": [{"type": "text", "text": text}]})
+     return msg_history
+diff --git a/tools/edit.py b/tools/edit.py
+index c55b038..e56cbca 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -7,7 +7,7 @@ def tool_info():
+         "description": """Custom editing tool for viewing, creating, and editing files\n
+ * State is persistent across command calls and discussions with the user.\n
+ * If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+-* The `create` command cannot be used if the specified `path` already exists as a file.\n
++* The `create` command cannot be used if the specified `path` already exists as a file; use `edit` or `str_replace` instead.\n
+ * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+ * The `edit` command overwrites the entire file with the provided `file_text`.\n
+ * The `str_replace` command replaces the unique occurrence of `old_str` with `new_str` in an existing file; use it for targeted edits. `old_str` must match exactly once.\n
+@@ -51,7 +51,7 @@ def validate_path(path: str, command: str) -> Path:
+     """
+     Validate the file path for each command:
+       - 'view': path may be a file or directory; must exist.
+-      - 'create': path must not exist (for new file creation).
++      - 'create': creates a new file; an existing file is rejected with a message to use 'edit'.
+       - 'edit': path must exist (for overwriting).
+     """
+     path_obj = Path(path)
+@@ -67,9 +67,8 @@ def validate_path(path: str, command: str) -> Path:
+         if not path_obj.exists():
+             raise ValueError(f"The path {path} does not exist.")
+     elif command == "create":
+-        # Path must not exist
+         if path_obj.exists():
+-            raise ValueError(f"Cannot create new file; {path} already exists.")
++            raise ValueError(f"Error: {path} already exists. Use the `edit` command to overwrite it.")
+     elif command in ("edit", "str_replace"):
+         # Path must exist and must be a file
+         if not path_obj.exists():

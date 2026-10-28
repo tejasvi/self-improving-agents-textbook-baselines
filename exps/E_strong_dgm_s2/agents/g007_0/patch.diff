@@ -1,0 +1,188 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a49d4dd..2ecd7f7 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,9 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
++import ast
++import traceback
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -122,6 +125,9 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
++        # Early header so the chat history file is never empty
++        safe_log(f"# Agent started\nGit dir: {self.git_tempdir}\nBase commit: {self.base_commit}")
++
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         new_msg_history = [
+@@ -137,21 +143,84 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _safe_chat(self, message, msg_history):
++        """
++        Wraps chat_with_agent so that exceptions are logged and never propagate.
++        On failure, returns the previous message history.
++        """
++        try:
++            result = chat_with_agent(message, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            return result or msg_history
++        except Exception:
++            safe_log(f"[_safe_chat] chat_with_agent raised:\n{traceback.format_exc()}")
++            return msg_history
++
+     def _has_real_edit(self):
+         """
+-        Returns True only if solution.py gained at least one added line that is
+-        neither blank nor a comment.
++        Returns True only if solution.py exists, is non-empty, parses with ast.parse,
++        and its diff contains at least one added line that is neither blank nor a comment.
+         """
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(sol_path):
++            return False
++        try:
++            with open(sol_path, 'r') as f:
++                content = f.read()
++        except Exception:
++            return False
++        if not content.strip():
++            return False
++        try:
++            ast.parse(content)
++        except Exception:
++            return False
++
+         patch = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         filtered = filter_patch_by_files(patch, ['solution.py'])
+         for line in filtered.splitlines():
+             if not line.startswith('+') or line.startswith('+++'):
+                 continue
+-            content = line[1:].strip()
+-            if content and not content.startswith('#'):
++            body = line[1:].strip()
++            if body and not body.startswith('#'):
+                 return True
+         return False
+ 
++    def _fallback_write_solution(self):
++        """
++        Last resort: ask the model for a single python code block and write it to solution.py.
++        Never writes an empty file.
++        """
++        safe_log("[fallback] Requesting a single python code block to write solution.py")
++        prompt = (
++            "Output ONLY one fenced ```python code block containing a complete, runnable Python "
++            "solution to the following problem. Read input from stdin and write output to stdout. "
++            "A brute-force solution is acceptable. No other text.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        history = self._safe_chat(prompt, [])
++        text = ""
++        for msg in reversed(history or []):
++            if msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            if isinstance(content, str):
++                text = content
++            elif isinstance(content, list):
++                text = "\n".join(
++                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
++                )
++            if text:
++                break
++        blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
++        if not blocks or not blocks[-1].strip():
++            safe_log("[fallback] No usable python block found; solution.py not written")
++            return False
++        code = blocks[-1]
++        with open(os.path.join(self.git_tempdir, 'solution.py'), 'w') as f:
++            f.write(code)
++        safe_log(f"[fallback] Wrote solution.py ({len(code)} chars)")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -177,28 +246,37 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ The final solution.py is what gets graded; helper files are ignored.
+ Within your first few tool calls, write a first-draft solution.py (even brute force), before any extended exploration. Never end your turn without real code in solution.py. Never send an empty reply. Keep tool calls and heredocs short to avoid output truncation; split long scripts into multiple files. If the exact formula is not found after some exploration, submit the best-known approach and keep improving it."""
+         instruction = f"{task}\n\n{method}"
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not msg_history:
+-            msg_history = []
++        msg_history = self._safe_chat(instruction, [])
++        safe_log(f"[forward] Initial attempt done; has_real_edit={self._has_real_edit()}")
+ 
+-        # Bounded retry: ensure solution.py contains real code
++        # Bounded escalating retries (no while loops)
+         reminder_text = (
+             "No solution code has been written to solution.py yet, so the task is not done. "
+-            f"You must call the editor tool right now to create {self.git_tempdir}/solution.py "
+-            "with your best current solution; a brute-force "
+-            "fallback is acceptable. Write your best attempt first, then test and refine it afterwards. "
++            f"You must call the editor tool right now to create or modify {self.git_tempdir}/solution.py "
++            "with your best current solution; a brute-force fallback is acceptable. "
++            "Write your best attempt first, then test and refine it afterwards. "
+             "Do not reply with an empty message."
+         )
++        short_prompt = (
++            f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Immediately write a best-effort or brute-force solution to {self.git_tempdir}/solution.py "
++            "using the editor tool. Do it now, then refine afterwards."
++        )
+         for attempt in range(3):
+             if self._has_real_edit():
++                safe_log("[forward] Real edit detected; stopping retries")
+                 break
+             safe_log(f"[forward] No real edit in solution.py; retry {attempt + 1}/3")
+-            msg_history = chat_with_agent(
+-                reminder_text,
+-                model=self.code_model,
+-                msg_history=msg_history,
+-                logging=safe_log,
+-            ) or msg_history
++            if attempt == 0:
++                msg_history = self._safe_chat(reminder_text, msg_history)
++            else:
++                msg_history = self._safe_chat(short_prompt, [])
++            safe_log(f"[forward] Retry {attempt + 1}/3 done; has_real_edit={self._has_real_edit()}")
++
++        if not self._has_real_edit():
++            safe_log("[forward] Still no real edit; running fallback")
++            self._fallback_write_solution()
++            safe_log(f"[forward] After fallback; has_real_edit={self._has_real_edit()}")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..543a0f8
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,18 @@
++"""
++Placeholder solution.py.
++
++No competitive programming problem statement was provided in this repository,
++so this file does not solve any specific task. It only echoes stdin back to
++stdout so that the file is a valid, runnable Python program. Replace it with a
++real solution once the problem statement is available.
++"""
++import sys
++
++
++def main():
++    data = sys.stdin.read()
++    sys.stdout.write(data)
++
++
++if __name__ == "__main__":
++    main()

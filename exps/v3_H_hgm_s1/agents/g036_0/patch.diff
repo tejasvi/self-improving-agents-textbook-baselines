@@ -1,0 +1,606 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index bd57e35..064ade1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,423 +1,2 @@
+-import argparse
+-import subprocess
+-import logging
+-from logging.handlers import RotatingFileHandler
+-import os
+-import threading
+-
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, list_non_test_tracked_files, read_starter_files, resolve_primary_source_file, write_fallback_solution
+-from utils.common_utils import extract_code_block
+-from tools.run_examples import tool_function as run_examples_tool
+-import json
+-import re
+-
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+-
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
+-
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
+-
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
+-
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+-
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
+-
+-def _is_empty_reply(msg_history):
+-    """
+-    Return True if the last assistant message in `msg_history` has only empty/whitespace text.
+-    A message carrying non-text blocks (e.g. tool calls) is not considered empty.
+-    Handles both block-style content (list of dicts with 'text') and plain string content.
+-    """
+-    for msg in reversed(msg_history or []):
+-        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+-            continue
+-        content = msg.get('content', '')
+-        if isinstance(content, str):
+-            return not content.strip()
+-        if isinstance(content, list):
+-            blocks = [b for b in content if isinstance(b, dict)]
+-            if any(b.get('type') not in ('text', 'output_text') for b in blocks):
+-                return False
+-            text = ''.join(b.get('text', '') for b in blocks if isinstance(b.get('text'), str))
+-            return not text.strip()
+-        return True
+-    return False
+-
+-
+-def _log_raw_empty_reply(msg_history):
+-    """Log the raw stop_reason/content of the last assistant message to help diagnose empty replies."""
+-    for msg in reversed(msg_history or []):
+-        if isinstance(msg, dict) and msg.get('role') == 'assistant':
+-            safe_log(f"[forward] Raw empty reply: stop_reason={msg.get('stop_reason')!r} content={msg.get('content')!r}")
+-            return
+-        if not isinstance(msg, dict):
+-            # e.g. OpenAI response objects
+-            safe_log(f"[forward] Raw empty reply (non-dict message): {msg!r}")
+-            return
+-    safe_log("[forward] Raw empty reply: no assistant message in history.")
+-
+-
+-def _last_assistant_text(msg_history):
+-    """Return the concatenated text of the last assistant message, or '' if none."""
+-    for msg in reversed(msg_history or []):
+-        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+-            continue
+-        content = msg.get('content', '')
+-        if isinstance(content, str):
+-            return content
+-        if isinstance(content, list):
+-            return ''.join(b.get('text', '') for b in content if isinstance(b, dict) and isinstance(b.get('text'), str))
+-    return ''
+-
+-
+-def _build_retry_prompt(git_tempdir, primary_path, patch, problem_statement=''):
+-    """Compact retry prompt for a fresh context. The problem statement is already in the repo README/problem description, so it is not repeated here."""
+-    patch_display = patch.strip() if patch.strip() else "EMPTY (no changes at all)"
+-    starter = read_starter_files(git_tempdir, primary_path=primary_path)
+-    starter_text = "\n\n".join(f"### {path}\n```\n{text}\n```" for path, text in starter) or "(no files)"
+-    primary_text = primary_path if primary_path else "(no non-test file found; create the appropriate source file)"
+-    return f"""I have uploaded a code repository in the directory {git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{problem_statement}
+-</problem_description>
+-
+-No source edits were detected so far. The current diff against the base commit is:
+-{patch_display}
+-
+-The solution file to edit is: {primary_text}
+-
+-Current contents of the non-test, non-doc files (primary file first):
+-{starter_text}
+-
+-Your first action must be an editor tool call with command=edit on {primary_text} containing the full solution (or command=create if the file does not exist); do not reply with an empty message. The solution must replace the starter stub and keep the required signature, adding any missing imports. After editing, reply with a short summary of the change."""
+-
+-
+-def _build_fallback_prompt(problem_statement, primary_path, git_tempdir):
+-    """Tool-free prompt asking for the complete primary file contents."""
+-    return f"""Problem:
+-{problem_statement}
+-
+-Output the complete contents of {primary_path} (inside {git_tempdir}, the solution file) that solves the problem, in one ```python fenced block, and nothing else. Keep the required signature and any imports needed. If the file is not Python, use the fence language matching its extension."""
+-
+-
+-def _build_extract_examples_prompt(problem_statement):
+-    return f"""Problem statement:
+-{problem_statement}
+-
+-Extract every example (sample input and expected output) from the problem statement above.
+-Reply with JSON only, no prose, in this exact shape:
+-{{"mode": "stdin" or "method", "class_name": "Solution", "method_name": "<method name or empty string>", "examples": [{{"input": "...", "expected": "..."}}]}}
+-Use mode "stdin" if the program reads standard input; use mode "method" if the task is a method of a Solution class, in which case "input" is the call arguments in 'name = value' form separated by commas or newlines, and "expected" is the Python literal of the return value. Copy the values exactly."""
+-
+-
+-def _parse_examples_fallback(problem_statement):
+-    """Regex fallback: pull 'Input:' / 'Output:' pairs from the statement (stdin mode)."""
+-    pattern = re.compile(r'Input:\s*(.*?)\s*Output:\s*(.*?)(?=\n\s*(?:Input:|Explanation:|Constraints:)|\Z)', re.DOTALL)
+-    examples = []
+-    for m in pattern.finditer(problem_statement or ''):
+-        inp, out = m.group(1).strip(), m.group(2).strip()
+-        if inp and out:
+-            examples.append({"input": inp, "expected": out})
+-    return {"mode": "stdin", "class_name": "Solution", "method_name": "", "examples": examples}
+-
+-
+-def _extract_examples(problem_statement, model):
+-    """Ask the model for examples as JSON; fall back to regexes if parsing fails."""
+-    try:
+-        history = chat_with_agent(_build_extract_examples_prompt(problem_statement), model=model, msg_history=[], logging=safe_log)
+-        text = _last_assistant_text(history)
+-        match = re.search(r'\{.*\}', text, re.DOTALL)
+-        data = json.loads(match.group(0)) if match else None
+-        if isinstance(data, dict) and isinstance(data.get('examples'), list) and data['examples']:
+-            return data
+-        safe_log("[forward] Example extraction returned no usable examples; using regex fallback.")
+-    except Exception as e:
+-        safe_log(f"[forward] Example extraction failed ({e}); using regex fallback.")
+-    return _parse_examples_fallback(problem_statement)
+-
+-
+-def _build_repair_prompt(problem_statement, solution_text, report):
+-    return f"""Problem statement:
+-{problem_statement}
+-
+-The current solution file is:
+-```
+-{solution_text}
+-```
+-
+-Running the examples from the problem statement produced this report:
+-{report}
+-
+-Re-read the problem requirements carefully, work out why the failing examples differ, and edit the solution file with the editor tool to fix it. You MUST edit the file; do not reply with only an explanation. Afterwards, reply with a short summary of the change."""
+-
+-
+-def _build_must_edit_prompt(problem_statement, primary_text):
+-    return f"""Your previous reply was empty. Problem statement:
+-{problem_statement}
+-
+-You must edit the file {primary_text} now with the editor tool so that it solves the problem, then reply with a short summary."""
+-
+-
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        primary_path = resolve_primary_source_file(self.git_tempdir, self.problem_statement, self.language)
+-        primary_text = primary_path if primary_path else "(no source file found; create the appropriate source file)"
+-        instruction = f"""{task}
+-
+-The solution file to edit is: {primary_text}
+-
+-Follow these steps in order:
+-1. Inspect the repository: read the starter file(s) (e.g. with bash `cat`, `ls`, `find`) to learn the required function/class signature and any existing tests.
+-2. Design the algorithm: reason carefully about the problem's constraints and the most efficient correct approach.
+-3. IMMEDIATELY implement it by editing the starter source file with the editor tool. The starter stub (`pass`) must be replaced with a full implementation. Keep the required signature. If the stub uses names such as `List`, add the missing imports (e.g. `from typing import List`).
+-4. Test: extract every sample input/output pair from the problem statement, run the problem's examples and a brute-force comparison on small random inputs via bash, and fix any mismatches or errors in the source file.
+-5. Final check: confirm via `git diff` (or equivalent) that the diff contains changes to the primary source file.
+-
+-Rules:
+-- You MUST modify the source file using the editor tool; never finish your turn with an empty reply or only a plan.
+-- Do not only modify test files; the primary source file must contain the solution.
+-- Do not end your turn until the implementation is written to disk.
+-- If the output differs from the sample output, do not conclude the answer is acceptable just because it is valid; hidden graders may compare exactly. Try to match the sample outputs exactly.
+-"""
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log(f"[forward] Initial pass complete; {len(msg_history)} messages in history.")
+-        if _is_empty_reply(msg_history):
+-            safe_log("[forward] Stall detected: last assistant message is empty after initial pass.")
+-            _log_raw_empty_reply(msg_history)
+-
+-        patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-
+-        # Fresh-context retries (bounded loop, never reuses the stalled history)
+-        for attempt in range(3):
+-            if has_source_edits(patch):
+-                break
+-            safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Retrying with fresh context.")
+-            retry_msg = _build_retry_prompt(self.git_tempdir, primary_path, patch, self.problem_statement)
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            if _is_empty_reply(msg_history):
+-                safe_log(f"[forward] Stall detected on retry attempt {attempt + 1}/3 (empty reply).")
+-                _log_raw_empty_reply(msg_history)
+-            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-
+-        # Tool-free fallback: ask for the full primary file as a single code block
+-        if not has_source_edits(patch):
+-            safe_log("[forward] Still no source edits after retries. Trying tool-free fallback.")
+-            if primary_path is None:
+-                safe_log("[forward] Fallback skipped: no non-test tracked files found.")
+-            else:
+-                fallback_msg = _build_fallback_prompt(self.problem_statement, primary_path, self.git_tempdir)
+-                fallback_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-                reply_text = _last_assistant_text(fallback_history)
+-                code = extract_code_block(reply_text)
+-                if code and code.strip():
+-                    if not code.endswith('\n'):
+-                        code += '\n'
+-                    with open(os.path.join(self.git_tempdir, primary_path), 'w', encoding='utf-8') as f:
+-                        f.write(code)
+-                    safe_log(f"[forward] Fallback wrote {len(code)} chars to {primary_path}.")
+-                    patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-                else:
+-                    safe_log("[forward] Fallback produced no code block; nothing written.")
+-
+-        # Last resort: write a minimal stub into the resolved file so the patch is non-empty and targets the right file
+-        if not has_source_edits(patch) and primary_path is not None:
+-            safe_log(f"[forward] Fallback failed. Writing minimal stub to {primary_path}.")
+-            write_fallback_solution(self.git_tempdir, primary_path)
+-            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-
+-        has_edit = has_source_edits(patch)
+-        if has_edit and primary_path is not None:
+-            safe_log("[forward] Running example verification loop.")
+-            spec = _extract_examples(self.problem_statement, self.code_model)
+-            solution_file = os.path.join(self.git_tempdir, primary_path)
+-            mode = spec.get('mode') if spec.get('mode') in ('stdin', 'method') else 'stdin'
+-            method_name = spec.get('method_name') or None
+-            class_name = spec.get('class_name') or 'Solution'
+-            examples = [e for e in spec['examples'] if isinstance(e, dict)]
+-            for round_idx in range(1, 5):
+-                if mode == 'method' and not method_name:
+-                    report = "Error: no method_name extracted for method mode."
+-                else:
+-                    report = run_examples_tool(solution_file, mode, examples,
+-                                               class_name=class_name, method_name=method_name)
+-                safe_log(f"[forward] Verification round {round_idx}/4:\n{report}")
+-                if report.startswith(f"{len(examples)}/{len(examples)} examples passed"):
+-                    break
+-                solution_text = open(solution_file, encoding='utf-8').read() if os.path.exists(solution_file) else ''
+-                repair = _build_repair_prompt(self.problem_statement, solution_text, report)
+-                msg_history = chat_with_agent(repair, model=self.code_model, msg_history=[], logging=safe_log)
+-                if _is_empty_reply(msg_history):
+-                    safe_log("[forward] Empty reply during repair; re-prompting once to edit the file.")
+-                    _log_raw_empty_reply(msg_history)
+-                    msg_history = chat_with_agent(_build_must_edit_prompt(self.problem_statement, primary_path),
+-                                                  model=self.code_model, msg_history=[], logging=safe_log)
+-        elif not has_edit:
+-            safe_log("[forward] Warning: agent finished without a non-test source edit.")
+-        safe_log(f"[forward] Final status: source edit exists = {has_edit}.")
+-
+-        return msg_history
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
+-    main()
++def test_x():
++    pass
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..f4bb6a2
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,170 @@
++import os
++import subprocess
++import sys
++import time
++
++DEFAULT_NUM_TESTS = 100
++DEFAULT_TIMEOUT = 5  # seconds per run
++MAX_NUM_TESTS = 2000
++REPORT_INPUT_CHARS = 2000
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Stress-test a candidate stdin/stdout Python program against a brute-force reference, or time it on a large input.\\n
++* mode 'stress' (default): generates random small inputs with generator_path (run as `python3 generator_path SEED`, which prints one input to stdout), runs both candidate_path and reference_path on each input, and compares their stdout (whitespace-normalized). Reports the number of agreements, the smallest failing input with expected vs. actual output, and any crashes or timeouts.\\n
++* mode 'timing': runs candidate_path once on input_path (a large input file) and reports the wall-clock time, exit status, and whether it timed out.\\n
++* Timeouts and crashes are always reported. Use a small timeout for brute-force-sized inputs.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "candidate_path": {
++                    "type": "string",
++                    "description": "Path to the candidate Python program (reads stdin, writes stdout)."
++                },
++                "mode": {
++                    "type": "string",
++                    "enum": ["stress", "timing"],
++                    "description": "'stress' to compare against a reference on random inputs, or 'timing' to time the candidate on input_path. Defaults to 'stress'."
++                },
++                "reference_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference Python program (required in 'stress' mode)."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to a Python generator program (required in 'stress' mode). It is run as `python3 generator_path SEED` and must print one random small input to stdout."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of random inputs to test in 'stress' mode. Defaults to 100."
++                },
++                "timeout": {
++                    "type": "number",
++                    "description": "Timeout in seconds for each program run. Defaults to 5."
++                },
++                "input_path": {
++                    "type": "string",
++                    "description": "Path to a large input file (required in 'timing' mode)."
++                }
++            },
++            "required": ["candidate_path"]
++        }
++    }
++
++
++def _normalize(text):
++    return "\n".join(line.rstrip() for line in (text or "").strip().splitlines())
++
++
++def _run(path, stdin_text, timeout):
++    """Run a Python program on stdin_text. Returns (status, stdout, stderr); status is 'ok', 'crash' or 'timeout'."""
++    try:
++        proc = subprocess.run(
++            [sys.executable, path], input=stdin_text, capture_output=True, text=True, timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return "timeout", "", f"Timed out after {timeout}s"
++    if proc.returncode != 0:
++        return "crash", proc.stdout, proc.stderr.strip()[-800:]
++    return "ok", proc.stdout, proc.stderr.strip()
++
++
++def _generate(generator_path, seed, timeout):
++    try:
++        proc = subprocess.run(
++            [sys.executable, generator_path, str(seed)],
++            capture_output=True, text=True, timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return None, "generator timed out"
++    if proc.returncode != 0:
++        return None, f"generator crashed: {proc.stderr.strip()[-400:]}"
++    return proc.stdout, ""
++
++
++def _stress(candidate_path, reference_path, generator_path, num_tests, timeout):
++    if not reference_path or not generator_path:
++        return "Error: 'reference_path' and 'generator_path' are required in 'stress' mode."
++    for label, p in (("candidate", candidate_path), ("reference", reference_path), ("generator", generator_path)):
++        if not os.path.exists(p):
++            return f"Error: {label} file not found: {p}"
++
++    agreements = 0
++    timeouts = 0
++    crashes = 0
++    failures = []  # (input_text, expected, actual, note)
++    for seed in range(num_tests):
++        gen_out, gen_err = _generate(generator_path, seed, timeout)
++        if gen_out is None:
++            return f"Error at seed {seed}: {gen_err}"
++        test_input = gen_out
++        ref_status, ref_out, ref_err = _run(reference_path, test_input, timeout)
++        if ref_status != "ok":
++            return (f"Reference failed on seed {seed} ({ref_status}); the brute force is unusable.\n"
++                    f"input: {test_input[:REPORT_INPUT_CHARS]!r}\n{ref_err}")
++        cand_status, cand_out, cand_err = _run(candidate_path, test_input, timeout)
++        if cand_status == "timeout":
++            timeouts += 1
++            failures.append((test_input, _normalize(ref_out), "", f"TIMEOUT: {cand_err}"))
++        elif cand_status == "crash":
++            crashes += 1
++            failures.append((test_input, _normalize(ref_out), _normalize(cand_out), f"CRASH: {cand_err}"))
++        elif _normalize(cand_out) == _normalize(ref_out):
++            agreements += 1
++        else:
++            failures.append((test_input, _normalize(ref_out), _normalize(cand_out), "WRONG ANSWER"))
++
++    lines = [f"Stress test: {agreements}/{num_tests} agreements with reference, "
++             f"{len(failures)} failing, {timeouts} timeouts, {crashes} crashes."]
++    if failures:
++        # Smallest failing input first (shortest, then lexicographic).
++        failures.sort(key=lambda f: (len(f[0]), f[0]))
++        inp, expected, actual, note = failures[0]
++        lines.append(f"Smallest failing input ({note}):")
++        lines.append(f"input: {inp[:REPORT_INPUT_CHARS]!r}")
++        lines.append(f"expected: {expected!r}")
++        lines.append(f"actual: {actual!r}")
++    return "\n".join(lines)
++
++
++def _timing(candidate_path, input_path, timeout):
++    if not input_path:
++        return "Error: 'input_path' is required in 'timing' mode."
++    if not os.path.exists(candidate_path):
++        return f"Error: candidate file not found: {candidate_path}"
++    if not os.path.exists(input_path):
++        return f"Error: input file not found: {input_path}"
++    with open(input_path, 'r', encoding='utf-8') as f:
++        data = f.read()
++    start = time.monotonic()
++    status, out, err = _run(candidate_path, data, timeout)
++    elapsed = time.monotonic() - start
++    if status == "timeout":
++        return f"Timing: TIMEOUT after {timeout}s on {input_path}."
++    if status == "crash":
++        return f"Timing: CRASH after {elapsed:.3f}s on {input_path}.\n{err}"
++    return (f"Timing: OK, {elapsed:.3f}s on {input_path} "
++            f"({len(out)} chars of output).")
++
++
++def tool_function(candidate_path, mode="stress", reference_path=None, generator_path=None,
++                  num_tests=DEFAULT_NUM_TESTS, timeout=DEFAULT_TIMEOUT, input_path=None):
++    mode = mode or "stress"
++    if mode not in ("stress", "timing"):
++        return "Error: 'mode' must be 'stress' or 'timing'."
++    try:
++        num_tests = int(num_tests) if num_tests is not None else DEFAULT_NUM_TESTS
++        timeout = float(timeout) if timeout is not None else DEFAULT_TIMEOUT
++    except (TypeError, ValueError):
++        return "Error: 'num_tests' must be an integer and 'timeout' a number."
++    if num_tests < 1 or num_tests > MAX_NUM_TESTS:
++        return f"Error: 'num_tests' must be between 1 and {MAX_NUM_TESTS}."
++    if timeout <= 0:
++        return "Error: 'timeout' must be positive."
++    if not candidate_path or not os.path.exists(candidate_path):
++        return f"Error: candidate file not found: {candidate_path}"
++    if mode == "timing":
++        return _timing(candidate_path, input_path, timeout)
++    return _stress(candidate_path, reference_path, generator_path, num_tests, timeout)

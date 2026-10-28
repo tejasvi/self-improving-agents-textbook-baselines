@@ -1,0 +1,161 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index cf52026..72a3517 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,7 +6,8 @@ import os
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, has_source_edits, list_non_test_tracked_files, read_starter_files
++from utils.common_utils import extract_code_block
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -93,6 +94,79 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _is_empty_reply(msg_history):
++    """
++    Return True if the last assistant message in `msg_history` has only empty/whitespace text.
++    A message carrying non-text blocks (e.g. tool calls) is not considered empty.
++    Handles both block-style content (list of dicts with 'text') and plain string content.
++    """
++    for msg in reversed(msg_history or []):
++        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++            continue
++        content = msg.get('content', '')
++        if isinstance(content, str):
++            return not content.strip()
++        if isinstance(content, list):
++            blocks = [b for b in content if isinstance(b, dict)]
++            if any(b.get('type') not in ('text', 'output_text') for b in blocks):
++                return False
++            text = ''.join(b.get('text', '') for b in blocks if isinstance(b.get('text'), str))
++            return not text.strip()
++        return True
++    return False
++
++
++def _last_assistant_text(msg_history):
++    """Return the concatenated text of the last assistant message, or '' if none."""
++    for msg in reversed(msg_history or []):
++        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++            continue
++        content = msg.get('content', '')
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            return ''.join(b.get('text', '') for b in content if isinstance(b, dict) and isinstance(b.get('text'), str))
++    return ''
++
++
++def _primary_source_file(git_tempdir):
++    """Return the primary non-test tracked file (first by sorted git ls-files, skipping dotfiles), or None."""
++    candidates = [p for p in list_non_test_tracked_files(git_tempdir)
++                  if not os.path.basename(p).startswith('.')]
++    return candidates[0] if candidates else None
++
++
++def _build_retry_prompt(problem_statement, git_tempdir, primary_path, patch):
++    """Compact, self-contained retry prompt for a fresh context."""
++    patch_display = patch.strip() if patch.strip() else "EMPTY (no changes at all)"
++    starter = read_starter_files(git_tempdir)
++    starter_text = "\n\n".join(f"### {path}\n```\n{text}\n```" for path, text in starter) or "(no files)"
++    primary_text = primary_path if primary_path else "(no non-test file found; create the appropriate source file)"
++    return f"""I have uploaded a code repository in the directory {git_tempdir}. Help solve the following problem.
++
++<problem_description>
++{problem_statement}
++</problem_description>
++
++No source edits were detected so far. The current diff against the base commit is:
++{patch_display}
++
++Primary source file: {primary_text}
++
++Current contents of the non-test files:
++{starter_text}
++
++Your first action must be an editor tool call with command=edit on {primary_text} containing the full solution (or command=create if the file does not exist); do not explore further and do not reply with an empty message. The solution must replace the starter stub and keep the required signature, adding any missing imports. After editing, reply with a short summary of the change."""
++
++
++def _build_fallback_prompt(problem_statement, primary_path, git_tempdir):
++    """Tool-free prompt asking for the complete primary file contents."""
++    return f"""Problem:
++{problem_statement}
++
++Output the complete contents of {primary_path} (inside {git_tempdir}) that solves the problem, in one ```python fenced block, and nothing else. Keep the required signature and any imports needed. If the file is not Python, use the fence language matching its extension."""
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -165,29 +239,52 @@ Rules:
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+         safe_log(f"[forward] Initial pass complete; {len(msg_history)} messages in history.")
++        if _is_empty_reply(msg_history):
++            safe_log("[forward] Stall detected: last assistant message is empty after initial pass.")
++
++        patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++        primary_path = _primary_source_file(self.git_tempdir)
+ 
++        # Fresh-context retries (bounded loop, never reuses the stalled history)
+         for attempt in range(3):
+-            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+             if has_source_edits(patch):
+                 break
+-            safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Re-prompting agent.")
+-            patch_display = patch.strip() if patch.strip() else "EMPTY (no changes at all)"
+-            retry_msg = f"""No source edits were detected in {self.git_tempdir}. The current diff against the base commit is:
+-
+-{patch_display}
+-
+-You have NOT yet modified the primary source file with a solution. Implement the solution NOW: use the editor tool to replace the starter stub (`pass`) in the main source file with a full implementation, adding any missing imports. Do not reply with only a plan or an empty message. After editing, reply with a short summary of the change."""
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        else:
++            safe_log(f"[forward] No source edits detected (attempt {attempt + 1}/3). Retrying with fresh context.")
++            retry_msg = _build_retry_prompt(self.problem_statement, self.git_tempdir, primary_path, patch)
++            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            if _is_empty_reply(msg_history):
++                safe_log(f"[forward] Stall detected on retry attempt {attempt + 1}/3 (empty reply).")
+             patch = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if not has_source_edits(patch):
+-                safe_log("[forward] Warning: agent finished without source edits after retries.")
+ 
+-        # Optional verification pass once a source edit exists
+-        if has_source_edits(patch):
++        # Tool-free fallback: ask for the full primary file as a single code block
++        if not has_source_edits(patch):
++            safe_log("[forward] Still no source edits after retries. Trying tool-free fallback.")
++            if primary_path is None:
++                safe_log("[forward] Fallback skipped: no non-test tracked files found.")
++            else:
++                fallback_msg = _build_fallback_prompt(self.problem_statement, primary_path, self.git_tempdir)
++                fallback_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
++                reply_text = _last_assistant_text(fallback_history)
++                code = extract_code_block(reply_text)
++                if code and code.strip():
++                    if not code.endswith('\n'):
++                        code += '\n'
++                    with open(os.path.join(self.git_tempdir, primary_path), 'w', encoding='utf-8') as f:
++                        f.write(code)
++                    safe_log(f"[forward] Fallback wrote {len(code)} chars to {primary_path}.")
++                    patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++                else:
++                    safe_log("[forward] Fallback produced no code block; nothing written.")
++
++        has_edit = has_source_edits(patch)
++        if has_edit:
++            # Verification pass once a source edit exists
+             verify_msg = """Verify your solution once more: run the problem's examples and a brute-force comparison on small random inputs via bash. If there are any mismatches, errors, or edge-case issues, fix them in the source file with the editor tool. Make sure the final source file is complete and imports are correct."""
+             safe_log("[forward] Running verification pass.")
+             msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        else:
++            safe_log("[forward] Warning: agent finished without a non-test source edit.")
++        safe_log(f"[forward] Final status: source edit exists = {has_edit}.")
+ 
+         return msg_history
+ 

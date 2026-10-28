@@ -1,0 +1,374 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index be510f2..4db1dbe 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -173,6 +174,95 @@ class AgenticSystem:
+                     changed_files.append(parts[3][2:] if parts[3].startswith('b/') else parts[3])
+         return any(not f.startswith('tests/') for f in changed_files)
+ 
++    def _parse_samples(self):
++        """
++        Parse 'Sample Input N' / 'Sample Output N' blocks from the problem statement.
++        Returns a list of (input_text, expected_output_text) tuples (may be empty).
++        """
++        text = self.problem_statement or ''
++        pattern = re.compile(
++            r'Sample Input\s*\d*[ \t]*:?[ \t]*\n(.*?)\n[ \t]*Sample Output\s*\d*[ \t]*:?[ \t]*\n(.*?)'
++            r'(?=\n[ \t]*\n|\n[ \t]*Sample Input|\n[ \t]*Explanation|\Z)',
++            re.S | re.I,
++        )
++
++        def clean(block):
++            lines = [l for l in block.splitlines() if not l.strip().startswith('```')]
++            return '\n'.join(lines).strip() + '\n'
++
++        samples = []
++        for m in pattern.finditer(text):
++            inp, out = clean(m.group(1)), clean(m.group(2))
++            if inp.strip() and out.strip():
++                samples.append((inp, out))
++        return samples
++
++    def _checkpoint_ok(self):
++        """
++        Return True if solution.py passes the samples in the problem statement
++        (run as `python3 solution.py` with a 10s timeout per sample).
++        If the statement has no parsable samples, return True only if solution.py has real code.
++        """
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        if not os.path.isfile(sol_path):
++            return False
++        with open(sol_path, 'r', encoding='utf-8', errors='replace') as f:
++            content = f.read()
++        code_lines = [
++            line for line in content.splitlines()
++            if line.strip() and not line.strip().startswith('#')
++        ]
++        if not code_lines:
++            return False
++
++        samples = self._parse_samples()
++        if not samples:
++            return True
++        if 'class Solution' in content and 'stdin' not in content and 'input(' not in content:
++            # Method-style task: no stdin driver to run, so only check that real code exists.
++            return True
++        for inp, expected in samples:
++            try:
++                res = subprocess.run(
++                    ["python3", "solution.py"], input=inp, cwd=self.git_tempdir,
++                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                    universal_newlines=True, timeout=10, check=False,
++                )
++            except subprocess.TimeoutExpired:
++                safe_log("checkpoint: solution.py timed out on a sample")
++                return False
++            if res.returncode != 0 or res.stdout.split() != expected.split():
++                safe_log(f"checkpoint: sample failed (rc={res.returncode})")
++                return False
++        return True
++
++    def _retry_context(self):
++        """
++        Build the context used for retry attempts: problem statement, tests/ listing,
++        truncated tests/brute.py, and the tail of the previous chat log.
++        """
++        tests_dir = os.path.join(self.git_tempdir, 'tests')
++        try:
++            listing = ', '.join(sorted(os.listdir(tests_dir))) or '(empty)'
++        except OSError:
++            listing = '(tests/ does not exist)'
++        try:
++            with open(os.path.join(tests_dir, 'brute.py'), 'r', encoding='utf-8', errors='replace') as f:
++                brute = f.read()[:4000]
++        except OSError:
++            brute = '(tests/brute.py not found)'
++        try:
++            with open(self.chat_history_file, 'r', encoding='utf-8', errors='replace') as f:
++                prev_log = f.read()[-3000:]
++        except OSError:
++            prev_log = '(no previous log)'
++        return (
++            f"# Problem\n{self.problem_statement}\n\n"
++            f"# Files in tests/\n{listing}\n\n"
++            f"# tests/brute.py (truncated)\n{brute}\n\n"
++            f"# Tail of previous attempt log (last 3000 chars)\n{prev_log}\n"
++        )
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -187,39 +277,57 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         method = """Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Immediately write a first complete solution.py; do not write test files or long analysis before this exists. Create each file in a separate tool call to avoid output truncation. For a `Solution` class method, add `from typing import *` and any imports you need at the top of solution.py.
+-3. Then list at least 8 edge cases derived from the constraints, covering: minimum size (min n), inputs with NO special elements (e.g. no missing/-1 values, no zeros, no answer-triggering values), inputs where ALL elements are special, special elements at the first and last positions, all values equal, strictly increasing and strictly decreasing (monotone) values, and maximum values. Write them to tests/edge_cases.py as a list of (input, expected_output) pairs, where each expected output is computed by the brute force (step 4), never by hand. Keep this file short.
+-4. Write tests/brute.py as a short, straightforward exhaustive reference that handles EVERY valid input, including inputs with no special elements. Write tests/gen.py that produces random valid inputs. The generator must NEVER skip, filter out, or `continue` past any generated case (do not write things like `if a.count(-1) == 0: continue`); it must sweep the size, the value range, and the density of special elements, including the extremes (density 0 and density 1) and tiny value ranges (e.g. 1..3, 1..10) so duplicates and collisions are frequent, plus larger ranges (1..100 and beyond). Write each in its own tool call. Write tests/stress.py that runs every case in tests/edge_cases.py and at least 1000 random cases from tests/gen.py, runs both solution.py (or the Solution method through a driver) and tests/brute.py on each input, and prints every mismatch. Run stress.py with several seeds.
+-5. Run solution.py on every sample in the statement and compare with the expected outputs exactly (for stdin programs: `python3 solution.py < sample1.txt`). Then run tests/stress.py and fix every mismatch.
+-6. If the solution relies on an unproven heuristic or candidate set, also test it against the brute force on larger random sizes (e.g. n up to 12) with a brute force that is still fast enough for that size.
++2. First write tests/brute.py, a short exhaustive reference that is correct on small inputs (create it with the editor tool, command=create). Then immediately copy it into solution.py wrapped in the required I/O format (read stdin, write stdout, or the Solution method if that is the required interface) as a checkpoint. Run the samples from the statement that fit the brute force and verify them. For a `Solution` class method, add `from typing import *` and any imports you need at the top of solution.py. Create each file in a separate tool call to avoid output truncation.
++3. Then list at least 8 edge cases derived from the constraints, covering: minimum size (min n), inputs with NO special elements (e.g. no missing/-1 values, no zeros, no answer-triggering values), inputs where ALL elements are special, special elements at the first and last positions, all values equal, strictly increasing and strictly decreasing (monotone) values, and maximum values. Write them to tests/edge_cases.py as a list of (input, expected_output) pairs, where each expected output is computed by tests/brute.py, never by hand. Keep this file short.
++4. Write tests/gen.py that produces random valid inputs. It must NEVER skip, filter out, or `continue` past any generated case. It must sweep the size, the value range, and the density of special elements, including density 0 and density 1, tiny value ranges (e.g. 1..3, 1..10) so duplicates are frequent, and larger ranges (1..100 and beyond). Write tests/stress.py that runs every case in tests/edge_cases.py and at least 1000 random cases from tests/gen.py through both solution.py and tests/brute.py, and prints every mismatch. Run stress.py with several seeds.
++5. Run solution.py on every sample in the statement and compare with the expected outputs exactly. Then run tests/stress.py and fix every mismatch.
++6. Hard problems: if the constraints are too large for the brute force (e.g. coordinates up to 1e16, or n up to 2e5), do not keep exploring ad hoc. Instead:
++   a. State the hypothesis family explicitly in one or two sentences (e.g. "the answer is a min over a small set of structured routes parameterised by block offsets and entry/exit tiles", or "the answer is a min over a few closed-form formulas in n, k, and the endpoints").
++   b. Implement the candidate for that family in tests/cand.py, which must be fast enough for the real limits.
++   c. Compare tests/cand.py against tests/brute.py on all small parameter grids. Report only a mismatch count and the first 3 mismatches, to keep outputs short.
++   d. Limit exploration to roughly 8 scripts for each hypothesis family before committing to the best candidate. If none matches, switch to a different family once, then commit to the best candidate anyway.
++   e. Only overwrite solution.py with a version that passes these comparisons. Never leave the checkpoint solution.py broken: it must always run and pass the samples that fit the brute force.
++   f. The final solution must guard the memory and time of any brute-force part (e.g. cap the window size), and use the candidate formula for large inputs. It must never crash with MemoryError.
+ 7. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-8. Keep the tests/ directory until the very end. Re-run the complete harness (tests/edge_cases.py and tests/stress.py) after EVERY modification of solution.py, including full rewrites from scratch. Do not delete or re-create the harness between iterations in a way that drops earlier checks.
+-9. Before finishing, re-read solution.py line by line. For every early return and special-case branch, check it against the problem statement and against the edge cases from step 3. Then confirm that tests/stress.py passes on the final version of solution.py.
++8. Keep the tests/ directory until the very end. Re-run the harness (tests/edge_cases.py and tests/stress.py) after EVERY modification of solution.py.
++9. Before finishing, re-read solution.py line by line. For every early return and special-case branch, check it against the problem statement and the edge cases. Then confirm that tests/stress.py passes on the final version of solution.py.
+ 10. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        retry_text = (
+-            f"Your previous attempt left solution.py as the empty stub. Do not plan at length. "
+-            f"In your very next action, call the editor tool with command=create to write the complete Python solution "
+-            f"to {self.git_tempdir}/solution.py for this problem:\n\n{self.problem_statement}\n\n"
+-            f"Keep messages short. After the file exists, run the samples and fix any problems."
+-        )
+         for attempt in range(3):
+-            if self._solution_written():
++            if self._checkpoint_ok():
+                 break
+-            safe_log(f"solution.py not written; retry attempt {attempt + 1}/3")
++            safe_log(f"checkpoint solution.py missing or failing samples; retry attempt {attempt + 1}/3")
++            retry_text = (
++                "The checkpoint solution.py is missing or fails the statement samples. "
++                "Use the context below. Do not restart the exploration from scratch.\n"
++                "(a) If solution.py in the repo is missing, write solution.py now from tests/brute.py (wrap it in the required I/O format) "
++                "with the editor tool, command=create, and run the samples.\n"
++                "(b) Then continue the fast-solution search under the budget: at most about 8 exploratory scripts per "
++                "hypothesis family, then commit to the best candidate. Overwrite solution.py only with a version that passes "
++                "the samples and the comparison against tests/brute.py.\n\n"
++                + self._retry_context()
++            )
+             init_edit = chat_with_agent(retry_text, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        if not self._solution_written():
+-            # Final fallback: ask only for a straightforward correct solution.
++        if not self._checkpoint_ok():
++            # Final fallback: a guarded brute force plus the best heuristic for large inputs.
+             fallback_text = (
+-                f"solution.py in {self.git_tempdir} is still missing a real solution. Write now, with the editor tool "
+-                f"(command=create), a straightforward correct Python solution to this problem and nothing else:\n\n"
++                f"solution.py in {self.git_tempdir} is still missing a working solution. Write it now, with the editor tool "
++                f"(command=create), as a single Python file that:\n"
++                f"- reads input in the required I/O format (or implements the required Solution method);\n"
++                f"- uses an exhaustive search only when the input is small, with explicit guards on memory and time "
++                f"(e.g. cap the window or array size, and cap the number of iterations);\n"
++                f"- for inputs above the caps, uses the best formula or heuristic you have found, and never raises MemoryError "
++                f"or lets an exception escape;\n"
++                f"- prints exactly one answer in the required output format.\n"
++                f"Then run the samples from the statement and fix any mismatch.\n\n"
+                 f"{self.problem_statement}"
+             )
+             init_edit = chat_with_agent(fallback_text, model=self.code_model, msg_history=[], logging=safe_log)
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..910667c
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,183 @@
++"""Coding agent: keeps a valid checkpoint solution.py and bounds exploration on hard formula problems.
++
++Assumes the surrounding framework provides chat_with_agent(instruction, msg_history, ...)
++returning (text, msg_history) and a tool-using agent that works inside the task workspace.
++"""
++
++import os
++import re
++import subprocess
++import sys
++
++MAX_RETRIES = 3
++SAMPLE_TIMEOUT = 10
++TAIL_CHARS = 3000
++BRUTE_TRUNC = 4000
++
++SAMPLE_RE = re.compile(
++    r"Sample Input\s*(\d*)\s*:?\s*\n(.*?)\n\s*Sample Output\s*\1\s*:?\s*\n(.*?)(?=\n\s*Sample Input|\Z)",
++    re.S | re.I,
++)
++
++METHOD_PROMPT = """You are solving a competitive programming problem in Python.
++Work inside the current directory. Final answer must be in solution.py and read stdin / write stdout.
++
++Steps:
++1. Read the problem statement carefully and extract the samples.
++2. First write tests/brute.py, then immediately copy it into solution.py wrapped in the required I/O format as a checkpoint; verify the samples that fit.
++3. Write a random tester that generates small inputs, runs brute.py and solution.py, and reports mismatches.
++4. Optimize solution.py only after it is correct on small inputs; keep it passing samples at every step.
++
++Hard problems:
++- If the constraints are too large for brute force, state the hypothesis family explicitly (e.g. the answer is a min over a small set of structured routes parameterised by block offsets and entry/exit tiles).
++- Implement the candidate in tests/cand.py and compare against tests/brute.py on all small parameter grids. Report only a mismatch count and the first 3 mismatches, to keep outputs short.
++- Limit exploration to roughly 8 scripts per hypothesis family before committing to a candidate.
++- solution.py may be overwritten only by a version that passes the comparisons.
++- Never leave the checkpoint solution broken.
++
++Keep messages and tool outputs short.
++"""
++
++FALLBACK_PROMPT = """No passing solution.py exists yet. Write solution.py now:
++- Use a brute force (from tests/brute.py if present) with explicit memory and time guards:
++  cap any window or array size (e.g. at 2*10^6 elements) and bound loop iterations.
++- For inputs exceeding the guards, fall back to the best available heuristic/formula instead of raising MemoryError.
++- The program must never crash: wrap the main logic in try/except and print a best-effort answer.
++- Verify it runs on the samples before finishing.
++"""
++
++RETRY_PROMPT = """The previous attempt did not leave a passing solution.py.
++
++PROBLEM STATEMENT:
++{problem}
++
++FILES IN tests/:
++{files}
++
++tests/brute.py (truncated):
++{brute}
++
++PREVIOUS CHAT LOG (tail):
++{tail}
++
++Please:
++(a) write solution.py from tests/brute.py if solution.py is missing or broken (wrapped in stdin/stdout I/O);
++(b) continue the fast-solution search under the budget (about 8 exploratory scripts per hypothesis family), and
++    only overwrite solution.py with a version that passes the comparisons against brute.py.
++Report only short findings.
++"""
++
++
++class AgenticSystem:
++    def __init__(self, workdir=None, chat_fn=None, problem_statement=""):
++        self.workdir = workdir or os.getcwd()
++        self.chat_fn = chat_fn  # chat_fn(instruction, msg_history) -> (text, msg_history)
++        self.problem_statement = problem_statement
++        self.chat_log_path = os.path.join(self.workdir, "chat_log.txt")
++
++    # ---------- helpers ----------
++    def _parse_samples(self):
++        samples = []
++        for m in SAMPLE_RE.finditer(self.problem_statement or ""):
++            samples.append((m.group(2).strip() + "\n", m.group(3).strip()))
++        return samples
++
++    def _solution_has_code(self):
++        path = os.path.join(self.workdir, "solution.py")
++        if not os.path.isfile(path):
++            return False
++        with open(path, "r", encoding="utf-8", errors="replace") as f:
++            text = f.read()
++        lines = [l.strip() for l in text.splitlines()]
++        code = [l for l in lines if l and not l.startswith("#") and l not in ("pass", '"""', "'''")]
++        return len(code) > 0
++
++    def _checkpoint_ok(self):
++        """Run solution.py on sample inputs. Returns True if it passes (or if no samples parse and code exists)."""
++        if not os.path.isfile(os.path.join(self.workdir, "solution.py")):
++            return False
++        samples = self._parse_samples()
++        if not samples:
++            return self._solution_has_code()
++        for inp, expected in samples:
++            try:
++                proc = subprocess.run(
++                    [sys.executable, "solution.py"],
++                    input=inp,
++                    capture_output=True,
++                    text=True,
++                    timeout=SAMPLE_TIMEOUT,
++                    cwd=self.workdir,
++                )
++            except subprocess.TimeoutExpired:
++                return False
++            except Exception:
++                return False
++            if proc.returncode != 0:
++                return False
++            got = " ".join(proc.stdout.split())
++            exp = " ".join(expected.split())
++            if got != exp:
++                return False
++        return True
++
++    def _files_listing(self):
++        d = os.path.join(self.workdir, "tests")
++        if not os.path.isdir(d):
++            return "(none)"
++        names = sorted(os.listdir(d))
++        return "\n".join(names) if names else "(empty)"
++
++    def _read_brute(self):
++        p = os.path.join(self.workdir, "tests", "brute.py")
++        if not os.path.isfile(p):
++            return "(missing)"
++        with open(p, "r", encoding="utf-8", errors="replace") as f:
++            return f.read()[:BRUTE_TRUNC]
++
++    def _log_tail(self):
++        if not os.path.isfile(self.chat_log_path):
++            return "(no log)"
++        with open(self.chat_log_path, "r", encoding="utf-8", errors="replace") as f:
++            return f.read()[-TAIL_CHARS:]
++
++    def _chat(self, instruction, msg_history):
++        if self.chat_fn is None:
++            return "", msg_history
++        text, msg_history = self.chat_fn(instruction, msg_history)
++        try:
++            with open(self.chat_log_path, "a", encoding="utf-8") as f:
++                f.write(str(text) + "\n")
++        except OSError:
++            pass
++        return text, msg_history
++
++    # ---------- main entry ----------
++    def forward(self):
++        msg_history = []
++        _, msg_history = self._chat(METHOD_PROMPT + "\n\nPROBLEM STATEMENT:\n" + self.problem_statement, msg_history)
++        ok = self._checkpoint_ok()
++
++        # bounded retry loop (no while True)
++        for _ in range(MAX_RETRIES):
++            if ok:
++                break
++            prompt = RETRY_PROMPT.format(
++                problem=self.problem_statement,
++                files=self._files_listing(),
++                brute=self._read_brute(),
++                tail=self._log_tail(),
++            )
++            _, msg_history = self._chat(prompt, [])
++            ok = self._checkpoint_ok()
++
++        if not ok:
++            _, msg_history = self._chat(FALLBACK_PROMPT, msg_history)
++            ok = self._checkpoint_ok()
++        return ok
++
++
++if __name__ == "__main__":
++    statement = sys.stdin.read() if not sys.stdin.isatty() else ""
++    agent = AgenticSystem(problem_statement=statement)
++    print("PASS" if agent.forward() else "FAIL")

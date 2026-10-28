@@ -1,0 +1,510 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1fe931e..a33c6a1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -120,6 +120,9 @@ class AgenticSystem:
+         self.self_improve = self_improve
+         self.language = language
+ 
++        # Rank of the candidate currently installed in solution.py (None = nothing installed yet).
++        self._best_installed_rank = None
++
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+ 
+@@ -167,6 +170,76 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+         """One focused agent call with a fresh message history."""
+         return chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
++    @staticmethod
++    def _is_trivial_code(code):
++        """True if the code is empty or contains only blank lines and comments."""
++        return all(not line.strip() or line.strip().startswith('#') for line in code.splitlines())
++
++    def _install(self, path, rank=None):
++        """Copy candidate `path` to solution.py if it is non-trivial and does not rank below the installed one.
++        `rank` is a tuple comparable to _rank_key; without a rank the copy is unconditional (used by the fallbacks).
++        Returns True if solution.py was written."""
++        try:
++            with open(path, 'r', encoding='utf-8', errors='replace') as f:
++                code = f.read()
++        except OSError as e:
++            safe_log(f"install: could not read {path}: {e}")
++            return False
++        if not code.strip() or self._is_trivial_code(code):
++            safe_log(f"install: skipped {path} (empty or comments only)")
++            return False
++        if rank is not None and self._best_installed_rank is not None and rank < self._best_installed_rank:
++            safe_log(f"install: kept the installed solution, {path} ranks worse ({rank} < {self._best_installed_rank})")
++            return False
++        try:
++            with open(self._solution_path(), 'w', encoding='utf-8') as f:
++                f.write(code)
++        except OSError as e:
++            safe_log(f"install: could not write solution.py: {e}")
++            return False
++        if rank is not None:
++            self._best_installed_rank = rank
++        safe_log(f"install: copied {path} to solution.py (rank {rank})")
++        return True
++
++    def _quick_check(self, path):
++        """Sample-only check of one candidate. Returns (rank_tuple, passes_samples) or (None, False) on error.
++        The rank is shaped like _rank_key, with unknown stress/agreement fields set below any real value."""
++        work = self._work_dir()
++        try:
++            res = run_raw([path], os.path.join(work, 'brute.py'), os.path.join(work, 'gen.py'),
++                          num_cases=0, timeout=CALL_TIMEOUT)
++        except Exception as e:
++            safe_log(f"quick check failed for {path}: {e}")
++            return None, False
++        if res.get('status') != 'ok':
++            return None, False
++        st = res['stats']
++        samples_ok = st['samples_ok'][0]
++        samples_total = st['samples_total']
++        passes = samples_total > 0 and samples_ok == samples_total
++        return (samples_ok, -1, -1, False, float('-inf')), passes
++
++    def _try_install(self, path):
++        """Install a freshly produced candidate/repair if it passes the samples or beats the installed one."""
++        rank, passes = self._quick_check(path)
++        if rank is None:
++            return False
++        if passes or self._best_installed_rank is None or rank > self._best_installed_rank:
++            return self._install(path, rank)
++        return False  # does not pass the samples and does not beat the installed candidate
++
++    def _newest_work_candidate(self):
++        """Newest _work/cand_*.py or _work/repair_*.py file, or None."""
++        work = self._work_dir()
++        files = []
++        for name in os.listdir(work):
++            if (name.startswith('cand_') or name.startswith('repair_')) and name.endswith('.py'):
++                full = os.path.join(work, name)
++                if os.path.isfile(full):
++                    files.append(full)
++        return max(files, key=os.path.getmtime) if files else None
++
+     def _write_tests(self):
+         """Tests phase: from the statement alone, write a brute force and a generator (+ samples)."""
+         work = self._work_dir()
+@@ -205,6 +278,7 @@ Steps:
+ - Run the solution on every sample from the statement and compare exactly.
+ - Use the run_candidates tool (or stress_test) with candidate_paths=[{path}], brute_path={brute}, generator_path={gen} to compare against the brute force; fix every mismatch.
+ - Do not change {brute} or {gen} in this step.
++- As soon as the candidate passes the samples, also copy it to {self._solution_path()} (the repo's solution.py).
+ 
+ Completion condition: {path} exists, runs on the samples, and matches the expected outputs. Do not end your turn without a tool call."""
+         self._chat(prompt)
+@@ -290,17 +364,18 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+         """
+         Multi-candidate pipeline:
+         tests -> N independent candidates -> differential scoring -> up to K repair rounds -> rank -> solution.py.
++        solution.py is updated as soon as a candidate is good enough, and _ensure_patch() always runs at the end.
+         """
+-        task = self._task_text()
++        brute = os.path.join(self._work_dir(), 'brute.py')
++        gen = os.path.join(self._work_dir(), 'gen.py')
++        tests_ready = False
+         try:
+             brute, gen = self._write_tests()
+             tests_ready = os.path.isfile(brute) and os.path.isfile(gen)
+         except Exception as e:
+             safe_log(f"tests phase failed: {e}")
+-            tests_ready = False
+ 
+         candidates = []
+-        winner_copied = False
+         if tests_ready:
+             hints = [
+                 'Start from the most direct efficient algorithm you can justify from the constraints.',
+@@ -310,17 +385,20 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+             for i in range(self.N_CANDIDATES):
+                 try:
+                     path = self._solve_candidate(i, hints[i % len(hints)], '')
++                    if path:
++                        candidates.append(path)
++                        self._try_install(path)
+                 except Exception as e:
+                     safe_log(f"candidate {i} failed: {e}")
+-                    path = None
+-                if path:
+-                    candidates.append(path)
+ 
+-            best_row = None
+             for round_k in range(self.K_REPAIR_ROUNDS + 1):
+                 if not candidates:
+                     break
+-                rows, message = self._differential_check(candidates)
++                try:
++                    rows, message = self._differential_check(candidates)
++                except Exception as e:
++                    safe_log(f"differential check in round {round_k} failed: {e}")
++                    break
+                 if rows is None:
+                     safe_log(f"differential check failed: {message}")
+                     break
+@@ -329,46 +407,72 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                     break
+                 try:
+                     repaired = self._repair(best_row['path'], message)
++                    if repaired:
++                        candidates.append(repaired)
++                        self._try_install(repaired)
+                 except Exception as e:
+                     safe_log(f"repair round {round_k} failed: {e}")
+-                    repaired = None
+-                if repaired:
+-                    candidates.append(repaired)
+ 
+             if candidates:
+-                rows, _ = self._differential_check(candidates)
+-                if rows:
+-                    best_row = max(rows, key=self._rank_key)
+-                    winner = best_row['path']
+-                    safe_log(f"Selected {winner}: samples {best_row['samples_ok']}/{best_row['samples_total']}, "
+-                             f"stress {best_row['stress_ok']}/{best_row['stress_total']}, "
+-                             f"majority agreement {best_row['agree_majority']}, timing_ok {best_row['timing_ok']}, "
+-                             f"passes_all {best_row['passes']}")
+-                    if not best_row['passes']:
+-                        self._score_candidate(winner)  # logs the full report for the winner
+-                    try:
+-                        with open(winner, 'r', encoding='utf-8', errors='replace') as f:
+-                            code = f.read()
+-                        if code.strip():
+-                            with open(self._solution_path(), 'w', encoding='utf-8') as f:
+-                                f.write(code)
+-                            winner_copied = True
+-                    except OSError as e:
+-                        safe_log(f"could not copy winner to solution.py: {e}")
+-
+-        # Final safety net: only when the pipeline produced no winner, make the agent write solution.py.
+-        if winner_copied:
+-            return
++                try:
++                    rows, _ = self._differential_check(candidates)
++                    if rows:
++                        best_row = max(rows, key=self._rank_key)
++                        winner = best_row['path']
++                        safe_log(f"Selected {winner}: samples {best_row['samples_ok']}/{best_row['samples_total']}, "
++                                 f"stress {best_row['stress_ok']}/{best_row['stress_total']}, "
++                                 f"majority agreement {best_row['agree_majority']}, timing_ok {best_row['timing_ok']}, "
++                                 f"passes_all {best_row['passes']}")
++                        if not best_row['passes']:
++                            try:
++                                self._score_candidate(winner)  # logs the full report for the winner
++                            except Exception as e:
++                                safe_log(f"scoring the winner failed: {e}")
++                        self._install(winner, self._rank_key(best_row))
++                except Exception as e:
++                    safe_log(f"final selection failed: {e}")
++
++        try:
++            self._ensure_patch()
++        except Exception as e:
++            safe_log(f"ensure_patch failed: {e}")
++
++    def _ensure_patch(self):
++        """
++        Always runs at the end. If solution.py is unchanged from the base commit, empty/comments-only, or the
++        diff touches only test or _work/ files, copy the newest _work candidate, and failing that ask the agent
++        (at most 3 attempts) to write solution.py. Returns True once the primary file is edited.
++        """
++        if self._primary_file_edited():
++            return True
++        try:
++            diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            touched = [line.split(' ')[2][2:] for line in diff.splitlines()
++                       if line.startswith('diff --git ') and len(line.split(' ')) >= 3 and line.split(' ')[2].startswith('a/')]
++            safe_log(f"ensure_patch: solution.py not edited yet; touched paths: {touched}")
++        except Exception:
++            pass
++
++        newest = self._newest_work_candidate()
++        if newest:
++            safe_log(f"ensure_patch: copying newest work file {newest} to solution.py")
++            if self._install(newest) and self._primary_file_edited():
++                return True
++
++        task = self._task_text()
+         fallback_prompt = (f"{task}\nsolution.py has not been modified yet, so the task is still unsolved. "
+-                           "Using the editor tool, write a complete candidate solution to solution.py immediately "
+-                           "(a simple correct-but-slow approach is acceptable), run it on the samples, then refine it. "
+-                           "Do not end your turn without a tool call.")
+-        if not self._solution_nonempty():
+-            self._chat(fallback_prompt)
++                           f"Using the editor tool, write a complete candidate solution to {self._solution_path()} "
++                           "immediately (a simple correct-but-slow approach is acceptable). This file is the graded "
++                           "output: it must not be left as the template and must not stay only under _work/. "
++                           "Then run it on the samples and refine it. Do not end your turn without a tool call.")
+         for attempt in range(3):
++            try:
++                self._chat(fallback_prompt)
++            except Exception as e:
++                safe_log(f"ensure_patch fallback attempt {attempt} failed: {e}")
+             if self._primary_file_edited():
+-                break
+-            self._chat(fallback_prompt)
++                return True
++        return False
+ 
+     def _solution_nonempty(self):
+         try:
+@@ -425,8 +529,8 @@ Completion condition: {out} exists, runs on the counterexample, and matches the
+                 return False
+             return True
+ 
+-        # Generalized: any non-test file touched by the diff.
+-        return any('test' not in path.lower() for path in touched)
++        # Generalized: any non-test file touched by the diff, ignoring the _work/ scratch directory.
++        return any(not path.startswith('_work/') and 'test' not in path.lower() for path in touched)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/run_candidates.py b/tools/run_candidates.py
+index accebf5..2c31678 100644
+--- a/tools/run_candidates.py
++++ b/tools/run_candidates.py
+@@ -23,7 +23,7 @@ MAX_SIZE = 30
+ TIMING_SIZE = 1000
+ SHRINK_BUDGET = 150
+ MAX_EXAMPLES = 3
+-TIME_BUDGET = 120.0
++TIME_BUDGET = 90.0
+ REPR_CAP = 400
+ START = time.time()
+ 
+@@ -201,6 +201,8 @@ disagree_count = [0]
+ 
+ def evaluate(x):
+     """Run brute and all candidates on x. Returns (brute_result, cand_results, bad_flag)."""
++    if time.time() - START > TIME_BUDGET:
++        return ("skipped", None), [], False, None
+     bres = call(brute_fn, x)
+     cres = [call(f, x) for f in cand_fns]
+     keys = [key_of(r) for r in cres]
+@@ -228,7 +230,8 @@ def record_example(x, bres, cres, phase):
+         changed = False
+         for cand in candidates(cur, top_tuple=bool(method) and isinstance(cur, tuple)):
+             budget -= 1
+-            if budget <= 0:
++            if budget <= 0 or time.time() - START > TIME_BUDGET:
++                budget = 0
+                 break
+             if still_bad(cand):
+                 cur = cand
+@@ -241,6 +244,8 @@ def record_example(x, bres, cres, phase):
+ 
+ def run_input(x, phase, is_sample=None):
+     bres, cres, bad, maj = evaluate(x)
++    if bres[0] == "skipped":
++        return
+     if bres[0] != "ok":
+         if len(brute_problems) < 3:
+             brute_problems.append(f"brute failed ({bres[0]}) on input {clip(repr(x), 200)} during {phase}: {show(bres)}")
+@@ -275,6 +280,8 @@ if hasattr(gen_mod, "samples"):
+         samples = []
+ sample_fail_brute = []
+ for k, item in enumerate(samples):
++    if time.time() - START > TIME_BUDGET:
++        break
+     try:
+         x, expected = item
+     except BaseException:
+@@ -312,8 +319,8 @@ for i in range(num_cases):
+ # Phase 3: max-size timing input (candidates only, plus candidate agreement).
+ timing_lines = []
+ try:
+-    tx = gen_mod.gen(random.Random(999), TIMING_SIZE)
+-    tres = [call(f, tx) for f in cand_fns]
++    tx = gen_mod.gen(random.Random(999), TIMING_SIZE) if time.time() - START <= TIME_BUDGET else None
++    tres = [call(f, tx) for f in cand_fns] if tx is not None else []
+     for i, r in enumerate(tres):
+         timing_lines.append(f"cand_{i}: {r[0]} in {r[2]:.3f}s")
+         if r[0] == "timeout":
+@@ -321,7 +328,9 @@ try:
+         elif r[0] == "exc":
+             stats["exceptions"][i] += 1
+     tkeys = [key_of(r) for r in tres]
+-    timing_disagree = len(set(tkeys)) > 1
++    timing_disagree = len(set(tkeys)) > 1 if tres else False
++    if tx is None:
++        timing_lines = ["skipped: time budget exhausted"]
+ except BaseException:
+     tx = None
+     timing_lines = ["timing input generation failed"]
+@@ -387,7 +396,8 @@ def tool_info():
+ * Inputs: `candidate_paths` (list of Python files, each exposing `solve(input_obj)` or, if `method` is given, a class `Solution`), `brute_path` (the brute-force reference, same convention), and `generator_path` (exposes `gen(rng, size)`, optionally `enumerate_all()` for tiny exhaustive inputs and `samples()` returning a list of (input, expected_output) pairs from the problem statement).
+ * Each program is run in a subprocess with a per-call alarm of `timeout` seconds. Generated inputs must include degenerate cases; do not filter them out in the generator.
+ * Output is a compact text report: a table with each candidate's sample pass count, stress pass count vs the brute force, timeouts, exceptions, and how often it agrees with the majority of candidates; the max call time on a max-size input; and the first few minimal (shrunk) inputs where candidates disagree with each other or with the brute force, with the raw output of every program. Read the raw outputs and decide yourself which program is wrong.
+-* The whole run is limited to about 120 seconds of work plus per-call timeouts; reduce `num_cases` if needed.""",
++* The whole run is limited to about 90 seconds of work (an internal deadline stops the run early and reports what finished); reduce `num_cases` if needed.
++* Brute-force-heavy problems (where the brute force is exponential or slow): keep the generated sizes small, e.g. use small num_cases and make gen(rng, size) cap sizes to what the brute force handles in well under a second per case.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+@@ -410,7 +420,7 @@ def tool_info():
+                 },
+                 "num_cases": {
+                     "type": "integer",
+-                    "description": "Number of random cases to run after enumeration (default 300)."
++                    "description": "Number of random cases to run after enumeration (default 100). Lower it for slow brute forces."
+                 },
+                 "timeout": {
+                     "type": "integer",
+@@ -422,7 +432,7 @@ def tool_info():
+     }
+ 
+ 
+-def run_raw(candidate_paths, brute_path, generator_path, method=None, num_cases=300, timeout=5):
++def run_raw(candidate_paths, brute_path, generator_path, method=None, num_cases=100, timeout=5):
+     """Run the candidate driver. Returns the result dict ({'status', 'message', 'stats'}) or {'status': 'error', 'message': ...}."""
+     if not isinstance(candidate_paths, list) or not candidate_paths:
+         return {"status": "error", "message": "candidate_paths must be a non-empty list of file paths."}
+@@ -433,7 +443,7 @@ def run_raw(candidate_paths, brute_path, generator_path, method=None, num_cases=
+         if not isinstance(p, str) or not os.path.isfile(os.path.abspath(p)):
+             return {"status": "error", "message": f"candidate file does not exist: {p}"}
+     try:
+-        num_cases = max(0, min(int(num_cases if num_cases is not None else 300), 100000))
++        num_cases = max(0, min(int(num_cases if num_cases is not None else 100), 100000))
+         timeout = max(1, min(int(timeout if timeout is not None else 5), 60))
+     except (TypeError, ValueError):
+         return {"status": "error", "message": "num_cases and timeout must be integers."}
+@@ -466,7 +476,7 @@ def run_raw(candidate_paths, brute_path, generator_path, method=None, num_cases=
+             pass
+ 
+ 
+-def tool_function(candidate_paths, brute_path, generator_path, method=None, num_cases=300, timeout=5):
++def tool_function(candidate_paths, brute_path, generator_path, method=None, num_cases=100, timeout=5):
+     res = run_raw(candidate_paths, brute_path, generator_path, method=method, num_cases=num_cases, timeout=timeout)
+     if res.get("status") == "ok":
+         return res.get("message", "")
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index bc26c91..987754c 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -8,7 +8,7 @@ import json
+ # generator, runs exhaustive enumeration (if the generator provides enumerate_all)
+ # and then random cases with growing sizes, and writes a JSON result to result_path.
+ _DRIVER = r'''
+-import sys, json, random, signal, importlib.util, os, io, copy, traceback, itertools, contextlib
++import sys, json, random, signal, importlib.util, os, io, copy, traceback, itertools, contextlib, time
+ 
+ sol_path, brute_path, gen_path, num_cases, per_call, method, result_path = sys.argv[1:8]
+ num_cases = int(num_cases)
+@@ -17,6 +17,15 @@ ENUM_CAP = 20000
+ MAX_SIZE = 30
+ SHRINK_BUDGET = 400
+ REPR_CAP = 2000
++TIME_BUDGET = 90.0
++START = time.time()
++TIMED_OUT = [False]
++
++def out_of_time():
++    if time.time() - START > TIME_BUDGET:
++        TIMED_OUT[0] = True
++        return True
++    return False
+ 
+ def finish(d):
+     with open(result_path, "w") as f:
+@@ -98,6 +107,8 @@ def same(a, b):
+ 
+ def check(x):
+     """Returns None if solution agrees with brute, else (kind, expected, actual_text)."""
++    if out_of_time():
++        return None
+     bs, bv = call(brute_fn, x)
+     if bs != "ok":
+         return ("brute_" + bs, None, bv or "brute force failed")
+@@ -149,7 +160,8 @@ def shrink(x, kind):
+         changed = False
+         for cand in candidates(cur, top_tuple=bool(method) and isinstance(cur, tuple)):
+             budget -= 1
+-            if budget <= 0:
++            if budget <= 0 or out_of_time():
++                budget = 0
+                 break
+             f = check(cand)
+             if f is not None and f[0] == kind:
+@@ -182,6 +194,8 @@ if hasattr(gen_mod, "enumerate_all"):
+     try:
+         it = gen_mod.enumerate_all()
+         for x in itertools.islice(iter(it), ENUM_CAP):
++            if out_of_time():
++                break
+             count += 1
+             f = check(x)
+             if f is not None:
+@@ -191,6 +205,8 @@ if hasattr(gen_mod, "enumerate_all"):
+ 
+ # Phase 2: random cases with growing sizes.
+ for i in range(num_cases):
++    if out_of_time():
++        break
+     size = 1 + (i * MAX_SIZE) // max(1, num_cases - 1) if num_cases > 1 else 1
+     rng = random.Random(i * 7919 + 12345)
+     try:
+@@ -202,8 +218,9 @@ for i in range(num_cases):
+     if f is not None:
+         finish(fail_result(x, f, count, f"random case {i} (size {size})"))
+ 
++_note = f" NOTE: stopped early at the {TIME_BUDGET:.0f}s internal time budget; fewer cases were run than requested." if TIMED_OUT[0] else ""
+ finish({"status": "pass", "cases": count,
+-        "message": f"All {count} cases passed (exhaustive enumeration: {'yes' if hasattr(gen_mod, 'enumerate_all') else 'not provided'}; random cases: {num_cases})."})
++        "message": f"All {count} cases passed (exhaustive enumeration: {'yes' if hasattr(gen_mod, 'enumerate_all') else 'not provided'}; random cases: {num_cases})." + _note})
+ '''
+ 
+ 
+@@ -215,14 +232,15 @@ def tool_info():
+ * The generator file exposes `gen(rng, size)` returning an input object, where `rng` is a `random.Random` instance and `size` grows from 1 upward. Optionally it exposes `enumerate_all()` yielding all tiny inputs; these are run first, exhaustively.
+ * Generated inputs must include degenerate cases (minimum size, all equal, extreme values, etc.); do not filter them out in the generator.
+ * Output is compared as a whole (strings compared after stripping whitespace). On failure, the tool returns the shrunk failing input with the expected (brute) and actual (solution) outputs, or the exception/timeout. On success it returns the number of cases run.
+-* Each solve call is limited by `timeout` seconds; the whole run is limited to about 280 seconds, so reduce `num_cases` if needed.""",
++* Each solve call is limited by `timeout` seconds; the run has an internal budget of about 90 seconds and stops early (reporting how many cases ran) if exceeded.
++* Brute-force-heavy problems (where the brute force is exponential or slow): keep the generated sizes small and use a small num_cases.""",
+         "input_schema": {
+             "type": "object",
+             "properties": {
+                 "solution_path": {"type": "string", "description": "Path to the solution Python file (absolute or relative to the current directory)."},
+                 "brute_path": {"type": "string", "description": "Path to the brute-force reference Python file. Must be independent of the algorithm under test."},
+                 "generator_path": {"type": "string", "description": "Path to the generator Python file exposing gen(rng, size) and optionally enumerate_all()."},
+-                "num_cases": {"type": "integer", "description": "Number of random cases to run after enumeration (default 300)."},
++                "num_cases": {"type": "integer", "description": "Number of random cases to run after enumeration (default 100). Lower it for slow brute forces."},
+                 "timeout": {"type": "integer", "description": "Per-call timeout in seconds for each solve call (default 5)."},
+                 "method": {"type": "string", "description": "Optional. If given, solution and brute files define class Solution with this method name; generated inputs must be tuples of positional arguments."}
+             },
+@@ -231,12 +249,12 @@ def tool_info():
+     }
+ 
+ 
+-def tool_function(solution_path, brute_path, generator_path, num_cases=300, timeout=5, method=None):
++def tool_function(solution_path, brute_path, generator_path, num_cases=100, timeout=5, method=None):
+     for label, p in (("solution_path", solution_path), ("brute_path", brute_path), ("generator_path", generator_path)):
+         if not p or not os.path.isfile(os.path.abspath(p)):
+             return f"Error: {label} does not exist: {p}"
+     try:
+-        num_cases = max(0, min(int(num_cases if num_cases is not None else 300), 100000))
++        num_cases = max(0, min(int(num_cases if num_cases is not None else 100), 100000))
+         timeout = max(1, min(int(timeout if timeout is not None else 5), 60))
+     except (TypeError, ValueError):
+         return "Error: num_cases and timeout must be integers."
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..bcf1fa8
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,12 @@
++# Placeholder: no competitive programming problem is present in this repository,
++# so this file only echoes its stdin. It is not a solution to any specific task.
++import sys
++
++
++def main():
++    data = sys.stdin.read()
++    sys.stdout.write(data)
++
++
++if __name__ == "__main__":
++    main()

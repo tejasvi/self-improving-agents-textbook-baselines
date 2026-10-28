@@ -1,0 +1,255 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index c1c8240..2a969a5 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,7 +8,7 @@ import os
+ import threading
+ import traceback
+ 
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm_withtools import CLAUDE_MODEL, CLAUDE_MAX_OUTPUT_TOKENS, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ from llm import create_client, get_response_from_llm
+ 
+@@ -190,10 +190,11 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def _run_agent(self, prompt, msg_history):
++    def _run_agent(self, prompt, msg_history, thinking=False, max_tokens=CLAUDE_MAX_OUTPUT_TOKENS):
+         """Run one agent call; on failure log the exception and return the old history."""
+         try:
+-            new_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            new_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log,
++                                          thinking=thinking, max_tokens=max_tokens)
+             safe_log(f"chat_with_agent returned history of length {len(new_history or [])}")
+             return new_history
+         except Exception as e:
+@@ -219,14 +220,22 @@ class AgenticSystem:
+         except Exception as e:
+             safe_log(f"Direct code fallback failed: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
+             return False
++        code = None
+         match = re.search(r'```python\s*\n(.*?)```', content or '', re.DOTALL)
+-        if not match or not match.group(1).strip():
+-            safe_log("Direct code fallback: no ```python block found in reply", level=logging.ERROR)
++        if match:
++            code = match.group(1)
++        else:
++            # No fence: accept the whole reply if it looks like a program.
++            text = (content or '').strip()
++            if text and ('input' in text or 'stdin' in text or 'def ' in text):
++                code = re.sub(r'^```[a-zA-Z]*\s*\n?|```\s*$', '', text).strip() + "\n"
++        if not code or not code.strip():
++            safe_log("Direct code fallback: no usable code found in reply", level=logging.ERROR)
+             return False
+         try:
+             os.makedirs(os.path.dirname(target_path), exist_ok=True)
+             with open(target_path, 'w') as f:
+-                f.write(match.group(1))
++                f.write(code)
+             safe_log(f"Direct code fallback wrote {target_path}")
+             return True
+         except OSError as e:
+@@ -263,7 +272,7 @@ Follow this workflow strictly. Do not skip steps.
+ 
+ 1. UNDERSTAND: Read the problem statement carefully. Identify the input format, output format, constraints, and the exact file/function you must produce (a complete program reading stdin/writing stdout, or a method of a given `Solution` class). Look at the existing files in the repository to find the target file.
+ 2. DESIGN: Work out a correct algorithm and its complexity against the constraints. Consider edge cases.
+-3. IMPLEMENT NOW: Immediately write a first working solution to the target file using the editor tool. Write the code first and reason afterwards, keeping comments brief. A simple correct solution is fine at this stage; you can optimize later. Do not only describe a plan in text - the file must be created or edited.
++3. IMPLEMENT NOW: Immediately write a first working solution to the target file using the editor tool. Write the code first and reason afterwards, keeping comments brief. A simple correct solution is fine at this stage; you can optimize later. Do not only describe a plan in text - the file must be created or edited. If the problem is hard, FIRST write and save a brute-force solution within your first response, then improve it.
+ 4. SAMPLE TESTS: Extract every sample input/output from the problem statement. Run the solution on each sample via bash (e.g. `echo "..." | python solution.py`, or by calling the method in a small python snippet) and compare the output with the expected output. Fix the solution until all samples pass.
+ 5. BRUTE FORCE + STRESS TEST: Write a simple brute-force reference implementation, then write a random generator of small inputs and compare the solution against the brute force over many random cases. Fix any mismatch.
+ 6. PERFORMANCE: Generate a max-constraint input and time the solution with bash (e.g. `time`). If it takes more than about 2 seconds, optimize the algorithm or implementation and re-verify steps 4 and 5.
+@@ -307,15 +316,16 @@ IMPORTANT:
+             if not self._file_is_stub_or_empty(target_path, stub_content):
+                 break
+             safe_log(f"Solution still missing (escalation {attempt}); requesting implementation.")
++            # Retries use thinking disabled so the full token budget goes to output.
+             if _history_is_degenerate(msg_history):
+                 # Poisoned/empty history: start a fresh, compact conversation.
+                 safe_log(f"History degenerate before escalation {attempt}; starting fresh conversation.")
+-                msg_history = self._run_agent(compact_prompt, [])
++                msg_history = self._run_agent(compact_prompt, [], thinking=False)
+             elif attempt == 2:
+                 # Fresh conversation with only the problem statement and a short instruction.
+-                msg_history = self._run_agent(prompt, [])
++                msg_history = self._run_agent(prompt, [], thinking=False)
+             else:
+-                msg_history = self._run_agent(prompt, _clean_history(msg_history))
++                msg_history = self._run_agent(prompt, _clean_history(msg_history), thinking=False)
+ 
+         if self._file_is_stub_or_empty(target_path, stub_content):
+             safe_log("Escalation did not produce a solution; trying direct code fallback.")
+diff --git a/llm.py b/llm.py
+index a2caa09..c143f39 100644
+--- a/llm.py
++++ b/llm.py
+@@ -8,6 +8,7 @@ import backoff
+ import openai
+ 
+ MAX_OUTPUT_TOKENS = 4096
++CLAUDE_MAX_OUTPUT_TOKENS = 8192  # claude-3-5-sonnet output limit
+ AVAILABLE_LLMS = [
+     # Anthropic models
+     "claude-3-5-sonnet-20240620",
+@@ -193,13 +194,23 @@ def get_response_from_llm(
+                 ],
+             }
+         ]
++        # No extended thinking here; a larger budget avoids empty max_tokens replies.
+         response = client.messages.create(
+             model=model,
+-            max_tokens=MAX_OUTPUT_TOKENS,
++            max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
+             temperature=temperature,
+             system=system_message,
+             messages=new_msg_history,
+         )
++        if not response.content and getattr(response, 'stop_reason', None) == 'max_tokens':
++            # Retry once with the same budget; a second empty reply is returned as ''.
++            response = client.messages.create(
++                model=model,
++                max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
++                temperature=temperature,
++                system=system_message,
++                messages=new_msg_history,
++            )
+         if not response.content:
+             # Empty content list: return '' so callers can treat it as an empty reply.
+             print(f"get_response_from_llm: empty response content (stop_reason={getattr(response, 'stop_reason', None)})")
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 3e3ed24..4343756 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -22,6 +22,55 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
++# claude-3-5-sonnet-20241022 supports at most 8192 output tokens.
++CLAUDE_MAX_OUTPUT_TOKENS = 8192
++CLAUDE_THINKING_BUDGET_CAP = 4000
++
++def _claude_create(client, model, messages, tools, tool_choice, max_tokens, thinking):
++    kwargs = dict(
++        model=model,
++        messages=messages,
++        max_tokens=max_tokens,
++        tool_choice=tool_choice,
++        tools=tools,
++    )
++    if thinking:
++        kwargs['thinking'] = {
++            'type': 'enabled',
++            'budget_tokens': min(CLAUDE_THINKING_BUDGET_CAP, max_tokens // 3),
++        }
++    return client.messages.create(**kwargs)
++
++def _response_has_usable_content(response):
++    """True if the response has at least one text or tool_use block."""
++    content = getattr(response, 'content', None) or []
++    return any(getattr(b, 'type', None) in ('text', 'tool_use') for b in content)
++
++def _create_with_budget_retry(client, model, messages, tools, tool_choice,
++                              max_tokens, thinking, logging, max_retries=3):
++    """
++    Call Claude; if the response has no text/tool_use blocks (e.g. thinking used up
++    max_tokens), retry with thinking disabled and a doubled max_tokens (capped).
++    """
++    response = _claude_create(client, model, messages, tools, tool_choice, max_tokens, thinking)
++    retry_messages = list(messages)
++    for attempt in range(1, max_retries + 1):
++        if _response_has_usable_content(response):
++            break
++        logging(f"Empty Claude response (stop_reason={getattr(response, 'stop_reason', None)}, "
++                f"thinking={thinking}, max_tokens={max_tokens}); retry {attempt}/{max_retries}.")
++        thinking = False
++        max_tokens = min(max_tokens * 2, CLAUDE_MAX_OUTPUT_TOKENS)
++        retry_messages = retry_messages + [{
++            "role": "user",
++            "content": [{
++                "type": "text",
++                "text": "Do not think at length. Immediately use the editor tool to write a working solution.",
++            }],
++        }]
++        response = _claude_create(client, model, retry_messages, tools, tool_choice, max_tokens, thinking)
++    return response
++
+ @backoff.on_exception(
+     backoff.expo,
+     (openai.RateLimitError, openai.APITimeoutError, anthropic.RateLimitError, anthropic.APIStatusError),
+@@ -30,16 +79,13 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+ )
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=None, max_retry=3, max_tokens=CLAUDE_MAX_OUTPUT_TOKENS, thinking=False,
+ ):
+     try:
+         if 'claude' in model:
+-            response = client.messages.create(
+-                model=model,
+-                messages=messages,
+-                max_tokens=4096,
+-                tool_choice=tool_choice,
+-                tools=tools,
++            response = _create_with_budget_retry(
++                client, model, messages, tools, tool_choice,
++                max_tokens=max_tokens, thinking=thinking, logging=logging,
+             )
+         elif model.startswith('o3-'):
+             response = client.responses.create(
+@@ -56,7 +102,8 @@ def get_response_withtools(
+     except Exception as e:
+         logging(f"Error in get_response_withtools: {str(e)}")
+         if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
++            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1,
++                                          max_tokens=max_tokens, thinking=thinking)
+ 
+         # Hitting the context window limit
+         if 'Input is too long for requested model' in str(e):
+@@ -340,6 +387,8 @@ def chat_with_agent_claude(
+         model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+         msg_history=None,
+         logging=print,
++        thinking=False,
++        max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
+     ):
+     # Construct message
+     if msg_history is None:
+@@ -373,6 +422,8 @@ def chat_with_agent_claude(
+             tool_choice={"type": "auto"},
+             tools=tools,
+             logging=logging,
++            max_tokens=max_tokens,
++            thinking=thinking,
+         )
+ 
+         # Check for tool use
+@@ -402,6 +453,8 @@ def chat_with_agent_claude(
+                 tool_choice={"type": "auto"},
+                 tools=tools,
+                 logging=logging,
++                max_tokens=max_tokens,
++                thinking=thinking,
+             )
+ 
+             # Check for next tool use
+@@ -520,13 +573,16 @@ def chat_with_agent(
+     msg_history=None,
+     logging=print,
+     convert=False,  # Convert the message history to a generic format, so that msg_history can be used across models
++    thinking=False,
++    max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
+ ):
+     if msg_history is None:
+         msg_history = []
+ 
+     if 'claude' in model:
+         # Claude models
+-        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging)
++        new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging,
++                                                       thinking=thinking, max_tokens=max_tokens)
+         conv_msg_history = convert_msg_history(new_msg_history, model=model)
+         logging(conv_msg_history)
+         if convert:

@@ -1,0 +1,217 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 39bfae0..507a12d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -137,6 +138,46 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _changed_files(self):
++        """
++        Return the list of file paths changed versus the base commit, parsed from
++        the 'diff --git a/X b/X' headers of the current diff.
++        """
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        files = []
++        for line in diff.splitlines():
++            match = re.match(r'^diff --git a/(.+) b/(.+)$', line)
++            if match:
++                files.append(match.group(2))
++        return files
++
++    @staticmethod
++    def _is_test_file(path):
++        normalized = path.replace('\\', '/')
++        parts = normalized.split('/')
++        name = parts[-1]
++        if any(part in ('test', 'tests') for part in parts[:-1]):
++            return True
++        if name.startswith('test_') or name.endswith('_test.py'):
++            return True
++        if name.endswith('.spec.js') or name.endswith('Test.java'):
++            return True
++        return False
++
++    def _classify_patch(self):
++        """
++        Classify the current repo diff as:
++          'EMPTY'     - no changes at all
++          'TEST_ONLY' - every changed file looks like a test file
++          'OK'        - at least one non-test file was changed
++        """
++        files = self._changed_files()
++        if not files:
++            return 'EMPTY'
++        if all(self._is_test_file(f) for f in files):
++            return 'TEST_ONLY'
++        return 'OK'
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -149,8 +190,40 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        workflow = """
++
++Follow this workflow:
++1. Explore the repository: look at the directory layout, the starter code (for example the `solution.py` file or the class/method named in the problem), and any existing tests or examples.
++2. Plan the algorithm: work out the approach and its time/space complexity, and check it against the input constraints in the problem statement.
++3. Implement the solution by editing or creating the main source file with the editor tool. Keep the required class names, method names, and signatures exactly as specified.
++4. Add any imports the starter code lacks (for example `from typing import List` if type hints use `List`).
++5. Write and run quick tests. Where feasible, compare your solution against a brute-force implementation on many small random inputs, and also check the examples from the problem statement and edge cases.
++6. If any test fails, fix the source file and re-run the tests until they pass.
++
++Important:
++- The task is only complete when you have modified a non-test source file. Ending the turn without modifying a non-test source file counts as failure.
++- Do not end your turn with an empty message. Always finish with a short summary of the changes you made.
++- Test files alone are not a solution; the actual implementation must be in the main source file.
++"""
++        instruction = f"{task}{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"Initial agent pass finished with {len(msg_history)} messages in history.")
++
++        for attempt in range(3):
++            status = self._classify_patch()
++            safe_log(f"Patch check attempt {attempt + 1}: {status}")
++            if status == 'OK':
++                break
++            if status == 'EMPTY':
++                corrective_msg = (
++                    "No changes have been made to the repository. Implement the solution now by editing "
++                    "the source file with the editor tool. Do not reply with an empty message."
++                )
++            else:
++                corrective_msg = (
++                    "Only test files were modified. Implement the actual solution in the main source file."
++                )
++            msg_history = chat_with_agent(corrective_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..71d5ddf 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -13,6 +13,9 @@ from tools import load_all_tools
+ CLAUDE_MODEL = 'claude-3-5-sonnet-20241022'
+ OPENAI_MODEL = 'claude-3-5-sonnet-20241022'
+ 
++MAX_EMPTY_RESPONSE_NUDGES = 2
++EMPTY_RESPONSE_NUDGE = "Your last response was empty. Continue and use the tools to make the required code edits."
++
+ def process_tool_call(tools_dict, tool_name, tool_input):
+     try:
+         if tool_name in tools_dict:
+@@ -375,23 +378,56 @@ def chat_with_agent_claude(
+             logging=logging,
+         )
+ 
+-        # Check for tool use
+-        tool_use = check_for_tool_use(response, model=client_model)
+-        while tool_use:
+-            # Process tool call
+-            tool_name = tool_use['tool_name']
+-            tool_input = tool_use['tool_input']
+-            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++        final_response = None
++        # Bounded retries when the model returns an empty message without a tool call
++        for nudge_round in range(MAX_EMPTY_RESPONSE_NUDGES + 1):
++            # Check for tool use
++            tool_use = check_for_tool_use(response, model=client_model)
++            while tool_use:
++                # Process tool call
++                tool_name = tool_use['tool_name']
++                tool_input = tool_use['tool_input']
++                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++
++                # Get tool response
++                new_msg_history.append({"role": "assistant", "content": response.content})
++                new_msg_history.append({
++                    "role": "user",
++                    "content": [
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": tool_use['tool_id'],
++                            "content": tool_result,
++                        }
++                    ],
++                })
++                response = get_response_withtools(
++                    client=client,
++                    model=client_model,
++                    messages=msg_history + new_msg_history,
++                    tool_choice={"type": "auto"},
++                    tools=tools,
++                    logging=logging,
++                )
++
++                # Check for next tool use
++                tool_use = check_for_tool_use(response, model=client_model)
++
++            # Get final response
++            final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
++            if final_response and final_response.strip():
++                break
++            if nudge_round == MAX_EMPTY_RESPONSE_NUDGES:
++                break
+ 
+-            # Get tool response
+-            new_msg_history.append({"role": "assistant", "content": response.content})
++            # Empty reply without tool call: nudge the model and try again
++            logging(f"Empty response from model; sending nudge ({nudge_round + 1}/{MAX_EMPTY_RESPONSE_NUDGES}).")
+             new_msg_history.append({
+                 "role": "user",
+                 "content": [
+                     {
+-                        "type": "tool_result",
+-                        "tool_use_id": tool_use['tool_id'],
+-                        "content": tool_result,
++                        "type": "text",
++                        "text": EMPTY_RESPONSE_NUDGE,
+                     }
+                 ],
+             })
+@@ -404,20 +440,17 @@ def chat_with_agent_claude(
+                 logging=logging,
+             )
+ 
+-            # Check for next tool use
+-            tool_use = check_for_tool_use(response, model=client_model)
+-
+-        # Get final response
+-        final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
+-        new_msg_history.append({
+-            "role": "assistant",
+-            "content": [
+-                {
+-                    "type": "text",
+-                    "text": final_response,
+-                }
+-            ],
+-        })
++        # Append final response (skip empty text blocks, which the API rejects)
++        if final_response and final_response.strip():
++            new_msg_history.append({
++                "role": "assistant",
++                "content": [
++                    {
++                        "type": "text",
++                        "text": final_response,
++                    }
++                ],
++            })
+ 
+     except Exception:
+         pass

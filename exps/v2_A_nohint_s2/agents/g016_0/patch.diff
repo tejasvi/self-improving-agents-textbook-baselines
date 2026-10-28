@@ -1,0 +1,150 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 24ad294..a31c775 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,7 @@ import shutil
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -148,8 +149,15 @@ class AgenticSystem:
+             safe_log(f"chat_with_agent failed: {repr(e)}", level=logging.ERROR)
+             return msg_history, False
+         if not self._last_assistant_has_content(new_history):
+-            safe_log("Agent returned an empty turn (no tool use, no text); treating as failure.", level=logging.ERROR)
+-            return new_history, False
++            safe_log("Agent returned an empty turn; sending one nudge.", level=logging.ERROR)
++            try:
++                new_history = chat_with_agent("Please continue and use the tools.", model=self.code_model, msg_history=new_history, logging=safe_log)
++            except Exception as e:
++                safe_log(f"chat_with_agent nudge failed: {repr(e)}", level=logging.ERROR)
++                return new_history, False
++            if not self._last_assistant_has_content(new_history):
++                safe_log("Agent still returned an empty turn after nudge; treating as failure.", level=logging.ERROR)
++                return new_history, False
+         return new_history, True
+ 
+     def _last_assistant_has_content(self, msg_history):
+@@ -192,6 +200,44 @@ class AgenticSystem:
+         except OSError:
+             return True
+ 
++    def _parse_constraint_hint(self):
++        """Return (variable, bound) for the first 'N <= 5000'-style bound in the statement, or None."""
++        text = self.problem_statement or ''
++        m = re.search(r'\b([A-Za-z])\s*(?:\\le(?:q)?|<=|\u2264)\s*(\d+)', text)
++        if not m:
++            return None
++        return m.group(1), int(m.group(2))
++
++    def _time_on_large_input(self, target_path):
++        """Build a max-size input and time `python target_path` on it. Returns (elapsed, timed_out).
++        Returns (None, False) when the output is missing (treated as failure by the caller)."""
++        gen_path = "/tmp/gen_max.py"
++        input_path = "/tmp/max_input.txt"
++        if not os.path.exists(gen_path):
++            hint = self._parse_constraint_hint()
++            hint_text = f"The constraint {hint[0]} <= {hint[1]} applies. " if hint else ""
++            self._run_agent(
++                f"{hint_text}Write a Python script to {gen_path} that prints one maximum-size valid input "
++                f"for the problem below to stdout (use the largest values allowed by the constraints). "
++                f"Use the editor tool, then run it.\n<problem_description>\n{self.problem_statement}\n</problem_description>",
++                [],
++            )
++        try:
++            with open(input_path, 'w') as f:
++                subprocess.run(["python", gen_path], stdout=f, stderr=subprocess.PIPE, timeout=10, check=True)
++        except Exception as e:
++            safe_log(f"Generator failed: {repr(e)}", level=logging.ERROR)
++            return None, False
++        start = time.time()
++        try:
++            with open(input_path) as fin:
++                proc = subprocess.run(["python", target_path], stdin=fin, capture_output=True, text=True, timeout=10, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return time.time() - start, True
++        if not proc.stdout.strip():
++            return None, False
++        return time.time() - start, False
++
+     def _extract_samples(self, problem_statement):
+         """Parse 'Sample Input k' / 'Sample Output k' blocks into (input, expected) pairs."""
+         text = problem_statement or ''
+@@ -327,18 +373,63 @@ Now do the following:
+ 4. Re-run the sample tests via bash and make sure they match exactly.
+ 5. Keep temporary files outside the repository (e.g. in /tmp).
+ If you cannot finish the optimization, leave the brute-force version in place. Reply briefly when done."""
+-        _, ok = self._run_agent(opt_prompt, [])
+-
+-        # Stage 3 (performance check on max-size input) is part of the optimization prompt above.
+-        # Stage 4: verify samples after optimization; restore the best passing snapshot on failure.
+-        final_report = self._run_samples(target_path)
+-        safe_log(final_report)
+-        if best_passing and not self._samples_all_pass(final_report):
+-            safe_log("Optimized solution fails samples; restoring the brute-force backup.", level=logging.ERROR)
++        best_fast_path = "/tmp/best_fast.py"
++        best_slow_path = "/tmp/best_slow.py"
++        history = []
++        timing_info = "No timing run yet."
++        for attempt in range(4):
++            safe_log(f"[optimization stage] attempt {attempt + 1}")
++            if attempt == 0:
++                prompt, history = opt_prompt, []
++            elif attempt == 1:
++                prompt = "Please continue and use the tools. Make sure the file is saved and the samples pass."
++            elif attempt == 2:
++                prompt = (f"{problem_header}\nFacts: a brute-force solution exists at {brute_path}. "
++                          f"Last timing result: {timing_info}\n"
++                          f"Write an efficient solution to {target_name} with the editor tool, then reply briefly.")
++                history = []
++            else:
++                prompt = (f"Your solution is still too slow. {timing_info} Brute force is exponential; "
++                          f"target a polynomial algorithm (DP/greedy/etc.). Rewrite {target_name} with the editor tool.")
++            _, ok = self._run_agent(prompt, history)
++            history = []
++
++            differs = False
+             try:
+-                shutil.copyfile(backup_path, target_path)
+-            except OSError as e:
+-                safe_log(f"Failed to restore backup: {repr(e)}", level=logging.ERROR)
++                with open(target_path) as f1, open(brute_path) as f2:
++                    differs = f1.read() != f2.read()
++            except OSError:
++                pass
++            report = self._run_samples(target_path)
++            passes = self._samples_all_pass(report)
++            elapsed, timed_out = self._time_on_large_input(target_path)
++            fast = elapsed is not None and not timed_out and elapsed < 10
++            timing_info = ("timed out after 10s on max input" if timed_out else
++                           "no output produced" if elapsed is None else f"took {elapsed:.2f}s on max input")
++            safe_log(f"[optimization stage] ok={ok} differs={differs} passes={passes} timing: {timing_info}")
++
++            if passes:
++                try:
++                    shutil.copyfile(target_path, best_slow_path)
++                    if fast:
++                        shutil.copyfile(target_path, best_fast_path)
++                except OSError as e:
++                    safe_log(f"Snapshot failed: {repr(e)}", level=logging.ERROR)
++            if ok and differs and passes and fast:
++                break
++
++        # Final: prefer best_fast, else keep current file if it passes samples, else best_slow.
++        if os.path.exists(best_fast_path):
++            shutil.copyfile(best_fast_path, target_path)
++            safe_log("[final] fast solution restored.")
++        elif self._samples_all_pass(self._run_samples(target_path)):
++            safe_log("[final] slow solution kept (passes samples, not fast).", level=logging.ERROR)
++        elif os.path.exists(best_slow_path):
++            shutil.copyfile(best_slow_path, target_path)
++            safe_log("[final] slow solution restored.", level=logging.ERROR)
++        else:
++            shutil.copyfile(brute_path, target_path)
++            safe_log("[final] brute force kept.", level=logging.ERROR)
+ 
+ 
+ def main():

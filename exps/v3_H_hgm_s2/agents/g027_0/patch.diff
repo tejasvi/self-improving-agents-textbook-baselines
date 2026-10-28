@@ -1,0 +1,374 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 6e9b47c..ecdb208 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -9,6 +9,7 @@ import threading
+ import json
+ import re
+ import time
++import shutil
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, simple_chat
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -541,6 +542,7 @@ Return ONLY the Python code in a single ```python code block.
+                 needs_repair = True
+             else:
+                 status = "OK"
++
+             out = res["stdout"]
+             if len(out) > 300:
+                 out = out[:300] + f"... [truncated, {len(res['stdout'])} chars total]"
+@@ -679,7 +681,8 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+         safe_log(f"[oracle] built oracle in {oracle_dir} (interactive={interactive}).")
+         return oracle_dir
+ 
+-    def _run_differential(self, solution_path, oracle_dir, n_tests=200, timeout=5, max_failures=3):
++    def _run_differential(self, solution_path, oracle_dir, n_tests=200, timeout=5, max_failures=3,
++                          ref_script="ref.py", gen_script="gen_small.py", seed_offset=0):
+         """
+         Run the solution against the oracle over seeds 0..n_tests-1.
+         - stdin/class problems: expected = ref.py(input), compared by tokens (or checker.py if present).
+@@ -713,7 +716,7 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+         for seed in range(n_tests):
+             if n_failures >= max_failures:
+                 break
+-            rc, inp, gerr, gto = _py("gen_small.py", [str(seed)], tmo=20)
++            rc, inp, gerr, gto = _py(gen_script, [str(seed + seed_offset)], tmo=20)
+             if gto or rc != 0 or not inp.strip():
+                 n_skipped += 1  # generator problem; not a solution failure
+                 continue
+@@ -732,9 +735,9 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+                     )
+                 continue
+ 
+-            ref_rc, expected, ref_err, ref_to = _py("ref.py", [], stdin_text=inp, tmo=20)
++            ref_rc, expected, ref_err, ref_to = _py(ref_script, [], stdin_text=inp, tmo=20)
+             if ref_to or ref_rc != 0:
+-                n_skipped += 1  # reference problem; do not blame the solution
++                n_skipped += 1  # reference problem (or baseline too slow on this mid-size input); do not blame the solution
+                 continue
+             res = self._run_candidate(solution_path, mode, method, inp, timeout=timeout, tag=f"diff{seed}")
+             actual = "" if res["timed_out"] else res["stdout"]
+@@ -770,6 +773,283 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+         )
+         return header + "\n\n" + "\n".join(failures), n_failures
+ 
++    # ------------------------------------------------------------------
++    # Candidate evaluation, mid-size oracle, and multi-candidate generation
++    # ------------------------------------------------------------------
++
++    CANDIDATE_STRATEGY_HINTS = [
++        "Reduce the DP state dimension: find which dimension can be eliminated or compressed, and rewrite the recurrence over fewer states.",
++        "Vectorize the hot loop with numpy (or restructure the loops so the inner work is array operations), keeping exact integer semantics.",
++        "Exploit the problem structure: monotonicity, prefix/suffix minimums or maximums, sorting, two pointers, or a greedy argument that is proven from the definition.",
++        "Change the algorithm entirely: use a different decomposition (e.g. divide and conquer, sqrt decomposition, or precomputed tables) that is provably within the time limit for the maximum constraints.",
++    ]
++
++    def _evaluate_candidate(self, path, oracle_dir, samples, perf_cases, mode, method):
++        """
++        Score one solution file. Tiers, in order:
++          1. samples (from the problem statement),
++          2. small differential tests against ref.py (if an oracle exists),
++          3. mid-size differential tests against baseline_ref.py via gen_mid.py (if both exist),
++          4. perf cases, counting statuses from the _run_candidate results.
++        Returns ((samples_ok, diff_fail, perf_bad, max_time), report). perf_bad counts TIMEOUT, SLOW and CRASH cases.
++        """
++        if not path or not os.path.exists(path):
++            return (False, 1, 0, 0.0), f"Solution file not found: {path}"
++        sample_report, samples_ok = self._run_samples(path, samples)
++        parts = [f"SAMPLES: {'PASS' if samples_ok else 'FAIL'}\n{self._clip(sample_report, 3000)}"]
++        diff_fail = 0
++        if oracle_dir:
++            diff_report, n_fail = self._run_differential(path, oracle_dir)
++            diff_fail += n_fail
++            parts.append(self._clip(diff_report, 3000))
++            if os.path.exists(os.path.join(oracle_dir, "baseline_ref.py")) and os.path.exists(os.path.join(oracle_dir, "gen_mid.py")):
++                mid_report, mid_fail = self._run_differential(
++                    path, oracle_dir, n_tests=30, timeout=5, max_failures=3,
++                    ref_script="baseline_ref.py", gen_script="gen_mid.py", seed_offset=0,
++                )
++                diff_fail += mid_fail
++                parts.append("MID-SIZE " + self._clip(mid_report, 3000))
++        counts = {"OK": 0, "SLOW": 0, "TIMEOUT": 0, "CRASH": 0}
++        max_time = 0.0
++        for i, (name, payload) in enumerate(perf_cases or []):
++            res = self._run_candidate(path, mode, method, payload, timeout=3.0, tag=f"cand_perf{i}")
++            max_time = max(max_time, res["elapsed"])
++            if res["timed_out"]:
++                kind, status = "TIMEOUT", "TIMEOUT (exceeded 3s)"
++            elif res["returncode"] != 0:
++                kind, status = "CRASH", f"CRASH (exit code {res['returncode']})"
++            elif res["elapsed"] > 1.5:
++                kind, status = "SLOW", "SLOW (exceeded 1.5s)"
++            else:
++                kind, status = "OK", "OK"
++            counts[kind] += 1
++            out = self._clip(res["stdout"], 300)
++            err = res["stderr"][-1000:] if len(res["stderr"]) > 1000 else res["stderr"]
++            parts.append(f"=== Case {i + 1}: {name} ({status}, time {res['elapsed']:.3f}s) ===\n"
++                         f"--- output (truncated) ---\n{out}\n--- stderr ---\n{err}\n")
++        perf_bad = counts["SLOW"] + counts["TIMEOUT"] + counts["CRASH"]
++        if perf_cases:
++            parts.insert(0, f"PERF COUNTS: OK={counts['OK']} SLOW={counts['SLOW']} TIMEOUT={counts['TIMEOUT']} CRASH={counts['CRASH']}")
++        return (bool(samples_ok), diff_fail, perf_bad, round(max_time, 3)), "\n\n".join(parts)
++
++    @staticmethod
++    def _rank(fields):
++        """Higher is better: correctness first, then fewest perf failures, then lowest max runtime."""
++        samples_ok, diff_fail, perf_bad, max_time = fields
++        return (bool(samples_ok), -diff_fail, -perf_bad, -max_time)
++
++    @staticmethod
++    def _compact_failure_summary(fields, report, max_blocks=2):
++        """Status counts plus the first raw failing blocks (keeps repair prompts small)."""
++        samples_ok, diff_fail, perf_bad, max_time = fields
++        lines = [f"samples_ok={samples_ok}, differential_failures={diff_fail}, perf_failures(SLOW/TIMEOUT/CRASH)={perf_bad}, max_time={max_time}s"]
++        for line in (report or "").splitlines():
++            if line.startswith("PERF COUNTS"):
++                lines.append(line)
++                break
++        blocks = re.split(r"(?m)^(?==== )", report or "")
++        bad = [b for b in blocks if b.startswith("=== ") and re.search(r"FAIL|TIMEOUT|SLOW|CRASH|Failing", b.split("\n", 1)[0])]
++        for b in bad[:max_blocks]:
++            lines.append(b if len(b) <= 900 else b[:900] + f'\n... [truncated, {len(b)} chars total]')
++        return "\n".join(lines)
++
++    def _build_midsize_oracle(self, oracle_dir, solution_path):
++        """
++        Called when solution_path passes samples and small differential tests. Saves it as baseline_ref.py
++        (a correct but possibly slow reference) and asks the model for gen_mid.py SEED, which prints valid
++        inputs about 10-50x larger than gen_small.py. Returns True when both files are usable.
++        """
++        if not oracle_dir or not solution_path or not os.path.exists(solution_path):
++            return False
++        shutil.copyfile(solution_path, os.path.join(oracle_dir, "baseline_ref.py"))
++        gen_small_path = os.path.join(oracle_dir, "gen_small.py")
++        small_src = ""
++        if os.path.exists(gen_small_path):
++            with open(gen_small_path, "r", encoding="utf-8", errors="replace") as f:
++                small_src = f.read()
++        prompt = f"""Write a Python program for the competitive programming problem below. It is an input generator.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++Here is the existing small-input generator, for reference:
++<gen_small>
++{self._clip(small_src, 4000)}
++</gen_small>
++
++Requirements:
++- The program takes one integer SEED as sys.argv[1] and prints ONE valid input to stdout (respecting every constraint).
++- Use random.Random(SEED) for determinism.
++- Sizes should be about 10-50x larger than gen_small (for example, the maximum N/Q a brute force can still handle in a few seconds).
++  Choose sizes that are moderate, not necessarily the absolute maximum.
++- Values must span the full allowed ranges (include both extremes and random values across the range).
++- Output ONLY the program in a single ```python code block.
++"""
++        text = simple_chat(prompt, model=self.code_model, max_tokens=8000, logging=safe_log) or ""
++        code = self._extract_code(text)
++        if not code:
++            safe_log("[mid-oracle] empty response for gen_mid.py.")
++            self.attempt_log.append("Mid-size oracle: generator produced an empty response; only small differential tests used.")
++            return False
++        try:
++            ast.parse(code)
++        except SyntaxError:
++            safe_log("[mid-oracle] gen_mid.py does not parse.")
++            return False
++        gen_mid_path = os.path.join(oracle_dir, "gen_mid.py")
++        with open(gen_mid_path, "w", encoding="utf-8") as f:
++            f.write(code + "\n")
++        try:
++            probe = subprocess.run(["python3", gen_mid_path, "0"], capture_output=True, text=True, timeout=20, cwd=oracle_dir)
++            ok = probe.returncode == 0 and bool(probe.stdout.strip())
++        except subprocess.TimeoutExpired:
++            ok = False
++        if not ok:
++            safe_log("[mid-oracle] gen_mid.py seed 0 failed or timed out; mid-size tier disabled.")
++            os.remove(gen_mid_path)
++            return False
++        safe_log(f"[mid-oracle] baseline_ref.py and gen_mid.py ready in {oracle_dir}.")
++        return True
++
++    def _generate_candidates(self, best_code, report_summary, k=3):
++        """
++        Ask the model for k independent complete replacement programs (tool-free chats, one strategy hint each).
++        Each candidate is validated with ast.parse and written to /tmp/cand_i.py (outside the repo).
++        Returns the list of written candidate paths (possibly empty).
++        """
++        hints = self.CANDIDATE_STRATEGY_HINTS
++        memory = self._attempt_memory()
++        paths = []
++        for i in range(min(k, len(hints))):
++            prompt = f"""Solve the competitive programming problem below in Python. You will write a complete replacement program.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++Current best program (correct on the samples or on earlier tests, but failing performance or correctness):
++<current_program>
++{self._clip(best_code, 6000)}
++</current_program>
++
++Failure summary of the current program:
++<failures>
++{report_summary}
++</failures>
++
++Earlier attempts (do not repeat refuted ideas):
++{self._clip(memory, 2000)}
++
++Strategy for this candidate: {hints[i]}
++
++Instructions:
++- First, give a brief complexity analysis (a few lines): the time complexity in terms of the constraints, and why it fits the time limit in Python (about 2 seconds).
++- Then output the complete program in a single ```python code block.
++- Keep the same interface as the current program (a stdin program, or a `Solution` class with the same method signature).
++- The program must be exact (no approximations). Correctness must match the problem definition.
++"""
++            text = simple_chat(prompt, model=self.code_model, max_tokens=16000, logging=safe_log) or ""
++            code = self._extract_code(text)
++            if not code:
++                safe_log(f"[candidate {i}] empty response.")
++                continue
++            try:
++                ast.parse(code)
++            except SyntaxError:
++                safe_log(f"[candidate {i}] code does not parse; discarded.")
++                continue
++            path = f"/tmp/cand_{i}.py"
++            with open(path, "w", encoding="utf-8") as f:
++                f.write(code + "\n")
++            paths.append(path)
++        return paths
++
++    def _candidate_repair_loop(self, task, samples, oracle_dir, cases, mode, method, max_rounds=2, k=3):
++        """
++        Keep-the-best candidate search for the non-interactive case.
++        Round: evaluate the current best; if it is not fully correct and fast, generate k tool-free candidates,
++        evaluate each, and overwrite the solution only if the winner is strictly better (lexicographic score).
++        After the candidate rounds fail, the agentic repair chat is used as a last resort with a capped prompt.
++        The best-scoring code is re-saved at the end so the final patch is never worse than the earlier baseline.
++        """
++        solution_path = self._solution_path()
++        if not solution_path or not os.path.exists(solution_path):
++            return
++        with open(solution_path, "r", encoding="utf-8", errors="replace") as f:
++            best_code = f.read()
++        fields, report = self._evaluate_candidate(solution_path, oracle_dir, samples, cases, mode, method)
++        safe_log(f"[candidates] baseline score {fields}\n{self._clip(report, 1500)}")
++        # Tier 2: once the baseline passes samples and small differential tests, use it as a mid-size oracle.
++        if oracle_dir and fields[0] and fields[1] == 0 and not os.path.exists(os.path.join(oracle_dir, "baseline_ref.py")):
++            if self._build_midsize_oracle(oracle_dir, solution_path):
++                fields, report = self._evaluate_candidate(solution_path, oracle_dir, samples, cases, mode, method)
++                safe_log(f"[candidates] baseline score after mid-size tier {fields}")
++        self.attempt_log.append(f"Baseline: samples_ok={fields[0]}, diff_fail={fields[1]}, perf_bad={fields[2]}, max_time={fields[3]}s.")
++
++        for round_idx in range(max_rounds):
++            if fields[0] and fields[1] == 0 and fields[2] == 0:
++                safe_log(f"[candidates round {round_idx}] best candidate is correct and fast; stopping.")
++                break
++            summary = self._compact_failure_summary(fields, report)
++            paths = self._generate_candidates(best_code, summary + ("\n\nRaw report of the current best:\n" + self._clip(report, 2500) if round_idx > 0 else ""), k=k)
++            if not paths:
++                self.attempt_log.append(f"Candidate round {round_idx}: no valid candidate produced (empty or unparsable responses).")
++                continue
++            scored = []
++            for p in paths:
++                cfields, creport = self._evaluate_candidate(p, oracle_dir, samples, cases, mode, method)
++                safe_log(f"[candidates round {round_idx}] {p} score {cfields}")
++                scored.append((cfields, p, creport))
++            win_fields, win_path, win_report = max(scored, key=lambda t: self._rank(t[0]))
++            improved = self._rank(win_fields) > self._rank(fields)
++            if improved:
++                with open(win_path, "r", encoding="utf-8", errors="replace") as f:
++                    best_code = f.read()
++                with open(solution_path, "w", encoding="utf-8") as f:
++                    f.write(best_code if best_code.endswith("\n") else best_code + "\n")
++                fields, report = win_fields, win_report
++            safe_log(f"[candidates round {round_idx}] winner {win_path} score {win_fields}; improved={improved}")
++            self.attempt_log.append(
++                f"Candidate round {round_idx}: {len(paths)} candidates, best score {win_fields}, "
++                f"{'adopted' if improved else 'not adopted (no improvement)'}."
++            )
++
++        if not (fields[0] and fields[1] == 0 and fields[2] == 0):
++            # Last resort: agentic repair with capped prompt.
++            current_diff = self._clip(str(diff_versus_commit(self.git_tempdir, self.base_commit)), 6000)
++            summary = self._compact_failure_summary(fields, report)
++            chat_with_agent(f"""{task}
++
++The solution passes or fails the stress tests below. Summary of the current best solution (counts and first raw cases):
++{summary}
++
++Current diff (truncated):
++{current_diff if current_diff.strip() else '(empty)'}
++
++Instructions:
++- Find the bottleneck of the algorithm and replace it with a faster exact algorithm. Keep the same interface.
++- Overwrite the solution with the editor tool, then re-run the samples with bash and confirm they pass.
++- Do not reply with text only; finish only after the fix is on disk and verified.
++""", model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log("[candidates] agentic last-resort repair finished.")
++            cand_fields, cand_report = self._evaluate_candidate(solution_path, oracle_dir, samples, cases, mode, method)
++            self.attempt_log.append(f"Agentic last-resort repair: score {cand_fields}.")
++            if self._rank(cand_fields) >= self._rank(fields):
++                fields, report = cand_fields, cand_report
++                with open(solution_path, "r", encoding="utf-8", errors="replace") as f:
++                    best_code = f.read()
++            else:
++                # Restore the best candidate so the final patch is never worse than the best seen.
++                with open(solution_path, "w", encoding="utf-8") as f:
++                    f.write(best_code if best_code.endswith("\n") else best_code + "\n")
++                safe_log(f"[candidates] agentic repair scored worse {cand_fields}; restored best {fields}.")
++
++        # Final guarantee: the best-scoring code is what remains on disk.
++        with open(solution_path, "w", encoding="utf-8") as f:
++            f.write(best_code if best_code.endswith("\n") else best_code + "\n")
++        safe_log(f"[candidates] final score {fields}")
++
+     def _run_interactive_perf(self, solution_path, oracle_dir, timeout=3.0):
+         """
+         Interactive problems: time the solution through the oracle's judge (never on plain stdin).
+@@ -1140,36 +1420,8 @@ Instructions:
+                 safe_log(f"[perf] stress input generation failed: {e}")
+             if not cases:
+                 safe_log("[perf] no stress cases available; skipping performance phase.")
+-            for round_idx in range(3 if cases else 0):
+-                solution_path = self._solution_path()
+-                if not solution_path:
+-                    break
+-                report, needs_repair = self._run_perf(solution_path, cases, mode=mode, method=method)
+-                safe_log(f"[perf round {round_idx}] solution: {solution_path}\n{report}")
+-                if not needs_repair:
+-                    safe_log(f"[perf round {round_idx}] all stress cases fast enough; stopping.")
+-                    break
+-                current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-                perf_msg = f"""{task}
+-
+-The solution passes the samples, but it is too slow or crashes on large adversarial inputs. Raw performance report
+-(each case: runtime, output, stderr; timeouts exceed 3 seconds, SLOW means above 1.5 seconds):
+-
+-{report}
+-
+-Current diff:
+-{current_diff if current_diff.strip() else '(empty)'}
+-
+-Instructions:
+-- Compute the worst-case operation count of your algorithm in terms of the constraints (e.g. n, the value ranges). If it is more than ~5e7 simple operations, design a fundamentally better algorithm (e.g. reduce DP states, use prefix minimums, exploit the problem structure) rather than adding heuristics or early-exit pruning.
+-- Keep the same required interface (the stdin program, or the `Solution` class method signature).
+-- Fix the solution file with the editor tool (`edit` or `create`, which overwrites).
+-- Re-verify correctness: re-run the sample inputs with bash and, if possible, compare against a brute-force implementation on small random inputs.
+-- Re-time on the max-size inputs and confirm they run comfortably within the limit.
+-- Do not reply with text only; finish only after the fixes are written to disk and verified.
+-"""
+-                chat_with_agent(perf_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-                safe_log(f"[perf round {round_idx}] repair chat finished.")
++            if cases:
++                self._candidate_repair_loop(task, samples, oracle_dir, cases, mode, method)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

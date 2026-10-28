@@ -1,0 +1,135 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 906fd80..2e5a245 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -336,6 +336,57 @@ class AgenticSystem:
+         safe_log(f"[{label}] history_len={len(history or [])} tool_use={self._history_has_tool_use(history)}")
+         return history
+ 
++    def _last_assistant_text(self, msg_history):
++        """
++        Return the concatenated text blocks of the last message in the history ('' if none).
++        """
++        if not msg_history:
++            return ''
++        content = msg_history[-1].get('content')
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            parts = []
++            for block in content:
++                if isinstance(block, dict) and block.get('type') == 'text':
++                    parts.append(str(block.get('text', '')))
++            return '\n'.join(parts)
++        return ''
++
++    def _review_round(self, task, solution_path, round_idx, prev_feedback=None):
++        """
++        Run one adversarial review round with a fresh message history.
++        `task` is accepted for interface consistency; the full self.problem_statement is used.
++        Returns the message history of the reviewer agent.
++        """
++        feedback_block = ''
++        if prev_feedback:
++            feedback_block = f"""
++The previous review round reported the following raw output (it may be a FAIL or may be incomplete). Address it first:
++{prev_feedback}
++"""
++        prompt = f"""You are an adversarial reviewer of a competitive programming solution (review round {round_idx + 1}).
++
++The solution file is: {solution_path}
++Read it with the editor tool first. The problem statement is:
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++{feedback_block}
++Checklist (complete every item, using bash to run things):
++1. List each explicit requirement and guarantee in the statement, including optimality/minimum claims (e.g. "minimum number of queries"), complexity bounds, and the exact input/output protocol.
++2. For each claim, write a small exhaustive reference (brute force / BFS / DP) under /tmp and compare against the solution on ALL small inputs. For optimality/minimality/counting claims, verify the solution's count or answer equals the reference optimum.
++3. For interactive problems: simulate the judge with a mock judge script and run the solution against it. Also verify the solution does not crash when the entire input is piped in at once (tokens read via sys.stdin.read().split() where the protocol permits). Prefer token-based input reading when the protocol allows.
++4. Check the solution against the sample inputs/outputs in the statement and on edge cases (minimum sizes, equal values, maximum-size timing where feasible).
++5. If any discrepancy is found, fix it by editing the solution file, then re-run the checks.
++
++Your final message must end with exactly one of these lines:
++REVIEW: ALL PASS
++REVIEW: FAIL <reason>
++"""
++        return self._call_agent(prompt, f"review {round_idx + 1}")
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -357,18 +408,21 @@ Follow this workflow:
+ (c) Actually write or modify the source files using the editor tool (or bash). The solution must live in the source code, NOT only in test files. If the task names a file (for example solution.py), create it at {self.git_tempdir}/solution.py exactly.
+ (d) Run and test the code with bash. Write small tests of your own for the examples and edge cases. Compare your output to every sample output EXACTLY; if the statement allows multiple answers, still try to reproduce the sample answer for the sample inputs by choosing the canonical construction the sample seems to use. The grader may do exact comparison with the sample output even if the statement says any valid answer is accepted. For interactive problems, write a small mock judge script that feeds input to your program and checks its output, and run your solution against it.
+ (e) Verify that every required file exists and is non-empty, and that the code compiles and runs. Fix any problems you find and repeat (d) and (e).
++If any experiment you run reveals your solution is suboptimal or wrong, you must fix it before finishing; never finish with a known counterexample.
+ 
+ Finish only when the required source file(s) contain your complete solution."""
+         instruction = instruction.replace(
+             "IMPORTANT: You must act through tools.",
+             "Your first action must be a tool call. IMPORTANT: You must act through tools.", 1)
++        # Scaffold the target file with a stub BEFORE the first call so the agent can
++        # use the editor 'edit' command directly. An unchanged stub is never mistaken
++        # for a real solution.
++        target = self._target_file()
++        self._write_skeleton(target)
+         init_edit = self._call_agent(instruction, "initial")
+ 
+         # Patch verification with a bounded retry loop (no while True).
+-        # The target file is scaffolded with a stub so that an unchanged stub
+-        # (or a missing file) is never mistaken for a real solution.
+-        target = self._target_file()
+-        short_statement = (self.problem_statement or '')[:2000]
++        full_statement = self.problem_statement or ''
+         for attempt in range(3):
+             if self._has_source_edit() and self._has_real_edit():
+                 break
+@@ -377,16 +431,17 @@ Finish only when the required source file(s) contain your complete solution."""
+             safe_log(f"[retry {attempt + 1}] No valid source edits detected; diff: {diff_text[:500]}")
+             self._write_skeleton(target)
+             rel_target = os.path.relpath(target, self.git_tempdir)
++            short_statement = full_statement
+             if attempt == 0:
+                 retry_prompt = f"""The file {target} exists with a stub. Your FIRST action must be a tool call. Use the editor tool `edit` command to overwrite it with a complete, correct, efficient solution. Then run it on the samples with bash.
+ 
+-Task (truncated):
++Task:
+ {short_statement}"""
+             elif attempt == 1:
+                 retry_prompt = f"""Your FIRST action must be a tool call. Overwrite {target} (it exists with a stub) using the editor tool with a simple, correct brute-force solution. Then run it on the samples with bash.
+ 
+-Task (truncated, {rel_target}):
+-{short_statement[:1000]}"""
++Task ({rel_target}):
++{short_statement}"""
+             else:
+                 retry_prompt = f"""Your FIRST action must be a tool call. Use the editor tool to write a baseline solution to {target} now. Then run it with bash."""
+             safe_log(f"[retry {attempt + 1}] prompt_len={len(retry_prompt)} (first instruction: tool call)")
+@@ -427,6 +482,25 @@ Your solution was run on the sample inputs from the problem statement, and some
+ The grader may do exact comparison with the sample output even if the statement says any valid answer is accepted. First check whether your output is valid; then modify the algorithm so that it deterministically reproduces the expected sample outputs exactly (e.g. different canonical choice, ordering, bit assignment, tie-breaking), while staying correct on all other inputs. Re-run the samples to confirm."""
+                 init_edit = chat_with_agent(sample_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
++        # Adversarial review stage: bounded (no while True). Stops early only when the
++        # reviewer reports ALL PASS and the solution still compiles.
++        if self._has_source_edit() and self._has_real_edit():
++            prev_feedback = None
++            for review_idx in range(3):
++                review_history = self._review_round(task, target, review_idx, prev_feedback=prev_feedback)
++                review_text = self._last_assistant_text(review_history)
++                safe_log(f"[review {review_idx + 1}] raw reviewer output:\n{review_text}")
++                compile_errors = self._python_compile_errors(self._current_diff())
++                if 'REVIEW: ALL PASS' in review_text and not compile_errors:
++                    safe_log(f"[review {review_idx + 1}] ALL PASS and solution compiles; stopping review.")
++                    break
++                if compile_errors:
++                    safe_log(f"[review {review_idx + 1}] py_compile errors after review:\n{compile_errors}")
++                    review_text = f"{review_text}\n\npy_compile errors:\n{compile_errors}"
++                prev_feedback = review_text
++        else:
++            safe_log("Skipping review stage: no valid solution edit.")
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

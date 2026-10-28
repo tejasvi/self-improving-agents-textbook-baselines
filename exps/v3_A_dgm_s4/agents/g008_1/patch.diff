@@ -1,0 +1,212 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 0cfe4d1..a83a96b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm import create_client, get_response_from_llm
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -94,6 +95,33 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _last_assistant_is_empty(msg_history):
++    """
++    True when the final assistant message has no tool_use block and only blank text.
++    """
++    if not msg_history:
++        return False
++    last = None
++    for m in reversed(msg_history):
++        if isinstance(m, dict) and m.get('role') == 'assistant':
++            last = m
++            break
++    if last is None:
++        return False
++    content = last.get('content')
++    if isinstance(content, str):
++        return not content.strip()
++    if isinstance(content, list):
++        for block in content:
++            btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++            if btype in ('tool_use', 'function_call', 'tool_call'):
++                return False
++            text = block.get('text') if isinstance(block, dict) else getattr(block, 'text', None)
++            if isinstance(text, str) and text.strip():
++                return False
++        return True
++    return content is None
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -234,11 +262,109 @@ class AgenticSystem:
+         name = match.group(1) if match else 'solution.py'
+         return os.path.abspath(os.path.join(self.git_tempdir, name))
+ 
++    def _file_matches_base(self, path):
++        """
++        True if the file content is identical to its content at base_commit.
++        """
++        rel = os.path.relpath(path, self.git_tempdir).replace('\\', '/')
++        result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:{rel}"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        if result.returncode != 0:
++            # Not present in base commit: it is new, so compare against empty content
++            base_content = b''
++        else:
++            base_content = result.stdout
++        try:
++            with open(path, 'rb') as f:
++                current = f.read()
++        except OSError:
++            return False
++        return current == base_content
++
+     def _has_source_edits(self):
+         """
+-        True if at least one changed file is not a test file.
++        True if at least one changed non-test file differs from the base commit.
++        A file identical to its base-commit content (e.g. an untouched stub) does not count.
+         """
+-        return any(not self._is_test_file(f) for f in self._get_changed_files())
++        for f in self._get_changed_files():
++            if self._is_test_file(f):
++                continue
++            abs_path = os.path.join(self.git_tempdir, f)
++            if os.path.isfile(abs_path) and self._file_matches_base(abs_path):
++                continue
++            return True
++        return False
++
++    def _direct_write_fallback(self, task_text):
++        """
++        Tool-free single LLM call asking for the full program in one python block.
++        Writes the extracted code to the target file and checks it compiles.
++        """
++        target_path = self._infer_target_file()
++        current = ''
++        if os.path.exists(target_path):
++            try:
++                with open(target_path, 'r') as f:
++                    current = f.read()
++            except OSError:
++                current = ''
++        prompt = (
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Current contents of {os.path.basename(target_path)} (stub):\n```python\n{current}\n```\n\n"
++            "Write a complete Python 3 solution to the problem above. It must read from standard input "
++            "and write to standard output (if the problem is interactive, flush stdout after every print and read judge replies from stdin). "
++            "Return ONLY the complete Python 3 program inside a single ```python code block, with no explanation."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++        except Exception as e:
++            safe_log(f"[forward] direct fallback: create_client failed: {e}")
++            return False
++
++        code_re = re.compile(r'```(?:python)?\n(.*?)```', re.DOTALL)
++
++        def _extract(text):
++            m = code_re.search(text)
++            return (m.group(1) if m else text).strip() + "\n"
++
++        def _ask(p):
++            content, _hist = get_response_from_llm(
++                p, client=client, model=client_model,
++                system_message="You are an expert competitive programmer.",
++                msg_history=[], temperature=0.0,
++            )
++            return content
++
++        def _compile(code):
++            os.makedirs(os.path.dirname(target_path), exist_ok=True)
++            with open(target_path, 'w') as f:
++                f.write(code)
++            res = subprocess.run(["python", "-m", "py_compile", target_path],
++                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++            return res.returncode == 0, res.stderr.decode(errors='replace')
++
++        try:
++            code = _extract(_ask(prompt))
++        except Exception as e:
++            safe_log(f"[forward] direct fallback LLM call failed: {e}")
++            return False
++        ok, err = _compile(code)
++        if not ok:
++            safe_log(f"[forward] direct fallback compile failed, asking once for a fix: {err[-500:]}")
++            fix_prompt = (
++                f"{prompt}\n\nYour previous program failed to compile with:\n{err}\n"
++                "Return ONLY the corrected complete Python 3 program inside a single ```python code block."
++            )
++            try:
++                code = _extract(_ask(fix_prompt))
++            except Exception as e:
++                safe_log(f"[forward] direct fallback retry LLM call failed: {e}")
++                return False
++            ok, err = _compile(code)
++        safe_log(f"[forward] direct fallback wrote {target_path}, compiled={ok}")
++        return ok
+ 
+     def forward(self):
+         """
+@@ -260,11 +386,20 @@ Follow these steps:
+ 3. Implement the complete solution in that file early, even if it is not yet perfect. It must be a full program that reads from standard input and writes to standard output, or the required method of the given Solution class.
+ 4. Write a few test inputs (including the sample inputs from the problem statement) and run them with the bash tool.
+ 5. Fix any failures or mismatches, then re-run the tests until the outputs are correct.
+-6. Always finish with the solution file saved on disk. A text-only reply without file edits is a failure.
++6. If the problem is interactive (it asks you to query a judge and read replies), flush stdout after every print/query, read the judge's replies from stdin, and test the program with a small local mock judge script that you write yourself.
++7. Always finish with the solution file saved on disk. A text-only reply without file edits is a failure.
+ """
+         instruction = f"{task}{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+         target_path = self._infer_target_file()
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        for _nudge in range(2):
++            if not _last_assistant_is_empty(msg_history):
++                break
++            safe_log("[forward] Last assistant reply was empty; nudging within the same conversation")
++            msg_history = chat_with_agent(
++                "Your last reply was empty. Call the editor tool now to create or edit the solution file.",
++                model=self.code_model, msg_history=msg_history, logging=safe_log,
++            )
+ 
+         def _log_state(label):
+             changed = self._get_changed_files()
+@@ -293,20 +428,24 @@ Follow these steps:
+             msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         if not _log_state("Final check after retries"):
++            try:
++                self._direct_write_fallback(task)
++            except Exception as e:
++                safe_log(f"[forward] direct fallback raised: {e}")
+             if not os.path.exists(target_path):
+                 stub = "import sys\n\ndata = sys.stdin.read()\nprint(0)\n"
+                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                 with open(target_path, 'w') as f:
+                     f.write(stub)
+                 safe_log(f"[forward] Wrote stub to {target_path}")
+-            _log_state("After stub written")
+-            final_prompt = (
+-                f"A stub exists at {target_path}. It is only a placeholder and must be replaced with a real implementation "
+-                "that reads stdin and writes stdout. Use the editor tool to overwrite it with a full solution, "
+-                "then test it with the sample inputs using bash and fix any errors."
++            _log_state("After direct fallback")
++            refine_prompt = (
++                "solution.py now contains a draft; test it with samples and fix bugs. "
++                f"The file is {target_path}. Use bash to run the sample inputs from the problem statement "
++                "and compare outputs; use the editor tool to fix any mismatch or error."
+             )
+-            msg_history = chat_with_agent(final_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+-            _log_state("After final stub-replacement pass")
++            msg_history = chat_with_agent(refine_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            _log_state("After refinement pass")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

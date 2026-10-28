@@ -1,0 +1,220 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..18c01cd 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -93,6 +94,21 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _last_assistant_text(msg_history):
++    """Return the text of the last assistant message in a message history ('' if none)."""
++    if not isinstance(msg_history, list):
++        return ""
++    for msg in reversed(msg_history):
++        if not isinstance(msg, dict) or msg.get("role") != "assistant":
++            continue
++        content = msg.get("content")
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            return " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict) and c.get("type") in ("text", "output_text"))
++        return ""
++    return ""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -153,12 +169,45 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+ 2. Write the solution in solution.py with the editor tool.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
++4. Write a brute-force reference for small inputs and a random small-input generator, then run the `stress_test` tool (a few hundred cases) comparing solution.py with the brute force. The tool takes solution_path, brute_path, generator_path and runs `python3 generator_path <seed>` to get each input; for a `Solution`-class problem, pass a small wrapper script that reads stdin and calls the method as solution_path/brute_path. Fix every mismatch.
+ 5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++6. Keep iterating until all checks pass. Put all helper files (brute force, generators, wrappers, sample inputs, scratch scripts) in a scratch directory such as /tmp, NOT in the repository. The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
++        # Verification / repair rounds: re-check the solution and fix any issue found.
++        msg_history = init_edit if isinstance(init_edit, list) else None
++        for round_idx in range(3):
++            review_prompt = f"""Verification round {round_idx + 1}/3. Review your work on the problem below and make sure solution.py is correct.
++
++<problem_description>
++{self.problem_statement}
++</problem_description>
++
++Please do the following:
++1. Re-read the problem statement carefully and list every constraint (input sizes, value ranges, time limit, edge cases) that might have been missed.
++2. Re-run solution.py on ALL sample inputs from the statement and compare the output exactly with the expected output.
++3. Write or reuse a brute-force reference and a random small-input generator in a scratch directory such as /tmp (not in the repository). For a `Solution`-class problem, write a wrapper script that reads stdin and calls the method.
++4. Run the `stress_test` tool with solution_path, brute_path and generator_path (use at least 200 cases).
++5. Generate a maximum-size input and check that solution.py runs well under the time limit (under 2 seconds).
++6. If anything fails, fix solution.py and repeat the relevant checks.
++
++Only when all checks pass, end your final response with the single word VERIFIED. If anything still fails, do not write VERIFIED."""
++            if msg_history is None:
++                sol_path = os.path.join(self.git_tempdir, 'solution.py')
++                try:
++                    with open(sol_path) as f:
++                        current_solution = f.read()
++                except OSError:
++                    current_solution = "(solution.py not found)"
++                review_prompt += f"\n\nCurrent solution.py ({sol_path}):\n```python\n{current_solution}\n```"
++            review = chat_with_agent(review_prompt, model=self.code_model, msg_history=msg_history or [], logging=safe_log)
++            if isinstance(review, list):
++                msg_history = review
++            if re.search(r"(?<!NOT )\bVERIFIED\b", _last_assistant_text(review)):
++                safe_log(f"Verification round {round_idx + 1}: VERIFIED")
++                break
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..3479e73
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,132 @@
++import os
++import subprocess
++import sys
++import time
++
++# Convention:
++# - generator_path is a script taking the seed as argv[1] and printing ONE test input to stdout.
++# - solution_path / brute_path are programs reading the input from stdin and writing the answer to stdout.
++#   For Solution-class problems, write a small wrapper script that reads the input and calls the method,
++#   then pass the wrapper as solution_path / brute_path.
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Stress test a solution against a brute-force reference using random inputs.
++
++* For seed in 0..num_cases-1: runs `python3 generator_path <seed>` to get an input, then runs brute_path and solution_path on that input via stdin (with a per-case timeout), and compares stdout (whitespace-normalized, token-wise).
++* Stops at the first mismatch, crash (non-zero exit), or timeout and reports the seed, the input, the expected and actual outputs, and stderr.
++* If all cases pass, reports 'All N cases passed' together with the maximum runtime observed.
++* Convention: generator_path takes the seed as argv[1] and prints one input to stdout. For Solution-class problems, write a wrapper script that reads stdin and calls the method, and pass the wrapper as solution_path/brute_path.
++* Relative paths are resolved against working_dir (default: current directory). Put helper files (generator, brute, wrapper) in a scratch directory such as /tmp.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the solution program (run as `python3 <path>` reading stdin)."},
++                "brute_path": {"type": "string", "description": "Path to the brute-force reference program (run as `python3 <path>` reading stdin)."},
++                "generator_path": {"type": "string", "description": "Path to the random input generator; invoked as `python3 <path> <seed>` and prints one input to stdout."},
++                "num_cases": {"type": "integer", "description": "Number of random seeds to test (default 200)."},
++                "timeout_per_case": {"type": "number", "description": "Timeout in seconds for each program run on each case (default 5)."},
++                "mode": {"type": "string", "description": "Input mode. Only 'stdin' is supported (default 'stdin')."},
++                "working_dir": {"type": "string", "description": "Directory in which relative paths are resolved and programs are run (default: current directory)."}
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++def _clip(s, n=2000):
++    if s is None:
++        return ''
++    if len(s) <= n:
++        return s
++    return s[: n // 2] + f"\n... <{len(s) - n} characters clipped> ...\n" + s[-n // 2:]
++
++def _norm_tokens(s):
++    return s.split()
++
++def _run(cmd, cwd, inp, timeout):
++    t0 = time.time()
++    try:
++        p = subprocess.run(cmd, cwd=cwd, input=inp, capture_output=True, text=True,
++                           timeout=timeout, errors='replace')
++        return p, time.time() - t0, None
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout if isinstance(e.stdout, str) else ''
++        err = e.stderr if isinstance(e.stderr, str) else ''
++        return None, time.time() - t0, (out, err)
++
++def tool_function(solution_path, brute_path, generator_path, num_cases=200, timeout_per_case=5,
++                  mode='stdin', working_dir=None):
++    cwd = working_dir or os.getcwd()
++    if not os.path.isdir(cwd):
++        return f"Error: working_dir '{cwd}' does not exist."
++    if mode not in (None, 'stdin'):
++        return f"Error: unsupported mode '{mode}'. Only 'stdin' is supported."
++    try:
++        num_cases = int(num_cases) if num_cases is not None else 200
++        num_cases = max(1, min(num_cases, 100000))
++    except (TypeError, ValueError):
++        num_cases = 200
++    try:
++        timeout_per_case = float(timeout_per_case) if timeout_per_case is not None else 5.0
++        timeout_per_case = max(0.1, min(timeout_per_case, 300.0))
++    except (TypeError, ValueError):
++        timeout_per_case = 5.0
++
++    def abs_path(p):
++        return p if os.path.isabs(p) else os.path.join(cwd, p)
++
++    gen = abs_path(generator_path)
++    sol = abs_path(solution_path)
++    brute = abs_path(brute_path)
++    for name, p in [('generator_path', gen), ('solution_path', sol), ('brute_path', brute)]:
++        if not os.path.isfile(p):
++            return f"Error: {name} '{p}' does not exist."
++
++    max_time = 0.0
++    for seed in range(num_cases):
++        # 1. generate input
++        gp, _, gerr = _run([sys.executable, gen, str(seed)], cwd, None, timeout_per_case)
++        if gerr is not None or gp.returncode != 0:
++            err = gp.stderr if gp is not None else gerr[1]
++            return (f"Generator failed at seed {seed}.\n"
++                    f"Stderr:\n{_clip(err)}")
++        inp = gp.stdout
++
++        # 2. run brute
++        bp, _, berr = _run([sys.executable, brute], cwd, inp, timeout_per_case)
++        if berr is not None:
++            return (f"Brute-force reference timed out at seed {seed}.\n"
++                    f"Input:\n{_clip(inp)}\n"
++                    f"Stderr:\n{_clip(berr[1])}")
++        if bp.returncode != 0:
++            return (f"Brute-force reference crashed at seed {seed} (exit code {bp.returncode}).\n"
++                    f"Input:\n{_clip(inp)}\n"
++                    f"Stderr:\n{_clip(bp.stderr)}")
++        expected = bp.stdout
++
++        # 3. run solution
++        sp, elapsed, serr = _run([sys.executable, sol], cwd, inp, timeout_per_case)
++        if serr is not None:
++            return (f"Solution TIMED OUT (limit {timeout_per_case}s) at seed {seed}.\n"
++                    f"Input:\n{_clip(inp)}\n"
++                    f"Expected output:\n{_clip(expected)}\n"
++                    f"Actual output (partial):\n{_clip(serr[0])}\n"
++                    f"Stderr:\n{_clip(serr[1])}")
++        max_time = max(max_time, elapsed)
++        if sp.returncode != 0:
++            return (f"Solution CRASHED at seed {seed} (exit code {sp.returncode}).\n"
++                    f"Input:\n{_clip(inp)}\n"
++                    f"Expected output:\n{_clip(expected)}\n"
++                    f"Actual output:\n{_clip(sp.stdout)}\n"
++                    f"Stderr:\n{_clip(sp.stderr)}")
++
++        # 4. compare
++        if _norm_tokens(expected) != _norm_tokens(sp.stdout):
++            return (f"WRONG ANSWER at seed {seed}.\n"
++                    f"Input:\n{_clip(inp)}\n"
++                    f"Expected output:\n{_clip(expected)}\n"
++                    f"Actual output:\n{_clip(sp.stdout)}\n"
++                    f"Stderr:\n{_clip(sp.stderr)}")
++
++    return f"All {num_cases} cases passed. Max runtime per case: {max_time:.3f}s"

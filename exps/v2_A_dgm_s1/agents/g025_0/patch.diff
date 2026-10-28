@@ -1,0 +1,245 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3895574..7578518 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import tempfile
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -119,6 +120,71 @@ def _is_test_file(path):
+         return True
+     return False
+ 
++SOURCE_EXTENSIONS = (".py", ".js", ".go", ".rs", ".java", ".cpp")
++CANDIDATE_CONTENT_CHARS = 6000
++CANDIDATE_MAX_FILES = 4
++STUB_PATTERN = re.compile(r"\bpass\b|TODO|unimplemented|NotImplemented")
++
++def _block_text(block):
++    """
++    Return (is_text_block, text) for a content block, which may be a dict or an SDK object.
++    """
++    if isinstance(block, dict):
++        btype = block.get('type')
++        text = block.get('text')
++    else:
++        btype = getattr(block, 'type', None)
++        text = getattr(block, 'text', None)
++    return btype == 'text' or (btype is None and text is not None), text
++
++def _is_empty_assistant_message(msg):
++    """
++    True if msg is an assistant message whose text content is empty or whitespace-only.
++    Messages carrying non-text blocks (e.g. tool_use) are never considered empty.
++    """
++    if not isinstance(msg, dict) or msg.get('role') != 'assistant':
++        return False
++    content = msg.get('content')
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return not content.strip()
++    texts = []
++    for block in content:
++        is_text, text = _block_text(block)
++        if not is_text:
++            return False
++        texts.append(text or '')
++    return not ''.join(texts).strip()
++
++def _sanitize_history(msg_history):
++    """
++    Return a copy of msg_history with trailing empty assistant messages removed.
++    The input list is never mutated.
++    """
++    if not msg_history:
++        return []
++    cleaned = list(msg_history)
++    num_trailing_empty = 0
++    for msg in reversed(cleaned):
++        if _is_empty_assistant_message(msg):
++            num_trailing_empty += 1
++        else:
++            break
++    if num_trailing_empty:
++        cleaned = cleaned[:len(cleaned) - num_trailing_empty]
++    return cleaned
++
++def _read_text_file(path, max_chars=None):
++    try:
++        with open(path, 'r', encoding='utf-8', errors='replace') as f:
++            content = f.read() if max_chars is None else f.read(max_chars)
++    except Exception:
++        return None
++    if max_chars is not None and len(content) >= max_chars:
++        content += "\n...[truncated]"
++    return content
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -197,6 +263,49 @@ class AgenticSystem:
+         """
+         return any(not _is_test_file(f) for f in self._changed_files())
+ 
++    def _find_candidate_files(self):
++        """
++        Locate non-test source files in the repo (tracked plus untracked) that are likely
++        to hold the implementation, and return their contents as a formatted string.
++        Files named solution.* come first, then files containing a stub marker
++        (pass / TODO / unimplemented / NotImplemented).
++        """
++        names = []
++        try:
++            for args in (["git", "-C", self.git_tempdir, "ls-files"],
++                         ["git", "-C", self.git_tempdir, "ls-files", "--others", "--exclude-standard"]):
++                out = subprocess.run(args, capture_output=True, text=True, timeout=120)
++                names.extend(line.strip() for line in out.stdout.splitlines() if line.strip())
++        except Exception as e:
++            safe_log(f"Could not list candidate files: {e}")
++
++        seen = set()
++        candidates = []
++        for name in names:
++            if name in seen or _is_test_file(name) or not name.endswith(SOURCE_EXTENSIONS):
++                continue
++            seen.add(name)
++            candidates.append(name)
++
++        def is_solution(name):
++            return os.path.basename(name).startswith("solution.")
++
++        def has_stub(name):
++            content = _read_text_file(os.path.join(self.git_tempdir, name), max_chars=CANDIDATE_CONTENT_CHARS)
++            return bool(content) and STUB_PATTERN.search(content) is not None
++
++        preferred = [n for n in candidates if is_solution(n)]
++        others = [n for n in candidates if not is_solution(n) and has_stub(n)]
++        chosen = (preferred + others)[:CANDIDATE_MAX_FILES]
++
++        parts = []
++        for name in chosen:
++            content = _read_text_file(os.path.join(self.git_tempdir, name), max_chars=CANDIDATE_CONTENT_CHARS)
++            if content is None:
++                continue
++            parts.append(f"### File: {name}\n```\n{content}\n```")
++        return "\n\n".join(parts)
++
+     def _save_problem_statement(self):
+         """
+         Write the problem statement to a temp file and return its path.
+@@ -211,6 +320,9 @@ class AgenticSystem:
+         The forward function for the AgenticSystem.
+         """
+         problem_file = self._save_problem_statement()
++        has_samples = re.search(r"Sample Input", self.problem_statement, re.IGNORECASE) is not None
++        candidate_text = self._find_candidate_files()
++
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+@@ -219,45 +331,72 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        workflow = """Required workflow:
+-1. Inspect the relevant files (e.g. the starter/stub file containing `pass` or the unimplemented function).
+-2. Immediately write the implementation into the source file using the editor tool. Do not wait to finish analysis first.
+-3. Then test the implementation (write quick checks or tests, and compare against a brute force solution when useful), and refine the source file until the checks pass.
+-4. After implementing, run the sample_check tool on all samples from the statement (the problem statement is saved at {problem_file}; pass it as `problem_file` and your solution file as `solution_path`). Treat any exact-output mismatch as a failure, even if the problem says multiple answers are accepted. Try to adjust the algorithm (ordering, tie-breaking, canonical choice) so that every sample output is reproduced exactly. Only give up on exact matching after trying at least 2-3 plausible canonical constructions, and explain why.
+-
+-A turn must never end with just a plan or a description of what you intend to do. The task is only complete once non-test source files have been modified.
+-You must modify the source files using the editor tool; do not stop after describing a plan."""
+-        workflow = workflow.replace("{problem_file}", problem_file)
++        steps = [
++            "1. Inspect the relevant files (e.g. the starter/stub file containing `pass` or the unimplemented function).",
++            "2. Immediately write the implementation into the source file using the editor tool. Do not wait to finish analysis first.",
++            "3. Then test the implementation (write quick checks or tests, and compare against a brute force solution when useful), and refine the source file until the checks pass.",
++        ]
++        if has_samples:
++            steps.append(
++                "4. After implementing, run the sample_check tool on all samples from the statement (the problem statement is saved at "
++                f"{problem_file}; pass it as `problem_file` and your solution file as `solution_path`). Treat any exact-output mismatch as a failure, "
++                "even if the problem says multiple answers are accepted. Try to adjust the algorithm (ordering, tie-breaking, canonical choice) so that "
++                "every sample output is reproduced exactly. Only give up on exact matching after trying at least 2-3 plausible canonical constructions, and explain why."
++            )
++        workflow = "Required workflow:\n" + "\n".join(steps) + (
++            "\n\nA turn must never end with just a plan or a description of what you intend to do. The task is only complete once "
++            "non-test source files have been modified.\nYou must modify the source files using the editor tool; do not stop after describing a plan."
++        )
+         instruction = f"{task}\n\n{workflow}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++        if candidate_text:
++            instruction += f"\n\nHere are the current contents of the candidate source files:\n\n{candidate_text}"
+ 
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        for attempt in range(3):
++        def corrective_message():
++            return (
++                "Your last turn did not edit any non-test source file (it may have been empty or only inspected the repo). "
++                "Do not describe a plan and do not explore further. Here is the task again:\n\n"
++                f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Current contents of the candidate source files:\n\n{self._find_candidate_files()}\n\n"
++                "Use the editor tool now to write the complete implementation into the main source file "
++                "(the file with the stub/`pass`). Do not explore further before editing."
++            )
++
++        def fresh_message():
++            return (
++                f"Task (repository at {self.git_tempdir}):\n\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Candidate source files:\n\n{self._find_candidate_files()}\n\n"
++                "Call the editor tool with command=edit (or create) and the complete implementation of the file in one call now."
++            )
++
++        max_attempts = 3
++        for attempt in range(max_attempts):
+             if self._has_source_edit():
+                 break
+-            if not self._changed_files():
+-                corrective = (
+-                    "Your last turn made no file edits. Do not just describe a plan. "
+-                    "Use the editor tool now to implement the solution in the main source file, "
+-                    "e.g. the file with the stub/`pass`."
+-                )
++            if attempt < max_attempts - 1:
++                strategy = "sanitized-history corrective prompt"
++                safe_log(f"[forward] Retry {attempt + 1}/{max_attempts}: strategy={strategy}.")
++                history = _sanitize_history(msg_history)
++                msg_history = chat_with_agent(corrective_message(), model=self.code_model, msg_history=history, logging=safe_log)
+             else:
+-                corrective = (
+-                    "Only test files were changed. Implement the fix in the non-test source files. "
+-                    "Use the editor tool now to modify the main source file(s)."
+-                )
+-            safe_log(f"[forward] Retry {attempt + 1}/3: no non-test source edit detected. Re-prompting agent.")
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                strategy = "fresh conversation with minimal prompt"
++                safe_log(f"[forward] Retry {attempt + 1}/{max_attempts}: strategy={strategy}.")
++                msg_history = chat_with_agent(fresh_message(), model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         if self._has_source_edit():
+-            verify = (
++            verify_parts = [
+                 "Good. Now run the tests or your own quick checks against the implementation "
+                 "and fix any failures. Do not remove or revert the source edits you already made. "
+-                f"You must run the sample_check tool (problem_file={problem_file}, solution_path = your solution file) "
+-                "and confirm that ALL samples PASS with exact output. If any sample FAILs, adjust the algorithm "
+-                "to reproduce the expected sample output exactly and re-run sample_check before finishing."
+-            )
+-            msg_history = chat_with_agent(verify, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            ]
++            if has_samples:
++                verify_parts.append(
++                    f"You must run the sample_check tool (problem_file={problem_file}, solution_path = your solution file) "
++                    "and confirm that ALL samples PASS with exact output. If any sample FAILs, adjust the algorithm "
++                    "to reproduce the expected sample output exactly and re-run sample_check before finishing."
++                )
++            msg_history = chat_with_agent("".join(verify_parts), model=self.code_model,
++                                          msg_history=_sanitize_history(msg_history), logging=safe_log)
+         else:
+             safe_log("[forward] Warning: no non-test source file was modified after retries.")
+ 

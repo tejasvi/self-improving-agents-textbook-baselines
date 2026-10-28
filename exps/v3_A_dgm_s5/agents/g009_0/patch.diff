@@ -1,0 +1,280 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 13eb252..2b01b4b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,7 @@ import fnmatch
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -197,75 +198,219 @@ class AgenticSystem:
+             return "empty"
+         return "test-only"
+ 
+-    def forward(self):
++    MAX_TARGET_CHARS = 8000
++
++    @staticmethod
++    def _block_field(block, key):
++        if isinstance(block, dict):
++            return block.get(key)
++        return getattr(block, key, None)
++
++    @classmethod
++    def _message_has_content(cls, msg):
+         """
+-        The forward function for the AgenticSystem.
++        Return True if an assistant message has non-empty text or a tool_use block.
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++        content = cls._block_field(msg, 'content') if not isinstance(msg, dict) else msg.get('content')
++        if isinstance(content, str):
++            return bool(content.strip())
++        if not isinstance(content, list):
++            return False
++        for block in content:
++            btype = cls._block_field(block, 'type')
++            if btype == 'tool_use':
++                return True
++            if btype == 'text':
++                text = cls._block_field(block, 'text')
++                if isinstance(text, str) and text.strip():
++                    return True
++        return False
+ 
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
++    @classmethod
++    def _sanitize_history(cls, msg_history):
++        """
++        Remove trailing assistant messages that have no non-empty text and no tool_use.
++        Returns [] if nothing meaningful remains.
++        """
++        if not isinstance(msg_history, list):
++            return []
++        history = list(msg_history)
++        while history:
++            last = history[-1]
++            role = last.get('role') if isinstance(last, dict) else getattr(last, 'role', None)
++            if role == 'assistant' and not cls._message_has_content(last):
++                history.pop()
++            else:
++                break
++        if not history:
++            return []
++        return history
+ 
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++    @staticmethod
++    def _summarize_last_assistant(msg_history):
++        if not isinstance(msg_history, list):
++            return "no history"
++        for msg in reversed(msg_history):
++            role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++            if role == 'assistant':
++                content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++                text = str(content)
++                return f"len={len(text)} preview={text[:200]!r}"
++        return "no assistant message"
++
++    def _safe_chat(self, prompt, history):
++        """
++        Call chat_with_agent without letting exceptions abort the run.
++        Returns the sanitized resulting history, or the previous history on failure.
++        """
++        previous = self._sanitize_history(history)
++        try:
++            result = chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
++            return self._sanitize_history(result)
++        except Exception:
++            import traceback
++            safe_log(
++                "chat_with_agent raised an exception:\n" + traceback.format_exc(),
++                level=logging.ERROR,
++            )
++            safe_log(
++                f"History length at failure: {len(history) if isinstance(history, list) else 'n/a'}; "
++                f"last assistant: {self._summarize_last_assistant(history)}",
++                level=logging.ERROR,
++            )
++            return previous
+ 
+-IMPORTANT: Your first action must be a call to the editor tool that creates or edits the solution file; never reply with only text and never end with an empty message. Write a working draft of the solution right away. The task is not complete until the solution file exists on disk and passes the samples.
+-"""
+-        workflow = """Follow these steps in order:
++    def _find_target_file(self):
++        """
++        Locate the primary non-test .py file in git_tempdir (solution.py, a class Solution file,
++        or a file with a TODO/pass stub). Returns (abs_path, content) or (None, None).
++        """
++        try:
++            result = subprocess.run(
++                ["git", "-C", self.git_tempdir, "ls-files"],
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                check=False,
++            )
++            tracked = result.stdout.decode('utf-8', errors='replace').splitlines()
++        except Exception:
++            tracked = []
++
++        candidates = []
++        for rel in tracked:
++            rel = rel.strip()
++            if not rel.endswith('.py') or self._is_test_path(rel):
++                continue
++            full = os.path.join(self.git_tempdir, rel)
++            try:
++                with open(full, 'r', encoding='utf-8', errors='replace') as f:
++                    content = f.read()
++            except OSError:
++                continue
++            basename = os.path.basename(rel)
++            if basename == 'solution.py':
++                priority = 0
++            elif 'class Solution' in content:
++                priority = 1
++            elif 'TODO' in content or re.search(r'^\s*pass\s*$', content, re.MULTILINE):
++                priority = 2
++            else:
++                continue
++            candidates.append((priority, rel, full, content))
+ 
+-(a) Restate the constraints and extract ALL sample tests from the problem statement (every example input and its exact expected output). Write them down precisely.
++        if not candidates:
++            return None, None
++        candidates.sort(key=lambda c: (c[0], c[1]))
++        _, _, full, content = candidates[0]
++        if len(content) > self.MAX_TARGET_CHARS:
++            content = content[:self.MAX_TARGET_CHARS] + "\n... [truncated]"
++        return full, content
+ 
+-(b) Write the solution to the code files in the repository.
++    def _patch_outcome(self):
++        if self._has_valid_patch():
++            return "valid"
++        return self._patch_status_description()
+ 
+-(c) Call the `run_samples` tool on ALL samples extracted in step (a). Treat ANY exact mismatch as a bug, even if the statement says that any valid answer is accepted: the hidden grader may compare outputs exactly. When a sample mismatches, do not dismiss it. Adjust the algorithm or construction to reproduce the sample output exactly, e.g. by using a canonical choice such as the lexicographically/numerically smallest or largest valid option, a tie-breaking rule, or the construction that the samples suggest. Only fall back to a checker-validated answer if reproducing the sample output is truly impossible, and say so explicitly. Repeat until all samples PASS.
++    def forward(self):
++        """
++        The forward function for the AgenticSystem.
++        """
++        target_path, target_content = self._find_target_file()
++        if target_path is None:
++            target_desc = (
++                f"No obvious starter file was found in {self.git_tempdir}; create the solution file "
++                f"(e.g. {self.git_tempdir}/solution.py) with the editor tool."
++            )
++        else:
++            target_desc = (
++                f"Edit this file: {target_path}. Current content:\n"
++                f"```python\n{target_content}\n```\n"
++                f"You must modify this file with the editor tool."
++            )
++        is_class_based = bool(target_content and 'class Solution' in target_content)
++        if is_class_based:
++            verify_hint = (
++                "This is a class-based task: verify by importing the Solution class through a bash command "
++                "(e.g. python3 -c \"from solution import Solution; ...\" run from the repo directory) "
++                "instead of run_samples, which only feeds stdin to a script."
++            )
++        else:
++            verify_hint = (
++                "Verify with run_samples on every sample you extracted (it runs the file via stdin)."
++            )
+ 
+-(d) Write a brute-force reference solution for small inputs and a random stress test that compares the solution with the brute force. The stress test must compare feasibility answers ('Yes'/'No') in both directions, so 'No' answers are cross-checked too, not only 'Yes' answers. For constructive answers, validate the output with a checker written for the problem. Fix any discrepancy you find.
++        instruction = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+-(e) Test edge cases (minimum sizes, equal values, degenerate structures) and max-size inputs. Check that the solution runs within the time limit on max-size inputs and optimize it if it is too slow.
++<problem_description>
++{self.problem_statement}
++</problem_description>
+ 
+-(f) Before finishing, re-read the problem statement carefully for the required output format (spacing, line breaks, case of 'Yes'/'No', etc.). Run `run_samples` one final time and note any remaining mismatch with the samples. Do not finish while any sample mismatches unless it is impossible to reproduce, and explain why in that case.
++{target_desc}
+ 
+-Do not write infinite or unbounded loops in any code you write; use bounded loops only."""
+-        instruction = f"{task}\n\n{workflow}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++Steps:
++1. Write a working draft of the solution into the file above with the editor tool right away.
++2. Then verify it: {verify_hint} Check every sample from the problem statement and match the expected output exactly.
++3. If anything fails, fix the file and re-verify. Optionally write a brute-force checker and a random stress test in a separate non-solution file (e.g. under tests/) and compare.
++4. Do not only edit test or scratch files; the solution file must contain the final implementation.
++"""
+ 
+         safe_log("Attempt 0: initial call to coding agent")
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not isinstance(msg_history, list):
+-            msg_history = []
++        msg_history = self._safe_chat(instruction, [])
++        safe_log(f"Attempt 0 outcome: {self._patch_outcome()}")
+ 
+         for attempt in range(3):
+             if self._has_valid_patch():
+-                safe_log(f"Patch check after attempt {attempt}: valid")
++                safe_log(f"Patch check before retry {attempt}: valid")
+                 break
+-            status = self._patch_status_description()
+-            safe_log(f"Patch check after attempt {attempt}: invalid ({status}); sending corrective message")
+-            if status == "empty":
+-                reason = "No file changes were detected."
+-            else:
+-                reason = "Only test files were modified."
+-            corrective = (
+-                f"{reason} The task is not complete. Immediately use the editor tool (create or edit) "
+-                f"to write the complete solution into the primary source or solution file in {self.git_tempdir}, "
+-                "with no further analysis first. Do not only edit test, brute-force, or stress scripts. "
+-                "After writing it, run the samples and fix any issues."
+-            )
+-            msg_history = chat_with_agent(corrective, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            if not isinstance(msg_history, list):
+-                msg_history = []
+-
+-        if not self._has_valid_patch():
+-            safe_log("Final attempt: no valid patch after retries; starting fresh history with minimal prompt")
+-            minimal = (
+-                f"Create the solution file now using the editor tool. The problem is: {self.problem_statement}. "
+-                "Write a complete, efficient solution immediately."
++            safe_log(f"Retry {attempt}: outcome={self._patch_outcome()}; starting fresh history")
++            target_hint = (
++                f"Target file: {target_path}\nCurrent content:\n```python\n{target_content}\n```\n"
++                if target_path else
++                f"Target file: create the solution file in {self.git_tempdir}.\n"
+             )
+-            final_history = chat_with_agent(minimal, model=self.code_model, msg_history=[], logging=safe_log)
+-            if self._has_valid_patch():
+-                safe_log("Final attempt outcome: valid patch produced")
++            if attempt == 0:
++                extra = "Write a correct, efficient solution."
++            elif attempt == 1:
++                extra = "Write the simplest correct solution, even if brute force."
+             else:
+-                safe_log("Final attempt outcome: still no valid patch", level=logging.WARNING)
+-        else:
++                extra = "Write the simplest correct solution, even if brute force. Do not analyze further; write it now."
++            prompt = (
++                f"Solve this programming problem.\n\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"{target_hint}\n"
++                f"Call the editor tool now to write the full solution into this file; do not reply with text only. "
++                f"{extra}"
++            )
++            msg_history = self._safe_chat(prompt, [])
++            safe_log(f"Retry {attempt} outcome: {self._patch_outcome()}")
++
++        if self._has_valid_patch():
+             safe_log("Agent finished with a valid patch")
++        else:
++            safe_log(
++                "LAST RESORT: model still made no valid non-test edit after retries; final outcome: "
++                f"{self._patch_outcome()}",
++                level=logging.WARNING,
++            )
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

@@ -1,0 +1,668 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 4779334..1dcfb3a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -8,6 +8,7 @@ import time
+ import uuid
+ from logging.handlers import RotatingFileHandler
+ import os
++import tempfile
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -54,6 +55,7 @@ RUN_TIMEOUT_S = 10        # timeout for every solution / generator / brute run
+ REPORT_CLIP = 2000        # max chars of any raw input/output in a report
+ CODE_CLIP = 30000         # max chars of solution code pasted into a prompt
+ TIME_LIMIT_S = 1.0        # soft limit for a max-size run
++CHECKER_CHECK_SEEDS = 20  # gen.py seeds used to verify checker.py against brute.py
+ 
+ BUDGET_LINE = ("Keep thinking under ~300 words per turn; do not spend output budget on long derivations "
+                "before the first file is written.")
+@@ -61,6 +63,13 @@ BUDGET_LINE = ("Keep thinking under ~300 words per turn; do not spend output bud
+ FIRST_DRAFT_LINE = ("Write a complete first draft of solution.py within your first few tool calls and keep your "
+                     "reasoning brief; never end your turn without having written the file. " + BUDGET_LINE)
+ 
++CHECKER_SPEC = """checker.py: a VALIDATOR for candidate outputs (problems often accept any valid answer, so exact comparison is not enough). Usage `python3 checker.py INPUT_FILE OUTPUT_FILE`, where INPUT_FILE holds one input and OUTPUT_FILE holds a candidate output produced by any correct program.
++- Exit 0 and print OK if the output is a valid answer for that input.
++- Otherwise print a short reason and exit 1. Never crash with a traceback: wrap parsing of the output in try/except and exit 1 on malformed output.
++- It must validate every constraint and requirement from the statement (format, counts, value ranges, the required property of the answer, and optimality/existence where the problem demands it).
++- Cross-check with brute.py when the input is small (choose a size guard, e.g. n <= 10 or total numbers <= 30, so brute.py stays fast): run it with subprocess.run(['python3', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'brute.py')], input=input_text, capture_output=True, text=True, timeout=10) and compare feasibility (e.g. the output says -1 iff brute says no answer) or the optimal value. Handle a brute timeout or failure without crashing. For large inputs SKIP the brute call and only validate the output directly.
++- Never read solution.py. Use only bounded loops (no `while True`)."""
++
+ BRUTE_FIRST_TEMPLATE = """You are preparing ground truth for the competitive programming problem below. Work in the directory {d}.
+ Do NOT write solution.py in this step.
+ 
+@@ -68,10 +77,12 @@ Do NOT write solution.py in this step.
+ {statement}
+ </problem_description>
+ 
+-Write brute.py only: a straightforward exhaustive / BFS / DP solution that is obviously correct on tiny inputs, reading stdin like the problem requires and writing stdout exactly like the problem requires. No optimisation.
++Write brute.py: a straightforward exhaustive / BFS / DP solution that is obviously correct on tiny inputs, reading stdin like the problem requires and writing stdout exactly like the problem requires. No optimisation.
+ Then run `python3 brute.py < input` on every sample in the statement and compare with the expected output exactly; fix brute.py until it matches on every sample.
+ Then write gen.py: a random generator of SMALL valid inputs (small sizes so brute.py is fast). Usage `python3 gen.py SEED` prints one input to stdout, using random.Random(int(sys.argv[1])) so it is deterministic per seed.
+-Keep reasoning very short and write the file within your first 2 tool calls. """ + BUDGET_LINE + """
++Then write {checker_spec}
++Check checker.py by running `python3 checker.py INPUT OUTPUT` on each sample (with the expected output) and on brute.py's output for a few gen.py seeds: it must print OK there, and must reject a corrupted output.
++Keep reasoning very short and write the files within your first 3 tool calls. """ + BUDGET_LINE + """
+ 
+ Harness report from the previous attempt (empty on the first call):
+ {report}
+@@ -97,8 +108,9 @@ Create the following files in {d} (if a file already exists and is correct, leav
+ 1. brute.py: an obviously correct exhaustive solution that reads stdin and writes stdout exactly like the problem requires. No optimisation; it only has to be correct on small inputs.
+ 2. gen.py: a random generator of SMALL valid inputs that respects the constraints. Usage `python3 gen.py SEED` prints one input to stdout. Use random.Random(int(sys.argv[1])) so it is deterministic per seed.
+ 3. gen_big.py: a generator of MAX-SIZE valid inputs. Usage `python3 gen_big.py SEED` prints one input at the largest allowed constraints. Cycle through adversarial shapes by seed (e.g. seed%4: all-equal values, random values, sorted/reverse-sorted, many distinct values or skewed sizes), so that pruning/early-break heuristics are stressed.
++4. {checker_spec}
+ 
+-Then check brute.py (if you wrote it) by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Finish by making sure all three files exist."""
++Then check brute.py (if you wrote it) by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Check checker.py on the samples (expected outputs must get OK) and on brute.py's outputs for a few seeds. Finish by making sure all four files exist."""
+ 
+ 
+ # Thread-local storage for logger instances
+@@ -282,10 +294,14 @@ class AgenticSystem:
+                              f"input:\n{inp[:REPORT_CLIP]}\nexpected:\n{exp[:REPORT_CLIP]}")
+                 continue
+             actual = p.stdout
+-            if actual.split() == exp.split():
++            if script == 'brute.py':
++                judged_ok, verdict = actual.split() == exp.split(), "exact token comparison."
++            else:
++                judged_ok, verdict = self._judge(inp, actual, exp)
++            if judged_ok:
+                 passed += 1
+             else:
+-                parts.append(f"Sample {idx}: FAILED\ninput:\n{inp[:REPORT_CLIP]}"
++                parts.append(f"Sample {idx}: FAILED (checker verdict: {verdict})\ninput:\n{inp[:REPORT_CLIP]}"
+                              f"expected:\n{exp[:REPORT_CLIP]}\nactual:\n{actual[:REPORT_CLIP]}"
+                              f"stderr:\n{(p.stderr or '')[-REPORT_CLIP:]}\n(exit code {p.returncode})")
+         report = f"Samples passed for {script}: {passed}/{len(samples)}."
+@@ -305,10 +321,113 @@ class AgenticSystem:
+         return all(isinstance(n, ast.Pass) or (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))
+                    for n in tree.body)
+ 
++    def _run_checker(self, input_text, output_text):
++        """
++        Run checker.py INPUT_FILE OUTPUT_FILE on temp files. Returns (accepted, reason).
++        Crashes, timeouts and missing files are rejections with a reason.
++        """
++        checker = os.path.join(self.git_tempdir, 'checker.py')
++        if not os.path.isfile(checker):
++            return False, "checker.py missing."
++        tmp = tempfile.mkdtemp(prefix='checker_')
++        try:
++            in_path = os.path.join(tmp, 'input.txt')
++            out_path = os.path.join(tmp, 'output.txt')
++            with open(in_path, 'w') as f:
++                f.write(input_text)
++            with open(out_path, 'w') as f:
++                f.write(output_text)
++            try:
++                p = subprocess.run(['python3', checker, in_path, out_path], cwd=self.git_tempdir,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                return False, f"checker.py timed out (limit {RUN_TIMEOUT_S}s)."
++            msg = (p.stdout or '').strip() or (p.stderr or '').strip()[-REPORT_CLIP:]
++            if p.returncode == 0:
++                return True, msg or "OK"
++            return False, (msg[-REPORT_CLIP:] if msg else f"checker.py exit code {p.returncode}")
++        finally:
++            shutil.rmtree(tmp, ignore_errors=True)
++
++    def _judge(self, input_text, output_text, expected_text=None):
++        """
++        Return (ok, reason). If checker.py is trusted, the checker decides validity. Otherwise (or when no
++        checker is trusted) the output must equal expected_text token-by-token.
++        """
++        if getattr(self, '_checker_trusted', False):
++            return self._run_checker(input_text, output_text)
++        if expected_text is None:
++            return False, "no checker is trusted and no expected output is available."
++        if output_text.split() == expected_text.split():
++            return True, "matches expected output."
++        return False, "output differs from expected output (no trusted checker)."
++
++    def _check_checker(self):
++        """
++        Verify checker.py: it must accept every sample's expected output, accept brute.py's output on
++        gen.py seeds 1..CHECKER_CHECK_SEEDS, and reject a corrupted output. Returns (ok, report).
++        """
++        for name in ('checker.py', 'brute.py', 'gen.py'):
++            if not os.path.isfile(os.path.join(self.git_tempdir, name)):
++                return False, f"Checker check: {name} missing."
++        problems = []
++        if not self._is_class_task():
++            for idx, inp, exp in self._parse_samples():
++                ok, reason = self._run_checker(inp, exp)
++                if not ok:
++                    problems.append(f"sample {idx}: checker rejected the expected output: {reason}")
++                    break
++        checked, rejected_corrupt = 0, False
++        for seed in range(1, CHECKER_CHECK_SEEDS + 1):
++            try:
++                g = subprocess.run(['python3', 'gen.py', str(seed)], cwd=self.git_tempdir,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++                if g.returncode != 0:
++                    problems.append(f"gen.py failed on seed {seed} during checker check.")
++                    break
++                inp = g.stdout
++                b = subprocess.run(['python3', 'brute.py'], cwd=self.git_tempdir, input=inp,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                problems.append(f"gen.py or brute.py timed out on seed {seed} during checker check.")
++                break
++            if b.returncode != 0 or not b.stdout.strip():
++                continue  # brute failures are reported by _check_brute, not by the checker
++            ok, reason = self._run_checker(inp, b.stdout)
++            checked += 1
++            if not ok:
++                problems.append(f"seed {seed}: checker rejected brute.py's valid output: {reason}\n"
++                                f"input:\n{inp[:REPORT_CLIP]}\nbrute output:\n{b.stdout[:REPORT_CLIP]}")
++                break
++            if not rejected_corrupt:
++                bad = self._corrupt(b.stdout)
++                bad_ok, _ = self._run_checker(inp, bad)
++                if bad_ok:
++                    problems.append(f"seed {seed}: checker ACCEPTED a corrupted output:\n{bad[:REPORT_CLIP]}")
++                    break
++                rejected_corrupt = True
++        if not problems and not rejected_corrupt:
++            problems.append("Checker check: could not produce a corrupted output to test (no brute output).")
++        if problems:
++            return False, "Checker check FAILED:\n" + "\n".join(problems)
++        return True, f"Checker check passed: accepts samples and {checked} brute outputs, rejects corruption."
++
++    @staticmethod
++    def _corrupt(output_text):
++        """Deliberately wrong output: append a huge token, or flip a lone -1 / a number to -1."""
++        toks = output_text.split()
++        if toks and toks[0] != '-1':
++            return output_text.rstrip('\n') + '\n999999999\n'
++        return output_text.rstrip('\n') + ' 999999999\n'
++
+     def _check_brute(self):
+-        """Verify brute.py on the samples and that gen.py runs. Returns (ok, report)."""
++        """
++        Verify brute.py on the samples, that gen.py runs, and that checker.py is trustworthy.
++        Sets self._checker_trusted. Returns (ok, report).
++        """
+         missing = [f for f in ('brute.py', 'gen.py') if not os.path.isfile(os.path.join(self.git_tempdir, f))]
+         if missing:
++            self._checker_trusted = False
+             return False, f"Missing file(s): {', '.join(missing)}."
+         passed, total, timed_out, report = self._run_samples(script='brute.py')
+         try:
+@@ -319,6 +438,19 @@ class AgenticSystem:
+         except subprocess.TimeoutExpired:
+             gen_ok, gen_msg = False, f"gen.py timed out on seed 1 (limit {RUN_TIMEOUT_S}s)."
+         ok = passed == total and not timed_out and gen_ok
++        # Checker trust is only meaningful once brute.py is verified; a missing checker is reported as such.
++        if os.path.isfile(os.path.join(self.git_tempdir, 'checker.py')):
++            if ok:
++                c_ok, c_msg = self._check_checker()
++            else:
++                c_ok, c_msg = False, "Checker check skipped: brute.py / gen.py not yet verified."
++            self._checker_trusted = c_ok
++            report += "\n" + c_msg
++            ok = ok and c_ok
++        else:
++            self._checker_trusted = False
++            report += "\nchecker.py is missing: write it (see the spec) so the harness can judge valid answers."
++            ok = False
+         return ok, report + "\n" + gen_msg
+ 
+     def _run_stress(self):
+@@ -332,6 +464,7 @@ class AgenticSystem:
+             return False, 0, "Stress skipped: gen.py and/or brute.py missing."
+         start = time.monotonic()
+         ran = 0
++        accepted_diffs = 0  # outputs that differ from brute but are accepted by the trusted checker
+         for seed in range(1, STRESS_SEEDS + 1):
+             if time.monotonic() - start > STRESS_BUDGET_S:
+                 break
+@@ -361,12 +494,20 @@ class AgenticSystem:
+                 return True, ran, (f"brute.py crashed on seed {seed}; brute may be wrong.\n"
+                                    f"input:\n{inp[:REPORT_CLIP]}\nbrute stderr:\n{b_err[-REPORT_CLIP:]}")
+             if s_out.split() != b_out.split():
+-                return True, ran, (f"MISMATCH on seed {seed}.\ninput:\n{inp[:REPORT_CLIP]}"
++                ok_j, verdict = self._judge(inp, s_out, b_out)
++                if ok_j:
++                    accepted_diffs += 1
++                    if accepted_diffs == 1:  # log the first accepted difference once per stress run
++                        safe_log(f"Stress seed {seed}: output differs from brute.py but checker.py accepts it "
++                                 f"({verdict}); counted as a pass.")
++                    continue
++                return True, ran, (f"MISMATCH on seed {seed} (checker verdict: {verdict}).\ninput:\n{inp[:REPORT_CLIP]}"
+                                    f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
+                                    f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
+                                    f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}\n"
+                                    f"Note: brute.py itself may be wrong; verify it against the statement.")
+-        return False, ran, f"Stress: {ran} seeds run, no mismatch."
++        note = f" ({accepted_diffs} differing outputs accepted by checker.py)" if accepted_diffs else ""
++        return False, ran, f"Stress: {ran} seeds run, no mismatch{note}."
+ 
+     def _run_timing(self):
+         """Run solution.py on max-size inputs from gen_big.py. Returns (ok, report)."""
+@@ -392,6 +533,9 @@ class AgenticSystem:
+             if s.returncode != 0:
+                 ok = False
+                 lines.append(f"seed {seed}: crashed in {dt:.2f}s, stderr:\n{(s.stderr or '')[-REPORT_CLIP:]}")
++            elif getattr(self, '_checker_trusted', False) and not (verdict := self._run_checker(g.stdout, s.stdout))[0]:
++                ok = False
++                lines.append(f"seed {seed}: invalid output on max-size input (checker verdict: {verdict[1]})")
+             elif dt > TIME_LIMIT_S:
+                 ok = False
+                 lines.append(f"seed {seed}: SLOW {dt:.2f}s (soft limit {TIME_LIMIT_S}s)")
+@@ -444,7 +588,8 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+ """
+ 
+     def _oracle_prompt(self):
+-        return ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement)
++        return ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement,
++                                      checker_spec=CHECKER_SPEC)
+ 
+     def _ask(self, prompt, msg_history=None):
+         """
+@@ -460,10 +605,11 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+             safe_log(f"Agent call failed: {e!r}")
+             return history
+ 
+-    def _ask_until_changed(self, prompt, before):
++    def _ask_until_changed(self, prompt, before, last_clean=False):
+         """
+         Call the agent; re-prompt (bounded) if solution.py is still missing, empty or unchanged.
+         Continuation calls reuse the message history of this phase instead of starting fresh.
++        If the previous harness report had no real failures (last_clean), a missing change is not nudged.
+         """
+         history = None
+         for n in range(MAX_NUDGES + 1):
+@@ -472,6 +618,9 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+             cur = self._read_solution()
+             if cur is not None and cur.strip() and cur != before:
+                 return True
++            if last_clean:
++                safe_log("solution.py unchanged, but the previous harness report had no real failures; not nudging.")
++                return False
+             safe_log(f"solution.py missing/empty/unchanged after call {n + 1}; re-prompting.")
+         return False
+ 
+@@ -487,7 +636,7 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+         for n in range(MAX_BRUTE_TRIES):
+             if n == 0:
+                 prompt = BRUTE_FIRST_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement,
+-                                                     report=report)
++                                                     report=report, checker_spec=CHECKER_SPEC)
+             else:
+                 prompt = ("The harness checked brute.py and gen.py. Harness report:\n" + report +
+                           "\n\nFix brute.py (and gen.py if needed) so that brute.py matches every sample exactly, "
+@@ -513,7 +662,9 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+         best = None  # (score, k, snapshot_path)
+         feedback = None
+         prev_code = self._read_solution()
++        prev_clean = False
+         class_task = self._is_class_task()
++        self._checker_trusted = False
+ 
+         # Phase 0: brute-force ground truth first (stdin tasks only).
+         if not class_task:
+@@ -545,14 +696,18 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                     prompt = self._task_text() + "\n" + self._method_text() + "\n\n" + FIRST_DRAFT_LINE
+             else:
+                 prompt = self._retry_prompt(feedback, prev_code)
+-            changed = self._ask_until_changed(prompt, before)
++            changed = self._ask_until_changed(prompt, before, last_clean=prev_clean)
+             if not changed:
+                 safe_log(f"Attempt {k}: agent produced no solution.py change after {MAX_NUDGES + 1} calls.")
+ 
+             # Create missing test helpers BEFORE any check, so the samples and stress test judge the same
+             # solution.py that the harness snapshots (the oracle call may also touch solution.py).
+-            if not class_task and not have(('brute.py', 'gen.py', 'gen_big.py')):
++            if not class_task and not have(('brute.py', 'gen.py', 'gen_big.py', 'checker.py')):
+                 self._ask(self._oracle_prompt())
++                # The checker may have been written only now: verify it before any judging uses it.
++                if have(('brute.py', 'gen.py', 'checker.py')):
++                    self._checker_trusted = self._check_checker()[0]
++                    safe_log(f"Checker verification after oracle phase: trusted={self._checker_trusted}")
+ 
+             ok, basic_msg = self._check_basic()
+             if not ok:
+@@ -595,6 +750,7 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                 feedback += "\n\n" + CRASH_HINT
+ 
+             clean = class_task or (samples_all_pass and not stress_mismatch and timing_ok and not samples_timeout)
++            prev_clean = clean
+             if clean:
+                 break  # all harness checks passed for this attempt
+ 
+diff --git a/solution.py b/solution.py
+index 4779334..1dcfb3a 100644
+--- a/solution.py
++++ b/solution.py
+@@ -8,6 +8,7 @@ import time
+ import uuid
+ from logging.handlers import RotatingFileHandler
+ import os
++import tempfile
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -54,6 +55,7 @@ RUN_TIMEOUT_S = 10        # timeout for every solution / generator / brute run
+ REPORT_CLIP = 2000        # max chars of any raw input/output in a report
+ CODE_CLIP = 30000         # max chars of solution code pasted into a prompt
+ TIME_LIMIT_S = 1.0        # soft limit for a max-size run
++CHECKER_CHECK_SEEDS = 20  # gen.py seeds used to verify checker.py against brute.py
+ 
+ BUDGET_LINE = ("Keep thinking under ~300 words per turn; do not spend output budget on long derivations "
+                "before the first file is written.")
+@@ -61,6 +63,13 @@ BUDGET_LINE = ("Keep thinking under ~300 words per turn; do not spend output bud
+ FIRST_DRAFT_LINE = ("Write a complete first draft of solution.py within your first few tool calls and keep your "
+                     "reasoning brief; never end your turn without having written the file. " + BUDGET_LINE)
+ 
++CHECKER_SPEC = """checker.py: a VALIDATOR for candidate outputs (problems often accept any valid answer, so exact comparison is not enough). Usage `python3 checker.py INPUT_FILE OUTPUT_FILE`, where INPUT_FILE holds one input and OUTPUT_FILE holds a candidate output produced by any correct program.
++- Exit 0 and print OK if the output is a valid answer for that input.
++- Otherwise print a short reason and exit 1. Never crash with a traceback: wrap parsing of the output in try/except and exit 1 on malformed output.
++- It must validate every constraint and requirement from the statement (format, counts, value ranges, the required property of the answer, and optimality/existence where the problem demands it).
++- Cross-check with brute.py when the input is small (choose a size guard, e.g. n <= 10 or total numbers <= 30, so brute.py stays fast): run it with subprocess.run(['python3', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'brute.py')], input=input_text, capture_output=True, text=True, timeout=10) and compare feasibility (e.g. the output says -1 iff brute says no answer) or the optimal value. Handle a brute timeout or failure without crashing. For large inputs SKIP the brute call and only validate the output directly.
++- Never read solution.py. Use only bounded loops (no `while True`)."""
++
+ BRUTE_FIRST_TEMPLATE = """You are preparing ground truth for the competitive programming problem below. Work in the directory {d}.
+ Do NOT write solution.py in this step.
+ 
+@@ -68,10 +77,12 @@ Do NOT write solution.py in this step.
+ {statement}
+ </problem_description>
+ 
+-Write brute.py only: a straightforward exhaustive / BFS / DP solution that is obviously correct on tiny inputs, reading stdin like the problem requires and writing stdout exactly like the problem requires. No optimisation.
++Write brute.py: a straightforward exhaustive / BFS / DP solution that is obviously correct on tiny inputs, reading stdin like the problem requires and writing stdout exactly like the problem requires. No optimisation.
+ Then run `python3 brute.py < input` on every sample in the statement and compare with the expected output exactly; fix brute.py until it matches on every sample.
+ Then write gen.py: a random generator of SMALL valid inputs (small sizes so brute.py is fast). Usage `python3 gen.py SEED` prints one input to stdout, using random.Random(int(sys.argv[1])) so it is deterministic per seed.
+-Keep reasoning very short and write the file within your first 2 tool calls. """ + BUDGET_LINE + """
++Then write {checker_spec}
++Check checker.py by running `python3 checker.py INPUT OUTPUT` on each sample (with the expected output) and on brute.py's output for a few gen.py seeds: it must print OK there, and must reject a corrupted output.
++Keep reasoning very short and write the files within your first 3 tool calls. """ + BUDGET_LINE + """
+ 
+ Harness report from the previous attempt (empty on the first call):
+ {report}
+@@ -97,8 +108,9 @@ Create the following files in {d} (if a file already exists and is correct, leav
+ 1. brute.py: an obviously correct exhaustive solution that reads stdin and writes stdout exactly like the problem requires. No optimisation; it only has to be correct on small inputs.
+ 2. gen.py: a random generator of SMALL valid inputs that respects the constraints. Usage `python3 gen.py SEED` prints one input to stdout. Use random.Random(int(sys.argv[1])) so it is deterministic per seed.
+ 3. gen_big.py: a generator of MAX-SIZE valid inputs. Usage `python3 gen_big.py SEED` prints one input at the largest allowed constraints. Cycle through adversarial shapes by seed (e.g. seed%4: all-equal values, random values, sorted/reverse-sorted, many distinct values or skewed sizes), so that pruning/early-break heuristics are stressed.
++4. {checker_spec}
+ 
+-Then check brute.py (if you wrote it) by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Finish by making sure all three files exist."""
++Then check brute.py (if you wrote it) by running `python3 brute.py < sample_input` on every sample in the statement and comparing with the expected output exactly. Fix brute.py if it does not match. Run gen.py for a few seeds to check that its output is valid. Check checker.py on the samples (expected outputs must get OK) and on brute.py's outputs for a few seeds. Finish by making sure all four files exist."""
+ 
+ 
+ # Thread-local storage for logger instances
+@@ -282,10 +294,14 @@ class AgenticSystem:
+                              f"input:\n{inp[:REPORT_CLIP]}\nexpected:\n{exp[:REPORT_CLIP]}")
+                 continue
+             actual = p.stdout
+-            if actual.split() == exp.split():
++            if script == 'brute.py':
++                judged_ok, verdict = actual.split() == exp.split(), "exact token comparison."
++            else:
++                judged_ok, verdict = self._judge(inp, actual, exp)
++            if judged_ok:
+                 passed += 1
+             else:
+-                parts.append(f"Sample {idx}: FAILED\ninput:\n{inp[:REPORT_CLIP]}"
++                parts.append(f"Sample {idx}: FAILED (checker verdict: {verdict})\ninput:\n{inp[:REPORT_CLIP]}"
+                              f"expected:\n{exp[:REPORT_CLIP]}\nactual:\n{actual[:REPORT_CLIP]}"
+                              f"stderr:\n{(p.stderr or '')[-REPORT_CLIP:]}\n(exit code {p.returncode})")
+         report = f"Samples passed for {script}: {passed}/{len(samples)}."
+@@ -305,10 +321,113 @@ class AgenticSystem:
+         return all(isinstance(n, ast.Pass) or (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))
+                    for n in tree.body)
+ 
++    def _run_checker(self, input_text, output_text):
++        """
++        Run checker.py INPUT_FILE OUTPUT_FILE on temp files. Returns (accepted, reason).
++        Crashes, timeouts and missing files are rejections with a reason.
++        """
++        checker = os.path.join(self.git_tempdir, 'checker.py')
++        if not os.path.isfile(checker):
++            return False, "checker.py missing."
++        tmp = tempfile.mkdtemp(prefix='checker_')
++        try:
++            in_path = os.path.join(tmp, 'input.txt')
++            out_path = os.path.join(tmp, 'output.txt')
++            with open(in_path, 'w') as f:
++                f.write(input_text)
++            with open(out_path, 'w') as f:
++                f.write(output_text)
++            try:
++                p = subprocess.run(['python3', checker, in_path, out_path], cwd=self.git_tempdir,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                return False, f"checker.py timed out (limit {RUN_TIMEOUT_S}s)."
++            msg = (p.stdout or '').strip() or (p.stderr or '').strip()[-REPORT_CLIP:]
++            if p.returncode == 0:
++                return True, msg or "OK"
++            return False, (msg[-REPORT_CLIP:] if msg else f"checker.py exit code {p.returncode}")
++        finally:
++            shutil.rmtree(tmp, ignore_errors=True)
++
++    def _judge(self, input_text, output_text, expected_text=None):
++        """
++        Return (ok, reason). If checker.py is trusted, the checker decides validity. Otherwise (or when no
++        checker is trusted) the output must equal expected_text token-by-token.
++        """
++        if getattr(self, '_checker_trusted', False):
++            return self._run_checker(input_text, output_text)
++        if expected_text is None:
++            return False, "no checker is trusted and no expected output is available."
++        if output_text.split() == expected_text.split():
++            return True, "matches expected output."
++        return False, "output differs from expected output (no trusted checker)."
++
++    def _check_checker(self):
++        """
++        Verify checker.py: it must accept every sample's expected output, accept brute.py's output on
++        gen.py seeds 1..CHECKER_CHECK_SEEDS, and reject a corrupted output. Returns (ok, report).
++        """
++        for name in ('checker.py', 'brute.py', 'gen.py'):
++            if not os.path.isfile(os.path.join(self.git_tempdir, name)):
++                return False, f"Checker check: {name} missing."
++        problems = []
++        if not self._is_class_task():
++            for idx, inp, exp in self._parse_samples():
++                ok, reason = self._run_checker(inp, exp)
++                if not ok:
++                    problems.append(f"sample {idx}: checker rejected the expected output: {reason}")
++                    break
++        checked, rejected_corrupt = 0, False
++        for seed in range(1, CHECKER_CHECK_SEEDS + 1):
++            try:
++                g = subprocess.run(['python3', 'gen.py', str(seed)], cwd=self.git_tempdir,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++                if g.returncode != 0:
++                    problems.append(f"gen.py failed on seed {seed} during checker check.")
++                    break
++                inp = g.stdout
++                b = subprocess.run(['python3', 'brute.py'], cwd=self.git_tempdir, input=inp,
++                                   capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
++            except subprocess.TimeoutExpired:
++                problems.append(f"gen.py or brute.py timed out on seed {seed} during checker check.")
++                break
++            if b.returncode != 0 or not b.stdout.strip():
++                continue  # brute failures are reported by _check_brute, not by the checker
++            ok, reason = self._run_checker(inp, b.stdout)
++            checked += 1
++            if not ok:
++                problems.append(f"seed {seed}: checker rejected brute.py's valid output: {reason}\n"
++                                f"input:\n{inp[:REPORT_CLIP]}\nbrute output:\n{b.stdout[:REPORT_CLIP]}")
++                break
++            if not rejected_corrupt:
++                bad = self._corrupt(b.stdout)
++                bad_ok, _ = self._run_checker(inp, bad)
++                if bad_ok:
++                    problems.append(f"seed {seed}: checker ACCEPTED a corrupted output:\n{bad[:REPORT_CLIP]}")
++                    break
++                rejected_corrupt = True
++        if not problems and not rejected_corrupt:
++            problems.append("Checker check: could not produce a corrupted output to test (no brute output).")
++        if problems:
++            return False, "Checker check FAILED:\n" + "\n".join(problems)
++        return True, f"Checker check passed: accepts samples and {checked} brute outputs, rejects corruption."
++
++    @staticmethod
++    def _corrupt(output_text):
++        """Deliberately wrong output: append a huge token, or flip a lone -1 / a number to -1."""
++        toks = output_text.split()
++        if toks and toks[0] != '-1':
++            return output_text.rstrip('\n') + '\n999999999\n'
++        return output_text.rstrip('\n') + ' 999999999\n'
++
+     def _check_brute(self):
+-        """Verify brute.py on the samples and that gen.py runs. Returns (ok, report)."""
++        """
++        Verify brute.py on the samples, that gen.py runs, and that checker.py is trustworthy.
++        Sets self._checker_trusted. Returns (ok, report).
++        """
+         missing = [f for f in ('brute.py', 'gen.py') if not os.path.isfile(os.path.join(self.git_tempdir, f))]
+         if missing:
++            self._checker_trusted = False
+             return False, f"Missing file(s): {', '.join(missing)}."
+         passed, total, timed_out, report = self._run_samples(script='brute.py')
+         try:
+@@ -319,6 +438,19 @@ class AgenticSystem:
+         except subprocess.TimeoutExpired:
+             gen_ok, gen_msg = False, f"gen.py timed out on seed 1 (limit {RUN_TIMEOUT_S}s)."
+         ok = passed == total and not timed_out and gen_ok
++        # Checker trust is only meaningful once brute.py is verified; a missing checker is reported as such.
++        if os.path.isfile(os.path.join(self.git_tempdir, 'checker.py')):
++            if ok:
++                c_ok, c_msg = self._check_checker()
++            else:
++                c_ok, c_msg = False, "Checker check skipped: brute.py / gen.py not yet verified."
++            self._checker_trusted = c_ok
++            report += "\n" + c_msg
++            ok = ok and c_ok
++        else:
++            self._checker_trusted = False
++            report += "\nchecker.py is missing: write it (see the spec) so the harness can judge valid answers."
++            ok = False
+         return ok, report + "\n" + gen_msg
+ 
+     def _run_stress(self):
+@@ -332,6 +464,7 @@ class AgenticSystem:
+             return False, 0, "Stress skipped: gen.py and/or brute.py missing."
+         start = time.monotonic()
+         ran = 0
++        accepted_diffs = 0  # outputs that differ from brute but are accepted by the trusted checker
+         for seed in range(1, STRESS_SEEDS + 1):
+             if time.monotonic() - start > STRESS_BUDGET_S:
+                 break
+@@ -361,12 +494,20 @@ class AgenticSystem:
+                 return True, ran, (f"brute.py crashed on seed {seed}; brute may be wrong.\n"
+                                    f"input:\n{inp[:REPORT_CLIP]}\nbrute stderr:\n{b_err[-REPORT_CLIP:]}")
+             if s_out.split() != b_out.split():
+-                return True, ran, (f"MISMATCH on seed {seed}.\ninput:\n{inp[:REPORT_CLIP]}"
++                ok_j, verdict = self._judge(inp, s_out, b_out)
++                if ok_j:
++                    accepted_diffs += 1
++                    if accepted_diffs == 1:  # log the first accepted difference once per stress run
++                        safe_log(f"Stress seed {seed}: output differs from brute.py but checker.py accepts it "
++                                 f"({verdict}); counted as a pass.")
++                    continue
++                return True, ran, (f"MISMATCH on seed {seed} (checker verdict: {verdict}).\ninput:\n{inp[:REPORT_CLIP]}"
+                                    f"brute (expected) output:\n{b_out[:REPORT_CLIP]}\n"
+                                    f"solution.py (actual) output:\n{s_out[:REPORT_CLIP]}\n"
+                                    f"solution.py stderr (exit {s_rc}):\n{s_err[-REPORT_CLIP:]}\n"
+                                    f"Note: brute.py itself may be wrong; verify it against the statement.")
+-        return False, ran, f"Stress: {ran} seeds run, no mismatch."
++        note = f" ({accepted_diffs} differing outputs accepted by checker.py)" if accepted_diffs else ""
++        return False, ran, f"Stress: {ran} seeds run, no mismatch{note}."
+ 
+     def _run_timing(self):
+         """Run solution.py on max-size inputs from gen_big.py. Returns (ok, report)."""
+@@ -392,6 +533,9 @@ class AgenticSystem:
+             if s.returncode != 0:
+                 ok = False
+                 lines.append(f"seed {seed}: crashed in {dt:.2f}s, stderr:\n{(s.stderr or '')[-REPORT_CLIP:]}")
++            elif getattr(self, '_checker_trusted', False) and not (verdict := self._run_checker(g.stdout, s.stdout))[0]:
++                ok = False
++                lines.append(f"seed {seed}: invalid output on max-size input (checker verdict: {verdict[1]})")
+             elif dt > TIME_LIMIT_S:
+                 ok = False
+                 lines.append(f"seed {seed}: SLOW {dt:.2f}s (soft limit {TIME_LIMIT_S}s)")
+@@ -444,7 +588,8 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+ """
+ 
+     def _oracle_prompt(self):
+-        return ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement)
++        return ORACLE_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement,
++                                      checker_spec=CHECKER_SPEC)
+ 
+     def _ask(self, prompt, msg_history=None):
+         """
+@@ -460,10 +605,11 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+             safe_log(f"Agent call failed: {e!r}")
+             return history
+ 
+-    def _ask_until_changed(self, prompt, before):
++    def _ask_until_changed(self, prompt, before, last_clean=False):
+         """
+         Call the agent; re-prompt (bounded) if solution.py is still missing, empty or unchanged.
+         Continuation calls reuse the message history of this phase instead of starting fresh.
++        If the previous harness report had no real failures (last_clean), a missing change is not nudged.
+         """
+         history = None
+         for n in range(MAX_NUDGES + 1):
+@@ -472,6 +618,9 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+             cur = self._read_solution()
+             if cur is not None and cur.strip() and cur != before:
+                 return True
++            if last_clean:
++                safe_log("solution.py unchanged, but the previous harness report had no real failures; not nudging.")
++                return False
+             safe_log(f"solution.py missing/empty/unchanged after call {n + 1}; re-prompting.")
+         return False
+ 
+@@ -487,7 +636,7 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+         for n in range(MAX_BRUTE_TRIES):
+             if n == 0:
+                 prompt = BRUTE_FIRST_TEMPLATE.format(d=self.git_tempdir, statement=self.problem_statement,
+-                                                     report=report)
++                                                     report=report, checker_spec=CHECKER_SPEC)
+             else:
+                 prompt = ("The harness checked brute.py and gen.py. Harness report:\n" + report +
+                           "\n\nFix brute.py (and gen.py if needed) so that brute.py matches every sample exactly, "
+@@ -513,7 +662,9 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+         best = None  # (score, k, snapshot_path)
+         feedback = None
+         prev_code = self._read_solution()
++        prev_clean = False
+         class_task = self._is_class_task()
++        self._checker_trusted = False
+ 
+         # Phase 0: brute-force ground truth first (stdin tasks only).
+         if not class_task:
+@@ -545,14 +696,18 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                     prompt = self._task_text() + "\n" + self._method_text() + "\n\n" + FIRST_DRAFT_LINE
+             else:
+                 prompt = self._retry_prompt(feedback, prev_code)
+-            changed = self._ask_until_changed(prompt, before)
++            changed = self._ask_until_changed(prompt, before, last_clean=prev_clean)
+             if not changed:
+                 safe_log(f"Attempt {k}: agent produced no solution.py change after {MAX_NUDGES + 1} calls.")
+ 
+             # Create missing test helpers BEFORE any check, so the samples and stress test judge the same
+             # solution.py that the harness snapshots (the oracle call may also touch solution.py).
+-            if not class_task and not have(('brute.py', 'gen.py', 'gen_big.py')):
++            if not class_task and not have(('brute.py', 'gen.py', 'gen_big.py', 'checker.py')):
+                 self._ask(self._oracle_prompt())
++                # The checker may have been written only now: verify it before any judging uses it.
++                if have(('brute.py', 'gen.py', 'checker.py')):
++                    self._checker_trusted = self._check_checker()[0]
++                    safe_log(f"Checker verification after oracle phase: trusted={self._checker_trusted}")
+ 
+             ok, basic_msg = self._check_basic()
+             if not ok:
+@@ -595,6 +750,7 @@ Then update solution.py with the editor tool, run the samples yourself (for a So
+                 feedback += "\n\n" + CRASH_HINT
+ 
+             clean = class_task or (samples_all_pass and not stress_mismatch and timing_ok and not samples_timeout)
++            prev_clean = clean
+             if clean:
+                 break  # all harness checks passed for this attempt
+ 

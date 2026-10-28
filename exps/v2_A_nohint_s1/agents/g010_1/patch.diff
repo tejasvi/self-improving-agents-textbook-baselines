@@ -1,0 +1,233 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 380c429..7f5c3c0 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,9 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ 
++import re
++
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -94,6 +97,43 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++SNAPSHOT_MAX_CHARS = 4000
++SNAPSHOT_SKIP_DIRS = {'.git', '__pycache__', 'node_modules', 'build'}
++
++
++def _read_repo_snapshot(git_tempdir, max_chars=SNAPSHOT_MAX_CHARS):
++    """
++    Lists files in git_tempdir and returns a text snapshot containing the file
++    listing plus the contents of solution.py and other small files (truncated).
++    """
++    lines = []
++    file_paths = []
++    for root, dirs, files in os.walk(git_tempdir):
++        dirs[:] = sorted(d for d in dirs if d not in SNAPSHOT_SKIP_DIRS)
++        for name in sorted(files):
++            file_paths.append(os.path.relpath(os.path.join(root, name), git_tempdir))
++    lines.append("Files in repository:")
++    lines.extend(f"  {p}" for p in file_paths[:200])
++    if len(file_paths) > 200:
++        lines.append(f"  ... ({len(file_paths) - 200} more files)")
++
++    # solution.py first, then other small files
++    ordered = sorted(file_paths, key=lambda p: (os.path.basename(p) != 'solution.py', p))
++    for rel in ordered:
++        full = os.path.join(git_tempdir, rel)
++        try:
++            if os.path.getsize(full) > max_chars:
++                continue
++            with open(full, 'r', encoding='utf-8', errors='replace') as f:
++                content = f.read()
++        except OSError:
++            continue
++        if len(content) > max_chars:
++            content = content[:max_chars] + "\n... (truncated)"
++        lines.append(f"\n--- {rel} ---\n{content}")
++    return "\n".join(lines)
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -173,70 +213,137 @@ class AgenticSystem:
+             )
+         return True, ""
+ 
++    def _direct_generate_solution(self, snapshot):
++        """
++        Last-resort fallback: ask the LLM for the full solution file in a single code block
++        (no tool use), write it to solution.py, and verify it compiles.
++        """
++        sol_path = self._solution_path()
++        safe_log("[fallback] Starting direct solution generation")
++        prompt = (
++            f"Solve the following competitive programming problem in Python.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Repository snapshot:\n{snapshot}\n\n"
++            "Respond with ONLY the complete contents of solution.py inside a single ```python code block. "
++            "No other text. If a Solution class with a method signature is given in the starter code, "
++            "keep the same class and method signature. The program must read stdin and write stdout "
++            "if no class is specified."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            response, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer.",
++                print_debug=False,
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"[fallback] LLM call failed: {e}")
++            return False
++
++        match = re.search(r"```(?:python|py)?\s*\n(.*?)```", response or "", re.DOTALL)
++        if not match:
++            safe_log("[fallback] No python code block found in LLM response")
++            return False
++        code = match.group(1)
++        if not code.strip():
++            safe_log("[fallback] Extracted code block is empty")
++            return False
++
++        # Preserve the starter class signature if the original file defined one
++        starter = self._read_starter_solution()
++        if starter and 'class Solution' in starter and 'class Solution' not in code:
++            safe_log("[fallback] Generated code lacks 'class Solution'; using it as-is")
++
++        with open(sol_path, 'w', encoding='utf-8') as f:
++            f.write(code if code.endswith('\n') else code + '\n')
++        safe_log(f"[fallback] Wrote {sol_path} ({len(code)} chars)")
++
++        ok, problem = self._check_solution_state()
++        if not ok:
++            safe_log(f"[fallback] Verification failed: {problem}")
++            return False
++        safe_log("[fallback] Generated solution compiles")
++        return True
++
++    def _read_starter_solution(self):
++        try:
++            with open(self._solution_path(), 'r', encoding='utf-8', errors='replace') as f:
++                return f.read()
++        except OSError:
++            return ""
++
++    def _build_short_prompt(self, sol_path, snapshot, problem, escalate):
++        head = (
++            f"Implement the solution for the problem below in {sol_path}.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Repository snapshot:\n{snapshot}\n\n"
++        )
++        if problem:
++            head += f"The previous attempt failed the repository check: {problem}\n\n"
++        if escalate:
++            head += (
++                f"Your first action must be an editor call that writes {sol_path}. "
++                "Write a complete, compilable solution immediately, then verify it on the samples."
++            )
++        else:
++            head += f"Write a first version of {sol_path} immediately using the editor tool, then test it."
++        return head
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+         """
+         sol_path = self._solution_path()
++        snapshot = _read_repo_snapshot(self.git_tempdir)
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following competitive programming problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+ 
+-Your task is to write a correct and efficient solution to the problem above. The final solution must be saved in the file {sol_path}.
+-The solution is either a complete Python program that reads standard input and writes standard output, or a method of a given `Solution` class (if the problem statement or repository specifies one). Follow whatever interface the problem or repository specifies exactly.
+-
+-Work through the following steps. Use the bash and editor tools to do the actual work; do not just describe what you would do.
+-
+-1. Explore the repository: run `ls -la {self.git_tempdir}` and inspect any existing files (e.g. starter code, tests, examples) with bash/editor. Determine the exact input/output format and the interface the solution must provide. If there is no existing file, create {sol_path}.
+-
+-2. Restate the problem to yourself: list the inputs, outputs, constraints (in particular the maximum sizes of n, the value ranges, and the time limit if given), and every sample input/output.
+-
+-3. Reason about the algorithm. Identify the required time complexity from the constraints (e.g. O(n log n) or O(n) for n up to 2*10^5), consider edge cases, and check your reasoning on the samples by hand.
+-
+-4. Write the full solution to {sol_path} EARLY, right away, even if you are not yet sure it is optimal. Make sure it is complete, uses fast I/O if input is large (e.g. sys.stdin.readline or sys.stdin.buffer), and runs without errors.
+-
+-5. Run the solution on every provided sample input and compare with the expected output. Fix any mismatch.
+-   a. Extract every sample input and expected output from the problem statement into files such as /tmp/samples/N.in and /tmp/samples/N.out (N = 1, 2, ...). Write a helper script, e.g. /tmp/run_samples.py (or /tmp/run_samples.sh), that runs the solution on each N.in and prints PASS_EXACT, PASS_VALID_ONLY, or FAIL for each sample. PASS_EXACT means the output is byte-for-byte identical to N.out (check with diff). PASS_VALID_ONLY means the output is different but you have verified it is a valid answer under the statement. FAIL means it is wrong or crashes.
+-   b. Compare your output with each sample's expected output EXACTLY (use diff). If the statement allows multiple valid answers and your output differs from a sample, do NOT assume the grader has a special checker. Hidden tests may compare output exactly with the reference solution's output. Treat each mismatch as a bug to resolve.
+-   c. For PASS_VALID_ONLY cases, reverse-engineer the sample outputs: inspect their structure (e.g. powers of two, ordering, minimal or maximal values, which free variables are set, bit order, lexicographic order). Enumerate several candidate deterministic constructions, implement each, and run each against all samples until one gives exact matches on all of them. Only then keep it. Keep the validity checker passing as well.
+-   d. If it is truly impossible to reproduce the samples exactly after trying several natural constructions, pick the most canonical deterministic output and state explicitly in your final summary that the sample outputs could not be matched exactly and why.
++Repository snapshot (starter code and file listing):
++{snapshot}
+ 
+-6. Write a brute-force reference implementation (a simple, obviously-correct version) in a separate file such as brute.py, and a random stress-test script that generates many small random inputs (respecting the constraints), runs both programs, and reports the first input where they disagree. Run the stress test and fix the solution until there are no mismatches.
+-
+-7. Benchmark on maximum-size inputs (e.g. the largest n allowed by the constraints, worst-case structure of the input). Make sure the solution finishes well within the time limit. If it is too slow, improve the algorithm or implementation and re-run the tests from steps 5 and 6.
+-
+-8. Before finishing, confirm that {sol_path} exists, is the final version of your solution, and compiles with `python -m py_compile {sol_path}`. Do not leave the solution file empty or missing. Give a brief summary of your final approach when done.
+-"""
++Your task: implement the solution in {sol_path}. The solution is either a complete Python program that reads standard input and writes standard output, or a method of the given `Solution` class if the repository specifies one. Follow the interface exactly.
++Write a first version of {sol_path} immediately using the editor tool, then test it on the samples."""
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++        safe_log("[forward] Stage 1: initial agent turn")
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Re-prompt in the same conversation if no solution was produced or it does not compile
+-        for attempt in range(3):
++        # Bounded retries: each attempt starts a NEW conversation with a short prompt
++        max_attempts = 3
++        for attempt in range(1, max_attempts + 1):
+             ok, problem = self._check_solution_state()
+             if ok:
++                safe_log(f"[forward] Solution check passed before attempt {attempt}")
+                 break
+-            safe_log(f"[forward] Solution check failed (attempt {attempt + 1}/3): {problem}")
+-            retry_msg = (
+-                f"The check of the repository failed: {problem}\n\n"
+-                f"Please fix this now. Write the complete solution to {sol_path} using the tools, "
+-                f"verify it compiles with `python -m py_compile {sol_path}`, and run it on the sample inputs."
+-            )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            safe_log(f"[forward] Solution check failed (attempt {attempt}/{max_attempts}): {problem}")
++            retry_msg = self._build_short_prompt(sol_path, snapshot, problem, escalate=(attempt >= 2))
++            safe_log(f"[forward] Stage 2.{attempt}: fresh conversation retry")
++            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++        else:
++            ok, problem = self._check_solution_state()
++
++        # Last resort: direct generation if the repository is still not in a valid state
++        if not ok:
++            safe_log(f"[forward] Retries exhausted; falling back to direct generation. Reason: {problem}")
++            if not self._direct_generate_solution(snapshot):
++                safe_log("[forward] Direct generation did not produce a valid solution")
+ 
+         # Second verification pass: stress and performance testing
+         test_msg = f"""Now verify the solution in {sol_path} thoroughly. Use the bash and editor tools.
+ 
+-1. Re-run all samples with diff (each sample must match byte-for-byte; a valid-but-different output counts as a bug, see step 5 of the original task). Then write a brute-force reference solution (simple and obviously correct) and a random stress-test script that generates many small random inputs respecting the problem constraints, runs both the solution and the brute force, and compares outputs. Run it on at least several hundred random cases.
++1. Re-run all samples with diff (each sample must match byte-for-byte; a valid-but-different output counts as a bug). Then write a brute-force reference solution (simple and obviously correct) and a random stress-test script that generates many small random inputs respecting the problem constraints, runs both the solution and the brute force, and compares outputs. Run it on at least several hundred random cases.
+ 2. Write a worst-case timing test: generate maximum-size inputs (largest allowed n and worst-case structure) and run the solution on them with `time`. The solution must finish comfortably within the time limit; if not, optimize the algorithm.
+ 3. If any discrepancy, crash, or timeout appears, find the root cause and fix {sol_path}. Then re-run the stress and timing tests until everything passes.
+-4. Re-run all samples with diff; if any sample is not an exact match, fix it before finishing. Multiple valid answers do not excuse a mismatch: the hidden tests may compare output byte-for-byte with the reference output. If you truly cannot reproduce a sample exactly, pick the most canonical deterministic output and say so explicitly in your report.
++4. Re-run all samples with diff; if any sample is not an exact match, fix it before finishing. If you truly cannot reproduce a sample exactly, pick the most canonical deterministic output and say so explicitly in your report.
+ 5. Make sure the final {sol_path} compiles with `python -m py_compile {sol_path}`. Keep helper files out of the solution file itself.
+ 
+-Completion criteria (all must hold before you finish): stress tests pass, timing tests pass on max-size inputs, the compile check passes, and all samples match byte-for-byte (verified with diff).
+-
+ When finished, briefly report the test results, including the sample match status."""
++        safe_log("[forward] Stage 3: verification turn")
+         msg_history = chat_with_agent(test_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+         return msg_history
+ 

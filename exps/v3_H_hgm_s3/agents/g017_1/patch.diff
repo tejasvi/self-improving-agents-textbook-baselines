@@ -1,0 +1,325 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1a2351e..ffa06fa 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -366,7 +366,16 @@ class AgenticSystem:
+             if new_history is None:
+                 raise ValueError("chat_with_agent returned None")
+             if new_history and self._is_degenerate_assistant(new_history[-1]):
+-                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent", level=logging.WARNING)
++                safe_log("[safe_chat] empty assistant turn returned by chat_with_agent; retrying once with a shortened prompt",
++                         level=logging.WARNING)
++                short_prompt = self._shortened_prompt(msg)
++                retry_history = chat_with_agent(short_prompt, model=self.code_model,
++                                                msg_history=self._sanitize_history(history),
++                                                logging=safe_log)
++                if retry_history and not self._is_degenerate_assistant(retry_history[-1]):
++                    return retry_history
++                safe_log("[safe_chat] shortened retry still degenerate", level=logging.WARNING)
++                return retry_history or new_history
+             elif len(new_history) <= len(history):
+                 safe_log("[safe_chat] chat_with_agent added no messages", level=logging.WARNING)
+             return new_history
+@@ -374,8 +383,19 @@ class AgenticSystem:
+             safe_log(f"[safe_chat] exception from chat_with_agent: {type(e).__name__}: {e}", level=logging.ERROR)
+             return self._sanitize_history(history)
+ 
++    def _shortened_prompt(self, msg):
++        """
++        A minimal prompt for a retry: the problem excerpt plus the instruction only.
++        """
++        excerpt = (self.problem_statement or '')[:3000]
++        return ("Instruction: continue the task by making the next tool call (edit the solution file, "
++                "or run tests). Do not reply with an empty message.\n\n"
++                f"Problem excerpt:\n{excerpt}\n\n"
++                f"(Original message began: {(msg or '')[:200]!r})")
++
+     _SAMPLE_FAILURE_MARKERS = ('DIFFER', 'MISMATCH')
+     _SAMPLE_PASS_MARKER = 'ALL SAMPLES EXACT MATCH'
++    _MULTI_ANSWER_SUMMARY = 'MULTI-ANSWER: samples not exact; validate with a checker'
+ 
+     def _history_events(self, msg_history):
+         """
+@@ -430,8 +450,23 @@ class AgenticSystem:
+ 
+     @classmethod
+     def _sample_report_failed(cls, report):
+-        """True if a run_samples report contains a mismatch (DIFFER / MISMATCH)."""
+-        return any(marker in report for marker in cls._SAMPLE_FAILURE_MARKERS)
++        """
++        Strict check: True only if a line is a 'Sample N: MISMATCH' line or the 'N SAMPLE(S) DIFFER'
++        summary. The multi-answer 'DIFFERENT (...)' label and the MULTI-ANSWER summary are not failures
++        here; they are handled by a validator prompt instead of sample-matching repair.
++        """
++        for line in report.splitlines():
++            stripped = line.strip()
++            if re.match(r'^Sample \d+: MISMATCH\b', stripped):
++                return True
++            if re.match(r'^\d+ SAMPLE\(S\) DIFFER$', stripped):
++                return True
++        return False
++
++    @classmethod
++    def _sample_report_multi(cls, report):
++        """True if a run_samples report flags a multi-answer problem (samples not exact by design)."""
++        return cls._MULTI_ANSWER_SUMMARY in report
+ 
+     def _last_verification_failed(self, msg_history):
+         """
+@@ -456,7 +491,7 @@ class AgenticSystem:
+             return True, 'no run_samples verification run after last edit'
+ 
+         last_report = later_results[-1].strip()
+-        if self._sample_report_failed(last_report):
++        if self._sample_report_failed(last_report) or self._sample_report_multi(last_report):
+             return True, last_report[-1500:]
+         return False, ''
+ 
+@@ -477,7 +512,7 @@ class AgenticSystem:
+         except Exception as e:
+             safe_log(f"[forward] direct sample check failed: {type(e).__name__}: {e}", level=logging.WARNING)
+             return None
+-        return self._sample_report_failed(report), report
++        return (self._sample_report_failed(report) or self._sample_report_multi(report)), report
+ 
+     def _direct_example_check(self):
+         """
+@@ -625,11 +660,33 @@ class AgenticSystem:
+         resume the agent with the failure excerpt. Never loops unboundedly.
+         """
+         final_failed, final_excerpt = True, 'not checked'
++        multi_prompted = False
+         for rnd in range(1, max_rounds + 1):
+             failed, excerpt = self._current_verification(msg_history)
+             if not failed:
+                 final_failed, final_excerpt = False, ''
+                 break
++            if self._sample_report_multi(excerpt) and not self._sample_report_failed(excerpt):
++                # Multi-answer problem: exact sample bytes are not the goal. Ask for a validator and a
++                # brute-force existence check once, then stop chasing sample bytes.
++                if multi_prompted:
++                    final_failed, final_excerpt = False, excerpt
++                    break
++                multi_prompted = True
++                safe_log(f"[forward] verify round {rnd}: multi-answer problem; requesting validator")
++                multi_prompt = (
++                    "This problem accepts several different correct outputs, so an exact sample match is not the goal.\n"
++                    "Write a validator and brute-force existence checker; stress-test n up to 10 including Yes-instances; "
++                    "do not chase sample bytes.\n"
++                    "Concretely: (1) write a checker that takes the input and your output and verifies the output's "
++                    "validity against the statement's rules; (2) write a brute-force reference that decides existence "
++                    "(Yes/No) for small n; (3) use the stress_test tool with a generator that produces both Yes and No "
++                    "instances, and fix the solution until it reports ALL OK; (4) check that the solution's Yes/No "
++                    "decision is never wrong, especially on inputs whose answer is Yes.\n\n"
++                    f"Original task:\n{task}"
++                )
++                msg_history = self._safe_chat(multi_prompt, self._sanitize_history(msg_history))
++                continue
+             safe_log(f"[forward] verify round {rnd}: verification failed/missing: {excerpt[:200]!r}")
+             repair_prompt = (
+                 "The solution fails the sample tests or has not been verified against them.\n"
+@@ -639,7 +696,7 @@ class AgenticSystem:
+                 "choice (ordering, tie-breaking, free-variable/basis choice, bit order, scaling) makes your "
+                 "output differ, and change the construction so that every sample output is reproduced exactly. "
+                 "Rewrite the solution file with the editor tool (use `edit`, after viewing it). Then call "
+-                "run_samples again and the brute-force stress test. Do not stop until the report says "
++                "run_samples again and the brute-force stress test (stress_test tool). Do not stop until the report says "
+                 "ALL SAMPLES EXACT MATCH. Always make the tool call rather than announcing a next step.\n\n"
+                 f"Original task:\n{task}"
+             )
+@@ -671,7 +728,9 @@ Follow this workflow:
+ 4. Write a stress test that compares your implementation against the brute force on many small random inputs. If they disagree, fix the solution.
+ 5. Check performance on maximum-size inputs (time limits matter). Optimize if needed.
+ 6. Fix any discrepancies and re-verify everything from steps 3-5.
+-7. After writing the solution, call run_samples with the problem statement (or run_examples if the problem has only Input/Output examples). Any sample mismatch is a failure, even if your output is a different valid answer, because the hidden grader may compare exactly. When multiple answers are valid, adjust your construction until the sample outputs are reproduced exactly.
++7. After writing the solution, call run_samples with the problem statement (or run_examples if the problem has only Input/Output examples). Any sample mismatch on a problem with a unique answer is a failure. Use run_samples and stress_test to verify correctness.
++8. Multi-answer problems (the statement says any valid answer, any of them, or multiple solutions are accepted): do not chase sample bytes. Instead require (a) a validator that checks any output against the statement's rules, (b) a brute-force *existence* answer (Yes/No) at moderate n (about 8-12), and (c) a generator that biases toward both outcomes (Yes and No instances, including many likely Yes cases). Run stress_test with the solution, brute force, generator, and checker_path=validator, and fix the solution until it reports ALL OK. run_samples will report a MULTI-ANSWER line for such problems; that is expected once the validator passes.
++9. Use the stress_test tool (not ad hoc heredoc harnesses) for randomized comparison. It takes absolute paths and a timeout, and reports the first failing seed with input and outputs.
+ 
+ Keep the required output file complete: a program file must read stdin and write stdout, and a method-style file must keep the `Solution` class and its method signatures. Put your work in the non-test source file.
+ """
+diff --git a/tools/run_samples.py b/tools/run_samples.py
+index a250b1b..c955ced 100644
+--- a/tools/run_samples.py
++++ b/tools/run_samples.py
+@@ -2,10 +2,20 @@ import re
+ import subprocess
+ 
+ SAMPLE_RE = re.compile(
+-    r'Sample Input\s*(\d+)\s*\n(.*?)\n\s*Sample Output\s*\1\s*\n(.*?)(?=\n\s*Sample Input|\n## |\Z)',
++    r'Sample Input\s*(\d+)\s*\n(.*?)\n\s*Sample Output\s*\1\s*\n(.*?)(?=\n\s*\n|\n\s*Sample Input|\n## |\Z)',
+     re.DOTALL,
+ )
+ 
++# Statements that accept several different correct outputs. For these, byte/token differences
++# are not failures by themselves: a validator / brute-force existence checker is needed.
++MULTI_ANSWER_RE = re.compile(
++    r'any of them|multiple solutions|any valid|any one of|if there are multiple',
++    re.IGNORECASE,
++)
++
++DIFFERENT_LABEL = 'DIFFERENT (multi-answer problem: write a validator)'
++MULTI_SUMMARY = 'MULTI-ANSWER: samples not exact; validate with a checker'
++
+ 
+ def tool_info():
+     return {
+@@ -47,8 +57,10 @@ def tool_function(solution_path, problem_text, python='python3'):
+     if not pairs:
+         return 'No "Sample Input N" / "Sample Output N" pairs found in problem_text.'
+ 
++    multi_answer = bool(MULTI_ANSWER_RE.search(problem_text or ''))
+     lines = []
+     failures = 0
++    multi_differs = 0
+     for idx, inp, expected in pairs:
+         inp_text = inp.strip('\n') + '\n'
+         try:
+@@ -74,14 +86,21 @@ def tool_function(solution_path, problem_text, python='python3'):
+ 
+         if _norm(got) == _norm(expected):
+             lines.append(f'Sample {idx}: PASS')
++        elif multi_answer:
++            multi_differs += 1
++            lines.append(f'Sample {idx}: {DIFFERENT_LABEL}')
++            lines.append(f'expected: {expected.strip()}')
++            lines.append(f'got: {got.strip()}')
+         else:
+             lines.append(f'Sample {idx}: MISMATCH')
+             lines.append(f'expected: {expected.strip()}')
+             lines.append(f'got: {got.strip()}')
+             failures += 1
+ 
+-    if failures == 0:
++    if failures == 0 and multi_differs == 0:
+         lines.append('ALL SAMPLES EXACT MATCH')
+-    else:
++    if failures:
+         lines.append(f'{failures} SAMPLE(S) DIFFER')
++    if multi_differs:
++        lines.append(MULTI_SUMMARY)
+     return '\n'.join(lines)
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..d02ca2c
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,118 @@
++import os
++import subprocess
++import tempfile
++
++
++def tool_info():
++    return {
++        'name': 'stress_test',
++        'description': (
++            'Randomized comparison of a solution against a brute-force reference. For seed = 1..iterations, '
++            'runs generator_path with the seed as its argument (it prints one test input to stdout), then runs '
++            'the solution and the brute force on that input with python3. Outputs are compared after whitespace '
++            'normalization, or, if checker_path is given, the checker is run as `checker input_file output_file '
++            'brute_output_file` (it must exit 0 if the solution output is valid) and the brute output is only used '
++            'as a reference. Returns the first failing seed with the input and both outputs, or "ALL OK". '
++            'Pass absolute paths. Use generators that produce both Yes and No style cases for decision problems.'
++        ),
++        'input_schema': {
++            'type': 'object',
++            'properties': {
++                'solution_path': {
++                    'type': 'string',
++                    'description': 'Absolute path to the solution Python file (reads stdin, writes stdout).',
++                },
++                'brute_path': {
++                    'type': 'string',
++                    'description': 'Absolute path to the brute-force reference Python file (reads stdin, writes stdout).',
++                },
++                'generator_path': {
++                    'type': 'string',
++                    'description': 'Absolute path to a Python generator. It is called as `python3 generator.py SEED` and prints one test input to stdout.',
++                },
++                'iterations': {
++                    'type': 'integer',
++                    'description': 'Number of seeds to test (seeds 1..iterations). Defaults to 200.',
++                },
++                'timeout': {
++                    'type': 'number',
++                    'description': 'Timeout in seconds for each program run. Defaults to 5.',
++                },
++                'checker_path': {
++                    'type': 'string',
++                    'description': 'Optional absolute path to a checker/validator. Called as `python3 checker.py INPUT_FILE OUTPUT_FILE BRUTE_OUTPUT_FILE`; exit code 0 means the solution output is valid.',
++                },
++            },
++            'required': ['solution_path', 'brute_path', 'generator_path'],
++        },
++    }
++
++
++def _run(args, input_text, timeout):
++    """Run a command; returns (ok, stdout, detail)."""
++    try:
++        proc = subprocess.run(args, input=input_text, capture_output=True, text=True, timeout=timeout)
++    except subprocess.TimeoutExpired:
++        return False, '', f'timeout after {timeout}s'
++    if proc.returncode != 0:
++        return False, proc.stdout, f'exit code {proc.returncode}: {proc.stderr.strip()[-800:]}'
++    return True, proc.stdout, ''
++
++
++def _norm(text):
++    return text.split()
++
++
++def tool_function(solution_path, brute_path, generator_path, iterations=200, timeout=5, checker_path=None):
++    python = 'python3'
++    try:
++        iterations = int(iterations) if iterations is not None else 200
++    except (TypeError, ValueError):
++        iterations = 200
++    try:
++        timeout = float(timeout) if timeout is not None else 5.0
++    except (TypeError, ValueError):
++        timeout = 5.0
++    for label, path in (('solution_path', solution_path), ('brute_path', brute_path),
++                        ('generator_path', generator_path)):
++        if not path or not os.path.isabs(path) or not os.path.isfile(path):
++            return f'ERROR: {label} must be an existing absolute file path (got {path!r}).'
++    if checker_path and (not os.path.isabs(checker_path) or not os.path.isfile(checker_path)):
++        return f'ERROR: checker_path must be an existing absolute file path (got {checker_path!r}).'
++
++    with tempfile.TemporaryDirectory() as tmpdir:
++        for seed in range(1, iterations + 1):
++            ok, test_input, detail = _run([python, generator_path, str(seed)], '', timeout)
++            if not ok:
++                return f'GENERATOR FAILED at seed {seed}: {detail}'
++            test_input = test_input if test_input.endswith('\n') else test_input + '\n'
++
++            ok, brute_out, detail = _run([python, brute_path], test_input, timeout)
++            if not ok:
++                return f'BRUTE FAILED at seed {seed}\ninput:\n{test_input}\nbrute: {detail}'
++
++            ok, sol_out, detail = _run([python, solution_path], test_input, timeout)
++            if not ok:
++                return (f'SOLUTION FAILED at seed {seed}: {detail}\n'
++                        f'input:\n{test_input}\nbrute output:\n{brute_out.strip()}')
++
++            if checker_path:
++                in_file = os.path.join(tmpdir, 'in.txt')
++                out_file = os.path.join(tmpdir, 'out.txt')
++                brute_file = os.path.join(tmpdir, 'brute.txt')
++                with open(in_file, 'w') as f:
++                    f.write(test_input)
++                with open(out_file, 'w') as f:
++                    f.write(sol_out)
++                with open(brute_file, 'w') as f:
++                    f.write(brute_out)
++                ok, check_out, detail = _run([python, checker_path, in_file, out_file, brute_file], '', timeout)
++                if not ok:
++                    return (f'CHECKER REJECTED at seed {seed}: {detail} {check_out.strip()}\n'
++                            f'input:\n{test_input}\nsolution output:\n{sol_out.strip()}\n'
++                            f'brute output:\n{brute_out.strip()}')
++            elif _norm(sol_out) != _norm(brute_out):
++                return (f'MISMATCH at seed {seed}\ninput:\n{test_input}\n'
++                        f'solution output:\n{sol_out.strip()}\nbrute output:\n{brute_out.strip()}')
++
++    return 'ALL OK'

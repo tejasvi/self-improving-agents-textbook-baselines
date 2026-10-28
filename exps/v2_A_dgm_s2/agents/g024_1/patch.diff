@@ -1,0 +1,279 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index a0798f2..8e39b3d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -267,6 +267,58 @@ def _is_empty_response(msg_history):
+     """
+     return (not _last_assistant_text(msg_history).strip()) and (not _has_tool_use(msg_history))
+ 
++
++STRESS_DIR = '/tmp/stress'
++STRESS_GATE_TIMEOUT = 900  # seconds, overall limit for one stress run
++STRESS_GATE_ROUNDS = 2
++
++def _find_solution_rel(repo_context):
++    """
++    Return the relative path of the primary solution file (prefers non-test solution.py).
++    """
++    for f in re.findall(r'^--- (.+?) ---$', repo_context or '', flags=re.MULTILINE):
++        if not _is_test_path(f) and os.path.basename(f) == 'solution.py':
++            return f
++    return 'solution.py'
++
++def _run_stress_gate(solution_path, num_cases=200, timeout=5):
++    """
++    Run the stress comparison in a subprocess with a time limit.
++    Returns None if the scratch harness (/tmp/stress/brute.py and gen.py) is absent,
++    otherwise (passed: bool, report: str).
++    """
++    brute = os.path.join(STRESS_DIR, 'brute.py')
++    gen = os.path.join(STRESS_DIR, 'gen.py')
++    if not (os.path.isfile(brute) and os.path.isfile(gen)):
++        return None
++    code = (
++        "import sys; sys.path.insert(0, %r); "
++        "from tools.stress_test import tool_function; "
++        "print(tool_function(%r, %r, %r, num_cases=%d, timeout=%d))"
++    ) % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
++         solution_path, brute, gen, num_cases, timeout)
++    try:
++        proc = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
++                              timeout=STRESS_GATE_TIMEOUT)
++        out = (proc.stdout or '').strip() or (proc.stderr or '').strip()
++    except subprocess.TimeoutExpired:
++        return False, f"stress test exceeded {STRESS_GATE_TIMEOUT}s time limit"
++    passed = out.startswith('ALL PASSED')
++    return passed, out[-1500:]
++
++def _compact_summary(git_tempdir, solution_rel, failure_report, max_chars=6000):
++    """
++    Compact summary for a fresh chat: current solution file plus the last failing case.
++    """
++    path = os.path.join(git_tempdir, solution_rel)
++    try:
++        with open(path, 'r', encoding='utf-8') as fh:
++            code = fh.read()
++    except Exception:
++        code = '(solution file could not be read)'
++    return (f"Current {solution_rel}:\n```python\n{code[:max_chars]}\n```\n\n"
++            f"Last stress-test result:\n{failure_report}\n")
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -368,10 +420,14 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ 
+ Please analyze the problem description carefully, then follow this workflow:
+ 1. Explore the repository with the editor `view` command or bash (e.g. `ls`, `cat`) to find the target file. If the task names a file such as `solution.py` that does not exist yet, create it.
+-2. Implement the complete solution by actually calling the editor tool to write the code to disk. Do not only describe the solution in text.
+-3. Run the program on the sample inputs with bash and compare the output against the expected outputs. Fix any discrepancies.
+-4. Consider time complexity (e.g. N up to 10^6) and test with a large input to make sure the solution is fast enough.
+-5. Do not stop until the source file is saved on disk with the full solution.
++2. Derive the algorithm carefully before coding. Do not guess a formula. Consider binary search on the answer, dynamic programming, greedy with a proof, sorting, prefix sums, etc. Check the constraints to pick an efficient approach.
++3. Implement the complete solution by calling the editor tool to write the code to disk (use the editor `create`/`edit` commands, not long bash heredocs). Keep the best current solution saved in the solution file at all times.
++4. Write a brute-force reference (`/tmp/stress/brute.py`) that is obviously correct for small inputs, and a random input generator (`/tmp/stress/gen.py`) that takes an integer seed as argv[1] and prints one small random valid input to stdout. Create these files with the editor tool in the /tmp/stress/ directory.
++5. Run the stress test with the `stress_test` tool (solution_path = the solution file, brute_path = /tmp/stress/brute.py, generator_path = /tmp/stress/gen.py). Stress testing must pass before you finish.
++6. If a stress test fails, do NOT tweak the formula by trial and error. Re-derive the algorithm from the problem statement (consider binary search on the answer, DP, greedy proofs), then write the corrected solution to the file immediately with the editor tool and re-run the stress test.
++7. Run the program on the sample inputs with bash and compare the output against the expected outputs. Consider time complexity (e.g. N up to 10^6) and test with a large input to make sure the solution is fast enough.
++8. Keep tool outputs short (e.g. use `head`, `tail`, or print only what is needed).
++9. Do not stop until the stress test passes and the source file is saved on disk with the full solution.
+ 
+ IMPORTANT: The task is incomplete until a source file has been created or edited with the editor or bash tool. Ending your turn without writing code to disk is a failure. If the task says to write a program in a file such as `solution.py`, you must ensure that file exists with the full solution."""
+         init_edit = self._chat_robust(instruction)
+@@ -404,9 +460,68 @@ Repository snapshot:
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         reason = _needs_retry(diff)
+         if reason is None:
++            self._stress_gate(task, repo_context)
+             return
+         safe_log(f"Patch validation still failing after maximum retries: {reason}. Running deterministic fallback.")
+         self._fallback_write_solution(task, repo_context)
++        self._stress_gate(task, repo_context)
++
++    def _unfinished_flag_logger(self, flags):
++        """
++        Return a logging callable that forwards to safe_log and records whether a max_tokens stop was seen.
++        """
++        def _log(message, *args, **kwargs):
++            text = str(message)
++            if 'max_tokens' in text:
++                flags['max_tokens'] = True
++            safe_log(message)
++        return _log
++
++    def _stress_gate(self, task, repo_context):
++        """
++        Post-run gate: run the scratch stress harness (/tmp/stress) against the final solution.
++        On failure, ask the model (bounded rounds) to re-derive and fix the algorithm.
++        """
++        solution_rel = _find_solution_rel(repo_context)
++        solution_path = os.path.join(self.git_tempdir, solution_rel)
++        result = _run_stress_gate(solution_path)
++        if result is None:
++            safe_log("Stress gate skipped: /tmp/stress/brute.py or gen.py not found.")
++            return
++        passed, report = result
++        safe_log(f"Stress gate initial result: passed={passed}; report={report[:500]!r}")
++        for rnd in range(STRESS_GATE_ROUNDS):
++            if passed:
++                break
++            fix_prompt = f"""{task}
++
++The stress test against the brute-force reference FAILED. Stress-test report:
++{report}
++
++Do NOT tweak the formula by trial and error. Re-derive the algorithm from the problem statement (consider binary search on the answer, DP, greedy proofs), then write the corrected full solution to {solution_rel} with the editor tool immediately. Then re-run the stress test with the stress_test tool (brute_path=/tmp/stress/brute.py, generator_path=/tmp/stress/gen.py) and do not finish until it prints ALL PASSED. Keep tool outputs short."""
++            flags = {'max_tokens': False}
++            history = chat_with_agent(fix_prompt, model=self.active_model, msg_history=[],
++                                      logging=self._unfinished_flag_logger(flags))
++            safe_log(f"Stress gate round {rnd}: model={self.active_model}, max_tokens={flags['max_tokens']}")
++            if _is_empty_response(history) or flags['max_tokens']:
++                # Unfinished reply: continue in a fresh chat with a compact summary.
++                safe_log(f"Stress gate round {rnd}: reply unfinished (empty or max_tokens); continuing with a compact summary.")
++                summary = _compact_summary(self.git_tempdir, solution_rel, report)
++                self._chat_robust(f"""{task}
++
++Continue the task. Compact summary of the current state:
++{summary}
++Fix the algorithm so that it passes the stress test against /tmp/stress/brute.py and /tmp/stress/gen.py. Re-derive the algorithm if needed, write the full solution to {solution_rel} with the editor tool, and re-run the stress test. Keep tool outputs short.""")
++            result = _run_stress_gate(solution_path)
++            if result is None:
++                safe_log("Stress gate: harness disappeared during the run; stopping the gate.")
++                return
++            passed, report = result
++            safe_log(f"Stress gate round {rnd} result: passed={passed}; report={report[:500]!r}")
++        if passed:
++            safe_log("Stress gate passed.")
++        else:
++            safe_log("Stress gate still failing after maximum rounds; finishing with the current solution.")
+ 
+     def _fallback_write_solution(self, task, repo_context):
+         """
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..8ec160d
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,122 @@
++import os
++import subprocess
++import sys
++
++MAX_REPORT_CHARS = 400
++MAX_CASES_LIMIT = 2000
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Stress-test a solution against a brute-force reference using a random input generator.\n
++* The generator is run as `python <generator_path> <seed>` and must print one test input to stdout.\n
++* The solution and the brute force are run as `python <path>` with the input on stdin; they must print the answer to stdout.\n
++* Outputs are compared after stripping trailing whitespace on each line.\n
++* Returns 'ALL PASSED' if every case matches, otherwise the smallest failing input together with the expected (brute) and actual (solution) outputs.\n
++* Use this after writing brute.py and gen.py in a scratch directory such as /tmp/stress/.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution Python program (reads stdin, writes stdout)."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the trusted brute-force Python program (reads stdin, writes stdout)."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to the random input generator; invoked as `python generator_path seed` and prints one input to stdout."
++                },
++                "num_cases": {
++                    "type": "integer",
++                    "description": "Number of random seeds to test (default 300)."
++                },
++                "timeout": {
++                    "type": "number",
++                    "description": "Per-program timeout in seconds (default 10)."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++def _truncate(text, limit=MAX_REPORT_CHARS):
++    text = text if text is not None else ''
++    if len(text) <= limit:
++        return text
++    return text[:limit] + '...[truncated]'
++
++
++def _normalize(text):
++    return '\n'.join(line.rstrip() for line in (text or '').strip().splitlines())
++
++
++def _run_py(path, args=(), stdin_text='', timeout=10.0):
++    """Run a python file; return (ok, stdout, error_text)."""
++    try:
++        proc = subprocess.run(
++            [sys.executable, path, *args],
++            input=stdin_text,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++            cwd=os.path.dirname(os.path.abspath(path)) or None,
++        )
++    except subprocess.TimeoutExpired:
++        return False, '', f'timed out after {timeout}s'
++    except Exception as e:
++        return False, '', f'failed to run: {e}'
++    if proc.returncode != 0:
++        return False, proc.stdout, f'exit code {proc.returncode}: {proc.stderr.strip()}'
++    return True, proc.stdout, ''
++
++
++def tool_function(solution_path, brute_path, generator_path, num_cases=300, timeout=10):
++    try:
++        num_cases = int(num_cases) if num_cases is not None else 300
++    except (TypeError, ValueError):
++        num_cases = 300
++    num_cases = max(1, min(num_cases, MAX_CASES_LIMIT))
++    try:
++        timeout = float(timeout) if timeout is not None else 10.0
++    except (TypeError, ValueError):
++        timeout = 10.0
++    timeout = max(0.1, min(timeout, 120.0))
++
++    for label, p in (('solution_path', solution_path), ('brute_path', brute_path),
++                     ('generator_path', generator_path)):
++        if not p or not os.path.isfile(p):
++            return f"Error: {label} does not exist: {p}"
++
++    failures = []  # (input_len, seed, input, expected, actual, note)
++    for seed in range(num_cases):
++        ok, test_input, err = _run_py(generator_path, args=[str(seed)], timeout=timeout)
++        if not ok:
++            return f"Error: generator failed at seed {seed}: {_truncate(err)}"
++        ok, expected, err = _run_py(brute_path, stdin_text=test_input, timeout=timeout)
++        if not ok:
++            failures.append((len(test_input), seed, test_input, '', '', f"brute failed: {err}"))
++            continue
++        ok, actual, err = _run_py(solution_path, stdin_text=test_input, timeout=timeout)
++        if not ok:
++            failures.append((len(test_input), seed, test_input, expected, actual, f"solution failed: {err}"))
++            continue
++        if _normalize(expected) != _normalize(actual):
++            failures.append((len(test_input), seed, test_input, expected, actual, 'output mismatch'))
++
++    if not failures:
++        return f"ALL PASSED ({num_cases} cases)"
++
++    # Smallest failing input (by length, then by seed) is easiest to debug.
++    failures.sort(key=lambda f: (f[0], f[1]))
++    _, seed, test_input, expected, actual, note = failures[0]
++    return (
++        f"FAILED {len(failures)}/{num_cases} cases ({note}). Smallest failing case (seed {seed}):\n"
++        f"input: {_truncate(test_input.strip())}\n"
++        f"expected (brute): {_truncate(_normalize(expected))}\n"
++        f"actual (solution): {_truncate(_normalize(actual))}"
++    )

@@ -1,0 +1,256 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ac3d587..5d22e8c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,7 +4,9 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -93,6 +95,57 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++
++def _message_has_tool_use(msg):
++    content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++    if not isinstance(content, list):
++        return False
++    for block in content:
++        btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++        if btype == 'tool_use':
++            return True
++    return False
++
++def _message_text(msg):
++    content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++    if isinstance(content, str):
++        return content
++    if not isinstance(content, list):
++        return ''
++    parts = []
++    for block in content:
++        if isinstance(block, dict):
++            text = block.get('text')
++        else:
++            text = getattr(block, 'text', None)
++        if isinstance(text, str):
++            parts.append(text)
++    return ''.join(parts)
++
++def _last_assistant_is_empty(msg_history):
++    """
++    True if the last assistant message has no non-whitespace text and no tool_use block.
++    """
++    if not msg_history:
++        return False
++    for msg in reversed(msg_history):
++        role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++        if role == 'assistant':
++            return (not _message_text(msg).strip()) and (not _message_has_tool_use(msg))
++    return False
++
++def _sanitize_history(msg_history):
++    """
++    Remove trailing empty assistant messages so retries do not condition on empty output.
++    Returns [] if nothing meaningful remains.
++    """
++    history = list(msg_history or [])
++    for _ in range(len(history)):
++        if not _last_assistant_is_empty(history):
++            break
++        history.pop()
++    return history
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -124,8 +177,9 @@ class AgenticSystem:
+         with open(chat_history_file, 'w') as f:
+             f.write('')
+ 
+-    # Substrings (lowercased) that mark a changed file as test/scratch rather than primary source.
+-    NON_SOURCE_MARKERS = ('test', 'tests', 'spec', 'brute', 'gen', 'scratch', 'conftest')
++    # Directory components and filenames that mark a changed file as test/scratch rather than primary source.
++    NON_SOURCE_DIRS = {'tests', 'test', 'spec'}
++    NON_SOURCE_BASENAMES = {'brute.py', 'gen.py', 'conftest.py'}
+ 
+     def _get_changed_files(self):
+         """
+@@ -151,18 +205,83 @@ class AgenticSystem:
+                 changed.append(f)
+         return changed
+ 
++    def _is_source_path(self, path):
++        """
++        True if a repo-relative path looks like primary source (not test/scratch/tmp).
++        """
++        if path.startswith('/tmp'):
++            return False
++        parts = [p for p in path.replace('\\', '/').split('/') if p]
++        if not parts:
++            return False
++        basename = parts[-1].lower()
++        dirs = [p.lower() for p in parts[:-1]]
++        if any(d in self.NON_SOURCE_DIRS for d in dirs):
++            return False
++        if basename in self.NON_SOURCE_BASENAMES:
++            return False
++        if basename.startswith('test_') or basename.endswith('_test.py'):
++            return False
++        return True
++
+     def _has_source_edit(self):
+         """
+-        True if at least one changed file is not test/scratch-like and not under /tmp.
++        True if at least one changed file is primary source (see _is_source_path).
+         """
+-        for path in self._get_changed_files():
+-            if path.startswith('/tmp'):
+-                continue
+-            lowered = path.lower()
+-            if any(marker in lowered for marker in self.NON_SOURCE_MARKERS):
+-                continue
+-            return True
+-        return False
++        return any(self._is_source_path(p) for p in self._get_changed_files())
++
++    def _find_solution_file(self):
++        """
++        Locate the solution file: solution.py, else the sole non-test .py file, else None.
++        """
++        candidates = []
++        for root, dirs, files in os.walk(self.git_tempdir):
++            dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__')]
++            for name in files:
++                if name.endswith('.py'):
++                    rel = os.path.relpath(os.path.join(root, name), self.git_tempdir)
++                    candidates.append(rel)
++        for rel in candidates:
++            if os.path.basename(rel) == 'solution.py':
++                return rel
++        source = [c for c in candidates if self._is_source_path(c)]
++        if len(source) == 1:
++            return source[0]
++        return None
++
++    def _direct_fallback(self):
++        """
++        Final fallback: ask the model directly (no tools) for the full Python solution and write it.
++        """
++        prompt = (
++            f"{self.problem_statement}\n\n"
++            "Return ONLY the complete Python solution in a single ```python code block. "
++            "No explanation."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                prompt, client=client, model=client_model,
++                system_message="You are an expert competitive programmer.",
++                msg_history=[], temperature=0.0,
++            )
++        except Exception as e:
++            safe_log(f"[forward] direct fallback LLM call failed: {e}")
++            return False
++        match = re.search(r"```python\s*\n(.*?)```", content or '', re.DOTALL)
++        if not match:
++            safe_log("[forward] direct fallback: no ```python block in response")
++            return False
++        code = match.group(1)
++        rel = self._find_solution_file()
++        if rel is None:
++            rel = 'solution.py'
++        path = os.path.join(self.git_tempdir, rel)
++        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++        with open(path, 'w') as f:
++            f.write(code)
++        safe_log(f"[forward] direct fallback wrote {rel}")
++        return True
+ 
+     def get_current_edits(self):
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+@@ -191,45 +310,45 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"""{task}
+-
+-Work in this order:
+-1. Restate the constraints (N, value ranges, time/memory limits, output format, precision) and pick an algorithm that fits them.
+-2. IMPLEMENT FIRST: view the repository directory and the starter/solution file, then write the complete solution into the solution file and save it. If the problem asks for a `Solution` class method, implement that method; otherwise make the program read stdin and write stdout. For floating-point output, print with at least 15 significant digits (e.g. `print(f"{{x:.15g}}")`).
+-3. THEN VERIFY: create `brute.py` (obviously correct, slow) and `gen.py` (takes an integer seed as sys.argv[1], seeds `random`, prints one small valid input with degenerate cases) in a scratch directory outside the repository such as /tmp/scratch/. Run the provided samples and diff the outputs, run the stress_test tool with at least 300 cases, and check edge cases and a max-size timing run.
+-4. FIX: if anything fails, find the root cause from the minimal failing input, fix the solution, and rerun the affected checks. Do not modify test files.
+-5. CLEAN UP: delete the scratch files outside the repository, then reply with the number of stress-test cases that passed.
++        first_prompt = f"""{task}
++
++Implement the solution now. View the repository directory {self.git_tempdir}, then write the complete solution into the solution file with the editor tool and save it. If the problem asks for a `Solution` class method, implement that method; otherwise make the program read stdin and write stdout. For floating-point output, print with at least 15 significant digits.
+ """
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        msg_history = init_edit
++        msg_history = chat_with_agent(first_prompt, model=self.code_model, msg_history=[], logging=safe_log)
+         safe_log(f"[forward] initial attempt done; source_edit={self._has_source_edit()}, changed_files={self._get_changed_files()}")
+ 
+-        # Bounded retry loop: force an actual source edit if none exists yet.
+-        for attempt in range(self.max_edit_retries):
+-            if self._has_source_edit():
++        has_edit = self._has_source_edit()
++        if not has_edit and _last_assistant_is_empty(msg_history):
++            safe_log("[forward] empty model response detected on first turn; retrying with sanitized history.")
++
++        # Escalating retries (bounded): 1) sanitized history + forceful prompt, 2) fresh history, 3) direct no-tools call.
++        for attempt in range(1, self.max_edit_retries + 1):
++            if has_edit:
+                 break
+             changed = self._get_changed_files()
+-            safe_log(f"[forward] no source edit detected (retry {attempt + 1}/{self.max_edit_retries}); changed_files={changed}")
+-            retry_msg = (
+-                f"ERROR: No edits to the primary source file have been made (changed files: {changed if changed else 'none'}). "
+-                "Do not just describe a solution. Use the editor tool now: first `view` the repository directory "
+-                f"{self.git_tempdir}, then `view` the starter/solution file, then `edit` it to implement the required function. "
+-                "Do not modify test files. Reply only after the file is saved."
+-            )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-
+-        has_edit = self._has_source_edit()
+-        if not has_edit:
+-            # Final fallback: fresh conversation with a short, direct prompt.
+-            safe_log(f"[forward] still no source edit after {self.max_edit_retries} retries; starting fresh attempt. changed_files={self._get_changed_files()}")
+-            fresh_msg = (
+-                f"{self.problem_statement}\n\n"
+-                f"Repository directory: {self.git_tempdir}\n"
+-                "View the directory, then edit the solution file to implement the required function now."
+-            )
+-            msg_history = chat_with_agent(fresh_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"[forward] no source edit detected (retry level {attempt}/{self.max_edit_retries}); changed_files={changed}")
++            if attempt == 1:
++                history = _sanitize_history(msg_history)
++                prompt = (
++                    f"You must call the editor tool now. Step 1: view {self.git_tempdir}. "
++                    "Step 2: edit the solution file with the full implementation. "
++                    "Do not reply with plain text."
++                )
++                msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=history, logging=safe_log)
++            elif attempt == 2:
++                prompt = (
++                    f"{self.problem_statement}\n\n"
++                    f"Repository directory: {self.git_tempdir}\n"
++                    "View the directory then write solution.py using the editor tool. Verification comes later."
++                )
++                msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            else:
++                if self._direct_fallback():
++                    safe_log("[forward] source edit produced by direct fallback (level 3).")
++                msg_history = []
+             has_edit = self._has_source_edit()
+-            safe_log(f"[forward] fresh attempt done; source_edit={has_edit}, changed_files={self._get_changed_files()}")
++            if has_edit:
++                safe_log(f"[forward] source edit produced at retry level {attempt}; changed_files={self._get_changed_files()}")
+ 
+         if not has_edit:
+             safe_log("[forward] WARNING: no source edit after all attempts; skipping verification.")

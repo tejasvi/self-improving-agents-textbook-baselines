@@ -1,0 +1,392 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index c6dc265..e08b3f8 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ import threading
+ import json
+ import re
+ import time
++import shutil
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, simple_chat
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -517,6 +518,171 @@ Return ONLY a JSON array of 3 objects: [{{"input": "<exact stdin text>", "output
+             return ""
+         return ""
+ 
++    def _gate(self, samples, oracle_path, gen_path, seed_start=0, num_tests=300):
++        """
++        Acceptance gate for the file on disk. Runs the samples and, if an oracle and generator are
++        available, the differential stress test. Sentinel outputs (inf, nan, numbers >= 1e17),
++        empty output, crashes and timeouts are failures (the stress tool and the exact sample
++        comparison both reject them).
++        Returns (ok, report, pass_rate) with pass_rate in [0, 1] over all sample and stress tests.
++        """
++        solution_path = self._solution_path()
++        if not solution_path or not os.path.exists(solution_path):
++            return False, f"Solution file not found: {solution_path}", 0.0
++        parts = []
++        total = 0
++        passed = 0
++        ok = True
++        if samples:
++            s_report, s_all = self._run_samples(solution_path, samples)
++            parts.append(s_report)
++            total += len(samples)
++            passed += min(len(samples), s_report.count("(PASS, "))
++            ok = ok and s_all
++        if oracle_path and gen_path and os.path.exists(oracle_path) and os.path.exists(gen_path):
++            st_ok, st_report = self._stress_round(solution_path, oracle_path, gen_path,
++                                                  seed_start=seed_start, num_tests=num_tests)
++            parts.append("=== STRESS TEST ===\n" + st_report)
++            m = (re.search(r"STRESS TEST PASSED: (\d+)/(\d+)", st_report)
++                 or re.search(r"STRESS TEST FAILED: passed (\d+)/(\d+)", st_report))
++            sp, sn = (int(m.group(1)), int(m.group(2))) if m else (0, num_tests)
++            total += sn
++            passed += sp
++            ok = ok and st_ok and sp == sn
++        if total == 0:
++            return False, "No samples and no oracle: no tests could be run.", 0.0
++        rate = passed / total
++        ok = ok and passed == total
++        report = "\n\n".join(parts)
++        return ok, report, rate
++
++    def _gate_repair_chat(self, task, report, rate, round_idx, solution_path, oracle_path, gen_path):
++        """One repair session driven by the gate. Round 0 is a minimal fix; later rounds switch strategy."""
++        current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        table = self._table_snapshot()
++        if round_idx == 0:
++            strategy = """STRATEGY for this round (round 0: minimal fix).
++- Find the SMALLEST failing input in the report. Run the oracle on it (`timeout 10 python3 ORACLE < input`) and trace what the current solution does on it.
++- Make the smallest change to the algorithm that fixes it. Do NOT special-case the input.
++- Re-run the samples and the stress test (`timeout 10 python3 SOLUTION < input`)."""
++        else:
++            strategy = f"""STRATEGY for this round (round {round_idx}: DISCARD the current algorithm). Previous repairs did not reach a green gate (pass rate {rate:.3f}). Stop patching the current approach:
++1. Implement the exact full-state version of the problem: the same state space the oracle explores (e.g. DP or Dijkstra over every state, with no compression and no size-gated shortcuts). Write it to {solution_path} with the editor tool.
++2. Confirm it equals the oracle on the samples and on the stress tests before any optimization.
++3. Then optimize with ONE restriction at a time (e.g. prune one dimension, use a faster data structure), re-running the stress test after each change. Revert any change that breaks equality with the oracle.
++4. If no optimization is verified, keep the exact full-state version: a correct answer that is slow is better than a fast wrong one."""
++        msg = f"""{self._briefing()}{task}
++
++REPAIR-UNTIL-GREEN, round {round_idx}. The acceptance gate FAILED (pass rate {rate:.3f}). Raw gate report (samples and stress test):
++
++{report}
++
++Oracle table over a small window (x = 0..7, y = 0..7; use it to find the pattern):
++{table}
++
++Paths:
++- Solution file: {solution_path}
++- Oracle (trusted brute force): {oracle_path}
++- Random input generator: {gen_path}  (run as `python3 {gen_path} <seed>`)
++
++Current diff:
++{current_diff if current_diff.strip() else '(empty)'}
++
++{strategy}
++
++Rules:
++- A failing sentinel output (inf, nan, 1e18-like values) is a real bug, never an acceptable answer.
++- Write the corrected solution to {solution_path} with the editor tool (overwrite), then re-run the samples.
++- Use `timeout` on every oracle or solution run in bash. Record findings in {self.notes_path}.
++- Never end your turn while the stress test or samples are failing. Do not reply with text only.
++"""
++        chat_with_agent(msg, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"[green round {round_idx}] repair chat finished.")
++
++    def _repair_until_green(self, task, samples, max_rounds=5):
++        """
++        Repair-until-green loop: up to `max_rounds` gate checks, each followed by a repair session
++        when the gate fails. The best-scoring candidate (by pass rate) is backed up to
++        /tmp/best_solution_<pid>.py; if the final file on disk scores lower, the backup is restored.
++        Returns True if the final gate is green.
++        """
++        solution_path = self._solution_path()
++        if not solution_path or not os.path.exists(solution_path):
++            safe_log("[green] no solution file; skipping repair-until-green.")
++            return False
++        oracle_path, gen_path = self._ensure_oracle(task, samples)
++        if not samples and not (oracle_path and gen_path):
++            safe_log("[green] no samples and no oracle; cannot gate the solution.")
++            return False
++        best_path = f"/tmp/best_solution_{os.getpid()}.py"
++        best_rate = -1.0
++        green = False
++        last_rate = 0.0
++        for round_idx in range(max_rounds):
++            solution_path = self._solution_path() or solution_path
++            ok, report, rate = self._gate(samples, oracle_path, gen_path)
++            last_rate = rate
++            safe_log(f"[green round {round_idx}] ok={ok} pass_rate={rate:.4f}\n{report[:4000]}")
++            if rate > best_rate and os.path.exists(solution_path):
++                best_rate = rate
++                shutil.copyfile(solution_path, best_path)
++                safe_log(f"[green round {round_idx}] new best candidate backed up to {best_path} (rate {rate:.4f}).")
++            if ok:
++                green = True
++                break
++            self._gate_repair_chat(task, report, rate, round_idx, solution_path, oracle_path, gen_path)
++
++        if not green:
++            # Score the file as it stands after the last repair session.
++            solution_path = self._solution_path() or solution_path
++            ok, report, rate = self._gate(samples, oracle_path, gen_path)
++            last_rate = rate
++            safe_log(f"[green final] ok={ok} pass_rate={rate:.4f}")
++            green = ok
++            if rate > best_rate and os.path.exists(solution_path):
++                best_rate = rate
++                shutil.copyfile(solution_path, best_path)
++
++        if last_rate < best_rate and os.path.exists(best_path):
++            shutil.copyfile(best_path, solution_path)
++            safe_log(f"[green] final file scored {last_rate:.4f} < best {best_rate:.4f}; restored best candidate to {solution_path}.")
++        return green
++
++    def _ensure_oracle(self, task, samples):
++        """
++        Build the oracle and generator once and cache them on self (_oracle_path, _gen_path).
++        Fallback when the automatic builder fails: the agent-written /tmp/oracle_v1.py, paired with a
++        working generator (/tmp/gen_v1.py or the auto generator); if that fails too, an agent session.
++        Returns (oracle_path, gen_path), either may be None.
++        """
++        if getattr(self, "_oracle_ready", False):
++            return self._oracle_path, self._gen_path
++        self._oracle_ready = True
++        self._oracle_path, self._gen_path = None, None
++        pid = os.getpid()
++        oracle_path, gen_path, note = self._build_oracle_and_gen(samples)
++        if not oracle_path:
++            safe_log(f"[oracle] automatic builder failed ({note}); trying the agent-written /tmp/oracle_v1.py.")
++            fallback = "/tmp/oracle_v1.py"
++            small = [s for s in samples if self._is_small_sample(s)][:5]
++            if os.path.exists(fallback):
++                mismatch = self._check_oracle_on_samples(fallback, small) if small else None
++                if mismatch:
++                    safe_log(f"[oracle] {fallback} does not reproduce the samples: {mismatch[:300]}")
++                else:
++                    for cand in ["/tmp/gen_v1.py", f"/tmp/auto_gen_{pid}.py"]:
++                        if not os.path.exists(cand):
++                            continue
++                        gcode, gout, _, gto = self._run_py(["python3", cand, "0"], None, 10)
++                        if not gto and gcode == 0 and gout.strip():
++                            oracle_path, gen_path = fallback, cand
++                            safe_log(f"[oracle] using {fallback} with generator {cand}.")
++                            break
++        if not oracle_path:
++            oracle_path, gen_path = self._scaled_oracle_session(task, note)
++        self._oracle_path, self._gen_path = oracle_path, gen_path
++        return oracle_path, gen_path
++
+     def _stress_round(self, solution_path, oracle_path, gen_path, seed_start, num_tests=300):
+         """Run the stress comparison in Python. Returns (passed, report)."""
+         report = stress_tool.tool_function(
+@@ -559,20 +725,18 @@ Instructions:
+ 
+     def _stress_phase(self, task, samples):
+         """
+-        Unconditional differential stress phase: build an oracle and generator, then run up to 3
+-        stress rounds, repairing on mismatch. Returns True if the oracle was built and used.
++        Unconditional differential stress phase: reuse the cached oracle and generator (built once by
++        _ensure_oracle), then run up to 3 stress rounds, repairing on mismatch.
++        Returns True if the oracle was available and the rounds ran.
+         """
+         solution_path = self._solution_path()
+         if not solution_path or not os.path.exists(solution_path):
+             safe_log("[stress] no solution file found; skipping stress phase.")
+             return False
+-        oracle_path, gen_path, note = self._build_oracle_and_gen(samples)
++        oracle_path, gen_path = self._ensure_oracle(task, samples)
+         if not oracle_path:
+-            safe_log(f"[stress] could not build a trustworthy oracle ({note}); starting an agent session to build a scaled-down oracle and generator.")
+-            oracle_path, gen_path = self._scaled_oracle_session(task, note)
+-            if not oracle_path:
+-                safe_log("[stress] agent-built oracle/generator still not usable; stress phase cannot run.")
+-                return False
++            safe_log("[stress] no usable oracle/generator; stress phase cannot run.")
++            return False
+         self._oracle_path = oracle_path
+         for round_idx in range(3):
+             passed, report = self._stress_round(solution_path, oracle_path, gen_path, seed_start=round_idx * 300)
+@@ -781,6 +945,7 @@ Working style:
+ - If the brute-force baseline is too slow for the constraints, do NOT give up on a formula and do NOT ship a brute force gated by input size. Explore on scaled-down instances instead: print oracle tables over small windows with the tool `formula_fit` (mode "table"), guess a formula, and test it with `formula_fit` (mode "fit", several small scales of the main size parameter K). Repeat until the formula has zero mismatches.
+ - The final answer must be a formula or efficient algorithm for the full constraints (O(1) or O(log) per case when possible). Never embed the brute force into the final answer for large inputs.
+ - Before finishing, time your solution on a max-size input with `timeout 5`.
++- Never end your turn while the stress test or samples are failing; if your optimized idea fails, fall back to the exact full-state solution that is correct and fits the time limit as best as possible.
+ """
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+         safe_log(f"[attempt 0] initial chat finished; source patch present: {self._has_source_patch()}")
+@@ -810,40 +975,13 @@ Then verify it by running it with bash on all sample inputs, and append your fin
+ 
+         self._hybrid_gate(task, "initial and retry phases")
+ 
+-        # Verification and repair phase: run the samples and have the agent fix failures.
++        # Verification and repair phase: the repair-until-green gate runs the samples and the
++        # oracle stress test, and repairs with differentiated strategies until green (max 5 rounds).
+         samples = self._extract_samples()
+         safe_log(f"[verify] extracted {len(samples)} sample(s).")
+         if not samples:
+-            # Nothing to run: do not send repair prompts claiming a sample failure.
+-            safe_log("[verify] no samples extracted; skipping sample-based repair rounds.")
+-        for round_idx in range(3 if samples else 0):
+-            solution_path = self._solution_path()
+-            report, all_passed = self._run_samples(solution_path, samples)
+-            safe_log(f"[verify round {round_idx}] solution: {solution_path}\n{report}")
+-            if all_passed:
+-                safe_log(f"[verify round {round_idx}] all samples passed; stopping.")
+-                break
+-            current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-            repair_msg = f"""{self._briefing()}{task}
+-
+-The solution has been run against the sample tests from the problem statement, and it did NOT pass. Raw report:
+-
+-{report}
+-
+-Current diff:
+-{current_diff if current_diff.strip() else '(empty)'}
+-
+-Instructions:
+-- Read the report carefully: compare expected vs. actual output, and check stderr and runtime (timeouts mean the algorithm is too slow).
+-- Fix the solution file with the editor tool (`edit` or `create`, which overwrites).
+-- Write a brute-force implementation that outputs the canonical answer (the lexicographically smallest / first-in-natural-order answer) by exhaustive enumeration, and compare the solution against it by EXACT output comparison on many small random inputs (small value ranges to force duplicates and ties). Do not switch to a validity-only checker unless the canonical rule cannot be matched.
+-- Generate a max-size input allowed by the constraints and time the solution on it.
+-- Re-run the solution on all sample inputs with bash and confirm they pass before finishing.
+-- Continue from the briefing above; do not redo earlier exploration. Record new findings in {self.notes_path}.
+-- Do not reply with text only; finish only after the fixes are written to disk and verified.
+-"""
+-            chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[verify round {round_idx}] repair chat finished.")
++            safe_log("[verify] no samples extracted; the gate will rely on the stress test only.")
++        self._repair_until_green(task, samples, max_rounds=5)
+ 
+         # Differential stress phase: always runs (even when samples pass). Compares the solution
+         # against a brute-force oracle on random small inputs and repairs on mismatch.
+@@ -897,6 +1035,9 @@ Random tests on a tiny range do NOT validate a formula: a wrong pattern can pass
+         self._timing_gate(task)
+         self._hybrid_gate(task, "timing gate")
+ 
++        # Final acceptance gate on the file on disk (restores the best candidate if the last one is worse).
++        self._repair_until_green(task, samples, max_rounds=5)
++
+         # Final guarantee: if the solution is still a stub or unchanged, ask once more for the baseline from the notes.
+         solution_path = self._solution_path()
+         if not solution_path or self._is_stub_solution(solution_path):
+diff --git a/tools/bash.py b/tools/bash.py
+index 769ae97..2a9a920 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -150,7 +150,10 @@ def wrap_with_timeout(command, timeout_sec):
+     )
+ 
+ async def tool_function_call(command, timeout=None, restart=None):
+-    """Execute a command in the bash shell."""
++    """Execute a command in bash. The command is written to a temp script and run as `bash <file>`
++    with stdin from /dev/null, so heredocs complete normally (no interactive `bash -i` session)."""
++    import tempfile
++    script_path = None
+     try:
+         try:
+             timeout_sec = int(timeout) if timeout not in (None, "") else DEFAULT_COMMAND_TIMEOUT
+@@ -158,13 +161,30 @@ async def tool_function_call(command, timeout=None, restart=None):
+             timeout_sec = DEFAULT_COMMAND_TIMEOUT
+         timeout_sec = max(1, min(timeout_sec, MAX_COMMAND_TIMEOUT))
+ 
+-        bash_session = BashSession()
++        fd, script_path = tempfile.mkstemp(prefix="bash_cmd_", suffix=".sh")
++        with os.fdopen(fd, "w") as f:
++            f.write(command if command.endswith("\n") else command + "\n")
+ 
+-        if not bash_session._started:
+-            await bash_session.start()
+-
+-        output, error = await bash_session.run(wrap_with_timeout(command, timeout_sec))
+-        error = filter_error(error)
++        proc = await asyncio.create_subprocess_exec(
++            "timeout", "-k", "5", str(timeout_sec), "bash", script_path,
++            stdin=asyncio.subprocess.DEVNULL,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.PIPE,
++            env=os.environ.copy(),
++        )
++        try:
++            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec + 15)
++        except asyncio.TimeoutError:
++            try:
++                proc.kill()
++            except ProcessLookupError:
++                pass
++            return f"Error: command did not return within {timeout_sec + 15} seconds and was killed."
++        output = out_b.decode(errors="ignore").strip()
++        error = filter_error(err_b.decode(errors="ignore").strip())
++        rc = proc.returncode
++        if rc in (124, 137):
++            output += f"\n[command killed: exceeded {timeout_sec}s timeout]"
+         result = ""
+         if output:
+             result += output
+@@ -173,6 +193,12 @@ async def tool_function_call(command, timeout=None, restart=None):
+         return result.strip()
+     except Exception as e:
+         return f"Error: {str(e)}"
++    finally:
++        if script_path and os.path.exists(script_path):
++            try:
++                os.remove(script_path)
++            except OSError:
++                pass
+ 
+ def tool_function(command, timeout=None, restart=None):
+     return asyncio.run(tool_function_call(command, timeout=timeout, restart=restart))
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+index 53f1acb..4066287 100644
+--- a/tools/stress_test.py
++++ b/tools/stress_test.py
+@@ -1,4 +1,5 @@
+ import subprocess
++import re
+ 
+ def tool_info():
+     return {
+@@ -53,6 +54,29 @@ def _run(cmd, stdin_text, timeout):
+ def _tokens(text):
+     return (text or "").split()
+ 
++def sentinel_tokens(text, allowed_text=""):
++    """
++    Tokens of `text` that look like sentinel/overflow values: inf, nan, or numbers with
++    magnitude >= 1e17. Tokens that also appear in `allowed_text` (e.g. the expected output)
++    are legitimate and are not returned.
++    """
++    allowed = set((allowed_text or "").split())
++    bad = []
++    for tok in (text or "").split():
++        if tok in allowed:
++            continue
++        clean = tok.strip(",;:")
++        if re.fullmatch(r"[+-]?(inf|infinity|nan)", clean, flags=re.IGNORECASE):
++            bad.append(tok)
++            continue
++        try:
++            value = float(clean)
++        except ValueError:
++            continue
++        if abs(value) >= 1e17:
++            bad.append(tok)
++    return bad
++
+ def tool_function(solution_cmd, oracle_cmd, gen_cmd, num_tests=300, seed_start=0, timeout_sec=10):
+     try:
+         num_tests = int(num_tests) if num_tests else 300
+@@ -90,6 +114,11 @@ def tool_function(solution_cmd, oracle_cmd, gen_cmd, num_tests=300, seed_start=0
+             failures.append((test_input, oout, "", "solution TIMEOUT"))
+         elif scode != 0:
+             failures.append((test_input, oout, sout, f"solution exit {scode}: {serr.strip()[:500]}"))
++        elif not _tokens(sout) and _tokens(oout):
++            failures.append((test_input, oout, sout, "empty output"))
++        elif sentinel_tokens(sout, oout):
++            failures.append((test_input, oout, sout,
++                             f"sentinel output {sentinel_tokens(sout, oout)[:3]} (inf/nan/>=1e17 not in oracle output)"))
+         elif _tokens(sout) != _tokens(oout):
+             failures.append((test_input, oout, sout, "output mismatch"))
+         else:

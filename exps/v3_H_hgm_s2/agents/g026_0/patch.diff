@@ -1,0 +1,214 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e54057a..6e9b47c 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -860,6 +860,118 @@ Instructions:
+             safe_log(f"[differential round {round_idx}] repair chat finished.")
+         return oracle_dir
+ 
++    def _recent_tmp_scripts(self):
++        """
++        Names of top-level .py files in /tmp written since this run started (helper scripts of earlier attempts).
++        """
++        start = getattr(self, "_start_time", 0.0)
++        names = []
++        try:
++            for name in sorted(os.listdir("/tmp")):
++                path = os.path.join("/tmp", name)
++                if name.endswith(".py") and os.path.isfile(path) and os.path.getmtime(path) >= start:
++                    names.append(path)
++        except OSError:
++            return []
++        return names[:20]
++
++    def _fallback_target_path(self):
++        """
++        Pick the file the fallback writer should overwrite (path relative to git_tempdir):
++        1) a file named in the problem statement, e.g. `solution.py`;
++        2) an existing non-test tracked source file (prefer solution.py / main.py);
++        3) otherwise a new solution.py.
++        """
++        for m in re.finditer(r'`([\w./-]+\.py)`', self.problem_statement or ""):
++            rel = m.group(1)
++            if rel.startswith("/") or ".." in rel.split("/"):
++                continue
++            rel = re.sub(r"^\./", "", rel)
++            if _is_test_file(rel) or self._is_framework_file(rel):
++                continue
++            return rel
++        result = subprocess.run(
++            ["git", "-C", self.git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        files = []
++        for f in result.stdout.decode(errors="replace").splitlines():
++            f = f.strip()
++            if not f or _is_test_file(f) or self._is_framework_file(f):
++                continue
++            if f.lower().endswith((".md", ".rst", ".txt")) or "readme" in f.lower():
++                continue
++            files.append(f)
++        py_files = [f for f in files if f.endswith(".py")]
++        for pref in ("solution.py", "main.py"):
++            for f in py_files:
++                if os.path.basename(f) == pref:
++                    return f
++        if py_files:
++            return py_files[0]
++        return "solution.py"
++
++    @staticmethod
++    def _extract_code(text):
++        m = re.search(r"```python\s*\n(.*?)```", text or "", re.DOTALL)
++        return (m.group(1) if m else (text or "")).strip()
++
++    def _fallback_write_solution(self, task):
++        """
++        Harness-level safety net, called when the agent's chats left no non-test source change.
++        Asks the model (no tools) for a complete program and writes it to the target file.
++        Bounded to 2 attempts; the second asks for the simplest possible brute force.
++        Returns the relative path written, or None.
++        """
++        rel = self._fallback_target_path()
++        path = os.path.join(self.git_tempdir, rel)
++        existing = ""
++        if os.path.isfile(path):
++            with open(path, "r", encoding="utf-8", errors="replace") as f:
++                existing = f.read()
++        safe_log(f"[fallback] no source patch after the agent chats; writing a baseline to {rel}")
++        candidate = ""
++        for attempt in range(2):
++            file_ctx = (
++                f"The file {rel} currently contains the following; keep the same interface if it defines one "
++                f"(for example a `Solution` class with a method, or a stdin program):\n<current_file>\n{existing}\n</current_file>"
++                if existing.strip() else f"The solution goes in the file {rel}."
++            )
++            hint = "" if attempt == 0 else (
++                "The previous answer was not usable. Now write the SIMPLEST possible brute force that follows "
++                "the definition exactly, even if it is far too slow.\n"
++            )
++            prompt = f"""Solve the competitive programming problem below in Python.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++{file_ctx}
++
++Output ONLY a complete program in a single ```python code block. Read input from stdin and print the answer to stdout exactly as the statement requires (unless the current file uses a `Solution` class, then keep that interface).
++Correctness first: a brute force or direct simulation from the definition is acceptable, even if slow. No analysis, no explanation outside the code block.
++{hint}"""
++            text = simple_chat(prompt, model=self.code_model, max_tokens=16000, logging=safe_log) or ""
++            code = self._extract_code(text)
++            if not code:
++                safe_log(f"[fallback] attempt {attempt}: empty response.")
++                continue
++            candidate = code
++            try:
++                ast.parse(code)
++                break  # syntactically valid program; no need to retry
++            except SyntaxError:
++                safe_log(f"[fallback] attempt {attempt}: code does not parse; retrying with a simpler brute force.")
++        if not candidate:
++            safe_log("[fallback] no code produced; leaving the repository unchanged.")
++            return None
++        os.makedirs(os.path.dirname(path) or self.git_tempdir, exist_ok=True)
++        with open(path, "w", encoding="utf-8") as f:
++            f.write(candidate + "\n")
++        safe_log(f"[fallback] wrote {len(candidate)} chars to {rel}")
++        return rel
++
+     def _is_framework_file(self, rel_path):
+         """
+         True if rel_path belongs to the agent's own framework (coding_agent.py, the LLM wrappers, tools/,
+@@ -898,20 +1010,26 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         instruction = f"""{task}
+ 
+-Follow this step-by-step workflow:
+-1) Inspect the repository: use bash (e.g. `ls -la`, `cat`) and the editor tool to view existing files, and determine which file the solution must be written to (use the file named in the problem statement; if none is named, use the existing solution/entry file in the repo).
+-2) Reason about the algorithm and the complexity needed for the input constraints before writing code. State the time complexity in terms of the constraints before coding and confirm it fits in Python within ~2 seconds.
+-3) Write the implementation to the required file using the editor tool's `create` or `edit` command. The file MUST be written to disk.
+-4) Run the program on every sample input in the problem statement with bash and compare its output with the expected output. Fix any mismatch and re-run until all samples pass.
++Follow this step-by-step workflow. The solution file must be WRITTEN EARLY, and refined afterwards.
++1) Inspect the repository with at most 1-2 bash commands (e.g. `ls -la`, `cat` the target file). Determine the target file: use the file named in the problem statement; if none is named, use the existing solution/entry file in the repo.
++2) IMMEDIATELY write a baseline correct solution to the target file with the editor tool (`create` overwrites). A brute force or a direct simulation written straight from the problem definition is acceptable, even if it is too slow. Correctness first. This write must happen BEFORE any further exploration: no analysis, no brute-force experiments, no scripts in /tmp, no tables of results, no closed-form search until the file exists on disk.
++3) Run the baseline on every sample input in the problem statement with bash, compare with the expected output, and fix mismatches (overwrite the file with the editor tool).
++4) Improvements (each one overwrites the solution file with the editor tool): reason about the algorithm and the complexity needed for the input constraints (state the time complexity in terms of the constraints; it must fit in Python within ~2 seconds), discover a formula or a faster algorithm, and replace the baseline with it. Keep the file correct at every step.
+ 5) Verify against an independent brute force on the LARGEST domain that brute force can feasibly handle (not only tiny inputs). Write the brute force directly from the problem definition, not from your formula, and stress-test the solution against it on many random inputs; fix any differences. A formula validated only on a tiny domain (e.g. N<=3) must NOT be trusted: check it on a larger domain where the brute force still runs.
+    For problems with multiple valid answers, write a validity checker instead of comparing exact outputs.
+    For interactive problems, the program must be run through a judge that simulates the interactor, not with plain stdin.
+ 6) Write helper scripts (brute force, generators, checkers, judges) with the editor tool's `create` command. Do NOT use bash heredocs (`cat << EOF`) to write files; the editor tool has no `str_replace` command, so use `create` to overwrite a file.
+ 7) Never end your turn with only text. Replying without writing the solution file to disk counts as FAILURE. Only finish after the solution file has been written and verified.
++
++Rules for the order of work:
++- Exploration must NOT happen before the first write of the solution file. Your first tool call after the inspection in step 1 MUST be the editor writing the solution file.
++- A long analysis without a file write counts as failure. Keep your reasoning short between tool calls; write code, then test it.
+ """
++        self._start_time = time.time()
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+         safe_log(f"[attempt 0] initial chat finished; source patch present: {self._has_source_patch()}")
+ 
++        prev_history = init_edit
+         for attempt in range(3):
+             if self._has_source_patch():
+                 safe_log(f"[retry {attempt}] source patch detected; stopping retries.")
+@@ -919,6 +1037,8 @@ Follow this step-by-step workflow:
+             current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+             changed = self._changed_files()
+             safe_log(f"[retry {attempt + 1}] no non-test source change. changed files: {changed}")
++            carry = self._clip(self._last_assistant_text(prev_history), 2000)
++            scripts = self._recent_tmp_scripts()
+             retry_msg = f"""{task}
+ 
+ The current state of the repository has NO source change: the diff is empty or only touches test files.
+@@ -928,11 +1048,23 @@ Changed files so far: {changed if changed else '(none)'}
+ Current diff:
+ {current_diff if current_diff.strip() else '(empty)'}
+ 
+-This is a strict instruction: immediately use the editor tool (`create` or `edit`) to write the solution file for the problem to disk, then verify it by running it with bash on all sample inputs. Do not reply with text only. Do not only edit test files.
++Carry-over from the previous attempt (its last message; it did NOT write the solution file):
++{carry if carry.strip() else '(no text)'}
++
++Helper scripts the previous attempt left in /tmp: {', '.join(scripts) if scripts else '(none)'}
++Reuse them only if they help; do not repeat their exploration.
++
++STRICT INSTRUCTION: your first tool call MUST be the editor writing the solution file (`create`, which overwrites) with a baseline correct solution. No exploration first: do not run brute-force experiments, do not tabulate results, do not search for a closed form before the file exists. A brute force or direct simulation from the definition is acceptable. After the file is written, run the samples with bash, then improve the file, overwriting it each time. Do not reply with text only. Do not only edit test files.
+ """
+             retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            prev_history = retry_history
+             safe_log(f"[retry {attempt + 1}] chat finished; source patch present: {self._has_source_patch()}")
+ 
++        if not self._has_source_patch():
++            # Harness-level guarantee: a baseline source file must exist before the later phases.
++            written = self._fallback_write_solution(task)
++            safe_log(f"[fallback] written: {written}; source patch present: {self._has_source_patch()}")
++
+         # Independent oracle + differential testing (runs even when no samples were extracted).
+         oracle_dir = self._run_oracle_phase(task, max_rounds=3)
+         safe_log(f"[oracle] differential phase finished; oracle dir: {oracle_dir}")
+diff --git a/llm_withtools.py b/llm_withtools.py
+index d28916a..43f0517 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -337,7 +337,7 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
+ 
+ EMPTY_MAX_TOKENS_NUDGE = (
+     "Your previous response was cut off. Do not think at length; "
+-    "call the editor tool now to write the file."
++    "write the file now with the editor tool, then keep thinking."
+ )
+ EMPTY_MAX_TOKENS_RETRY_LIMIT = 2
+ EMPTY_MAX_TOKENS_RETRY_BUDGET = 8192
+@@ -405,6 +405,11 @@ def chat_with_agent_claude(
+         response, used_msgs = get_response_handling_empty(
+             client, client_model, msg_history + new_msg_history, tools, logging,
+         )
++        if _is_empty_max_tokens(response):
++            # Still no output after the nudges: do not append an empty assistant turn. The caller
++            # sees the history without it and can detect the failure (e.g. run the harness fallback).
++            logging("[empty max_tokens] giving up on this chat; returning without an empty assistant turn.")
++            return used_msgs[len(msg_history):]  # new turns only (caller prepends msg_history)
+         # Keep any nudge in the history so later tool turns stay consistent with it
+         new_msg_history = used_msgs[len(msg_history):]
+ 

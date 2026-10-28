@@ -1,0 +1,425 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 384a727..57efd74 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,9 @@ import os
+ import re
+ import py_compile
+ import threading
++import shutil
++import tempfile
++import time
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -95,6 +98,31 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _strip_fences(s):
++    """Drop markdown code-fence lines and surrounding blank lines from a sample block."""
++    lines = [ln.rstrip() for ln in s.split('\n') if not ln.strip().startswith('```')]
++    while lines and not lines[0].strip():
++        lines.pop(0)
++    while lines and not lines[-1].strip():
++        lines.pop()
++    return '\n'.join(lines)
++
++MAX_ATTEMPTS = 4
++
++STRATEGY_HINTS = [
++    "Strategy: first write the simplest provably correct brute force in brute.py, then derive a formula or fast algorithm from brute-force data.",
++    "Strategy: reason about the structure of the problem analytically before coding; verify the key claim against brute.py on small inputs.",
++    "Strategy: write the simplest provably correct algorithm first (even if slow), make it pass the samples, then optimize.",
++    "Strategy: the previous approaches failed. Re-read the statement carefully, check the failing sample tokens by hand, and pick a different approach.",
++]
++
++ADVERSARIAL_PROMPT = """Final adversarial review. All samples pass now. Your job is to try to break solution.py:
++1. Write an independent brute force in brute.py directly from the problem statement (plain simulation or full enumeration; do not reuse the fast idea).
++2. Stress-test solution.py against brute.py with the `stress_test` tool (generator with degenerate cases: minimum sizes, equal values, extremes; plus exhaustive enumeration of tiny inputs when feasible).
++3. Time solution.py on a maximum-size input; it must finish well under 2 seconds.
++4. Fix any mismatch or slowness you find in solution.py. Keep all samples passing (they are in samples/*.in and samples/*.out under the repo directory).
++"""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -113,6 +141,10 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.samples_dir = os.path.join(git_tempdir, 'samples')
++        self.sample_names = []
++        self.lessons = []
++        self.last_report = None
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -172,6 +204,113 @@ class AgenticSystem:
+         safe_log("_solution_edited: valid solution.py edit detected")
+         return True
+ 
++    def _extract_samples(self):
++        """
++        Parse 'Sample Input k' / 'Sample Output k' blocks from the problem statement (with a
++        fallback to 'Input'/'Output' code-fenced pairs) and write them to
++        {git_tempdir}/samples/k.in and k.out. Returns the list of sample names written.
++        Returns [] (and logs) when nothing is found, in which case verification is skipped.
++        """
++        text = self.problem_statement or ""
++        pattern = re.compile(
++            r"Sample\s+Input\s*(\d+)\s*:?[ \t]*\n(.*?)Sample\s+Output\s*\1\s*:?[ \t]*\n"
++            r"(?:```[^\n]*\n)?(.*?)(?=\n[ \t]*\n|```|Sample\s+Input|Explanation|\Z)",
++            re.IGNORECASE | re.DOTALL,
++        )
++        samples = {}
++        for m in pattern.finditer(text):
++            samples[int(m.group(1))] = (_strip_fences(m.group(2)), _strip_fences(m.group(3)))
++
++        if not samples:
++            fence = re.compile(
++                r"Input\s*:?[ \t]*\n```[^\n]*\n(.*?)```.*?Output\s*:?[ \t]*\n```[^\n]*\n(.*?)```",
++                re.IGNORECASE | re.DOTALL,
++            )
++            for idx, m in enumerate(fence.finditer(text), start=1):
++                samples[idx] = (_strip_fences(m.group(1)), _strip_fences(m.group(2)))
++
++        self.sample_names = []
++        if not samples:
++            safe_log("_extract_samples: no samples found in problem statement; skipping sample verification",
++                     level=logging.WARNING)
++            return self.sample_names
++
++        os.makedirs(self.samples_dir, exist_ok=True)
++        for k in sorted(samples):
++            inp, outp = samples[k]
++            with open(os.path.join(self.samples_dir, f"{k}.in"), 'w') as f:
++                f.write(inp + "\n")
++            with open(os.path.join(self.samples_dir, f"{k}.out"), 'w') as f:
++                f.write(outp + "\n")
++            self.sample_names.append(str(k))
++        safe_log(f"_extract_samples: wrote {len(self.sample_names)} sample(s) to {self.samples_dir}")
++        return self.sample_names
++
++    def _run_samples(self, timeout=10):
++        """
++        Deterministic verifier (no LLM involved). For each extracted sample runs
++        `python3 solution.py < k.in` with a timeout and compares whitespace tokens with k.out.
++        Returns (results, report): results is a list of dicts with keys
++        name, ok, seconds, stdout (head), stderr (tail); report is formatted text.
++        """
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
++        results = []
++        for name in self.sample_names:
++            with open(os.path.join(self.samples_dir, f"{name}.in")) as f:
++                inp = f.read()
++            with open(os.path.join(self.samples_dir, f"{name}.out")) as f:
++                expected = f.read()
++            start = time.time()
++            stdout, stderr, ok = "", "", False
++            try:
++                proc = subprocess.run(
++                    ["python3", solution_path], input=inp, capture_output=True, text=True,
++                    timeout=timeout, cwd=self.git_tempdir,
++                )
++                stdout, stderr = proc.stdout or "", proc.stderr or ""
++                ok = proc.returncode == 0 and stdout.split() == expected.split()
++            except subprocess.TimeoutExpired as e:
++                stdout = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
++                stderr = f"TIMEOUT after {timeout}s"
++            except Exception as e:
++                stderr = f"runner error: {e}"
++            secs = round(time.time() - start, 3)
++            results.append({
++                "name": name, "ok": ok, "seconds": secs,
++                "stdout": stdout[:500], "stderr": stderr[-1000:],
++            })
++
++        lines = []
++        for r in results:
++            lines.append(f"[{'PASS' if r['ok'] else 'FAIL'}] sample {r['name']} ({r['seconds']}s)")
++            if not r['ok']:
++                lines.append(f"  expected tokens: {open(os.path.join(self.samples_dir, r['name'] + '.out')).read().split()[:40]}")
++                lines.append(f"  stdout head: {r['stdout'][:300]!r}")
++                lines.append(f"  stderr tail: {r['stderr'][-300:]!r}")
++        passed = sum(1 for r in results if r['ok'])
++        lines.append(f"{passed}/{len(results)} samples passed")
++        return results, "\n".join(lines)
++
++    def _restore_snapshot(self, path):
++        shutil.copyfile(path, os.path.join(self.git_tempdir, 'solution.py'))
++
++    def _cleanup_artifacts(self):
++        """Remove __pycache__, .pyc files and the extracted samples dir so the patch stays clean."""
++        for root, dirs, files in os.walk(self.git_tempdir):
++            if '.git' in dirs:
++                dirs.remove('.git')
++            for d in list(dirs):
++                if d == '__pycache__' or d == '.pytest_cache':
++                    shutil.rmtree(os.path.join(root, d), ignore_errors=True)
++                    dirs.remove(d)
++            for fn in files:
++                if fn.endswith('.pyc'):
++                    try:
++                        os.remove(os.path.join(root, fn))
++                    except OSError:
++                        pass
++        shutil.rmtree(self.samples_dir, ignore_errors=True)
++
+     def _write_fallback_solution(self):
+         """
+         Write a minimal fallback solution.py so the patch is never empty.
+@@ -192,9 +331,34 @@ class AgenticSystem:
+         except Exception as e:
+             safe_log(f"Failed to write fallback solution.py: {e}", level=logging.ERROR)
+ 
++    def _evaluate_candidate(self):
++        """
++        Return (score, report, all_pass) for the current solution.py, or (None, report, False)
++        if solution.py is missing, empty or does not compile.
++        score = (n_passed, -max_runtime) so that higher is better.
++        """
++        path = os.path.join(self.git_tempdir, 'solution.py')
++        try:
++            if not os.path.exists(path) or os.path.getsize(path) <= 0:
++                return None, "solution.py is missing or empty", False
++            py_compile.compile(path, doraise=True)
++        except Exception as e:
++            return None, f"solution.py does not compile: {e}", False
++
++        if not self.sample_names:
++            return (0, 0.0), "no samples extracted; verification skipped", True
++
++        results, report = self._run_samples()
++        passed = sum(1 for r in results if r['ok'])
++        max_rt = max((r['seconds'] for r in results), default=0.0)
++        return (passed, -max_rt), report, passed == len(results)
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Runs a bounded number of attempts. Each attempt gets a fresh message history plus the
++        best solution so far, the last verifier report and accumulated lessons. Candidates are
++        snapshotted and scored by sample verification; the best snapshot is restored at the end.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -206,38 +370,89 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         method = """Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch. You can use the `stress_test` tool, which runs an optional exhaustive enumeration (`enumerate_all()` in the generator file) followed by random cases from `gen(rng, size)`, and reports a shrunk failing input with expected and actual outputs.
+-   - The brute force must be independent of the algorithm under test: write it directly from the problem statement (e.g. plain simulation or full enumeration), not by reusing your fast idea.
+-   - Your generator must NOT discard or skip degenerate inputs (no special/missing values, all special, minimum length, all equal values, max values). Do not add filters such as `if a.count(-1) == 0: continue` that exclude cases your solution handles specially.
+-   - Before finishing, list the edge cases explicitly (e.g. no special elements, all elements special, minimum size, all elements equal, extreme values, sorted and reverse-sorted input) and run each one through both the brute force and the solution.
+-   - Also exhaustively enumerate all inputs of tiny size and value range where feasible (use `enumerate_all()` in the generator).
+-5. Audit every early return and special-case branch in the final code and confirm it is correct for every input that can reach it, not only for the input it was written for. A branch such as "return 0 when all elements are -1" must be checked against inputs where its condition is false but the branch is still reached.
+-6. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-7. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
++2. Keep the brute force in its own file brute.py and the fast solution in solution.py. They must be separate files.
++3. Write solution.py early with the editor tool. Guard the entry point with `if __name__ == '__main__':` (read stdin only inside main()) so that it can be imported by tests.
++4. Run it on every sample in the statement and compare with the expected outputs exactly. Save the samples as files (e.g. sample1.txt) and run `python3 solution.py < sample1.txt`. Double-check your own test inputs (e.g. the T value must match the number of cases). For a `Solution` class method, write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
++5. Checkpoint: as soon as you have a correct but possibly slow solution, make sure it is in solution.py and passes the samples. Never leave solution.py in a state that fails the samples.
++6. Write a brute-force reference in brute.py (directly from the statement, independent of your fast idea) and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with brute.py. You can use the `stress_test` tool, which runs an optional exhaustive enumeration (`enumerate_all()` in the generator file) followed by random cases from `gen(rng, size)`. Fix every mismatch.
++   - Your generator must NOT discard or skip degenerate inputs (minimum length, all equal values, max values, sorted and reverse-sorted input, special values). Do not add filters that exclude cases your solution handles specially.
++   - Exhaustively enumerate all inputs of tiny size and value range where feasible (use `enumerate_all()`).
++7. Audit every early return and special-case branch and confirm it is correct for every input that can reach it.
++8. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
++9. Keep messages short and avoid long reasoning without tool calls; very long outputs get cut off. If you have used more than ~15 tool calls without a solution.py that passes the samples, write the best correct-but-slow version now.
++10. Before finishing, remove scratch files you created besides brute.py, the generator and the sample files if they are not needed, and make sure no __pycache__ directories or .pyc files remain. The final solution.py is what gets graded; helper files are ignored."""
++
+         first_line = ("Your first action must be a tool call that writes a complete draft solution.py; "
+                       "avoid long analysis before writing the file.\n\n")
+-        instruction = f"{first_line}{task}\n\n{method}"
+-        init_msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log("Initial attempt finished")
++        instruction_base = f"{first_line}{task}\n\n{method}"
++
++        self._extract_samples()
++        cand_dir = tempfile.mkdtemp(prefix='cands_')
++        best = None  # dict with keys: score, path, attempt
++        adversarial_done = False
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
+ 
+-        for attempt in range(3):
+-            if self._solution_edited():
++        for attempt in range(MAX_ATTEMPTS):
++            if best is not None and best['all_pass'] and adversarial_done:
++                safe_log("forward: samples pass and adversarial review completed; stopping")
+                 break
+-            safe_log(f"Retry attempt {attempt + 1}: no valid solution.py edit yet", level=logging.WARNING)
+-            retry_instruction = (
+-                f"{task}\n\n"
+-                "IMPORTANT: Previous attempts produced no edit to solution.py. "
+-                f"Immediately use the editor tool `create` command to write {self.git_tempdir}/solution.py "
+-                "with a complete solution. Keep thinking short; write the file first, then run the samples and fix issues."
++            if best is not None and best['all_pass']:
++                mode = "adversarial"
++                adversarial_done = True
++                extra = ADVERSARIAL_PROMPT.format(git_tempdir=self.git_tempdir)
++            else:
++                mode = "strategy"
++                extra = STRATEGY_HINTS[attempt % len(STRATEGY_HINTS)]
++
++            best_src = ""
++            if best is not None and os.path.exists(best['path']):
++                with open(best['path']) as f:
++                    best_src = f.read()
++            last_report = self.last_report or "(no verifier report yet; no attempt has produced a valid solution.py)"
++            lessons_text = "\n".join(f"- {x}" for x in self.lessons) or "(none yet)"
++
++            instr = (
++                f"{instruction_base}\n\n"
++                f"=== Attempt {attempt + 1} of {MAX_ATTEMPTS} ({mode}) ===\n"
++                f"{extra}\n\n"
++                f"Lessons from earlier attempts:\n{lessons_text}\n\n"
++                f"Best solution.py so far (score {best['score'] if best else 'none'}):\n"
++                f"```python\n{best_src or '(none)'}\n```\n\n"
++                f"Last verifier report (from running the extracted samples):\n{last_report}\n"
+             )
+-            chat_with_agent(retry_instruction, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"forward: attempt {attempt + 1}/{MAX_ATTEMPTS} mode={mode}")
++            try:
++                chat_with_agent(instr, model=self.code_model, msg_history=[], logging=safe_log)
++            except Exception as e:
++                safe_log(f"forward: attempt {attempt + 1} raised {e}", level=logging.ERROR)
++                self.lessons.append(f"Attempt {attempt + 1} crashed: {e}")
++                continue
++            safe_log(f"forward: attempt {attempt + 1} finished")
+ 
+-        if not self._solution_edited():
+-            safe_log("All retries failed; writing fallback solution.py", level=logging.WARNING)
++            score, report, all_pass = self._evaluate_candidate()
++            self.last_report = report
++            safe_log(f"forward: attempt {attempt + 1} verifier:\n{report}")
++            if score is None:
++                self.lessons.append(f"Attempt {attempt + 1}: {report}")
++                continue
++            self.lessons.append(f"Attempt {attempt + 1} ({mode}): score={score}; {report.splitlines()[-1]}")
++
++            snap = os.path.join(cand_dir, f"attempt_{attempt + 1}.py")
++            shutil.copyfile(solution_path, snap)
++            if best is None or score > best['score']:
++                best = {'score': score, 'path': snap, 'attempt': attempt + 1, 'all_pass': all_pass}
++
++        if best is not None:
++            safe_log(f"forward: restoring best candidate from attempt {best['attempt']} (score {best['score']})")
++            self._restore_snapshot(best['path'])
++        else:
++            safe_log("forward: no valid candidate produced; writing fallback solution.py", level=logging.WARNING)
+             self._write_fallback_solution()
+-        return init_msg_history
++
++        self._cleanup_artifacts()
++        shutil.rmtree(cand_dir, ignore_errors=True)
++        return None
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..08856ad
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,98 @@
++"""Draft helpers for sample extraction and deterministic sample verification.
++
++These are standalone drafts; they are integrated into coding_agent.py afterwards.
++"""
++import os
++import re
++import subprocess
++import time
++
++
++def _extract_samples(problem_statement, out_dir, log=print):
++    """Parse 'Sample Input k' / 'Sample Output k' blocks and write out_dir/k.in and k.out.
++
++    Returns a list of sample names (ints as strings) that were written. Empty list if none found.
++    """
++    text = problem_statement or ""
++    pattern = re.compile(
++        r"Sample\s+Input\s*(\d+)\s*[:\-]?\s*\n(.*?)\n\s*Sample\s+Output\s*\1\s*[:\-]?\s*\n(.*?)(?=\n\s*Sample\s+Input|\Z)",
++        re.IGNORECASE | re.DOTALL,
++    )
++    samples = {}
++    for m in pattern.finditer(text):
++        k = int(m.group(1))
++        samples[k] = (_strip_fence(m.group(2)), _strip_fence(m.group(3)))
++
++    if not samples:
++        # Generic fallback: 'Input' / 'Output' code-fenced pairs.
++        fence = re.compile(r"Input\s*:?\s*\n```[^\n]*\n(.*?)```.*?Output\s*:?\s*\n```[^\n]*\n(.*?)```",
++                           re.IGNORECASE | re.DOTALL)
++        for idx, m in enumerate(fence.finditer(text), start=1):
++            samples[idx] = (m.group(1), m.group(2))
++
++    if not samples:
++        log("No samples found in problem statement; skipping sample verification.")
++        return []
++
++    os.makedirs(out_dir, exist_ok=True)
++    names = []
++    for k in sorted(samples):
++        inp, outp = samples[k]
++        with open(os.path.join(out_dir, f"{k}.in"), "w") as f:
++            f.write(inp.strip("\n") + "\n")
++        with open(os.path.join(out_dir, f"{k}.out"), "w") as f:
++            f.write(outp.strip("\n") + "\n")
++        names.append(str(k))
++    log(f"Extracted {len(names)} sample(s) to {out_dir}")
++    return names
++
++
++def _strip_fence(s):
++    s = s.strip("\n")
++    s = re.sub(r"^```[^\n]*\n", "", s)
++    s = re.sub(r"\n```\s*$", "", s)
++    return s
++
++
++def _run_samples(solution_path, samples_dir, names, timeout=10):
++    """Run `python3 solution.py < k.in` for each sample and compare tokens with k.out.
++
++    Returns (results, report) where results is a list of dicts with keys
++    name, ok, seconds, stdout, stderr (heads/tails trimmed), and report is formatted text.
++    """
++    results = []
++    for name in names:
++        in_path = os.path.join(samples_dir, f"{name}.in")
++        out_path = os.path.join(samples_dir, f"{name}.out")
++        with open(in_path) as f:
++            inp = f.read()
++        with open(out_path) as f:
++            expected = f.read()
++        start = time.time()
++        try:
++            proc = subprocess.run(
++                ["python3", solution_path], input=inp, capture_output=True, text=True, timeout=timeout
++            )
++            secs = time.time() - start
++            stdout, stderr = proc.stdout, proc.stderr
++            ok = proc.returncode == 0 and stdout.split() == expected.split()
++        except subprocess.TimeoutExpired as e:
++            secs = time.time() - start
++            stdout = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
++            stderr = f"TIMEOUT after {timeout}s"
++            ok = False
++        results.append({
++            "name": name, "ok": ok, "seconds": round(secs, 3),
++            "stdout": stdout[:500], "stderr": stderr[-1000:],
++        })
++
++    lines = []
++    for r in results:
++        status = "PASS" if r["ok"] else "FAIL"
++        lines.append(f"[{status}] sample {r['name']} ({r['seconds']}s)")
++        if not r["ok"]:
++            lines.append(f"  stdout head: {r['stdout'][:300]!r}")
++            lines.append(f"  stderr tail: {r['stderr'][-300:]!r}")
++    passed = sum(1 for r in results if r["ok"])
++    lines.append(f"{passed}/{len(results)} samples passed")
++    return results, "\n".join(lines)

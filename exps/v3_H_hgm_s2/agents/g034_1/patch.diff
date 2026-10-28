@@ -1,0 +1,445 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 787f291..31899dc 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -178,6 +178,9 @@ class AgenticSystem:
+         self.language = language
+         self.attempt_log = []  # hypotheses tried and their refutations, injected into later prompts
+         self._oracle_dir = None
++        self._samples = []
++        self._snapshot_dir = None
++        self._best_snapshot = None  # (solution_path, snapshot_copy_path, sha256)
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -465,7 +468,7 @@ Return ONLY the Python code in a single ```python code block.
+ """
+         cases = []
+         for attempt in range(2):  # bounded retries: LLM output or generator script may be broken
+-            cases = self._run_generator_once(prompt, mode, method)
++            cases = self._filter_valid_cases(self._run_generator_once(prompt, mode, method), mode)
+             if cases:
+                 break
+             safe_log(f"[perf] generator attempt {attempt} produced no usable cases.")
+@@ -539,15 +542,17 @@ Return ONLY the Python code in a single ```python code block.
+         Parses only the status headers that _run_perf itself writes.
+         """
+         rows = []
+-        for m in re.finditer(r"^=== Case (\d+): (.*) \((TIMEOUT|SLOW|CRASH|OK)[^\n]*?time ([\d.]+)s\) ===$",
++        for m in re.finditer(r"^=== Case (\d+): (.*) \((TIMEOUT|SLOW|CRASH|OK|WRONG ANSWER|INVALID INPUT)[^\n]*?time ([\d.]+)s\) ===$",
+                              report or "", re.M):
+             rows.append((m.group(1), m.group(2), m.group(3), m.group(4)))
+         if not rows:
+             return "No perf case results."
+         total = len(rows)
+-        counts = {k: sum(1 for r in rows if r[2] == k) for k in ("TIMEOUT", "SLOW", "CRASH", "OK")}
+-        bad = [r for r in rows if r[2] != "OK"]
+-        lines = [f"{counts['TIMEOUT']} of {total} cases timed out; {counts['SLOW']} SLOW; {counts['CRASH']} CRASH; {counts['OK']} OK."]
++        kinds = ("TIMEOUT", "SLOW", "CRASH", "WRONG ANSWER", "INVALID INPUT", "OK")
++        counts = {k: sum(1 for r in rows if r[2] == k) for k in kinds}
++        bad = [r for r in rows if r[2] not in ("OK", "INVALID INPUT")]
++        lines = [f"{counts['TIMEOUT']} of {total} cases timed out; {counts['SLOW']} SLOW; {counts['CRASH']} CRASH; "
++                 f"{counts['WRONG ANSWER']} WRONG ANSWER; {counts['INVALID INPUT']} INVALID INPUT (ignored); {counts['OK']} OK."]
+         for case_no, name, status, elapsed in bad[:2]:
+             lines.append(f"Example: case {case_no} ({name}) {status}, time {elapsed}s.")
+         return "\n".join(lines)
+@@ -631,6 +636,184 @@ Instructions:
+         shutil.rmtree(cand_dir, ignore_errors=True)
+         return False
+ 
++    # ------------------------------------------------------------------
++    # Input validation, checker, and the correctness gate (snapshot + rollback)
++    # ------------------------------------------------------------------
++
++    def _validate_stdin_input(self, text, oracle_dir=None):
++        """
++        Run the oracle's validate_input.py on one stdin-style input.
++        Returns (ok, reason). When no validator exists, returns (True, "no validator").
++        """
++        oracle_dir = oracle_dir or self._oracle_dir
++        vpath = os.path.join(oracle_dir, "validate_input.py") if oracle_dir else None
++        if not vpath or not os.path.exists(vpath):
++            return True, "no validator"
++        fd, in_path = tempfile.mkstemp(prefix="_val_", suffix=".txt", dir=oracle_dir)
++        try:
++            with os.fdopen(fd, "w") as f:
++                f.write(text)
++            proc = subprocess.run(["python3", vpath, in_path], capture_output=True, text=True,
++                                  timeout=20, cwd=oracle_dir)
++            first = (proc.stdout or "").strip().splitlines()
++            ok = proc.returncode == 0 and bool(first) and first[0].startswith("OK")
++            reason = (proc.stdout or proc.stderr or "").strip()[-500:]
++            return ok, reason
++        except subprocess.TimeoutExpired:
++            return False, "validator timed out"
++        finally:
++            try:
++                os.remove(in_path)
++            except OSError:
++                pass
++
++    def _filter_valid_cases(self, cases, mode):
++        """
++        Drop stress cases that violate the constraints (checked by validate_input.py). Logs each skip.
++        Class-mode cases are not validated (no generic validator for Python-literal arguments).
++        """
++        if mode != "stdin" or not self._oracle_dir:
++            return cases
++        kept = []
++        for name, payload in cases:
++            ok, reason = self._validate_stdin_input(payload)
++            if ok:
++                kept.append((name, payload))
++            else:
++                safe_log(f"[perf] skipped invalid stress case '{name}': {reason}")
++        return kept
++
++    def _check_perf_output(self, payload, actual):
++        """
++        Run the oracle's checker.py (with --fast so exhaustive verification is skipped on large N).
++        Returns None when no checker exists, else (ok, reason).
++        """
++        oracle_dir = self._oracle_dir
++        cpath = os.path.join(oracle_dir, "checker.py") if oracle_dir else None
++        if not cpath or not os.path.exists(cpath):
++            return None
++        fd_in, in_path = tempfile.mkstemp(prefix="_pin_", suffix=".txt", dir=oracle_dir)
++        fd_out, out_path = tempfile.mkstemp(prefix="_pout_", suffix=".txt", dir=oracle_dir)
++        try:
++            with os.fdopen(fd_in, "w") as f:
++                f.write(payload)
++            with os.fdopen(fd_out, "w") as f:
++                f.write(actual)
++            proc = subprocess.run(["python3", cpath, in_path, out_path, "--fast"], capture_output=True,
++                                  text=True, timeout=20, cwd=oracle_dir)
++            first = (proc.stdout or "").strip().splitlines()
++            ok = proc.returncode == 0 and bool(first) and first[0].startswith("OK")
++            return ok, (proc.stdout or proc.stderr or "").strip()[-500:]
++        except subprocess.TimeoutExpired:
++            return False, "checker timed out"
++        finally:
++            for p in (in_path, out_path):
++                try:
++                    os.remove(p)
++                except OSError:
++                    pass
++
++    def _correctness_suite(self, solution_path, oracle_dir, samples):
++        """
++        Full correctness gate: samples (when extracted) and differential tests (300 seeds, checker.py when present).
++        Returns (ok, report). ok is True only if every enabled check passes.
++        """
++        if not samples and not oracle_dir:
++            return True, "no samples or oracle available; nothing verified"
++        parts = []
++        ok = True
++        if samples:
++            srep, sok = self._run_samples(solution_path, samples)
++            parts.append(srep)
++            ok = ok and sok
++        if oracle_dir:
++            drep, nfail = self._run_differential(solution_path, oracle_dir, n_tests=300)
++            parts.append(drep)
++            ok = ok and nfail == 0
++        return ok, "\n\n".join(parts)
++
++    def _take_snapshot(self, solution_path):
++        """
++        Copy solution_path into a snapshot directory under /tmp and remember (orig path, copy, hash).
++        """
++        if not self._snapshot_dir:
++            self._snapshot_dir = tempfile.mkdtemp(prefix="agent_snapshot_", dir="/tmp")
++        dst = os.path.join(self._snapshot_dir, "best_" + os.path.basename(solution_path))
++        shutil.copyfile(solution_path, dst)
++        self._best_snapshot = (solution_path, dst, self._file_hash(dst))
++        safe_log(f"[gate] snapshot updated from {solution_path} (hash {self._best_snapshot[2][:12]}).")
++
++    def _checkpoint(self, solution_path):
++        """
++        Run the correctness suite on solution_path. When it passes, snapshot the file.
++        Returns (ok, report).
++        """
++        if not solution_path or not os.path.exists(solution_path):
++            return False, f"Solution file not found: {solution_path}"
++        ok, report = self._correctness_suite(solution_path, self._oracle_dir, self._samples)
++        if ok:
++            self._take_snapshot(solution_path)
++        return ok, report
++
++    def _restore_snapshot(self, reason):
++        """
++        Roll the solution file back to the last passing snapshot. Returns True when restored.
++        """
++        if not self._best_snapshot:
++            safe_log(f"[gate] rollback requested ({reason}) but no passing snapshot exists.")
++            return False
++        orig, snap, snap_hash = self._best_snapshot
++        if self._file_hash(snap) != snap_hash:
++            safe_log("[gate] snapshot file is corrupted; refusing to roll back.")
++            return False
++        shutil.copyfile(snap, orig)
++        safe_log(f"[gate] ROLLBACK to last passing snapshot for {orig} ({reason}).")
++        return True
++
++    def _gate(self, solution_path, label, task):
++        """
++        Re-validate the solution after an edit. If it fails: one bounded repair chat with the raw failure
++        report, re-check, and roll back to the last passing snapshot if it still fails.
++        Returns True when the file on disk passes the suite.
++        """
++        solution_path = solution_path or self._solution_path()
++        if not solution_path or not os.path.exists(solution_path):
++            return False
++        ok, report = self._checkpoint(solution_path)
++        if ok:
++            safe_log(f"[gate {label}] correctness suite passed.")
++            return True
++        safe_log(f"[gate {label}] correctness suite FAILED; running one bounded repair chat.\n{self._clip(report, 3000)}")
++        if not self._best_snapshot:
++            # No earlier passing version to fall back to; still give the agent one repair attempt.
++            chat_with_agent(f"""{task}
++
++The correctness suite (samples and differential tests) FAILED after the last edit. Raw report:
++
++{self._clip(report, 6000)}
++
++Fix the solution file at {solution_path} with the editor tool so that all samples and differential tests pass.
++Re-run the samples with bash. Do not reply with text only.
++""", model=self.code_model, msg_history=[], logging=safe_log)
++            ok, report = self._checkpoint(solution_path)
++            safe_log(f"[gate {label}] after repair: {'passed' if ok else 'still failing'}.")
++            return ok
++        chat_with_agent(f"""{task}
++
++The correctness suite (samples and differential tests) FAILED after the last edit. Raw report:
++
++{self._clip(report, 6000)}
++
++Fix the solution file at {solution_path} with the editor tool so that all samples and differential tests pass.
++Re-run the samples with bash. Do not reply with text only.
++""", model=self.code_model, msg_history=[], logging=safe_log)
++        ok, report = self._checkpoint(solution_path)
++        if ok:
++            safe_log(f"[gate {label}] repaired solution passes the suite.")
++            return True
++        self._restore_snapshot(f"{label}: still failing after one repair chat")
++        return False
++
+     def _run_perf(self, solution_path, cases, mode=None, method=None, timeout=3.0, slow_threshold=1.5):
+         """
+         Run the solution on each (name, payload) case with a strict timeout.
+@@ -646,13 +829,23 @@ Instructions:
+                 status = f"TIMEOUT (exceeded {timeout:g}s)"
+                 needs_repair = True
+             elif res["returncode"] != 0:
+-                status = f"CRASH (exit code {res['returncode']})"
+-                needs_repair = True
++                valid, vreason = (self._validate_stdin_input(payload) if mode == "stdin" else (True, ""))
++                if not valid:
++                    # The generated input violates the constraints; this is not a solution failure.
++                    status = f"INVALID INPUT (skipped, not a solution failure: {vreason[:200]})"
++                    safe_log(f"[perf] case '{name}' skipped: invalid input.")
++                else:
++                    status = f"CRASH (exit code {res['returncode']})"
++                    needs_repair = True
+             elif res["elapsed"] > slow_threshold:
+                 status = f"SLOW (exceeded {slow_threshold:g}s)"
+                 needs_repair = True
+             else:
+                 status = "OK"
++                checked = self._check_perf_output(payload, res["stdout"]) if mode == "stdin" else None
++                if checked is not None and not checked[0]:
++                    status = f"WRONG ANSWER (checker: {checked[1][:300]})"
++                    needs_repair = True
+             out = res["stdout"]
+             if len(out) > 300:
+                 out = out[:300] + f"... [truncated, {len(res['stdout'])} chars total]"
+@@ -755,12 +948,25 @@ Use `python3` to test each file with bash after writing it.
+   formula, a known trick, or a shortcut: a formula can be wrong even when it matches tiny cases. Correctness is the only goal here; speed is not.
+   If the problem has a unique answer per input, ref.py output must match exactly.
+ - gen_small.py: takes one integer SEED as argv[1] and prints ONE small but VALID input to stdout (respecting every constraint of the statement).
+-  Use random.Random(SEED) for determinism. Seeds 0..9 should cover corner cases (minimum sizes, equal values, boundary values); larger seeds give random small inputs.
+-  The largest inputs it produces should be as large as ref.py can still brute-force within about 1 second, so that the reference covers the largest feasible domain,
+-  not only tiny inputs.
++  Use random.Random(SEED) for determinism. It MUST cover several regimes, selected by SEED % 5:
++    * SEED % 5 == 0: tiny inputs (minimum sizes, N=1, all equal values, boundary values).
++    * SEED % 5 == 1: dense small value range with MANY duplicates (values drawn from a range of about 3..10 distinct values).
++    * SEED % 5 == 2: value range comparable to N (e.g. values in 1..N or 1..2N, so collisions are frequent but not total).
++    * SEED % 5 == 3: boundary/extreme values (values at the minimum and maximum allowed, e.g. A_i = X, A_i = 1, mixed with ordinary ones).
++    * SEED % 5 == 4: structured adversarial shapes (sorted, reverse-sorted, periodic, palindromic, one outlier, all-distinct, etc.).
++  Sizes should go up to a few hundred (N up to ~300) in the larger seeds, where ref.py remains feasible, so that the reference covers mid-size inputs
++  and not only tiny ones. Keep every generated input inside the constraints (validate it mentally before printing).
++- ref.py must be OBVIOUSLY correct, not fast. An O(N^2) reference (e.g. a hash map or pairwise scan) is allowed for mid-size inputs, but it must be validated
++  against a pure O(N^3) brute force (or full enumeration) on tiny inputs (N <= 6) before you rely on it. Do not use any clever formula in ref.py.
++- validate_input.py INPUT_FILE: reads the input file given as argv[1] and prints exactly one line, OK if the input satisfies EVERY constraint of the statement
++  (value ranges, sizes, relations between values, guaranteed properties, exact token count, valid format) or FAIL: <reason> otherwise. Exit code 0 on OK, 1 on FAIL.
++  Check every constraint in the statement; the generator must only produce inputs this validator accepts.
++- checker.py (when present) takes INPUT_FILE ACTUAL_FILE and optionally the flag --fast as argv[3]. With --fast, skip any exhaustive verification whose cost
++  grows steeply with N (for example an O(N^3) search); only do exhaustive checks when N is small. Always print OK or FAIL: <reason> as the first line.
+ {judge_clause}
+ - checker.py (ONLY if the problem allows multiple valid answers): takes INPUT_FILE and ACTUAL_FILE as argv[1] and argv[2] and prints a line starting with OK
+   if the actual output is valid for the input, otherwise FAIL: <reason>. Do not write checker.py for problems with a unique answer.
++- validate_input.py: required, see the gen_small.py contract above.
+ - gen_large.py (optional): takes SEED as argv[1] and prints one input at the maximum allowed size for timing.
+ 
+ Verification you must do before finishing:
+@@ -772,7 +978,7 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+ """
+         chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        required = ["ref.py", "gen_small.py"] + (["judge.py"] if interactive else [])
++        required = ["ref.py", "gen_small.py", "validate_input.py"] + (["judge.py"] if interactive else [])
+         missing = [f for f in required if not os.path.exists(os.path.join(oracle_dir, f))]
+         if missing:
+             safe_log(f"[oracle] missing files {missing} in {oracle_dir}; differential testing disabled.")
+@@ -791,7 +997,7 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+         safe_log(f"[oracle] built oracle in {oracle_dir} (interactive={interactive}).")
+         return oracle_dir
+ 
+-    def _run_differential(self, solution_path, oracle_dir, n_tests=200, timeout=5, max_failures=3):
++    def _run_differential(self, solution_path, oracle_dir, n_tests=300, timeout=5, max_failures=3):
+         """
+         Run the solution against the oracle over seeds 0..n_tests-1.
+         - stdin/class problems: expected = ref.py(input), compared by tokens (or checker.py if present).
+@@ -829,6 +1035,14 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+             if gto or rc != 0 or not inp.strip():
+                 n_skipped += 1  # generator problem; not a solution failure
+                 continue
++            if mode == "stdin":
++                vpath = os.path.join(oracle_dir, "validate_input.py")
++                if os.path.exists(vpath):
++                    vok, vreason = self._validate_stdin_input(inp, oracle_dir=oracle_dir)
++                    if not vok:
++                        n_skipped += 1
++                        safe_log(f"[differential] seed {seed}: generator output invalid, skipped: {vreason[:200]}")
++                        continue
+             if has_judge:
+                 jrc, jout, jerr, jto = _py("judge.py", [solution_path], stdin_text=inp, tmo=timeout * 3)
+                 verdict_lines = [ln for ln in (jout or "").splitlines() if ln.strip()]
+@@ -1182,6 +1396,7 @@ STRICT INSTRUCTION: your first tool call MUST be the editor writing the solution
+ 
+         # Independent oracle + differential testing (runs even when no samples were extracted).
+         oracle_dir = self._run_oracle_phase(task, max_rounds=3)
++        self._oracle_dir = oracle_dir
+         safe_log(f"[oracle] differential phase finished; oracle dir: {oracle_dir}")
+         if self.attempt_log:
+             # Later prompts (sample and perf repair) also carry the attempt memory.
+@@ -1189,7 +1404,13 @@ STRICT INSTRUCTION: your first tool call MUST be the editor writing the solution
+ 
+         # Verification and repair phase: run the samples and have the agent fix failures.
+         samples = self._extract_samples()
++        self._samples = samples
+         safe_log(f"[verify] extracted {len(samples)} sample(s).")
++        # First checkpoint: the baseline after the initial chat and oracle repair loop.
++        first_path = self._solution_path()
++        if first_path:
++            ok0, rep0 = self._checkpoint(first_path)
++            safe_log(f"[gate initial] suite {'passed' if ok0 else 'FAILED'}; snapshot {'taken' if ok0 else 'not taken'}.\n{self._clip(rep0, 1500)}")
+         for round_idx in range(3 if samples else 0):
+             solution_path = self._solution_path()
+             report, all_passed = self._run_samples(solution_path, samples)
+@@ -1221,6 +1442,8 @@ Instructions:
+             safe_log(f"[verify round {round_idx}] repair chat finished; solution changed: {changed}.")
+             if not changed:
+                 safe_log(f"[verify round {round_idx}] no-op repair round (file unchanged).")
++            else:
++                self._gate(solution_path, f"verify round {round_idx}", task)
+ 
+         # Performance phase: generate adversarial max-size inputs, time the solution, and repair if slow.
+         solution_path = self._solution_path()
+@@ -1293,6 +1516,7 @@ Instructions:
+                 chat_with_agent(perf_msg, model=self.code_model, msg_history=[], logging=safe_log)
+                 if self._file_hash(solution_path) != before:
+                     safe_log(f"[perf round {round_idx}] repair chat changed the solution file.")
++                    self._gate(solution_path, f"perf round {round_idx}", task)
+                 else:
+                     safe_log(f"[perf round {round_idx}] no-op repair round (file unchanged); calling regeneration fallback.")
+                     mode_now, method_now = self._detect_mode(solution_path)
+@@ -1302,6 +1526,7 @@ Instructions:
+                     )
+                     if self._regenerate_solution(task, solution_path, regen_summary, samples,
+                                                  oracle_dir, mode_now, method_now):
++                        self._gate(solution_path, f"regenerate round {round_idx}", task)
+                         safe_log(f"[perf round {round_idx}] regenerated solution accepted; re-running perf.")
+                         report, needs_repair = self._run_perf(solution_path, cases, mode=mode_now, method=method_now)
+                         safe_log(f"[perf round {round_idx}] re-run after regeneration:\n{report}")
+@@ -1312,6 +1537,18 @@ Instructions:
+                         safe_log(f"[perf round {round_idx}] regeneration rejected; solution unchanged.")
+                 safe_log(f"[perf round {round_idx}] repair chat finished.")
+ 
++        # Final gate: re-run the suite on the file that will be graded; roll back if it regressed.
++        final_path = self._solution_path()
++        if final_path and os.path.exists(final_path):
++            ok_f, rep_f = self._checkpoint(final_path)
++            safe_log(f"[gate final] suite {'passed' if ok_f else 'FAILED'}.\n{self._clip(rep_f, 1500)}")
++            if not ok_f:
++                if self._best_snapshot and self._restore_snapshot("final suite failed"):
++                    ok_r, _ = self._correctness_suite(final_path, self._oracle_dir, self._samples)
++                    safe_log(f"[gate final] restored snapshot; re-check {'passed' if ok_r else 'FAILED'}.")
++                else:
++                    safe_log("[gate final] no passing snapshot to restore; leaving the current file.")
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/validate_input.py b/validate_input.py
+new file mode 100644
+index 0000000..0131c42
+--- /dev/null
++++ b/validate_input.py
+@@ -0,0 +1,55 @@
++import sys
++
++
++def main():
++    # Constraints: 1 <= N <= 2*10^5, 1 <= X <= 2*10^5, 1 <= A_i <= X
++    # Input: line 1 = "N X", line 2 = N integers A_1..A_N
++    MAXN = 200000
++    MAXX = 200000
++
++    data = sys.stdin.buffer.read().split()
++    if len(data) < 2:
++        print("FAIL expected at least N and X")
++        return 1
++
++    try:
++        n = int(data[0])
++        x = int(data[1])
++    except ValueError:
++        print("FAIL non-integer token present")
++        return 1
++
++    if not (1 <= n <= MAXN):
++        print("FAIL N=%d out of range [1, %d]" % (n, MAXN))
++        return 1
++    if not (1 <= x <= MAXX):
++        print("FAIL X=%d out of range [1, %d]" % (x, MAXX))
++        return 1
++
++    if len(data) != 2 + n:
++        print("FAIL expected exactly %d array values, got %d" % (n, len(data) - 2))
++        return 1
++
++    try:
++        arr = list(map(int, data[2:]))
++    except ValueError:
++        print("FAIL non-integer token present")
++        return 1
++
++    if min(arr) < 1 or max(arr) > x:
++        # Rare path: locate the first offending index for a precise message.
++        for i, a in enumerate(arr):
++            if not (1 <= a <= x):
++                print("FAIL A_%d=%d violates 1 <= A_i <= X=%d" % (i + 1, a, x))
++                return 1
++
++    print("OK")
++    return 0
++
++
++if __name__ == "__main__":
++    try:
++        sys.exit(main())
++    except Exception as e:
++        print("FAIL unexpected error: %s" % e)
++        sys.exit(1)

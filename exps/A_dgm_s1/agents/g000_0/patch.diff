@@ -1,0 +1,207 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 39bfae0..87e129e 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -111,6 +111,7 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.max_fix_iterations = 2
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -149,9 +150,40 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++        instruction = f"""{task}
++
++Please analyze the problem description carefully, then follow these steps in order. Passing the provided samples alone is NOT sufficient evidence of correctness, so do not skip the verification phase.
++
++(a) Restate the constraints (N, value ranges, time/memory limits, output format, precision requirements). Derive the algorithm and estimate its time and memory complexity. Check that it fits the constraints.
++
++(b) Implement the solution in the repository (the solution file for this task). If the problem asks for a `Solution` class method, implement that method; otherwise make the program read standard input and write standard output.
++
++(c) Run all provided sample inputs and compare the outputs with the expected outputs (diff them).
++
++(d) Write a brute-force reference (`brute.py`) that is obviously correct but slow, and a small-input random generator (`gen.py`) that takes an integer seed as `sys.argv[1]`, seeds `random` with it, and prints one small valid input (keep sizes small enough for the brute force, e.g. N <= 8 and small values, and include degenerate cases such as equal values, zeros, and duplicates). Create these files in a scratch directory OUTSIDE the repository, e.g. `/tmp/scratch/`, so they do not pollute the patch. Then run the `stress_test` tool with solution_path pointing to your solution, brute_path to brute.py, generator_path to gen.py, and num_tests of at least 300. Use float_tolerance 0 for integer/exact outputs and a small tolerance (e.g. 1e-6) for floating-point outputs.
++
++(e) Test edge cases explicitly: minimum N (N=1 or the smallest allowed), maximum N, equal values, extreme values (largest/smallest allowed), and degenerate inputs. Generate a max-size input in the scratch directory and time your solution on it (use `time`) to confirm it runs well within the time limit.
++
++(f) For floating-point output, print with at least 15 significant digits (e.g. `print(f"{{x:.15g}}")` or enough decimal places as the problem requires), and consider summation order and numerical stability (e.g. avoid subtracting nearly equal large values, prefer computing probabilities directly over large intermediate products).
++
++(g) If any sample, stress test, edge case, or timing check fails, analyze the failing input, find the root cause (logic bug vs. edge case vs. precision issue vs. too slow), fix the solution, and rerun the stress test and the affected checks. Make sure the brute force itself is correct before blaming the solution.
++
++(h) Only finish when all samples pass, the stress test reports no mismatches, and edge cases and timing are fine. Then delete all scratch files (everything you created outside the final solution, including /tmp/scratch) so that only the final solution remains in the repository. Finally, report how many stress-test cases passed.
++"""
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
++        # Bounded verification/fix loop: feed back stress-test results and ask for fixes.
++        msg_history = init_edit
++        for _ in range(self.max_fix_iterations):
++            followup = (
++                "Please re-verify your solution: rerun the samples and the stress_test tool "
++                "(brute.py / gen.py in your scratch directory outside the repository, at least 300 cases). "
++                "If there is any mismatch, crash, timeout, or sample failure, debug it with the minimal failing input, "
++                "fix the solution, and rerun. When everything passes, delete the scratch files outside the repository "
++                "and reply with the number of stress-test cases that passed."
++            )
++            msg_history = chat_with_agent(followup, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..98e47a2
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,147 @@
++import os
++import re
++import subprocess
++import sys
++import time
++
++_INT_RE = re.compile(r'^[+-]?\d+$')
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Differential stress test between a solution and a brute-force reference.\n
++* Runs the generator once per seed i in range(num_tests) as `generator_path i` (seed is passed as argv[1]); the generator must print a test input to stdout.\n
++* Feeds that input via stdin to both `solution_path` and `brute_path` and compares their stdout token by token.\n
++* Numeric tokens are compared with absolute/relative tolerance `float_tolerance` (when > 0); all other tokens must match exactly.\n
++* Stops at the first mismatch, crash, or timeout and returns the failing input, both outputs, and stderr.\n
++* Otherwise returns 'All N tests passed' together with the maximum observed runtime.\n
++* Python files (.py) are run with the current Python interpreter; other files are executed directly, so they must be executable.\n
++* Keep generated inputs small so the brute force finishes quickly. Put scratch files outside the repository (e.g. /tmp).""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution program to test."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference program."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to the random input generator. It is called as `generator_path <seed>` and prints one test input to stdout."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of random tests to run (seeds 0..num_tests-1). Default 200."
++                },
++                "float_tolerance": {
++                    "type": "number",
++                    "description": "Absolute/relative tolerance for numeric tokens. Use 0 for exact comparison. Default 1e-6."
++                },
++                "timeout_seconds": {
++                    "type": "number",
++                    "description": "Timeout in seconds for each program run. Default 10."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++def _command(path, args):
++    if path.endswith('.py'):
++        return [sys.executable, path] + args
++    return [path] + args
++
++
++def _tokens_match(a, b, float_tolerance):
++    if a == b:
++        return True
++    if float_tolerance and float_tolerance > 0 and not (_INT_RE.match(a) and _INT_RE.match(b)):
++        try:
++            x = float(a)
++            y = float(b)
++        except ValueError:
++            return False
++        if x != x or y != y:  # NaN
++            return False
++        if x == y:
++            return True
++        return abs(x - y) <= max(float_tolerance, float_tolerance * abs(y))
++    return False
++
++
++def _outputs_match(out_a, out_b, float_tolerance):
++    ta = out_a.split()
++    tb = out_b.split()
++    if len(ta) != len(tb):
++        return False
++    return all(_tokens_match(x, y, float_tolerance) for x, y in zip(ta, tb))
++
++
++def _run(cmd, stdin_text, timeout):
++    """Returns (returncode, stdout, stderr, elapsed) or (None, '', message, elapsed) on timeout."""
++    start = time.time()
++    try:
++        proc = subprocess.run(
++            cmd,
++            input=stdin_text,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++        return proc.returncode, proc.stdout, proc.stderr, time.time() - start
++    except subprocess.TimeoutExpired as e:
++        stderr = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or '')
++        return None, '', stderr + f"\nTIMEOUT after {timeout} seconds", time.time() - start
++
++
++def tool_function(solution_path, brute_path, generator_path, num_tests=200, float_tolerance=1e-6, timeout_seconds=10):
++    num_tests = int(num_tests)
++    float_tolerance = float(float_tolerance)
++    timeout_seconds = float(timeout_seconds)
++
++    for path in (solution_path, brute_path, generator_path):
++        if not os.path.exists(path):
++            return f"Error: file not found: {path}"
++
++    max_runtime = 0.0
++    for i in range(num_tests):
++        # Generate input
++        gen_code, gen_out, gen_err, _ = _run(_command(generator_path, [str(i)]), '', timeout_seconds)
++        if gen_code != 0:
++            return (f"Generator failed on seed {i} (return code {gen_code}).\n"
++                    f"stderr:\n{gen_err}")
++        test_input = gen_out
++
++        # Run solution
++        sol_code, sol_out, sol_err, sol_time = _run(_command(solution_path, []), test_input, timeout_seconds)
++        max_runtime = max(max_runtime, sol_time)
++        if sol_code is None or sol_code != 0:
++            reason = "TIMEOUT" if sol_code is None else f"crashed with return code {sol_code}"
++            return (f"Test {i} FAILED: solution {reason}.\n"
++                    f"Input:\n{test_input}\n"
++                    f"Solution output:\n{sol_out}\n"
++                    f"Solution stderr:\n{sol_err}")
++
++        # Run brute force
++        br_code, br_out, br_err, _ = _run(_command(brute_path, []), test_input, timeout_seconds)
++        if br_code is None or br_code != 0:
++            reason = "TIMEOUT" if br_code is None else f"crashed with return code {br_code}"
++            return (f"Test {i} could not be checked: brute force {reason}. "
++                    f"Reduce input size in the generator or fix the brute force.\n"
++                    f"Input:\n{test_input}\n"
++                    f"Brute output:\n{br_out}\n"
++                    f"Brute stderr:\n{br_err}")
++
++        if not _outputs_match(sol_out, br_out, float_tolerance):
++            return (f"Test {i} FAILED: output mismatch.\n"
++                    f"Input:\n{test_input}\n"
++                    f"Solution output:\n{sol_out}\n"
++                    f"Brute output:\n{br_out}\n"
++                    f"Solution stderr:\n{sol_err}")
++
++    return f"All {num_tests} tests passed. Max solution runtime: {max_runtime:.3f} seconds."

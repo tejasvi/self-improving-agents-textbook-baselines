@@ -1,0 +1,338 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 31899dc..0152693 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -542,17 +542,18 @@ Return ONLY the Python code in a single ```python code block.
+         Parses only the status headers that _run_perf itself writes.
+         """
+         rows = []
+-        for m in re.finditer(r"^=== Case (\d+): (.*) \((TIMEOUT|SLOW|CRASH|OK|WRONG ANSWER|INVALID INPUT)[^\n]*?time ([\d.]+)s\) ===$",
++        for m in re.finditer(r"^=== Case (\d+): (.*) \((TIMEOUT|SLOW|CRASH|OK|WRONG ANSWER|INVALID INPUT|UNKNOWN)[^\n]*?time ([\d.]+)s\) ===$",
+                              report or "", re.M):
+             rows.append((m.group(1), m.group(2), m.group(3), m.group(4)))
+         if not rows:
+             return "No perf case results."
+         total = len(rows)
+-        kinds = ("TIMEOUT", "SLOW", "CRASH", "WRONG ANSWER", "INVALID INPUT", "OK")
++        kinds = ("TIMEOUT", "SLOW", "CRASH", "WRONG ANSWER", "INVALID INPUT", "UNKNOWN", "OK")
+         counts = {k: sum(1 for r in rows if r[2] == k) for k in kinds}
+-        bad = [r for r in rows if r[2] not in ("OK", "INVALID INPUT")]
++        bad = [r for r in rows if r[2] not in ("OK", "INVALID INPUT", "UNKNOWN")]
+         lines = [f"{counts['TIMEOUT']} of {total} cases timed out; {counts['SLOW']} SLOW; {counts['CRASH']} CRASH; "
+-                 f"{counts['WRONG ANSWER']} WRONG ANSWER; {counts['INVALID INPUT']} INVALID INPUT (ignored); {counts['OK']} OK."]
++                 f"{counts['WRONG ANSWER']} WRONG ANSWER; {counts['UNKNOWN']} UNKNOWN (checker could not decide, not counted as failures); "
++                 f"{counts['INVALID INPUT']} INVALID INPUT (ignored); {counts['OK']} OK."]
+         for case_no, name, status, elapsed in bad[:2]:
+             lines.append(f"Example: case {case_no} ({name}) {status}, time {elapsed}s.")
+         return "\n".join(lines)
+@@ -686,7 +687,9 @@ Instructions:
+     def _check_perf_output(self, payload, actual):
+         """
+         Run the oracle's checker.py (with --fast so exhaustive verification is skipped on large N).
+-        Returns None when no checker exists, else (ok, reason).
++        Returns None when no checker exists, else a tri-state (status, reason) with status in
++        ("ok", "fail", "unknown"). A checker timeout or crash is "unknown" (the checker is not trusted
++        there), never "fail", so it cannot be blamed on the solution.
+         """
+         oracle_dir = self._oracle_dir
+         cpath = os.path.join(oracle_dir, "checker.py") if oracle_dir else None
+@@ -702,10 +705,14 @@ Instructions:
+             proc = subprocess.run(["python3", cpath, in_path, out_path, "--fast"], capture_output=True,
+                                   text=True, timeout=20, cwd=oracle_dir)
+             first = (proc.stdout or "").strip().splitlines()
+-            ok = proc.returncode == 0 and bool(first) and first[0].startswith("OK")
+-            return ok, (proc.stdout or proc.stderr or "").strip()[-500:]
++            if proc.returncode != 0 and not (first and first[0].startswith("FAIL")):
++                # The checker itself crashed: no verdict about the solution.
++                return "unknown", f"checker crashed (exit {proc.returncode}): " + (proc.stderr or "").strip()[-300:]
++            if first and first[0].startswith("OK") and proc.returncode == 0:
++                return "ok", (proc.stdout or "").strip()[-500:]
++            return "fail", (proc.stdout or proc.stderr or "").strip()[-500:]
+         except subprocess.TimeoutExpired:
+-            return False, "checker timed out"
++            return "unknown", "checker timed out"
+         finally:
+             for p in (in_path, out_path):
+                 try:
+@@ -713,7 +720,7 @@ Instructions:
+                 except OSError:
+                     pass
+ 
+-    def _correctness_suite(self, solution_path, oracle_dir, samples):
++    def _correctness_suite(self, solution_path, oracle_dir, samples, n_tests=500, cross_check=True):
+         """
+         Full correctness gate: samples (when extracted) and differential tests (300 seeds, checker.py when present).
+         Returns (ok, report). ok is True only if every enabled check passes.
+@@ -727,11 +734,132 @@ Instructions:
+             parts.append(srep)
+             ok = ok and sok
+         if oracle_dir:
+-            drep, nfail = self._run_differential(solution_path, oracle_dir, n_tests=300)
++            drep, nfail = self._run_differential(solution_path, oracle_dir, n_tests=n_tests)
+             parts.append(drep)
+             ok = ok and nfail == 0
++            if cross_check:
++                xok, xrep = self._cross_check_solution(solution_path, oracle_dir)
++                parts.append(xrep)
++                ok = ok and xok
+         return ok, "\n\n".join(parts)
+ 
++    def _cross_check_solution(self, solution_path, oracle_dir, n_seeds=60, timeout=5):
++        """
++        Final cross-check against a tool-less, independently generated solution (simple_chat, no tools,
++        so it cannot see or copy the agent's file). Both programs run on gen_small.py seeds; outputs are
++        compared by tokens, or by checker.py when the answers may be non-unique. Any disagreement is
++        passed with the raw failing inputs to a repair chat. Returns (ok, report).
++        Skipped (ok=True) for interactive problems or when the independent solution cannot be produced.
++        """
++        if not oracle_dir or not os.path.exists(os.path.join(oracle_dir, "gen_small.py")):
++            return True, "CROSS-CHECK: skipped (no generator)."
++        if os.path.exists(os.path.join(oracle_dir, "judge.py")):
++            return True, "CROSS-CHECK: skipped (interactive problem)."
++        mode, method = self._detect_mode(solution_path)
++        cross_prompt = f"""Solve the competitive programming problem below in Python 3 with a DIFFERENT algorithm from the obvious one
++(prefer an efficient approach that is still exact). Read from standard input and write to standard output, unless the statement
++explicitly asks for a function of a class, in which case write only the class.
++Return ONLY one python code block with the complete program, no explanation.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++"""
++        try:
++            text = simple_chat(cross_prompt, model=self.code_model, logging=safe_log)
++        except Exception as e:
++            return True, f"CROSS-CHECK: skipped (independent solution unavailable: {e})."
++        code = self._extract_code(text or "")
++        if not code.strip():
++            return True, "CROSS-CHECK: skipped (no independent solution produced)."
++        fd, cross_path = tempfile.mkstemp(prefix="_cross_", suffix=".py", dir=oracle_dir)
++        with os.fdopen(fd, "w") as f:
++            f.write(code + "\n")
++        has_checker = os.path.exists(os.path.join(oracle_dir, "checker.py"))
++        disagreements = []
++        compared = 0
++        try:
++            for seed in range(n_seeds):
++                g = subprocess.run(["python3", os.path.join(oracle_dir, "gen_small.py"), str(seed)],
++                                   capture_output=True, text=True, timeout=20, cwd=oracle_dir)
++                inp = g.stdout
++                if g.returncode != 0 or not inp.strip():
++                    continue
++                if mode == "stdin" and not self._validate_stdin_input(inp, oracle_dir=oracle_dir)[0]:
++                    continue
++                a = self._run_candidate(solution_path, mode, method, inp, timeout=timeout, tag=f"xa{seed}")
++                b = self._run_candidate(cross_path, mode, method, inp, timeout=timeout, tag=f"xb{seed}")
++                if a["timed_out"] or b["timed_out"] or a["returncode"] != 0 or b["returncode"] != 0:
++                    continue  # crashes/timeouts are covered by the other checks, not decided here
++                compared += 1
++                if has_checker and mode == "stdin":
++                    ok_a = self._check_perf_output_at(oracle_dir, inp, a["stdout"])
++                    ok_b = self._check_perf_output_at(oracle_dir, inp, b["stdout"])
++                    if ok_a[0] == "unknown" or ok_b[0] == "unknown":
++                        continue
++                    agree = ok_a[0] == ok_b[0] == "ok"
++                else:
++                    agree = (a["stdout"].split() == b["stdout"].split()) if mode == "stdin" \
++                        else self._outputs_match(a["stdout"], b["stdout"])
++                if not agree:
++                    disagreements.append(
++                        f"=== Disagreement (seed {seed}) ===\n--- input ---\n{self._clip(inp)}\n"
++                        f"--- solution output ---\n{self._clip(a['stdout'])}\n"
++                        f"--- independent output ---\n{self._clip(b['stdout'])}\n")
++                    if len(disagreements) >= 2:
++                        break
++        except subprocess.TimeoutExpired:
++            pass
++        finally:
++            try:
++                os.remove(cross_path)
++            except OSError:
++                pass
++        if not disagreements:
++            return True, f"CROSS-CHECK: no disagreement ({compared} seeds compared)."
++        rep_text = f"CROSS-CHECK: FAILURES FOUND ({len(disagreements)} disagreements over {compared} seeds)\n\n" + "\n".join(disagreements)
++        safe_log(f"[cross-check] {rep_text[:1500]}")
++        chat_with_agent(f"""{self.problem_statement}
++
++An independent solution (written without access to your code) disagrees with your solution on the inputs below.
++Raw report (the independent solution may itself be wrong; decide using the problem statement and a brute-force check):
++
++{self._clip(rep_text, 5000)}
++
++Find the discrepancy by hand on the smallest failing input, decide which program is wrong, and fix the solution file {solution_path}
++with the editor tool. Re-run the samples with bash. Do not reply with text only.
++""", model=self.code_model, msg_history=[], logging=safe_log)
++        return False, rep_text
++
++    @staticmethod
++    def _check_perf_output_at(oracle_dir, payload, actual):
++        """
++        checker.py verdict (status, reason) for one input/output pair, with the same tri-state as _check_perf_output.
++        """
++        fd_in, in_path = tempfile.mkstemp(prefix="_cin_", suffix=".txt", dir=oracle_dir)
++        fd_out, out_path = tempfile.mkstemp(prefix="_cout_", suffix=".txt", dir=oracle_dir)
++        try:
++            with os.fdopen(fd_in, "w") as f:
++                f.write(payload)
++            with os.fdopen(fd_out, "w") as f:
++                f.write(actual)
++            proc = subprocess.run(["python3", os.path.join(oracle_dir, "checker.py"), in_path, out_path],
++                                  capture_output=True, text=True, timeout=20, cwd=oracle_dir)
++            first = (proc.stdout or "").strip().splitlines()
++            if first and first[0].startswith("OK") and proc.returncode == 0:
++                return "ok", ""
++            if first and first[0].startswith("FAIL"):
++                return "fail", first[0]
++            return "unknown", f"checker exit {proc.returncode}"
++        except subprocess.TimeoutExpired:
++            return "unknown", "checker timed out"
++        finally:
++            for p in (in_path, out_path):
++                try:
++                    os.remove(p)
++                except OSError:
++                    pass
++
+     def _take_snapshot(self, solution_path):
+         """
+         Copy solution_path into a snapshot directory under /tmp and remember (orig path, copy, hash).
+@@ -843,9 +971,11 @@ Re-run the samples with bash. Do not reply with text only.
+             else:
+                 status = "OK"
+                 checked = self._check_perf_output(payload, res["stdout"]) if mode == "stdin" else None
+-                if checked is not None and not checked[0]:
++                if checked is not None and checked[0] == "fail":
+                     status = f"WRONG ANSWER (checker: {checked[1][:300]})"
+                     needs_repair = True
++                elif checked is not None and checked[0] == "unknown":
++                    status = f"UNKNOWN (checker timed out)" if "timed out" in checked[1] else f"UNKNOWN (checker error: {checked[1][:200]})"
+             out = res["stdout"]
+             if len(out) > 300:
+                 out = out[:300] + f"... [truncated, {len(res['stdout'])} chars total]"
+@@ -947,38 +1077,58 @@ Use `python3` to test each file with bash after writing it.
+   Derive it directly from the definition in the statement (brute-force search, simulation, exhaustive enumeration). Do NOT use a clever closed-form
+   formula, a known trick, or a shortcut: a formula can be wrong even when it matches tiny cases. Correctness is the only goal here; speed is not.
+   If the problem has a unique answer per input, ref.py output must match exactly.
+-- gen_small.py: takes one integer SEED as argv[1] and prints ONE small but VALID input to stdout (respecting every constraint of the statement).
+-  Use random.Random(SEED) for determinism. It MUST cover several regimes, selected by SEED % 5:
+-    * SEED % 5 == 0: tiny inputs (minimum sizes, N=1, all equal values, boundary values).
+-    * SEED % 5 == 1: dense small value range with MANY duplicates (values drawn from a range of about 3..10 distinct values).
+-    * SEED % 5 == 2: value range comparable to N (e.g. values in 1..N or 1..2N, so collisions are frequent but not total).
+-    * SEED % 5 == 3: boundary/extreme values (values at the minimum and maximum allowed, e.g. A_i = X, A_i = 1, mixed with ordinary ones).
+-    * SEED % 5 == 4: structured adversarial shapes (sorted, reverse-sorted, periodic, palindromic, one outlier, all-distinct, etc.).
+-  Sizes should go up to a few hundred (N up to ~300) in the larger seeds, where ref.py remains feasible, so that the reference covers mid-size inputs
+-  and not only tiny ones. Keep every generated input inside the constraints (validate it mentally before printing).
++- gen_small.py: takes one integer SEED as argv[1] and prints ONE valid input to stdout (respecting every constraint of the statement).
++  Use random.Random(SEED) for determinism. It MUST cover several regimes crossed with a size ladder:
++    * Regime = SEED % 5 (the value distribution):
++      - 0: tiny inputs (minimum sizes, N=1, all equal values, boundary values).
++      - 1: dense small value range with MANY duplicates (values drawn from a range of about 2..5 distinct values, so most values repeat).
++      - 2: value range comparable to N (e.g. values in 1..N or 1..2N, so collisions are frequent but not total).
++      - 3: boundary/extreme values (values at the minimum and maximum allowed, e.g. A_i = X, A_i = 1, mixed with ordinary ones).
++      - 4: structured adversarial shapes (sorted, reverse-sorted, periodic, palindromic, one outlier, all-distinct, etc.).
++      Also include explicit repeated-value regimes: many duplicates of the same value, and targets/queries that equal a value which
++      occurs several times (combine repeated values with the target/answer value so counting and inclusion-exclusion are exercised).
++    * Size ladder = SEED // 5: size grows with SEED // 5 so that small seeds are tiny and larger seeds reach N up to ~2000.
++      For example N = min(2000, 2 + (SEED // 5) * 37) (any monotone ladder that reaches about 2000 for SEED//5 around 54 is fine).
++      Keep the ladder for the largest sizes within the constraints; when the statement caps N lower, cap the ladder at that bound.
++  Keep every generated input inside the constraints (validate it mentally before printing). validate_input.py must accept it.
++- ref.py must be OBVIOUSLY correct, not fast. An O(N^2) reference (e.g. a hash map or pairwise scan) is allowed for mid-size inputs, but it must be validated
++  against a pure O(N^3) brute force (or full enumeration) on tiny inputs (N <= 6) before you rely on it. Do not use any clever formula in ref.py.
++  ref.py is the slow ground truth; it is used for small inputs (up to a few hundred elements).
++- ref_fast.py: an EFFICIENT algorithm (near-linear or O(N log N) / O(N * distinct values) where possible) that is still obviously correct.
++  It reads the same stdin and prints the same exact output format as ref.py. It is used for medium and large generated inputs (up to N~2000)
++  where ref.py is too slow. Validate ref_fast.py against ref.py on tiny inputs (gen_small.py seeds 0..60 and a few small random cases)
++  and make sure they agree before finishing. If you cannot make an efficient version agree, still write ref_fast.py as the O(N^2) hash-based version.
+ - ref.py must be OBVIOUSLY correct, not fast. An O(N^2) reference (e.g. a hash map or pairwise scan) is allowed for mid-size inputs, but it must be validated
+   against a pure O(N^3) brute force (or full enumeration) on tiny inputs (N <= 6) before you rely on it. Do not use any clever formula in ref.py.
+ - validate_input.py INPUT_FILE: reads the input file given as argv[1] and prints exactly one line, OK if the input satisfies EVERY constraint of the statement
+   (value ranges, sizes, relations between values, guaranteed properties, exact token count, valid format) or FAIL: <reason> otherwise. Exit code 0 on OK, 1 on FAIL.
+   Check every constraint in the statement; the generator must only produce inputs this validator accepts.
+-- checker.py (when present) takes INPUT_FILE ACTUAL_FILE and optionally the flag --fast as argv[3]. With --fast, skip any exhaustive verification whose cost
+-  grows steeply with N (for example an O(N^3) search); only do exhaustive checks when N is small. Always print OK or FAIL: <reason> as the first line.
++- checker.py (when present) takes INPUT_FILE ACTUAL_FILE and optionally the flag --fast as argv[3]. Its DEFAULT path must run in near-linear time
++  (O(N log N) or O(N * distinct values) at most, never quadratic or worse) on inputs up to N~2000 or more, so it never times out.
++  If the answer is "no answer" / -1 / impossible, the checker must still verify it EXACTLY using an efficient method (for example a hash-set sweep,
++  or a documented O(N * distinct) algorithm), not a heuristic. Only skip work under --fast when it is provably not needed for correctness.
++  Always print OK or FAIL: <reason> as the first line; exit code 0 on OK.
+ {judge_clause}
+ - checker.py (ONLY if the problem allows multiple valid answers): takes INPUT_FILE and ACTUAL_FILE as argv[1] and argv[2] and prints a line starting with OK
+   if the actual output is valid for the input, otherwise FAIL: <reason>. Do not write checker.py for problems with a unique answer.
+ - validate_input.py: required, see the gen_small.py contract above.
++- Required files summary: ref.py, ref_fast.py, gen_small.py, validate_input.py (+ checker.py when multiple answers are valid, + judge.py when interactive).
+ - gen_large.py (optional): takes SEED as argv[1] and prints one input at the maximum allowed size for timing.
+ 
+ Verification you must do before finishing:
+ 1. Run ref.py on the outputs of gen_small.py for seeds 0..30 and make sure it never crashes and always prints an answer.
++   Also run ref_fast.py on seeds 0..60 and compare it with ref.py on the seeds where ref.py is fast enough. They must agree.
++   Run checker.py (if present) on ref.py outputs for a few seeds, including N~2000 seeds, and time it: it must finish in seconds.
+ 2. Sanity-check ref.py by hand on at least one sample from the statement if any is given in the statement.
+ 3. If judge.py is present, smoke-test it against a deliberately wrong program (e.g. one that prints nothing and exits) written with the editor tool in {oracle_dir}; confirm judge.py prints FAIL and does not hang.
+ 
+-Finish only after all required files exist in {oracle_dir} and pass these checks. Do not reply with text only.
++Finish only after all required files (including ref_fast.py) exist in {oracle_dir} and pass these checks. Do not reply with text only.
+ """
+         chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         required = ["ref.py", "gen_small.py", "validate_input.py"] + (["judge.py"] if interactive else [])
++        if not os.path.exists(os.path.join(oracle_dir, "ref_fast.py")):
++            safe_log("[oracle] ref_fast.py missing; differential testing will use ref.py only.")
+         missing = [f for f in required if not os.path.exists(os.path.join(oracle_dir, f))]
+         if missing:
+             safe_log(f"[oracle] missing files {missing} in {oracle_dir}; differential testing disabled.")
+@@ -997,6 +1147,9 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+         safe_log(f"[oracle] built oracle in {oracle_dir} (interactive={interactive}).")
+         return oracle_dir
+ 
++    # Generated inputs longer than this (in characters) are checked with ref_fast.py instead of ref.py.
++    FAST_REF_MIN_CHARS = 2000
++
+     def _run_differential(self, solution_path, oracle_dir, n_tests=300, timeout=5, max_failures=3):
+         """
+         Run the solution against the oracle over seeds 0..n_tests-1.
+@@ -1025,6 +1178,7 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+         mode, method = self._detect_mode(solution_path)
+         has_judge = os.path.exists(os.path.join(oracle_dir, "judge.py"))
+         has_checker = os.path.exists(os.path.join(oracle_dir, "checker.py"))
++        has_ref_fast = os.path.exists(os.path.join(oracle_dir, "ref_fast.py"))
+         failures = []
+         n_failures = 0
+         n_skipped = 0
+@@ -1058,7 +1212,11 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+                     )
+                 continue
+ 
+-            ref_rc, expected, ref_err, ref_to = _py("ref.py", [], stdin_text=inp, tmo=20)
++            # Large generated inputs use ref_fast.py (when present); small ones use the naive ref.py.
++            ref_script = "ref.py"
++            if has_ref_fast and len(inp) > self.FAST_REF_MIN_CHARS:
++                ref_script = "ref_fast.py"
++            ref_rc, expected, ref_err, ref_to = _py(ref_script, [], stdin_text=inp, tmo=20)
+             if ref_to or ref_rc != 0:
+                 n_skipped += 1  # reference problem; do not blame the solution
+                 continue
+@@ -1076,7 +1234,10 @@ Finish only after all required files exist in {oracle_dir} and pass these checks
+                     f.write(actual)
+                 crc, cout, _, cto = _py("checker.py", [in_path, out_path], tmo=20)
+                 first = (cout or "").strip().splitlines()
+-                ok = (not cto) and crc == 0 and bool(first) and first[0].startswith("OK")
++                if cto or (crc != 0 and not (first and first[0].startswith("FAIL"))):
++                    n_skipped += 1  # checker could not decide (timeout/crash): UNKNOWN, not a solution failure
++                    continue
++                ok = crc == 0 and bool(first) and first[0].startswith("OK")
+             elif mode == "class":
+                 ok = self._outputs_match(actual, expected)
+             else:
+@@ -1540,7 +1701,10 @@ Instructions:
+         # Final gate: re-run the suite on the file that will be graded; roll back if it regressed.
+         final_path = self._solution_path()
+         if final_path and os.path.exists(final_path):
+-            ok_f, rep_f = self._checkpoint(final_path)
++            # Extended suite (larger seed count + cross-check) on the file that will be graded.
++            ok_f, rep_f = self._correctness_suite(final_path, self._oracle_dir, self._samples, n_tests=1000)
++            if ok_f:
++                self._take_snapshot(final_path)
+             safe_log(f"[gate final] suite {'passed' if ok_f else 'FAILED'}.\n{self._clip(rep_f, 1500)}")
+             if not ok_f:
+                 if self._best_snapshot and self._restore_snapshot("final suite failed"):

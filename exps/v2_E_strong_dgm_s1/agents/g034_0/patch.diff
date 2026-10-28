@@ -1,0 +1,2064 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 74b214c..bfed9a8 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ import re
++import time
+ 
+ from tools import stress_test, bash
+ 
+@@ -205,6 +206,7 @@ class AgenticSystem:
+                     return False
+         return True
+ 
++    # ------------------------------------------------------------------
+     # ------------------------------------------------------------------
+     # Staged, short prompts. Each stage starts from a fresh history.
+     # ------------------------------------------------------------------
+@@ -219,7 +221,10 @@ class AgenticSystem:
+         return self._task_header() + (
+             f"\nSTEP 1 (DRAFT): Immediately use the editor tool to write a complete, working solution to "
+             f"{self.git_tempdir}/solution.py (a Python program reading stdin, writing stdout, or the requested "
+-            "method if the statement asks for a class). Do not analyze at length first. Do not reply without a tool call."
++            "method if the statement asks for a class). Use only the Python standard library; if you are unsure "
++            "whether a module (e.g. numpy) is available, check it first with `python3 -c 'import numpy'`, "
++            "and do not import anything that is not installed. "
++            "Do not analyze at length first. Do not reply without a tool call."
+         )
+ 
+     def _oracle_prompt(self):
+@@ -232,21 +237,47 @@ class AgenticSystem:
+             "Do not reply without a tool call."
+         )
+ 
+-    def _repair_prompt(self, failures, prev_diff):
++    def _checker_prompt(self):
+         return self._task_header() + (
+-            f"\nSTEP 3 (REPAIR): The harness ran solution.py against the samples and against brute.py. "
+-            f"Raw results (unprocessed):\n<failures>\n{failures}\n</failures>\n\n"
++            f"\nSTEP 2b (CHECKER): Write {self.git_tempdir}/checker.py, run as "
++            "`python3 checker.py input_file output_file` (optionally with a third argument, the reference output file). "
++            "It must exit 0 only if the output in output_file is valid for the input in input_file, and exit non-zero "
++            "otherwise, printing a short reason. It must: (1) check the output format (token count, allowed tokens, "
++            "line structure); (2) verify every constraint stated in the problem on the input; (3) verify the answer's "
++            "correctness. Many problems accept any valid answer, so do not compare with brute.py's exact text. "
++            "When the expected answer is -1, NO, or otherwise says that no solution exists, brute-force the existence "
++            "check on the input (feasible for small and medium inputs) and fail if a valid answer exists. "
++            "Then self-test checker.py: run it on the sample inputs with the sample outputs (must exit 0), and on "
++            "several corrupted outputs (wrong value, wrong count, invalid token, violated constraint) which must fail. "
++            "Use the editor tool to write it now. Do not reply without a tool call."
++        )
++
++    def _repair_prompt(self, failures, prev_diff, harness_suspect=False, extra=""):
++        suspect = ""
++        if harness_suspect:
++            suspect = ("\nWARNING: the previous repair round did not change solution.py, or the failure report repeated. "
++                       "Check whether the harness expectations are wrong; the solution may already be correct. "
++                       "Verify the expected output against the problem statement before editing.\n")
++        return self._task_header() + (
++            f"\nSTEP 3 (REPAIR): The harness ran solution.py against the samples, the checker, and brute.py. "
++            f"Raw results (unprocessed):\n<failures>\n{failures}\n</failures>\n{suspect}\n"
+             f"Previous edit diff (may be empty):\n<prev_diff>\n{prev_diff}\n</prev_diff>\n\n"
+-            f"Fix {self.git_tempdir}/solution.py using the editor tool so that it matches the expected outputs on "
++            f"{extra}"
++            f"Fix {self.git_tempdir}/solution.py using the editor tool so that it satisfies the problem on "
+             "these inputs. Reason from the failing input and the expected output. Re-run the failing input after editing. "
++            "If the failure is 'TOO SLOW', improve the algorithm's complexity. "
+             "Do not reply without a tool call."
+         )
+ 
+-    def _alt_prompt(self, approach_hint):
++    def _alt_prompt(self, approach_hint, prior_summaries=""):
++        prior = ""
++        if prior_summaries:
++            prior = ("\nFailure summaries of earlier candidates (avoid their mistakes):\n"
++                     f"<prior_candidates>\n{prior_summaries}\n</prior_candidates>\n")
+         return self._task_header() + (
+-            f"\nSTEP 4 (ALTERNATIVE): Write an independent second solution to {self.git_tempdir}/solution_alt.py "
+-            "using a different algorithm. Do not modify solution.py. "
+-            f"Approach hint: {approach_hint}. "
++            f"\nSTEP 4 (ALTERNATIVE): Write an independent solution to {self.git_tempdir}/{{target}} "
++            "using the approach below. Do not modify solution.py. Use only the Python standard library. "
++            f"Approach hint: {approach_hint}.{prior} "
+             "Use the editor tool to write it now. Do not reply without a tool call."
+         )
+ 
+@@ -287,22 +318,101 @@ class AgenticSystem:
+                 n += sum(1 for b in content if isinstance(b, dict) and b.get("type") in ("tool_use", "function_call"))
+         return n
+ 
++    # ------------------------------------------------------------------
++    # Sample parsing and judging
++    # ------------------------------------------------------------------
++    _PROSE_RE = re.compile(r"^\s*(#|The |the |Note|NOTE|Explanation|Explanations|Output|Input|Constraints|Sample)", re.I)
++
++    @classmethod
++    def _looks_like_prose(cls, text):
++        """True when a captured expected output is really statement prose rather than data."""
++        if not text.strip():
++            return True
++        for line in text.splitlines():
++            if not line.strip():
++                continue
++            if cls._PROSE_RE.match(line):
++                return True
++            if len(line.split()) > 6 and re.search(r"[a-zA-Z]{3,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}", line):
++                return True
++        return False
++
+     def _parse_samples(self):
+-        """Extract (input, expected output) pairs from the statement, e.g. 'Sample Input 1' / 'Sample Output 1'."""
+-        text = self.problem_statement
+-        pattern = re.compile(
+-            r"(?:Sample|Example)\s*Input\s*(\d*)\s*:?\s*\n(.*?)\n\s*(?:Sample|Example)\s*Output\s*\1\s*:?\s*\n(.*?)(?=\n\s*(?:Sample|Example)\s*Input|\Z)",
+-            re.S | re.I,
+-        )
++        """Extract (input, expected output) pairs from the statement, e.g. 'Sample Input 1' / 'Sample Output 1'.
++        The expected output ends at the first blank line or prose/heading line; prose-like outputs are dropped."""
++        lines = self.problem_statement.splitlines()
++        head = re.compile(r"^\s*(?:Sample|Example)\s*Input\s*(\d*)\s*:?\s*$", re.I)
++        out_head = re.compile(r"^\s*(?:Sample|Example)\s*Output\s*(\d*)\s*:?\s*$", re.I)
+         samples = []
+-        for m in pattern.finditer(text):
+-            inp = "\n".join(l.rstrip() for l in m.group(2).strip().splitlines()) + "\n"
+-            out = m.group(3).strip()
+-            samples.append((inp, out))
++        i = 0
++        n = len(lines)
++        while i < n:
++            m = head.match(lines[i])
++            if not m:
++                i += 1
++                continue
++            idx = m.group(1)
++            j = i + 1
++            inp_lines = []
++            while j < n and not out_head.match(lines[j]):
++                if head.match(lines[j]):
++                    break
++                inp_lines.append(lines[j])
++                j += 1
++            if j >= n or not out_head.match(lines[j]):
++                i = j
++                continue
++            j += 1
++            out_lines = []
++            while j < n:
++                s = lines[j]
++                if not s.strip() or head.match(s) or out_head.match(s) or self._PROSE_RE.match(s) \
++                        or len(s.split()) > 6:
++                    break
++                out_lines.append(s)
++                j += 1
++            inp = "\n".join(l.rstrip() for l in inp_lines).strip("\n")
++            out = "\n".join(l.rstrip() for l in out_lines).strip()
++            i = j
++            if not inp.strip() or not out:
++                continue
++            if self._looks_like_prose(out):
++                continue
++            samples.append((inp + "\n", out))
+         return samples
+ 
++    def _checker_path(self):
++        return os.path.join(self.git_tempdir, "checker.py")
++
++    def _judge(self, inp_path, out_text, expected=None):
++        """Return (ok, reason). Uses checker.py when present; otherwise compares tokens to `expected`."""
++        checker = self._checker_path()
++        if os.path.exists(checker):
++            out_path = os.path.join(self.git_tempdir, ".judge_out.txt")
++            with open(out_path, "w") as f:
++                f.write(out_text)
++            try:
++                p = subprocess.run(["python3", checker, inp_path, out_path], capture_output=True, text=True,
++                                   timeout=20, cwd=self.git_tempdir)
++                if p.returncode == 0:
++                    return True, ""
++                return False, (p.stdout + p.stderr)[-1500:]
++            except subprocess.TimeoutExpired:
++                return False, "checker timed out"
++        if expected is None:
++            return False, "no checker and no expected output"
++        if out_text.split() == expected.split():
++            return True, ""
++        return False, f"expected {expected.split()[:20]} got {out_text.split()[:20]}"
++
++    def _judge_text(self, inp, out_text, expected=None):
++        tmp = os.path.join(self.git_tempdir, ".judge_in.txt")
++        with open(tmp, "w") as f:
++            f.write(inp)
++        return self._judge(tmp, out_text, expected)
++
+     def _run_samples(self):
+-        """Run solution.py on each parsed sample; return raw mismatch text ('' when all pass)."""
++        """Run solution.py on each parsed sample; judge with checker when present. Return raw failure text."""
+         samples = self._parse_samples()
+         if not samples:
+             return ""
+@@ -316,18 +426,54 @@ class AgenticSystem:
+                 err = p.stderr
+             except subprocess.TimeoutExpired:
+                 got, err = "", "timed out after 10 seconds"
+-            if got.split() != expected.split():
++            ok, reason = self._judge_text(inp, got, expected)
++            if not ok:
+                 report.append(f"Sample {i} FAILED\n--- input ---\n{inp}--- expected ---\n{expected}\n"
+-                              f"--- actual ---\n{got}--- stderr ---\n{err[-1500:]}")
++                              f"--- actual ---\n{got}--- stderr ---\n{err[-1500:]}\n--- judge ---\n{reason}")
+         if report:
+             return "\n\n".join(report)
+         return ""
+ 
++    def _perf_check(self):
++        """Generate a max-size input (gen.py SEED 1000), time solution.py, and check the output.
++        Returns '' when fine, otherwise a failure message (contains 'TOO SLOW: Xs' when slow)."""
++        gen_path = os.path.join(self.git_tempdir, "gen.py")
++        sol = os.path.join(self.git_tempdir, "solution.py")
++        if not os.path.exists(gen_path) or not os.path.exists(sol):
++            return ""
++        try:
++            g = subprocess.run(["python3", gen_path, "0", "1000"], capture_output=True, text=True,
++                               timeout=20, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return "PERF: gen.py timed out at scale 1000"
++        if g.returncode != 0 or not g.stdout.strip():
++            return f"PERF: gen.py failed at scale 1000: {g.stderr[-500:]}"
++        inp = g.stdout
++        t0 = time.time()
++        try:
++            p = subprocess.run(["python3", sol], input=inp, capture_output=True, text=True,
++                               timeout=30, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return "TOO SLOW: >30s on max-size input"
++        elapsed = time.time() - t0
++        msgs = []
++        if p.returncode != 0:
++            msgs.append(f"PERF: solution crashed on max-size input: {p.stderr[-800:]}")
++        else:
++            ok, reason = self._judge_text(inp, p.stdout)
++            if not ok:
++                msgs.append(f"PERF: max-size output rejected: {reason}")
++        if elapsed > 1.5:
++            msgs.append(f"TOO SLOW: {elapsed:.2f}s (limit 1.5s) on max-size input")
++        return "\n".join(msgs)
++
+     def _stress(self):
+-        """Run the stress test (solution vs brute.py with gen.py) and return the raw output."""
++        """Run the stress test (solution vs brute.py with gen.py, judged by checker when present)."""
+         common = dict(solution_cmd="python3 solution.py", generator_cmd="python3 gen.py",
+                       reference_cmd="python3 brute.py", timeout=5, seeds_per_scale=25,
+-                      scales=[1, 2, 3, 5, 8, 20, 50])
++                      scales=[1, 2, 3, 5, 8, 20, 50, 1000])
++        if os.path.exists(self._checker_path()):
++            common["checker_cmd"] = "python3 checker.py"
+         old_cwd = bash._STATE.get('cwd')
+         try:
+             bash._STATE['cwd'] = self.git_tempdir
+@@ -339,17 +485,19 @@ class AgenticSystem:
+ 
+     def _run_candidate_on(self, path, inp):
+         try:
++            t0 = time.time()
+             p = subprocess.run(["python3", path], input=inp, capture_output=True, text=True,
+                                timeout=5, cwd=self.git_tempdir)
+-            return p.stdout if p.returncode == 0 else None
++            elapsed = time.time() - t0
++            return (p.stdout if p.returncode == 0 else None), elapsed
+         except subprocess.TimeoutExpired:
+-            return None
++            return None, 5.0
+ 
+-    def _compare_candidates(self, candidates, brute_path):
+-        """Score each candidate file on samples + generator inputs against brute.py; copy the best to solution.py."""
++    def _candidate_inputs(self):
++        """Samples + generator inputs (small/medium) + one max-size input."""
+         inputs = [inp for inp, _ in self._parse_samples()]
+         gen_path = os.path.join(self.git_tempdir, "gen.py")
+-        if os.path.exists(gen_path) and os.path.exists(brute_path):
++        if os.path.exists(gen_path):
+             for seed in range(30):
+                 scale = [1, 3, 8, 20][seed % 4]
+                 try:
+@@ -359,82 +507,164 @@ class AgenticSystem:
+                         inputs.append(p.stdout)
+                 except subprocess.TimeoutExpired:
+                     pass
+-        if not inputs or not os.path.exists(brute_path):
++            try:
++                p = subprocess.run(["python3", gen_path, "0", "1000"], capture_output=True,
++                                   text=True, timeout=20, cwd=self.git_tempdir)
++                if p.returncode == 0 and p.stdout.strip():
++                    inputs.append(p.stdout)
++            except subprocess.TimeoutExpired:
++                pass
++        return inputs
++
++    def _reference_output(self, brute_path, inp):
++        """Brute-force output for inp, or None when there is no brute.py or it fails."""
++        if not os.path.exists(brute_path):
+             return None
+-        scores = {}
++        try:
++            p = subprocess.run(["python3", brute_path], input=inp, capture_output=True, text=True,
++                               timeout=5, cwd=self.git_tempdir)
++            return p.stdout if p.returncode == 0 else None
++        except subprocess.TimeoutExpired:
++            return None
++
++    def _candidate_summary(self, path, target):
++        """Short failure summary of a candidate file on the samples, used in the next candidate's prompt."""
++        report = []
++        for i, (inp, expected) in enumerate(self._parse_samples(), 1):
++            got = self._run_candidate_on(path, inp)[0]
++            ok, reason = self._judge_text(inp, got or "", expected)
++            if not ok:
++                report.append(f"sample {i}: {reason[:200]}")
++        if not report:
++            return f"{target}: passed all samples"
++        return f"{target}: " + " | ".join(report)[:400]
++
++    def _compare_candidates(self, candidates, brute_path):
++        """Score each candidate by _judge over samples + generated inputs + max-size, with a time penalty.
++        Copies the best (fastest on ties) to solution.py. Returns the chosen path or None."""
++        inputs = self._candidate_inputs()
++        if not inputs:
++            return None
++        has_checker = os.path.exists(self._checker_path())
++        results = {}
+         for path in candidates:
+             if not os.path.exists(path):
+                 continue
+             score = 0
++            total_time = 0.0
+             for inp in inputs:
+-                ref = None
+-                try:
+-                    p = subprocess.run(["python3", brute_path], input=inp, capture_output=True, text=True,
+-                                       timeout=5, cwd=self.git_tempdir)
+-                    ref = p.stdout if p.returncode == 0 else None
+-                except subprocess.TimeoutExpired:
+-                    ref = None
+-                got = self._run_candidate_on(path, inp)
+-                if ref is not None and got is not None and got.split() == ref.split():
++                got, elapsed = self._run_candidate_on(path, inp)
++                total_time += elapsed
++                if got is None:
++                    continue
++                expected = None
++                if not has_checker:
++                    expected = self._reference_output(brute_path, inp)
++                    if expected is None:
++                        continue
++                ok, _ = self._judge_text(inp, got, expected)
++                if ok:
+                     score += 1
+-            scores[path] = score
+-            safe_log(f"[compare] {os.path.basename(path)} score={score}/{len(inputs)}")
+-        if not scores:
++            penalty = 0.05 * total_time
++            results[path] = (score - penalty, score, total_time)
++            safe_log(f"[compare] {os.path.basename(path)} score={score}/{len(inputs)} time={total_time:.2f}s")
++        if not results:
+             return None
+-        best = max(scores, key=lambda k: scores[k])
++        # Highest score first; on ties prefer the faster candidate.
++        best = max(results, key=lambda k: (results[k][0], -results[k][2]))
+         with open(best) as f:
+             text = f.read()
+         with open(os.path.join(self.git_tempdir, "solution.py"), "w") as f:
+             f.write(text)
+-        safe_log(f"[compare] selected {os.path.basename(best)} with score {scores[best]}")
++        safe_log(f"[compare] selected {os.path.basename(best)} with score {results[best][1]}")
+         return best
+ 
+     def forward(self):
+         """
+-        Staged workflow: draft -> oracle -> sample/stress repair rounds -> alternative candidate -> selection.
++        Staged workflow: draft -> oracle -> checker -> repair rounds -> N alternative candidates -> selection.
+         """
+         sol_path = os.path.join(self.git_tempdir, "solution.py")
+         brute_path = os.path.join(self.git_tempdir, "brute.py")
+         K = 3
++        N_CANDS = 3
++        hints = [
++            "a direct, different algorithm (e.g. a greedy or sorting-based approach)",
++            "a different data structure or decomposition (e.g. prefix sums, hashing, or a segment/Fenwick tree)",
++            "a mathematical or constructive characterization of the answer",
++        ]
+ 
+         # Stage 1: draft
+         ok = self._run_stage(self._draft_prompt(), attempts=3)
+         safe_log(f"[stage] draft: {'ok' if ok else 'FAILED'}")
+ 
+-        # Stage 2: oracle
++        # Stage 2: oracle, then checker
+         ok = self._run_stage(self._oracle_prompt(), attempts=2, target="brute.py")
+         safe_log(f"[stage] oracle: {'ok' if ok else 'FAILED'}")
++        ok = self._run_stage(self._checker_prompt(), attempts=2, target="checker.py")
++        safe_log(f"[stage] checker: {'ok' if ok else 'FAILED'}")
+ 
+-        # Stage 3: samples + stress, repair up to K rounds
++        # Stage 3: samples + stress + perf, repair up to K rounds
+         prev_diff = ""
++        prev_failure = None
++        harness_suspect = False
++        repeats = 0
+         for rnd in range(K):
+             failures = self._run_samples()
+-            if not failures and os.path.exists(brute_path):
+-                failures = self._stress()
+-                if "ALL PASSED" in failures:
+-                    failures = ""
++            if not failures:
++                if os.path.exists(brute_path):
++                    failures = self._stress()
++                    if "ALL PASSED" in failures:
++                        failures = ""
++                if not failures:
++                    failures = self._perf_check()
+             safe_log(f"[repair] round {rnd + 1}/{K}: {'all passed' if not failures else 'failures'}")
+             if not failures:
+                 break
++            if prev_failure is not None and failures == prev_failure:
++                repeats += 1
++                harness_suspect = True
++                if repeats >= 2:
++                    safe_log("[repair] identical failure repeated twice; stopping repair loop (harness suspect)")
++                    break
++                safe_log("[repair] identical failure repeated; harness_suspect=True")
++            prev_failure = failures
+             before = self._file_snapshot(sol_path)
+-            self._run_stage(self._repair_prompt(failures, prev_diff), attempts=2)
++            self._run_stage(self._repair_prompt(failures, prev_diff, harness_suspect=harness_suspect),
++                            attempts=2)
+             after = self._file_snapshot(sol_path)
++            if before is not None and before == after:
++                harness_suspect = True
++                safe_log("[repair] solution.py unchanged after repair; harness_suspect=True")
+             prev_diff = "" if before is None or after is None else (
+                 f"--- before\n{before}\n+++ after\n{after}" if before != after else "(no change)")
+ 
+-        # Stage 4: alternative candidate, then select best by harness score
+-        cand1 = os.path.join(self.git_tempdir, "cand1.py")
+-        cand2 = os.path.join(self.git_tempdir, "solution_alt.py")
++        # Stage 4: N alternative candidates in fresh contexts, each told about earlier failures
++        cands = []
+         cur = self._file_snapshot(sol_path)
+         if cur is not None:
+-            with open(cand1, "w") as f:
++            cand0 = os.path.join(self.git_tempdir, "cand0.py")
++            with open(cand0, "w") as f:
+                 f.write(cur)
+-        ok = self._run_stage(self._alt_prompt("an approach different from the one in solution.py "
+-                                              "(e.g. a different data structure, a different decomposition, or a direct simulation)"),
+-                             attempts=2, target="solution_alt.py")
+-        safe_log(f"[stage] alternative: {'ok' if ok else 'FAILED'}")
+-        if os.path.exists(cand2) and os.path.exists(cand1):
+-            best = self._compare_candidates([cand1, cand2], brute_path)
++            cands.append(cand0)
++        prior_summaries = []
++        if prev_failure:
++            prior_summaries.append(f"candidate 0 (solution.py): {prev_failure[:800]}")
++        for k in range(N_CANDS):
++            target = f"cand{k + 1}.py"
++            tpath = os.path.join(self.git_tempdir, target)
++            if os.path.exists(tpath):
++                os.remove(tpath)
++            prompt = self._alt_prompt(hints[k % len(hints)],
++                                      prior_summaries="\n".join(prior_summaries)).replace("{target}", target)
++            ok = self._run_stage(prompt, attempts=2, target=target)
++            safe_log(f"[stage] candidate {k + 1}: {'ok' if ok else 'FAILED'}")
++            if os.path.exists(tpath):
++                cands.append(tpath)
++                prior_summaries.append(self._candidate_summary(tpath, target))
++
++        # Stage 5: selection by verified score
++        if len(cands) >= 1:
++            best = self._compare_candidates(cands, brute_path)
+             safe_log(f"[compare] best candidate: {best}")
+ 
+         # Last resort: the solution must not remain the starter stub.
+@@ -454,6 +684,7 @@ class AgenticSystem:
+                 safe_log("[verify] WARNING: solution.py still looks like the stub")
+ 
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/brute.py b/brute.py
+new file mode 100644
+index 0000000..e33af7d
+--- /dev/null
++++ b/brute.py
+@@ -0,0 +1,27 @@
++"""Brute-force reference (oracle) for the current problem.
++
++PLACEHOLDER: the problem's input format and constraints were not available
++when this file was written, so no real brute force is implemented yet.
++Replace read_input()/brute_force() with an obviously correct, exhaustive
++solution that reads stdin and writes the answer to stdout (same format as
++the problem's expected output). Use only the Python standard library.
++"""
++import sys
++
++
++def read_input():
++    return sys.stdin.read()
++
++
++def brute_force(data):
++    raise NotImplementedError("brute.py is a placeholder; implement the brute-force oracle")
++
++
++def main():
++    data = read_input()
++    result = brute_force(data)
++    sys.stdout.write(str(result) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/cand1.py b/cand1.py
+new file mode 100644
+index 0000000..bfed9a8
+--- /dev/null
++++ b/cand1.py
+@@ -0,0 +1,721 @@
++import argparse
++import subprocess
++import logging
++from logging.handlers import RotatingFileHandler
++import os
++import threading
++import re
++import time
++
++from tools import stress_test, bash
++
++from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++
++# reset_to_commit(git_dname, commit)
++# apply_patch(git_dname, patch_str)
++
++# TEST COMMANDS for different languages
++# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
++NPM_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
++    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
++    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
++    ["npm", "run", "test"]
++]
++
++CPP_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
++    ["sh", "-c", "cd build"],
++    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
++    ["make"],
++    ["sh", "-c", "cd ../"]
++]
++
++TEST_COMMANDS = {
++    "python": [["pytest", "-rA", "--tb=long"]],
++    "rust": [["cargo", "test", "--", "--include-ignored"]],
++    "go": [["go", "test", "./..."]],
++    "javascript": NPM_TEST_COMMANDS,
++    "cpp": CPP_TEST_COMMANDS,
++    "java": [["./gradlew", "test"]],
++}
++
++# Thread-local storage for logger instances
++thread_local = threading.local()
++
++def get_thread_logger():
++    """
++    Get the logger instance specific to the current thread.
++    Returns None if no logger has been set for this thread.
++    """
++    return getattr(thread_local, 'logger', None)
++
++def set_thread_logger(logger):
++    """
++    Set the logger instance for the current thread.
++    """
++    thread_local.logger = logger
++
++def setup_logger(log_file='./chat_history.md', level=logging.INFO):
++    """
++    Set up a logger with both file and console handlers.
++    """
++    # Create logger with a unique name based on thread ID
++    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
++    logger.setLevel(level)
++    
++    # Remove existing handlers to avoid duplicates
++    logger.handlers = []
++    
++    # Create formatters
++    file_formatter = logging.Formatter('%(message)s')
++    
++    # Create and set up file handler
++    os.makedirs(os.path.dirname(log_file), exist_ok=True)
++    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
++    file_handler.setLevel(level)
++    file_handler.setFormatter(file_formatter)
++    
++    # Add handlers to logger
++    logger.addHandler(file_handler)
++    
++    # Store logger in thread-local storage
++    set_thread_logger(logger)
++    
++    return logger
++
++def safe_log(message, level=logging.INFO):
++    """
++    Thread-safe logging function that ensures messages go to the correct logger.
++    """
++    logger = get_thread_logger()
++    if logger:
++        logger.log(level, message)
++    else:
++        print(f"Warning: No logger found for thread {threading.get_ident()}")
++
++class AgenticSystem:
++    def __init__(
++            self,
++            problem_statement,
++            git_tempdir,
++            base_commit,
++            chat_history_file='./chat_history.md',
++            test_description=None,
++            self_improve=False,
++            language='python'
++        ):
++        self.problem_statement = problem_statement
++        self.git_tempdir = git_tempdir
++        self.base_commit = base_commit
++        self.chat_history_file = chat_history_file
++        self.test_description = test_description
++        self.self_improve = self_improve
++        self.language = language
++
++        # Set the code model based on whether self-improvement is enabled
++        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
++
++        # Initialize logger and store it in thread-local storage
++        self.logger = setup_logger(chat_history_file)
++        
++        # Clear the log file
++        with open(chat_history_file, 'w') as f:
++            f.write('')
++
++    def get_current_edits(self):
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        new_msg_history = [
++            {
++                "role": "user",
++                "content": [
++                    {
++                        "type": "text",
++                        "text": f"# Current Repo Edits\n{diff}",
++                    }
++                ],
++            }
++        ]
++        return new_msg_history
++
++    def _has_source_edit(self):
++        """
++        Returns True if the repo diff (versus base_commit) contains added lines in at least one
++        non-helper, non-test file, and solution.py is not just the untouched starter stub.
++        """
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++
++        # Split the diff into per-file blocks, keyed by the file path from the "diff --git" header.
++        blocks = {}
++        current = None
++        for line in diff.splitlines():
++            if line.startswith("diff --git"):
++                # Format: diff --git a/<path> b/<path>
++                parts = line.split(" b/")
++                path = parts[-1].strip() if len(parts) > 1 else line
++                current = path
++                blocks[current] = []
++            elif current is not None:
++                blocks[current].append(line)
++
++        def is_helper_or_test(path):
++            name = os.path.basename(path)
++            if name in ("brute.py", "gen.py", "checker.py"):
++                return True
++            if name.startswith("test") and name.endswith(".py"):
++                return True
++            if name.endswith("_test.py"):
++                return True
++            if "tests/" in path or path.startswith("tests/"):
++                return True
++            # Input / sample files
++            if name.startswith("input") or name.startswith("sample"):
++                return True
++            return False
++
++        has_added = False
++        for path, lines in blocks.items():
++            if is_helper_or_test(path):
++                continue
++            if any(l.startswith("+") and not l.startswith("+++") for l in lines):
++                has_added = True
++                break
++        if not has_added:
++            return False
++
++        # Stub check for solution.py: must not be only the starter stub (imports/defs/pass).
++        solution_path = os.path.join(self.git_tempdir, "solution.py")
++        if os.path.exists(solution_path):
++            with open(solution_path) as f:
++                body_lines = []
++                for raw in f.read().splitlines():
++                    s = raw.strip()
++                    if not s or s.startswith("#") or s.startswith("import ") or s.startswith("from ") \
++                            or s == "pass" or s == "...":
++                        continue
++                    if s.startswith("class ") or s.startswith("def "):
++                        # Signature-only lines are not body; one-liners like "def f(): return 1" are.
++                        head, _, tail = s.partition(":")
++                        if not tail.strip() or tail.strip() == "pass":
++                            continue
++                    body_lines.append(s)
++                if not body_lines:
++                    return False
++        return True
++
++    # ------------------------------------------------------------------
++    # ------------------------------------------------------------------
++    # Staged, short prompts. Each stage starts from a fresh history.
++    # ------------------------------------------------------------------
++    def _task_header(self):
++        return (f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++                f"Help solve the following problem.\n\n<problem_description>\n{self.problem_statement}\n"
++                "</problem_description>\n\n"
++                f"Your task is to make changes to the files in the {self.git_tempdir} directory to address "
++                "the <problem_description>. I have already taken care of the required dependencies.\n")
++
++    def _draft_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 1 (DRAFT): Immediately use the editor tool to write a complete, working solution to "
++            f"{self.git_tempdir}/solution.py (a Python program reading stdin, writing stdout, or the requested "
++            "method if the statement asks for a class). Use only the Python standard library; if you are unsure "
++            "whether a module (e.g. numpy) is available, check it first with `python3 -c 'import numpy'`, "
++            "and do not import anything that is not installed. "
++            "Do not analyze at length first. Do not reply without a tool call."
++        )
++
++    def _oracle_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 2 (ORACLE): solution.py exists now. Write {self.git_tempdir}/brute.py, an obviously correct "
++            "brute-force solution (same I/O format, reads stdin), and "
++            f"{self.git_tempdir}/gen.py, invoked as `python3 gen.py SEED SCALE`, printing one valid input. "
++            "SCALE 1-3 gives tiny inputs, SCALE 5-100 gives medium inputs (n 50-300) with small and large values, "
++            "duplicate-heavy and edge-value cases. Keep inputs within the constraints. Do not fix solution.py in this step. "
++            "Do not reply without a tool call."
++        )
++
++    def _checker_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 2b (CHECKER): Write {self.git_tempdir}/checker.py, run as "
++            "`python3 checker.py input_file output_file` (optionally with a third argument, the reference output file). "
++            "It must exit 0 only if the output in output_file is valid for the input in input_file, and exit non-zero "
++            "otherwise, printing a short reason. It must: (1) check the output format (token count, allowed tokens, "
++            "line structure); (2) verify every constraint stated in the problem on the input; (3) verify the answer's "
++            "correctness. Many problems accept any valid answer, so do not compare with brute.py's exact text. "
++            "When the expected answer is -1, NO, or otherwise says that no solution exists, brute-force the existence "
++            "check on the input (feasible for small and medium inputs) and fail if a valid answer exists. "
++            "Then self-test checker.py: run it on the sample inputs with the sample outputs (must exit 0), and on "
++            "several corrupted outputs (wrong value, wrong count, invalid token, violated constraint) which must fail. "
++            "Use the editor tool to write it now. Do not reply without a tool call."
++        )
++
++    def _repair_prompt(self, failures, prev_diff, harness_suspect=False, extra=""):
++        suspect = ""
++        if harness_suspect:
++            suspect = ("\nWARNING: the previous repair round did not change solution.py, or the failure report repeated. "
++                       "Check whether the harness expectations are wrong; the solution may already be correct. "
++                       "Verify the expected output against the problem statement before editing.\n")
++        return self._task_header() + (
++            f"\nSTEP 3 (REPAIR): The harness ran solution.py against the samples, the checker, and brute.py. "
++            f"Raw results (unprocessed):\n<failures>\n{failures}\n</failures>\n{suspect}\n"
++            f"Previous edit diff (may be empty):\n<prev_diff>\n{prev_diff}\n</prev_diff>\n\n"
++            f"{extra}"
++            f"Fix {self.git_tempdir}/solution.py using the editor tool so that it satisfies the problem on "
++            "these inputs. Reason from the failing input and the expected output. Re-run the failing input after editing. "
++            "If the failure is 'TOO SLOW', improve the algorithm's complexity. "
++            "Do not reply without a tool call."
++        )
++
++    def _alt_prompt(self, approach_hint, prior_summaries=""):
++        prior = ""
++        if prior_summaries:
++            prior = ("\nFailure summaries of earlier candidates (avoid their mistakes):\n"
++                     f"<prior_candidates>\n{prior_summaries}\n</prior_candidates>\n")
++        return self._task_header() + (
++            f"\nSTEP 4 (ALTERNATIVE): Write an independent solution to {self.git_tempdir}/{{target}} "
++            "using the approach below. Do not modify solution.py. Use only the Python standard library. "
++            f"Approach hint: {approach_hint}.{prior} "
++            "Use the editor tool to write it now. Do not reply without a tool call."
++        )
++
++    def _short_prompt(self, target):
++        return (f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Call the editor tool now to write the full Python solution into {target}.")
++
++    def _run_stage(self, prompt, attempts=3, target="solution.py"):
++        """Run one stage. Retries in a fresh context with shorter prompts; success = file changed."""
++        target_path = os.path.join(self.git_tempdir, target)
++        before = self._file_snapshot(target_path)
++        for attempt in range(attempts):
++            # First try the full stage prompt; later attempts use a shorter prompt, always in a fresh context.
++            p = prompt if attempt == 0 else self._short_prompt(target_path)
++            history = chat_with_agent(p, model=self.code_model, msg_history=[], logging=safe_log)
++            changed = self._file_snapshot(target_path) != before
++            if target == "solution.py":
++                changed = changed or self._has_source_edit()
++            safe_log(f"[stage] attempt {attempt + 1}/{attempts} done; tool_use_blocks={self._count_tool_uses(history)}; "
++                     f"file changed={changed}")
++            if changed:
++                return True
++        return False
++
++    def _file_snapshot(self, path):
++        try:
++            with open(path) as f:
++                return f.read()
++        except OSError:
++            return None
++
++    @staticmethod
++    def _count_tool_uses(history):
++        n = 0
++        for m in history or []:
++            content = m.get("content") if isinstance(m, dict) else None
++            if isinstance(content, list):
++                n += sum(1 for b in content if isinstance(b, dict) and b.get("type") in ("tool_use", "function_call"))
++        return n
++
++    # ------------------------------------------------------------------
++    # Sample parsing and judging
++    # ------------------------------------------------------------------
++    _PROSE_RE = re.compile(r"^\s*(#|The |the |Note|NOTE|Explanation|Explanations|Output|Input|Constraints|Sample)", re.I)
++
++    @classmethod
++    def _looks_like_prose(cls, text):
++        """True when a captured expected output is really statement prose rather than data."""
++        if not text.strip():
++            return True
++        for line in text.splitlines():
++            if not line.strip():
++                continue
++            if cls._PROSE_RE.match(line):
++                return True
++            if len(line.split()) > 6 and re.search(r"[a-zA-Z]{3,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}", line):
++                return True
++        return False
++
++    def _parse_samples(self):
++        """Extract (input, expected output) pairs from the statement, e.g. 'Sample Input 1' / 'Sample Output 1'.
++        The expected output ends at the first blank line or prose/heading line; prose-like outputs are dropped."""
++        lines = self.problem_statement.splitlines()
++        head = re.compile(r"^\s*(?:Sample|Example)\s*Input\s*(\d*)\s*:?\s*$", re.I)
++        out_head = re.compile(r"^\s*(?:Sample|Example)\s*Output\s*(\d*)\s*:?\s*$", re.I)
++        samples = []
++        i = 0
++        n = len(lines)
++        while i < n:
++            m = head.match(lines[i])
++            if not m:
++                i += 1
++                continue
++            idx = m.group(1)
++            j = i + 1
++            inp_lines = []
++            while j < n and not out_head.match(lines[j]):
++                if head.match(lines[j]):
++                    break
++                inp_lines.append(lines[j])
++                j += 1
++            if j >= n or not out_head.match(lines[j]):
++                i = j
++                continue
++            j += 1
++            out_lines = []
++            while j < n:
++                s = lines[j]
++                if not s.strip() or head.match(s) or out_head.match(s) or self._PROSE_RE.match(s) \
++                        or len(s.split()) > 6:
++                    break
++                out_lines.append(s)
++                j += 1
++            inp = "\n".join(l.rstrip() for l in inp_lines).strip("\n")
++            out = "\n".join(l.rstrip() for l in out_lines).strip()
++            i = j
++            if not inp.strip() or not out:
++                continue
++            if self._looks_like_prose(out):
++                continue
++            samples.append((inp + "\n", out))
++        return samples
++
++    def _checker_path(self):
++        return os.path.join(self.git_tempdir, "checker.py")
++
++    def _judge(self, inp_path, out_text, expected=None):
++        """Return (ok, reason). Uses checker.py when present; otherwise compares tokens to `expected`."""
++        checker = self._checker_path()
++        if os.path.exists(checker):
++            out_path = os.path.join(self.git_tempdir, ".judge_out.txt")
++            with open(out_path, "w") as f:
++                f.write(out_text)
++            try:
++                p = subprocess.run(["python3", checker, inp_path, out_path], capture_output=True, text=True,
++                                   timeout=20, cwd=self.git_tempdir)
++                if p.returncode == 0:
++                    return True, ""
++                return False, (p.stdout + p.stderr)[-1500:]
++            except subprocess.TimeoutExpired:
++                return False, "checker timed out"
++        if expected is None:
++            return False, "no checker and no expected output"
++        if out_text.split() == expected.split():
++            return True, ""
++        return False, f"expected {expected.split()[:20]} got {out_text.split()[:20]}"
++
++    def _judge_text(self, inp, out_text, expected=None):
++        tmp = os.path.join(self.git_tempdir, ".judge_in.txt")
++        with open(tmp, "w") as f:
++            f.write(inp)
++        return self._judge(tmp, out_text, expected)
++
++    def _run_samples(self):
++        """Run solution.py on each parsed sample; judge with checker when present. Return raw failure text."""
++        samples = self._parse_samples()
++        if not samples:
++            return ""
++        sol = os.path.join(self.git_tempdir, "solution.py")
++        report = []
++        for i, (inp, expected) in enumerate(samples, 1):
++            try:
++                p = subprocess.run(["python3", sol], input=inp, capture_output=True, text=True,
++                                   timeout=10, cwd=self.git_tempdir)
++                got = p.stdout
++                err = p.stderr
++            except subprocess.TimeoutExpired:
++                got, err = "", "timed out after 10 seconds"
++            ok, reason = self._judge_text(inp, got, expected)
++            if not ok:
++                report.append(f"Sample {i} FAILED\n--- input ---\n{inp}--- expected ---\n{expected}\n"
++                              f"--- actual ---\n{got}--- stderr ---\n{err[-1500:]}\n--- judge ---\n{reason}")
++        if report:
++            return "\n\n".join(report)
++        return ""
++
++    def _perf_check(self):
++        """Generate a max-size input (gen.py SEED 1000), time solution.py, and check the output.
++        Returns '' when fine, otherwise a failure message (contains 'TOO SLOW: Xs' when slow)."""
++        gen_path = os.path.join(self.git_tempdir, "gen.py")
++        sol = os.path.join(self.git_tempdir, "solution.py")
++        if not os.path.exists(gen_path) or not os.path.exists(sol):
++            return ""
++        try:
++            g = subprocess.run(["python3", gen_path, "0", "1000"], capture_output=True, text=True,
++                               timeout=20, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return "PERF: gen.py timed out at scale 1000"
++        if g.returncode != 0 or not g.stdout.strip():
++            return f"PERF: gen.py failed at scale 1000: {g.stderr[-500:]}"
++        inp = g.stdout
++        t0 = time.time()
++        try:
++            p = subprocess.run(["python3", sol], input=inp, capture_output=True, text=True,
++                               timeout=30, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return "TOO SLOW: >30s on max-size input"
++        elapsed = time.time() - t0
++        msgs = []
++        if p.returncode != 0:
++            msgs.append(f"PERF: solution crashed on max-size input: {p.stderr[-800:]}")
++        else:
++            ok, reason = self._judge_text(inp, p.stdout)
++            if not ok:
++                msgs.append(f"PERF: max-size output rejected: {reason}")
++        if elapsed > 1.5:
++            msgs.append(f"TOO SLOW: {elapsed:.2f}s (limit 1.5s) on max-size input")
++        return "\n".join(msgs)
++
++    def _stress(self):
++        """Run the stress test (solution vs brute.py with gen.py, judged by checker when present)."""
++        common = dict(solution_cmd="python3 solution.py", generator_cmd="python3 gen.py",
++                      reference_cmd="python3 brute.py", timeout=5, seeds_per_scale=25,
++                      scales=[1, 2, 3, 5, 8, 20, 50, 1000])
++        if os.path.exists(self._checker_path()):
++            common["checker_cmd"] = "python3 checker.py"
++        old_cwd = bash._STATE.get('cwd')
++        try:
++            bash._STATE['cwd'] = self.git_tempdir
++            return stress_test.tool_function(**common)
++        except Exception as e:
++            return f"Error: stress test raised {type(e).__name__}: {e}"
++        finally:
++            bash._STATE['cwd'] = old_cwd
++
++    def _run_candidate_on(self, path, inp):
++        try:
++            t0 = time.time()
++            p = subprocess.run(["python3", path], input=inp, capture_output=True, text=True,
++                               timeout=5, cwd=self.git_tempdir)
++            elapsed = time.time() - t0
++            return (p.stdout if p.returncode == 0 else None), elapsed
++        except subprocess.TimeoutExpired:
++            return None, 5.0
++
++    def _candidate_inputs(self):
++        """Samples + generator inputs (small/medium) + one max-size input."""
++        inputs = [inp for inp, _ in self._parse_samples()]
++        gen_path = os.path.join(self.git_tempdir, "gen.py")
++        if os.path.exists(gen_path):
++            for seed in range(30):
++                scale = [1, 3, 8, 20][seed % 4]
++                try:
++                    p = subprocess.run(["python3", gen_path, str(seed), str(scale)], capture_output=True,
++                                       text=True, timeout=5, cwd=self.git_tempdir)
++                    if p.returncode == 0 and p.stdout.strip():
++                        inputs.append(p.stdout)
++                except subprocess.TimeoutExpired:
++                    pass
++            try:
++                p = subprocess.run(["python3", gen_path, "0", "1000"], capture_output=True,
++                                   text=True, timeout=20, cwd=self.git_tempdir)
++                if p.returncode == 0 and p.stdout.strip():
++                    inputs.append(p.stdout)
++            except subprocess.TimeoutExpired:
++                pass
++        return inputs
++
++    def _reference_output(self, brute_path, inp):
++        """Brute-force output for inp, or None when there is no brute.py or it fails."""
++        if not os.path.exists(brute_path):
++            return None
++        try:
++            p = subprocess.run(["python3", brute_path], input=inp, capture_output=True, text=True,
++                               timeout=5, cwd=self.git_tempdir)
++            return p.stdout if p.returncode == 0 else None
++        except subprocess.TimeoutExpired:
++            return None
++
++    def _candidate_summary(self, path, target):
++        """Short failure summary of a candidate file on the samples, used in the next candidate's prompt."""
++        report = []
++        for i, (inp, expected) in enumerate(self._parse_samples(), 1):
++            got = self._run_candidate_on(path, inp)[0]
++            ok, reason = self._judge_text(inp, got or "", expected)
++            if not ok:
++                report.append(f"sample {i}: {reason[:200]}")
++        if not report:
++            return f"{target}: passed all samples"
++        return f"{target}: " + " | ".join(report)[:400]
++
++    def _compare_candidates(self, candidates, brute_path):
++        """Score each candidate by _judge over samples + generated inputs + max-size, with a time penalty.
++        Copies the best (fastest on ties) to solution.py. Returns the chosen path or None."""
++        inputs = self._candidate_inputs()
++        if not inputs:
++            return None
++        has_checker = os.path.exists(self._checker_path())
++        results = {}
++        for path in candidates:
++            if not os.path.exists(path):
++                continue
++            score = 0
++            total_time = 0.0
++            for inp in inputs:
++                got, elapsed = self._run_candidate_on(path, inp)
++                total_time += elapsed
++                if got is None:
++                    continue
++                expected = None
++                if not has_checker:
++                    expected = self._reference_output(brute_path, inp)
++                    if expected is None:
++                        continue
++                ok, _ = self._judge_text(inp, got, expected)
++                if ok:
++                    score += 1
++            penalty = 0.05 * total_time
++            results[path] = (score - penalty, score, total_time)
++            safe_log(f"[compare] {os.path.basename(path)} score={score}/{len(inputs)} time={total_time:.2f}s")
++        if not results:
++            return None
++        # Highest score first; on ties prefer the faster candidate.
++        best = max(results, key=lambda k: (results[k][0], -results[k][2]))
++        with open(best) as f:
++            text = f.read()
++        with open(os.path.join(self.git_tempdir, "solution.py"), "w") as f:
++            f.write(text)
++        safe_log(f"[compare] selected {os.path.basename(best)} with score {results[best][1]}")
++        return best
++
++    def forward(self):
++        """
++        Staged workflow: draft -> oracle -> checker -> repair rounds -> N alternative candidates -> selection.
++        """
++        sol_path = os.path.join(self.git_tempdir, "solution.py")
++        brute_path = os.path.join(self.git_tempdir, "brute.py")
++        K = 3
++        N_CANDS = 3
++        hints = [
++            "a direct, different algorithm (e.g. a greedy or sorting-based approach)",
++            "a different data structure or decomposition (e.g. prefix sums, hashing, or a segment/Fenwick tree)",
++            "a mathematical or constructive characterization of the answer",
++        ]
++
++        # Stage 1: draft
++        ok = self._run_stage(self._draft_prompt(), attempts=3)
++        safe_log(f"[stage] draft: {'ok' if ok else 'FAILED'}")
++
++        # Stage 2: oracle, then checker
++        ok = self._run_stage(self._oracle_prompt(), attempts=2, target="brute.py")
++        safe_log(f"[stage] oracle: {'ok' if ok else 'FAILED'}")
++        ok = self._run_stage(self._checker_prompt(), attempts=2, target="checker.py")
++        safe_log(f"[stage] checker: {'ok' if ok else 'FAILED'}")
++
++        # Stage 3: samples + stress + perf, repair up to K rounds
++        prev_diff = ""
++        prev_failure = None
++        harness_suspect = False
++        repeats = 0
++        for rnd in range(K):
++            failures = self._run_samples()
++            if not failures:
++                if os.path.exists(brute_path):
++                    failures = self._stress()
++                    if "ALL PASSED" in failures:
++                        failures = ""
++                if not failures:
++                    failures = self._perf_check()
++            safe_log(f"[repair] round {rnd + 1}/{K}: {'all passed' if not failures else 'failures'}")
++            if not failures:
++                break
++            if prev_failure is not None and failures == prev_failure:
++                repeats += 1
++                harness_suspect = True
++                if repeats >= 2:
++                    safe_log("[repair] identical failure repeated twice; stopping repair loop (harness suspect)")
++                    break
++                safe_log("[repair] identical failure repeated; harness_suspect=True")
++            prev_failure = failures
++            before = self._file_snapshot(sol_path)
++            self._run_stage(self._repair_prompt(failures, prev_diff, harness_suspect=harness_suspect),
++                            attempts=2)
++            after = self._file_snapshot(sol_path)
++            if before is not None and before == after:
++                harness_suspect = True
++                safe_log("[repair] solution.py unchanged after repair; harness_suspect=True")
++            prev_diff = "" if before is None or after is None else (
++                f"--- before\n{before}\n+++ after\n{after}" if before != after else "(no change)")
++
++        # Stage 4: N alternative candidates in fresh contexts, each told about earlier failures
++        cands = []
++        cur = self._file_snapshot(sol_path)
++        if cur is not None:
++            cand0 = os.path.join(self.git_tempdir, "cand0.py")
++            with open(cand0, "w") as f:
++                f.write(cur)
++            cands.append(cand0)
++        prior_summaries = []
++        if prev_failure:
++            prior_summaries.append(f"candidate 0 (solution.py): {prev_failure[:800]}")
++        for k in range(N_CANDS):
++            target = f"cand{k + 1}.py"
++            tpath = os.path.join(self.git_tempdir, target)
++            if os.path.exists(tpath):
++                os.remove(tpath)
++            prompt = self._alt_prompt(hints[k % len(hints)],
++                                      prior_summaries="\n".join(prior_summaries)).replace("{target}", target)
++            ok = self._run_stage(prompt, attempts=2, target=target)
++            safe_log(f"[stage] candidate {k + 1}: {'ok' if ok else 'FAILED'}")
++            if os.path.exists(tpath):
++                cands.append(tpath)
++                prior_summaries.append(self._candidate_summary(tpath, target))
++
++        # Stage 5: selection by verified score
++        if len(cands) >= 1:
++            best = self._compare_candidates(cands, brute_path)
++            safe_log(f"[compare] best candidate: {best}")
++
++        # Last resort: the solution must not remain the starter stub.
++        if not self._has_source_edit():
++            safe_log("[verify] fallback: minimal prompt to write solution.py")
++            ok = self._run_stage(self._draft_prompt(), attempts=2)
++            safe_log(f"[stage] fallback: {'ok' if ok else 'FAILED'}")
++        if not self._has_source_edit():
++            # Still a stub: use the brute-force reference if the agent wrote one, so the solution is non-stub.
++            if os.path.exists(brute_path):
++                with open(brute_path) as f:
++                    text = f.read()
++                with open(sol_path, "w") as f:
++                    f.write(text)
++                safe_log("[verify] fallback: copied brute.py into solution.py (non-stub)")
++            else:
++                safe_log("[verify] WARNING: solution.py still looks like the stub")
++
++
++
++def main():
++    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
++    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
++    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
++    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
++    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
++    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
++    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
++    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
++    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
++    args = parser.parse_args()
++
++    # Process the repository
++    agentic_system = AgenticSystem(
++        problem_statement=args.problem_statement,
++        git_tempdir=args.git_dir,
++        base_commit=args.base_commit,
++        chat_history_file=args.chat_history_file,
++        test_description=args.test_description,
++        self_improve=args.self_improve,
++        language=args.language,
++    )
++
++    # Run the agentic system to try to solve the problem
++    agentic_system.forward()
++
++    # Get code diff and save to model_patch.diff
++    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
++    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
++    with open(model_patch_outfile, 'w') as f:
++        f.write(model_patch)
++
++if __name__ == "__main__":
++    main()
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..bfed9a8
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,721 @@
++import argparse
++import subprocess
++import logging
++from logging.handlers import RotatingFileHandler
++import os
++import threading
++import re
++import time
++
++from tools import stress_test, bash
++
++from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++
++# reset_to_commit(git_dname, commit)
++# apply_patch(git_dname, patch_str)
++
++# TEST COMMANDS for different languages
++# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
++NPM_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
++    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
++    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
++    ["npm", "run", "test"]
++]
++
++CPP_TEST_COMMANDS = [
++    ["sh", "-c", "set -e"],
++    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
++    ["sh", "-c", "cd build"],
++    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
++    ["make"],
++    ["sh", "-c", "cd ../"]
++]
++
++TEST_COMMANDS = {
++    "python": [["pytest", "-rA", "--tb=long"]],
++    "rust": [["cargo", "test", "--", "--include-ignored"]],
++    "go": [["go", "test", "./..."]],
++    "javascript": NPM_TEST_COMMANDS,
++    "cpp": CPP_TEST_COMMANDS,
++    "java": [["./gradlew", "test"]],
++}
++
++# Thread-local storage for logger instances
++thread_local = threading.local()
++
++def get_thread_logger():
++    """
++    Get the logger instance specific to the current thread.
++    Returns None if no logger has been set for this thread.
++    """
++    return getattr(thread_local, 'logger', None)
++
++def set_thread_logger(logger):
++    """
++    Set the logger instance for the current thread.
++    """
++    thread_local.logger = logger
++
++def setup_logger(log_file='./chat_history.md', level=logging.INFO):
++    """
++    Set up a logger with both file and console handlers.
++    """
++    # Create logger with a unique name based on thread ID
++    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
++    logger.setLevel(level)
++    
++    # Remove existing handlers to avoid duplicates
++    logger.handlers = []
++    
++    # Create formatters
++    file_formatter = logging.Formatter('%(message)s')
++    
++    # Create and set up file handler
++    os.makedirs(os.path.dirname(log_file), exist_ok=True)
++    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
++    file_handler.setLevel(level)
++    file_handler.setFormatter(file_formatter)
++    
++    # Add handlers to logger
++    logger.addHandler(file_handler)
++    
++    # Store logger in thread-local storage
++    set_thread_logger(logger)
++    
++    return logger
++
++def safe_log(message, level=logging.INFO):
++    """
++    Thread-safe logging function that ensures messages go to the correct logger.
++    """
++    logger = get_thread_logger()
++    if logger:
++        logger.log(level, message)
++    else:
++        print(f"Warning: No logger found for thread {threading.get_ident()}")
++
++class AgenticSystem:
++    def __init__(
++            self,
++            problem_statement,
++            git_tempdir,
++            base_commit,
++            chat_history_file='./chat_history.md',
++            test_description=None,
++            self_improve=False,
++            language='python'
++        ):
++        self.problem_statement = problem_statement
++        self.git_tempdir = git_tempdir
++        self.base_commit = base_commit
++        self.chat_history_file = chat_history_file
++        self.test_description = test_description
++        self.self_improve = self_improve
++        self.language = language
++
++        # Set the code model based on whether self-improvement is enabled
++        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
++
++        # Initialize logger and store it in thread-local storage
++        self.logger = setup_logger(chat_history_file)
++        
++        # Clear the log file
++        with open(chat_history_file, 'w') as f:
++            f.write('')
++
++    def get_current_edits(self):
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        new_msg_history = [
++            {
++                "role": "user",
++                "content": [
++                    {
++                        "type": "text",
++                        "text": f"# Current Repo Edits\n{diff}",
++                    }
++                ],
++            }
++        ]
++        return new_msg_history
++
++    def _has_source_edit(self):
++        """
++        Returns True if the repo diff (versus base_commit) contains added lines in at least one
++        non-helper, non-test file, and solution.py is not just the untouched starter stub.
++        """
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++
++        # Split the diff into per-file blocks, keyed by the file path from the "diff --git" header.
++        blocks = {}
++        current = None
++        for line in diff.splitlines():
++            if line.startswith("diff --git"):
++                # Format: diff --git a/<path> b/<path>
++                parts = line.split(" b/")
++                path = parts[-1].strip() if len(parts) > 1 else line
++                current = path
++                blocks[current] = []
++            elif current is not None:
++                blocks[current].append(line)
++
++        def is_helper_or_test(path):
++            name = os.path.basename(path)
++            if name in ("brute.py", "gen.py", "checker.py"):
++                return True
++            if name.startswith("test") and name.endswith(".py"):
++                return True
++            if name.endswith("_test.py"):
++                return True
++            if "tests/" in path or path.startswith("tests/"):
++                return True
++            # Input / sample files
++            if name.startswith("input") or name.startswith("sample"):
++                return True
++            return False
++
++        has_added = False
++        for path, lines in blocks.items():
++            if is_helper_or_test(path):
++                continue
++            if any(l.startswith("+") and not l.startswith("+++") for l in lines):
++                has_added = True
++                break
++        if not has_added:
++            return False
++
++        # Stub check for solution.py: must not be only the starter stub (imports/defs/pass).
++        solution_path = os.path.join(self.git_tempdir, "solution.py")
++        if os.path.exists(solution_path):
++            with open(solution_path) as f:
++                body_lines = []
++                for raw in f.read().splitlines():
++                    s = raw.strip()
++                    if not s or s.startswith("#") or s.startswith("import ") or s.startswith("from ") \
++                            or s == "pass" or s == "...":
++                        continue
++                    if s.startswith("class ") or s.startswith("def "):
++                        # Signature-only lines are not body; one-liners like "def f(): return 1" are.
++                        head, _, tail = s.partition(":")
++                        if not tail.strip() or tail.strip() == "pass":
++                            continue
++                    body_lines.append(s)
++                if not body_lines:
++                    return False
++        return True
++
++    # ------------------------------------------------------------------
++    # ------------------------------------------------------------------
++    # Staged, short prompts. Each stage starts from a fresh history.
++    # ------------------------------------------------------------------
++    def _task_header(self):
++        return (f"I have uploaded a code repository in the directory {self.git_tempdir}. "
++                f"Help solve the following problem.\n\n<problem_description>\n{self.problem_statement}\n"
++                "</problem_description>\n\n"
++                f"Your task is to make changes to the files in the {self.git_tempdir} directory to address "
++                "the <problem_description>. I have already taken care of the required dependencies.\n")
++
++    def _draft_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 1 (DRAFT): Immediately use the editor tool to write a complete, working solution to "
++            f"{self.git_tempdir}/solution.py (a Python program reading stdin, writing stdout, or the requested "
++            "method if the statement asks for a class). Use only the Python standard library; if you are unsure "
++            "whether a module (e.g. numpy) is available, check it first with `python3 -c 'import numpy'`, "
++            "and do not import anything that is not installed. "
++            "Do not analyze at length first. Do not reply without a tool call."
++        )
++
++    def _oracle_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 2 (ORACLE): solution.py exists now. Write {self.git_tempdir}/brute.py, an obviously correct "
++            "brute-force solution (same I/O format, reads stdin), and "
++            f"{self.git_tempdir}/gen.py, invoked as `python3 gen.py SEED SCALE`, printing one valid input. "
++            "SCALE 1-3 gives tiny inputs, SCALE 5-100 gives medium inputs (n 50-300) with small and large values, "
++            "duplicate-heavy and edge-value cases. Keep inputs within the constraints. Do not fix solution.py in this step. "
++            "Do not reply without a tool call."
++        )
++
++    def _checker_prompt(self):
++        return self._task_header() + (
++            f"\nSTEP 2b (CHECKER): Write {self.git_tempdir}/checker.py, run as "
++            "`python3 checker.py input_file output_file` (optionally with a third argument, the reference output file). "
++            "It must exit 0 only if the output in output_file is valid for the input in input_file, and exit non-zero "
++            "otherwise, printing a short reason. It must: (1) check the output format (token count, allowed tokens, "
++            "line structure); (2) verify every constraint stated in the problem on the input; (3) verify the answer's "
++            "correctness. Many problems accept any valid answer, so do not compare with brute.py's exact text. "
++            "When the expected answer is -1, NO, or otherwise says that no solution exists, brute-force the existence "
++            "check on the input (feasible for small and medium inputs) and fail if a valid answer exists. "
++            "Then self-test checker.py: run it on the sample inputs with the sample outputs (must exit 0), and on "
++            "several corrupted outputs (wrong value, wrong count, invalid token, violated constraint) which must fail. "
++            "Use the editor tool to write it now. Do not reply without a tool call."
++        )
++
++    def _repair_prompt(self, failures, prev_diff, harness_suspect=False, extra=""):
++        suspect = ""
++        if harness_suspect:
++            suspect = ("\nWARNING: the previous repair round did not change solution.py, or the failure report repeated. "
++                       "Check whether the harness expectations are wrong; the solution may already be correct. "
++                       "Verify the expected output against the problem statement before editing.\n")
++        return self._task_header() + (
++            f"\nSTEP 3 (REPAIR): The harness ran solution.py against the samples, the checker, and brute.py. "
++            f"Raw results (unprocessed):\n<failures>\n{failures}\n</failures>\n{suspect}\n"
++            f"Previous edit diff (may be empty):\n<prev_diff>\n{prev_diff}\n</prev_diff>\n\n"
++            f"{extra}"
++            f"Fix {self.git_tempdir}/solution.py using the editor tool so that it satisfies the problem on "
++            "these inputs. Reason from the failing input and the expected output. Re-run the failing input after editing. "
++            "If the failure is 'TOO SLOW', improve the algorithm's complexity. "
++            "Do not reply without a tool call."
++        )
++
++    def _alt_prompt(self, approach_hint, prior_summaries=""):
++        prior = ""
++        if prior_summaries:
++            prior = ("\nFailure summaries of earlier candidates (avoid their mistakes):\n"
++                     f"<prior_candidates>\n{prior_summaries}\n</prior_candidates>\n")
++        return self._task_header() + (
++            f"\nSTEP 4 (ALTERNATIVE): Write an independent solution to {self.git_tempdir}/{{target}} "
++            "using the approach below. Do not modify solution.py. Use only the Python standard library. "
++            f"Approach hint: {approach_hint}.{prior} "
++            "Use the editor tool to write it now. Do not reply without a tool call."
++        )
++
++    def _short_prompt(self, target):
++        return (f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                f"Call the editor tool now to write the full Python solution into {target}.")
++
++    def _run_stage(self, prompt, attempts=3, target="solution.py"):
++        """Run one stage. Retries in a fresh context with shorter prompts; success = file changed."""
++        target_path = os.path.join(self.git_tempdir, target)
++        before = self._file_snapshot(target_path)
++        for attempt in range(attempts):
++            # First try the full stage prompt; later attempts use a shorter prompt, always in a fresh context.
++            p = prompt if attempt == 0 else self._short_prompt(target_path)
++            history = chat_with_agent(p, model=self.code_model, msg_history=[], logging=safe_log)
++            changed = self._file_snapshot(target_path) != before
++            if target == "solution.py":
++                changed = changed or self._has_source_edit()
++            safe_log(f"[stage] attempt {attempt + 1}/{attempts} done; tool_use_blocks={self._count_tool_uses(history)}; "
++                     f"file changed={changed}")
++            if changed:
++                return True
++        return False
++
++    def _file_snapshot(self, path):
++        try:
++            with open(path) as f:
++                return f.read()
++        except OSError:
++            return None
++
++    @staticmethod
++    def _count_tool_uses(history):
++        n = 0
++        for m in history or []:
++            content = m.get("content") if isinstance(m, dict) else None
++            if isinstance(content, list):
++                n += sum(1 for b in content if isinstance(b, dict) and b.get("type") in ("tool_use", "function_call"))
++        return n
++
++    # ------------------------------------------------------------------
++    # Sample parsing and judging
++    # ------------------------------------------------------------------
++    _PROSE_RE = re.compile(r"^\s*(#|The |the |Note|NOTE|Explanation|Explanations|Output|Input|Constraints|Sample)", re.I)
++
++    @classmethod
++    def _looks_like_prose(cls, text):
++        """True when a captured expected output is really statement prose rather than data."""
++        if not text.strip():
++            return True
++        for line in text.splitlines():
++            if not line.strip():
++                continue
++            if cls._PROSE_RE.match(line):
++                return True
++            if len(line.split()) > 6 and re.search(r"[a-zA-Z]{3,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}", line):
++                return True
++        return False
++
++    def _parse_samples(self):
++        """Extract (input, expected output) pairs from the statement, e.g. 'Sample Input 1' / 'Sample Output 1'.
++        The expected output ends at the first blank line or prose/heading line; prose-like outputs are dropped."""
++        lines = self.problem_statement.splitlines()
++        head = re.compile(r"^\s*(?:Sample|Example)\s*Input\s*(\d*)\s*:?\s*$", re.I)
++        out_head = re.compile(r"^\s*(?:Sample|Example)\s*Output\s*(\d*)\s*:?\s*$", re.I)
++        samples = []
++        i = 0
++        n = len(lines)
++        while i < n:
++            m = head.match(lines[i])
++            if not m:
++                i += 1
++                continue
++            idx = m.group(1)
++            j = i + 1
++            inp_lines = []
++            while j < n and not out_head.match(lines[j]):
++                if head.match(lines[j]):
++                    break
++                inp_lines.append(lines[j])
++                j += 1
++            if j >= n or not out_head.match(lines[j]):
++                i = j
++                continue
++            j += 1
++            out_lines = []
++            while j < n:
++                s = lines[j]
++                if not s.strip() or head.match(s) or out_head.match(s) or self._PROSE_RE.match(s) \
++                        or len(s.split()) > 6:
++                    break
++                out_lines.append(s)
++                j += 1
++            inp = "\n".join(l.rstrip() for l in inp_lines).strip("\n")
++            out = "\n".join(l.rstrip() for l in out_lines).strip()
++            i = j
++            if not inp.strip() or not out:
++                continue
++            if self._looks_like_prose(out):
++                continue
++            samples.append((inp + "\n", out))
++        return samples
++
++    def _checker_path(self):
++        return os.path.join(self.git_tempdir, "checker.py")
++
++    def _judge(self, inp_path, out_text, expected=None):
++        """Return (ok, reason). Uses checker.py when present; otherwise compares tokens to `expected`."""
++        checker = self._checker_path()
++        if os.path.exists(checker):
++            out_path = os.path.join(self.git_tempdir, ".judge_out.txt")
++            with open(out_path, "w") as f:
++                f.write(out_text)
++            try:
++                p = subprocess.run(["python3", checker, inp_path, out_path], capture_output=True, text=True,
++                                   timeout=20, cwd=self.git_tempdir)
++                if p.returncode == 0:
++                    return True, ""
++                return False, (p.stdout + p.stderr)[-1500:]
++            except subprocess.TimeoutExpired:
++                return False, "checker timed out"
++        if expected is None:
++            return False, "no checker and no expected output"
++        if out_text.split() == expected.split():
++            return True, ""
++        return False, f"expected {expected.split()[:20]} got {out_text.split()[:20]}"
++
++    def _judge_text(self, inp, out_text, expected=None):
++        tmp = os.path.join(self.git_tempdir, ".judge_in.txt")
++        with open(tmp, "w") as f:
++            f.write(inp)
++        return self._judge(tmp, out_text, expected)
++
++    def _run_samples(self):
++        """Run solution.py on each parsed sample; judge with checker when present. Return raw failure text."""
++        samples = self._parse_samples()
++        if not samples:
++            return ""
++        sol = os.path.join(self.git_tempdir, "solution.py")
++        report = []
++        for i, (inp, expected) in enumerate(samples, 1):
++            try:
++                p = subprocess.run(["python3", sol], input=inp, capture_output=True, text=True,
++                                   timeout=10, cwd=self.git_tempdir)
++                got = p.stdout
++                err = p.stderr
++            except subprocess.TimeoutExpired:
++                got, err = "", "timed out after 10 seconds"
++            ok, reason = self._judge_text(inp, got, expected)
++            if not ok:
++                report.append(f"Sample {i} FAILED\n--- input ---\n{inp}--- expected ---\n{expected}\n"
++                              f"--- actual ---\n{got}--- stderr ---\n{err[-1500:]}\n--- judge ---\n{reason}")
++        if report:
++            return "\n\n".join(report)
++        return ""
++
++    def _perf_check(self):
++        """Generate a max-size input (gen.py SEED 1000), time solution.py, and check the output.
++        Returns '' when fine, otherwise a failure message (contains 'TOO SLOW: Xs' when slow)."""
++        gen_path = os.path.join(self.git_tempdir, "gen.py")
++        sol = os.path.join(self.git_tempdir, "solution.py")
++        if not os.path.exists(gen_path) or not os.path.exists(sol):
++            return ""
++        try:
++            g = subprocess.run(["python3", gen_path, "0", "1000"], capture_output=True, text=True,
++                               timeout=20, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return "PERF: gen.py timed out at scale 1000"
++        if g.returncode != 0 or not g.stdout.strip():
++            return f"PERF: gen.py failed at scale 1000: {g.stderr[-500:]}"
++        inp = g.stdout
++        t0 = time.time()
++        try:
++            p = subprocess.run(["python3", sol], input=inp, capture_output=True, text=True,
++                               timeout=30, cwd=self.git_tempdir)
++        except subprocess.TimeoutExpired:
++            return "TOO SLOW: >30s on max-size input"
++        elapsed = time.time() - t0
++        msgs = []
++        if p.returncode != 0:
++            msgs.append(f"PERF: solution crashed on max-size input: {p.stderr[-800:]}")
++        else:
++            ok, reason = self._judge_text(inp, p.stdout)
++            if not ok:
++                msgs.append(f"PERF: max-size output rejected: {reason}")
++        if elapsed > 1.5:
++            msgs.append(f"TOO SLOW: {elapsed:.2f}s (limit 1.5s) on max-size input")
++        return "\n".join(msgs)
++
++    def _stress(self):
++        """Run the stress test (solution vs brute.py with gen.py, judged by checker when present)."""
++        common = dict(solution_cmd="python3 solution.py", generator_cmd="python3 gen.py",
++                      reference_cmd="python3 brute.py", timeout=5, seeds_per_scale=25,
++                      scales=[1, 2, 3, 5, 8, 20, 50, 1000])
++        if os.path.exists(self._checker_path()):
++            common["checker_cmd"] = "python3 checker.py"
++        old_cwd = bash._STATE.get('cwd')
++        try:
++            bash._STATE['cwd'] = self.git_tempdir
++            return stress_test.tool_function(**common)
++        except Exception as e:
++            return f"Error: stress test raised {type(e).__name__}: {e}"
++        finally:
++            bash._STATE['cwd'] = old_cwd
++
++    def _run_candidate_on(self, path, inp):
++        try:
++            t0 = time.time()
++            p = subprocess.run(["python3", path], input=inp, capture_output=True, text=True,
++                               timeout=5, cwd=self.git_tempdir)
++            elapsed = time.time() - t0
++            return (p.stdout if p.returncode == 0 else None), elapsed
++        except subprocess.TimeoutExpired:
++            return None, 5.0
++
++    def _candidate_inputs(self):
++        """Samples + generator inputs (small/medium) + one max-size input."""
++        inputs = [inp for inp, _ in self._parse_samples()]
++        gen_path = os.path.join(self.git_tempdir, "gen.py")
++        if os.path.exists(gen_path):
++            for seed in range(30):
++                scale = [1, 3, 8, 20][seed % 4]
++                try:
++                    p = subprocess.run(["python3", gen_path, str(seed), str(scale)], capture_output=True,
++                                       text=True, timeout=5, cwd=self.git_tempdir)
++                    if p.returncode == 0 and p.stdout.strip():
++                        inputs.append(p.stdout)
++                except subprocess.TimeoutExpired:
++                    pass
++            try:
++                p = subprocess.run(["python3", gen_path, "0", "1000"], capture_output=True,
++                                   text=True, timeout=20, cwd=self.git_tempdir)
++                if p.returncode == 0 and p.stdout.strip():
++                    inputs.append(p.stdout)
++            except subprocess.TimeoutExpired:
++                pass
++        return inputs
++
++    def _reference_output(self, brute_path, inp):
++        """Brute-force output for inp, or None when there is no brute.py or it fails."""
++        if not os.path.exists(brute_path):
++            return None
++        try:
++            p = subprocess.run(["python3", brute_path], input=inp, capture_output=True, text=True,
++                               timeout=5, cwd=self.git_tempdir)
++            return p.stdout if p.returncode == 0 else None
++        except subprocess.TimeoutExpired:
++            return None
++
++    def _candidate_summary(self, path, target):
++        """Short failure summary of a candidate file on the samples, used in the next candidate's prompt."""
++        report = []
++        for i, (inp, expected) in enumerate(self._parse_samples(), 1):
++            got = self._run_candidate_on(path, inp)[0]
++            ok, reason = self._judge_text(inp, got or "", expected)
++            if not ok:
++                report.append(f"sample {i}: {reason[:200]}")
++        if not report:
++            return f"{target}: passed all samples"
++        return f"{target}: " + " | ".join(report)[:400]
++
++    def _compare_candidates(self, candidates, brute_path):
++        """Score each candidate by _judge over samples + generated inputs + max-size, with a time penalty.
++        Copies the best (fastest on ties) to solution.py. Returns the chosen path or None."""
++        inputs = self._candidate_inputs()
++        if not inputs:
++            return None
++        has_checker = os.path.exists(self._checker_path())
++        results = {}
++        for path in candidates:
++            if not os.path.exists(path):
++                continue
++            score = 0
++            total_time = 0.0
++            for inp in inputs:
++                got, elapsed = self._run_candidate_on(path, inp)
++                total_time += elapsed
++                if got is None:
++                    continue
++                expected = None
++                if not has_checker:
++                    expected = self._reference_output(brute_path, inp)
++                    if expected is None:
++                        continue
++                ok, _ = self._judge_text(inp, got, expected)
++                if ok:
++                    score += 1
++            penalty = 0.05 * total_time
++            results[path] = (score - penalty, score, total_time)
++            safe_log(f"[compare] {os.path.basename(path)} score={score}/{len(inputs)} time={total_time:.2f}s")
++        if not results:
++            return None
++        # Highest score first; on ties prefer the faster candidate.
++        best = max(results, key=lambda k: (results[k][0], -results[k][2]))
++        with open(best) as f:
++            text = f.read()
++        with open(os.path.join(self.git_tempdir, "solution.py"), "w") as f:
++            f.write(text)
++        safe_log(f"[compare] selected {os.path.basename(best)} with score {results[best][1]}")
++        return best
++
++    def forward(self):
++        """
++        Staged workflow: draft -> oracle -> checker -> repair rounds -> N alternative candidates -> selection.
++        """
++        sol_path = os.path.join(self.git_tempdir, "solution.py")
++        brute_path = os.path.join(self.git_tempdir, "brute.py")
++        K = 3
++        N_CANDS = 3
++        hints = [
++            "a direct, different algorithm (e.g. a greedy or sorting-based approach)",
++            "a different data structure or decomposition (e.g. prefix sums, hashing, or a segment/Fenwick tree)",
++            "a mathematical or constructive characterization of the answer",
++        ]
++
++        # Stage 1: draft
++        ok = self._run_stage(self._draft_prompt(), attempts=3)
++        safe_log(f"[stage] draft: {'ok' if ok else 'FAILED'}")
++
++        # Stage 2: oracle, then checker
++        ok = self._run_stage(self._oracle_prompt(), attempts=2, target="brute.py")
++        safe_log(f"[stage] oracle: {'ok' if ok else 'FAILED'}")
++        ok = self._run_stage(self._checker_prompt(), attempts=2, target="checker.py")
++        safe_log(f"[stage] checker: {'ok' if ok else 'FAILED'}")
++
++        # Stage 3: samples + stress + perf, repair up to K rounds
++        prev_diff = ""
++        prev_failure = None
++        harness_suspect = False
++        repeats = 0
++        for rnd in range(K):
++            failures = self._run_samples()
++            if not failures:
++                if os.path.exists(brute_path):
++                    failures = self._stress()
++                    if "ALL PASSED" in failures:
++                        failures = ""
++                if not failures:
++                    failures = self._perf_check()
++            safe_log(f"[repair] round {rnd + 1}/{K}: {'all passed' if not failures else 'failures'}")
++            if not failures:
++                break
++            if prev_failure is not None and failures == prev_failure:
++                repeats += 1
++                harness_suspect = True
++                if repeats >= 2:
++                    safe_log("[repair] identical failure repeated twice; stopping repair loop (harness suspect)")
++                    break
++                safe_log("[repair] identical failure repeated; harness_suspect=True")
++            prev_failure = failures
++            before = self._file_snapshot(sol_path)
++            self._run_stage(self._repair_prompt(failures, prev_diff, harness_suspect=harness_suspect),
++                            attempts=2)
++            after = self._file_snapshot(sol_path)
++            if before is not None and before == after:
++                harness_suspect = True
++                safe_log("[repair] solution.py unchanged after repair; harness_suspect=True")
++            prev_diff = "" if before is None or after is None else (
++                f"--- before\n{before}\n+++ after\n{after}" if before != after else "(no change)")
++
++        # Stage 4: N alternative candidates in fresh contexts, each told about earlier failures
++        cands = []
++        cur = self._file_snapshot(sol_path)
++        if cur is not None:
++            cand0 = os.path.join(self.git_tempdir, "cand0.py")
++            with open(cand0, "w") as f:
++                f.write(cur)
++            cands.append(cand0)
++        prior_summaries = []
++        if prev_failure:
++            prior_summaries.append(f"candidate 0 (solution.py): {prev_failure[:800]}")
++        for k in range(N_CANDS):
++            target = f"cand{k + 1}.py"
++            tpath = os.path.join(self.git_tempdir, target)
++            if os.path.exists(tpath):
++                os.remove(tpath)
++            prompt = self._alt_prompt(hints[k % len(hints)],
++                                      prior_summaries="\n".join(prior_summaries)).replace("{target}", target)
++            ok = self._run_stage(prompt, attempts=2, target=target)
++            safe_log(f"[stage] candidate {k + 1}: {'ok' if ok else 'FAILED'}")
++            if os.path.exists(tpath):
++                cands.append(tpath)
++                prior_summaries.append(self._candidate_summary(tpath, target))
++
++        # Stage 5: selection by verified score
++        if len(cands) >= 1:
++            best = self._compare_candidates(cands, brute_path)
++            safe_log(f"[compare] best candidate: {best}")
++
++        # Last resort: the solution must not remain the starter stub.
++        if not self._has_source_edit():
++            safe_log("[verify] fallback: minimal prompt to write solution.py")
++            ok = self._run_stage(self._draft_prompt(), attempts=2)
++            safe_log(f"[stage] fallback: {'ok' if ok else 'FAILED'}")
++        if not self._has_source_edit():
++            # Still a stub: use the brute-force reference if the agent wrote one, so the solution is non-stub.
++            if os.path.exists(brute_path):
++                with open(brute_path) as f:
++                    text = f.read()
++                with open(sol_path, "w") as f:
++                    f.write(text)
++                safe_log("[verify] fallback: copied brute.py into solution.py (non-stub)")
++            else:
++                safe_log("[verify] WARNING: solution.py still looks like the stub")
++
++
++
++def main():
++    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
++    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
++    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
++    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
++    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
++    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
++    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
++    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
++    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
++    args = parser.parse_args()
++
++    # Process the repository
++    agentic_system = AgenticSystem(
++        problem_statement=args.problem_statement,
++        git_tempdir=args.git_dir,
++        base_commit=args.base_commit,
++        chat_history_file=args.chat_history_file,
++        test_description=args.test_description,
++        self_improve=args.self_improve,
++        language=args.language,
++    )
++
++    # Run the agentic system to try to solve the problem
++    agentic_system.forward()
++
++    # Get code diff and save to model_patch.diff
++    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
++    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
++    with open(model_patch_outfile, 'w') as f:
++        f.write(model_patch)
++
++if __name__ == "__main__":
++    main()
+diff --git a/solution_alt.py b/solution_alt.py
+new file mode 100644
+index 0000000..27cc1f7
+--- /dev/null
++++ b/solution_alt.py
+@@ -0,0 +1,79 @@
++"""Alternative implementation of sample parsing for problem statements.
++
++Different algorithm from solution.py's line-by-line state machine:
++  1. Find every "Sample/Example Input|Output [N]" header with one regex over the whole text.
++  2. Each block is the text between consecutive headers (segment-based, not line-by-line).
++  3. Output blocks are truncated at the first blank line or prose/heading line.
++  4. Output blocks that still look like prose are dropped.
++
++Standalone: standard library only, no repo imports.
++Usage: python3 solution_alt.py < statement.txt   (prints the samples as JSON)
++"""
++import json
++import re
++import sys
++
++HEADER_RE = re.compile(
++    r"^[ \t]*(?:Sample|Example)[ \t]*(Input|Output)[ \t]*(\d*)[ \t]*:?[ \t]*$",
++    re.IGNORECASE | re.MULTILINE,
++)
++PROSE_LINE_RE = re.compile(
++    r"^\s*(#|The\s|the\s|Note|NOTE|Explanation|Output|Input|Constraints|Sample)",
++    re.IGNORECASE,
++)
++WORDY_RE = re.compile(r"[A-Za-z]{3,}\s+[A-Za-z]{2,}\s+[A-Za-z]{2,}")
++
++
++def _is_prose_line(line):
++    if PROSE_LINE_RE.match(line):
++        return True
++    return len(line.split()) > 6 and bool(WORDY_RE.search(line))
++
++
++def _truncate_output(block):
++    """Keep only the leading data lines of an output block."""
++    kept = []
++    for line in block.lstrip("\n").splitlines():
++        if not line.strip() or _is_prose_line(line):
++            break
++        kept.append(line.rstrip())
++    return "\n".join(kept).strip()
++
++
++def looks_like_prose(text):
++    if not text.strip():
++        return True
++    return any(_is_prose_line(l) for l in text.splitlines() if l.strip())
++
++
++def parse_samples(statement):
++    """Return a list of (input_text, expected_output_text) pairs, in statement order."""
++    headers = list(HEADER_RE.finditer(statement))
++    samples = []
++    for idx, h in enumerate(headers):
++        if h.group(1).lower() != "input":
++            continue
++        # Find the next header; it must be the matching Output header.
++        if idx + 1 >= len(headers):
++            break
++        nxt = headers[idx + 1]
++        if nxt.group(1).lower() != "output" or nxt.group(2) != h.group(2):
++            continue
++        inp = statement[h.end():nxt.start()].strip("\n")
++        inp = "\n".join(l.rstrip() for l in inp.splitlines()).strip()
++        # Output extends to the next header (or end of text).
++        end = headers[idx + 2].start() if idx + 2 < len(headers) else len(statement)
++        out = _truncate_output(statement[nxt.end():end])
++        if not inp or not out or looks_like_prose(out):
++            continue
++        samples.append((inp + "\n", out))
++    return samples
++
++
++def main():
++    statement = sys.stdin.read()
++    print(json.dumps(parse_samples(statement), indent=2))
++
++
++if __name__ == "__main__":
++    main()

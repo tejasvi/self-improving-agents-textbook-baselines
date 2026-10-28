@@ -1,0 +1,714 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7ff551a..3bf7e6f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,477 +1,109 @@
+-import argparse
+-import ast
++import json
+ import subprocess
+-import logging
+-from logging.handlers import RotatingFileHandler
+-import os
+-import re
+-import threading
+-
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from llm import create_client, get_response_from_llm
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+-from tools.run_samples import tool_function as run_samples_tool
+-
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+-
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
+-
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
+-
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
+-
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+-
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
+-
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    def _changed_files(self):
+-        """
+-        Return the list of file paths changed versus base_commit (including untracked files),
+-        parsed from the 'diff --git a/X b/X' headers of the repository diff.
+-        """
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        files = []
+-        for line in diff.splitlines():
+-            match = re.match(r'^diff --git a/(\S+) b/(\S+)$', line)
+-            if match:
+-                path = match.group(2)
+-                if path not in files:
+-                    files.append(path)
+-        return files
+-
+-    @staticmethod
+-    def _is_test_file(path):
+-        parts = path.replace('\\', '/').split('/')
+-        name = parts[-1]
+-        if any(p in ('test', 'tests') for p in parts[:-1]):
+-            return True
+-        if name.startswith('test_') or name.endswith('_test.py') or name in ('test.py', 'tests.py'):
+-            return True
+-        return False
+-
+-    def _mentioned_deliverables(self):
+-        """
+-        Python file names mentioned in backticks in the problem statement, e.g. `solution.py`.
+-        """
+-        return re.findall(r'`([\w./-]+\.py)`', self.problem_statement or '')
+-
+-    def _file_is_nonempty(self, rel_path, min_chars=20):
+-        """True if the file exists under git_tempdir and has more than a few characters of content."""
+-        full = os.path.join(self.git_tempdir, rel_path)
+-        if not os.path.isfile(full):
+-            return False
+-        try:
+-            with open(full, 'r', errors='ignore') as f:
+-                return len(f.read().strip()) >= min_chars
+-        except OSError:
+-            return False
+-
+-    def _has_meaningful_edit(self):
+-        """
+-        True only if at least one changed file is a non-empty non-test file, and any deliverable
+-        file explicitly named in the problem statement appears among the changed files and is non-empty.
+-        """
+-        changed = self._changed_files()
+-        if not any(not self._is_test_file(f) and self._file_is_nonempty(f) for f in changed):
+-            return False
+-        mentioned = [d.lstrip('./') for d in self._mentioned_deliverables()]
+-        for deliverable in mentioned:
+-            matches = [f for f in changed if f == deliverable or f.endswith('/' + deliverable)]
+-            if not matches or not any(self._file_is_nonempty(f) for f in matches):
+-                return False
+-        # The deliverable must also compile, so a syntactically broken file triggers the fallback.
+-        to_check = mentioned if mentioned else ['solution.py']
+-        for deliverable in to_check:
+-            matches = [f for f in changed if f == deliverable or f.endswith('/' + deliverable)]
+-            for f in matches:
+-                if not self._py_compiles(f):
+-                    return False
+-        return True
+-
+-    def _py_compiles(self, rel_path):
+-        """True if `python -m py_compile` succeeds on the file under git_tempdir."""
+-        full = os.path.join(self.git_tempdir, rel_path)
+-        if not os.path.isfile(full):
+-            return False
++import sys
++
++MAX_CHARS = 2000
++
++
++def _cap(s):
++    s = s or ""
++    if len(s) > MAX_CHARS:
++        return s[:MAX_CHARS] + "\n...[truncated]"
++    return s
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": (
++            "Compare a solution against a brute-force reference on randomly generated inputs. "
++            "The generator is called as `python gen.py <seed>` and must print one test input to stdout. "
++            "Runs solution and brute with per-test timeouts, compares whitespace-normalised tokens. "
++            "Returns 'ALL OK n tests' or the first mismatch (input, expected, actual, stderr), truncated. "
++            "Keep brute-force sizes small. Use `timeout 60` for long commands and store artifacts in /tmp/work."
++        ),
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the candidate solution Python file."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the trusted brute-force Python file."
++                },
++                "gen_path": {
++                    "type": "string",
++                    "description": "Path to the random input generator Python file; takes an integer seed argument."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of random tests to run (default 200)."
++                },
++                "per_test_timeout": {
++                    "type": "number",
++                    "description": "Timeout in seconds for each program run (default 10)."
++                },
++                "seed": {
++                    "type": "integer",
++                    "description": "Starting seed for the generator (default 0)."
++                }
++            },
++            "required": ["solution_path", "brute_path", "gen_path"]
++        }
++    }
++
++
++def _run(path, inp, timeout):
++    try:
++        r = subprocess.run([sys.executable, path], input=inp, capture_output=True,
++                           text=True, timeout=timeout)
++        return r.stdout, r.stderr, None
++    except subprocess.TimeoutExpired:
++        return "", "", "TIMEOUT"
++
++
++def tool_function(solution_path, brute_path, gen_path, num_tests=200,
++                  per_test_timeout=10, seed=0):
++    num_tests = int(num_tests)
++    per_test_timeout = float(per_test_timeout)
++    seed = int(seed)
++    for i in range(num_tests):
++        s = seed + i
+         try:
+-            result = subprocess.run(
+-                ['python', '-m', 'py_compile', full],
+-                cwd=self.git_tempdir, capture_output=True, text=True, timeout=60,
+-            )
+-            return result.returncode == 0
+-        except (OSError, subprocess.SubprocessError) as e:
+-            safe_log(f"[compile] py_compile could not run on {rel_path}: {e}")
+-            return False
++            g = subprocess.run([sys.executable, gen_path, str(s)], capture_output=True,
++                               text=True, timeout=per_test_timeout)
++        except subprocess.TimeoutExpired:
++            return f"Generator timed out at seed {s}"
++        inp = g.stdout
++        exp_out, exp_err, exp_status = _run(brute_path, inp, per_test_timeout)
++        if exp_status is not None:
++            return f"Brute force timed out at seed {s}\nInput:\n{_cap(inp)}"
++        act_out, act_err, act_status = _run(solution_path, inp, per_test_timeout)
++        if act_status is not None:
++            return (f"MISMATCH at seed {s}: solution timed out\n"
++                    f"Input:\n{_cap(inp)}\nExpected:\n{_cap(exp_out)}\n"
++                    f"Actual:\n(timeout)\nStderr:\n{_cap(act_err)}")
++        if exp_out.split() != act_out.split():
++            return (f"MISMATCH at seed {s}\nInput:\n{_cap(inp)}\n"
++                    f"Expected:\n{_cap(exp_out)}\nActual:\n{_cap(act_out)}\n"
++                    f"Stderr:\n{_cap(act_err)}")
++    return f"ALL OK {num_tests} tests"
+ 
+-    @staticmethod
+-    def _sanitize_history(msg_history):
+-        """
+-        Drop trailing assistant messages whose content blocks are all empty text (no tool_use).
+-        Returns [] if nothing meaningful is left.
+-        """
+-        if not isinstance(msg_history, list):
+-            return []
+-        history = list(msg_history)
+-
+-        def is_empty_assistant(msg):
+-            if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+-                return False
+-            content = msg.get('content', [])
+-            if isinstance(content, str):
+-                return content.strip() == ''
+-            if not isinstance(content, list):
+-                return True
+-            for block in content:
+-                if isinstance(block, dict):
+-                    if block.get('type') == 'tool_use':
+-                        return False
+-                    if block.get('type') == 'text' and str(block.get('text', '')).strip():
+-                        return False
+-                    if block.get('type') not in (None, 'text'):
+-                        return False
+-                elif block:
+-                    return False
+-            return True
+-
+-        for _ in range(len(history)):
+-            if not history or not is_empty_assistant(history[-1]):
+-                break
+-            history.pop()
+-        return history if history else []
+-
+-    @staticmethod
+-    def _agent_made_tool_calls(msg_history):
+-        """True if the history contains at least one assistant tool_use block."""
+-        if not isinstance(msg_history, list):
+-            return False
+-        for msg in msg_history:
+-            if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+-                continue
+-            content = msg.get('content', [])
+-            if isinstance(content, list):
+-                for block in content:
+-                    if isinstance(block, dict) and block.get('type') == 'tool_use':
+-                        return True
+-        return False
+-
+-    def _fallback_write_solution(self):
+-        """
+-        Last resort: ask the model directly for only the Python program and write it to the deliverable
+-        (first file named in backticks in the problem, default solution.py).
+-        """
+-        if self._has_meaningful_edit():
+-            return
+-        mentioned = [d.lstrip('./') for d in self._mentioned_deliverables()]
+-        rel_target = mentioned[0] if mentioned else 'solution.py'
+-        safe_log(f"[fallback] No meaningful edit after retries; requesting complete program directly for {rel_target}.")
+-        prompt = (
+-            "Solve the following competitive programming problem in Python 3.\n\n"
+-            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-            "Output ONLY the full Python 3 program in one ```python fenced block. "
+-            "The program must read standard input and write standard output. No explanation."
+-        )
+-        target = os.path.join(self.git_tempdir, rel_target)
+-        for attempt in range(1, 4):
+-            try:
+-                client, client_model = create_client(self.code_model)
+-                content, _ = get_response_from_llm(
+-                    prompt,
+-                    client=client,
+-                    model=client_model,
+-                    system_message="You are an expert competitive programmer.",
+-                    msg_history=[],
+-                )
+-            except Exception as e:
+-                safe_log(f"[fallback] LLM request failed (attempt {attempt}/3): {e}")
+-                continue
+-            content = content or ''
+-            matches = re.findall(r'```python\s*\n(.*?)```', content, flags=re.DOTALL)
+-            if matches:
+-                code = matches[-1]
+-            elif '```' not in content:
+-                code = content
+-            else:
+-                safe_log(f"[fallback] No ```python fenced block found (attempt {attempt}/3).")
+-                continue
+-            if not code.strip():
+-                safe_log(f"[fallback] Empty code (attempt {attempt}/3).")
+-                continue
+-            try:
+-                ast.parse(code)
+-            except SyntaxError as e:
+-                safe_log(f"[fallback] Generated code does not parse (attempt {attempt}/3): {e}")
+-                continue
+-            try:
+-                os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+-                with open(target, 'w') as f:
+-                    f.write(code)
+-                safe_log(f"[fallback] Wrote {len(code)} chars to {target}")
+-            except OSError as e:
+-                safe_log(f"[fallback] Could not write {target}: {e}")
+-            return
+-        safe_log("[fallback] Giving up: no valid program produced.")
+-
+-    def _diff_summary(self):
+-        changed = self._changed_files()
+-        if not changed:
+-            return "no changes"
+-        return "\n".join(f"- {f}" for f in changed)
+-
+-    def _run_samples_check(self):
+-        """
+-        Run the sample runner programmatically on the deliverable solution.py.
+-        Returns (all_pass, report_text).
+-        """
+-        solution_path = os.path.join(self.git_tempdir, 'solution.py')
+-        if not os.path.exists(solution_path):
+-            return False, f"{solution_path} does not exist; no samples could be run."
+-        try:
+-            report = run_samples_tool(problem_text=self.problem_statement, solution_path=solution_path)
+-        except Exception as e:
+-            safe_log(f"[samples] run_samples failed: {e}")
+-            return False, f"run_samples could not be executed: {e}"
+-        all_pass = 'DIFFERS' not in report and 'No sample input/output pairs' not in report
+-        return all_pass, report
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        # Store the problem statement so the run_samples tool can read it
+-        try:
+-            with open('/tmp/problem.md', 'w') as f:
+-                f.write(self.problem_statement or '')
+-        except Exception as e:
+-            safe_log(f"Could not write /tmp/problem.md: {e}")
+-
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        workflow = """
+-If the problem is a standard input/output program, the deliverable is a Python file named solution.py in the repository root (create it with the editor tool if it does not exist). If the problem asks for a method of a given `Solution` class, edit the file that contains that class.
+-
+-Follow these steps explicitly, calling the tools as you go:
+-1. Explore the repository with the editor tool (view directories and files) and bash (ls, cat, etc.) to understand the existing code and the expected interface.
+-2. Reason about the algorithm: restate the problem, derive a correct algorithm, and check its time and memory complexity against the input constraints.
+-3. Create or edit the deliverable source file (e.g. solution.py) with the editor tool. Write a complete implementation, not a partial sketch.
+-4. Run the program on the sample inputs from the problem statement with bash and check that the output matches the expected output.
+-5. Call the run_samples tool with the problem statement (the full text is also saved in /tmp/problem.md) and the path of your solution file. It reports PASS or DIFFERS for every sample, with the expected and actual outputs.
+-   - If any sample DIFFERS, treat it as a probable failure even if the statement says that any valid answer is accepted: the grader may compare outputs exactly. Do not stop at a valid-looking answer.
+-   - Study how the expected sample outputs are constructed (ordering, which values are chosen, tie-breaking such as smallest or largest, canonical choice, bit layout, output format) and revise the algorithm so that your output matches every sample byte for byte.
+-   - Only keep a differing output if no natural deterministic construction reproduces the samples. In that case, state explicitly in your final reply that you could not match the samples and why.
+-6. Where feasible, write a brute-force version and compare it against your solution on many small random inputs using bash. Fix any mismatches.
+-7. Fix and optimize the solution based on the test results, making sure it meets the constraints. Re-run run_samples after every change to the solution.
+-
+-If the problem is interactive, write a local judge simulator in /tmp to test it; the samples may not exist.
+-
+-Important: Replying without calling tools, or ending your turn without having written or edited the source/deliverable file, counts as failure. Do not only modify test files; the actual source file must be implemented.
+-"""
+-        instruction = f"{task}\n\n{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not isinstance(msg_history, list):
+-            msg_history = []
+-        if not self._agent_made_tool_calls(msg_history):
+-            safe_log("[turn] First turn was empty / made no tool calls; going directly to clean restart path.")
+-
+-        # Every retry starts from a clean history with a short prompt that includes the problem once.
+-        condensed_task = (
+-            f"{task}\n"
+-            f"Your first action must be an editor create call writing {self.git_tempdir}/solution.py "
+-            "with a full Python 3 solution (or the deliverable file named in the problem); then test it "
+-            "with bash on the sample inputs (or a local judge simulator if the problem is interactive), "
+-            "and refine it until it is correct and efficient. Do not reply without editing the deliverable."
+-        )
+-        for attempt in range(1, 4):
+-            if self._has_meaningful_edit():
+-                break
+-            reason = (
+-                f"no meaningful source edits detected (changed files: {self._diff_summary()}); "
+-                "the diff is empty, touches only test files, is empty, does not compile, or is missing a deliverable file named in the problem"
+-            )
+-            safe_log(f"[retry {attempt}/3] Retrying from clean history: {reason}")
+-            new_history = chat_with_agent(condensed_task, model=self.code_model, msg_history=[], logging=safe_log)
+-            if isinstance(new_history, list):
+-                msg_history = new_history
+-
+-        if not self._has_meaningful_edit():
+-            safe_log("[retry] No meaningful source edit after retries; trying fallback.")
+-        self._fallback_write_solution()
+-        if not self._has_meaningful_edit():
+-            safe_log("[retry] Still no meaningful source edit after fallback.")
+-
+-        # Bounded post-run sample check: feed any DIFFERS output back to the agent
+-        for attempt in range(1, 3):
+-            all_pass, report = self._run_samples_check()
+-            safe_log(f"[samples {attempt}/2] {'all samples PASS' if all_pass else 'some samples DIFFER'}")
+-            if all_pass:
+-                break
+-            follow_up = (
+-                "The sample runner (run_samples) reports that your solution does not reproduce the expected sample outputs:\n\n"
+-                f"{report}\n\n"
+-                "The grader may compare outputs exactly, so a DIFFERS result is a probable failure even if several answers "
+-                "are allowed. Analyse how the expected outputs were constructed (ordering, tie-breaking, canonical choice, "
+-                "bit layout, output format), adapt the algorithm with the editor tool so that every sample matches byte for byte, "
+-                "then re-run the samples. If no natural deterministic construction reproduces the samples, keep the best answer "
+-                "and explain in your reply why it cannot be matched."
+-            )
+-            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=self._sanitize_history(msg_history), logging=safe_log)
+-            if not isinstance(msg_history, list):
+-                break
+ 
+ def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
++    data = sys.stdin.read()
++    if not data.strip():
++        print(json.dumps(tool_info(), indent=2))
++        return
++    try:
++        args = json.loads(data)
++    except Exception:
++        print("Invalid JSON input")
++        return
++    print(tool_function(**args))
+ 
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..bb86124
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,126 @@
++import os
++import subprocess
++import sys
++
++MAX_REPORT_CHARS = 4000
++MAX_FIELD_CHARS = 1200
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Stress-test a solution against a brute-force reference on random inputs.\n
++* The generator is run as `python3 gen_path <seed>` (the seed is passed as the first command-line argument; it prints one test input to standard output). Test i uses seed (seed + i).\n
++* For every generated input, both solution_path and brute_path are run with a per-run timeout and their outputs are compared as whitespace-separated tokens.\n
++* Returns 'ALL OK n tests' if every test matches, otherwise the first mismatch with the input, expected (brute-force) output, actual (solution) output and stderr. Output is truncated.\n
++* Keep brute-force sizes small so that the whole run finishes quickly. Use `timeout 60` on long shell commands. Store brute.py and gen.py in /tmp/work so they can be reused.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Absolute path to the candidate Python solution file to test."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Absolute path to the trusted brute-force Python reference file."
++                },
++                "gen_path": {
++                    "type": "string",
++                    "description": "Absolute path to the random input generator. It is run as `python3 gen_path <seed>` and prints one test input to standard output."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of random tests to run. Defaults to 200."
++                },
++                "per_test_timeout": {
++                    "type": "number",
++                    "description": "Timeout in seconds for each program run on each test. Defaults to 10."
++                },
++                "seed": {
++                    "type": "integer",
++                    "description": "Base seed. Test i uses seed (seed + i). Defaults to 0."
++                }
++            },
++            "required": ["solution_path", "brute_path", "gen_path"]
++        }
++    }
++
++
++def _clip(text, limit=MAX_FIELD_CHARS):
++    text = text or ""
++    if len(text) <= limit:
++        return text
++    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
++
++
++def _run(argv, stdin_text, timeout, cwd):
++    """Run argv; return (stdout, stderr, returncode, timed_out_flag)."""
++    try:
++        proc = subprocess.run(argv, input=stdin_text, capture_output=True, text=True,
++                              timeout=timeout, cwd=cwd)
++        return proc.stdout, proc.stderr, proc.returncode, False
++    except subprocess.TimeoutExpired as e:
++        out = e.stdout if isinstance(e.stdout, str) else ""
++        err = e.stderr if isinstance(e.stderr, str) else ""
++        return out, err, None, True
++
++
++def tool_function(solution_path: str, brute_path: str, gen_path: str, num_tests: int = 200,
++                  per_test_timeout: float = 10, seed: int = 0) -> str:
++    for label, path in (("solution_path", solution_path), ("brute_path", brute_path), ("gen_path", gen_path)):
++        if not path or not os.path.isfile(path):
++            return f"Error: {label} does not exist: {path}"
++    try:
++        num_tests = int(num_tests)
++        per_test_timeout = float(per_test_timeout)
++        seed = int(seed)
++    except (TypeError, ValueError) as e:
++        return f"Error: invalid numeric argument: {e}"
++    if num_tests <= 0:
++        return "Error: num_tests must be positive."
++    if per_test_timeout <= 0:
++        return "Error: per_test_timeout must be positive."
++
++    cwd = os.path.dirname(os.path.abspath(solution_path)) or None
++    py = sys.executable or "python3"
++
++    # Bounded loop: exactly num_tests iterations.
++    for i in range(num_tests):
++        cur_seed = seed + i
++        gen_out, gen_err, gen_rc, gen_timeout = _run(
++            [py, gen_path, str(cur_seed)], None, per_test_timeout, cwd)
++        if gen_timeout or gen_rc != 0:
++            return (f"Generator failed on seed {cur_seed} (test {i + 1}): "
++                    f"{'timed out' if gen_timeout else f'exit code {gen_rc}'}\n"
++                    f"stderr:\n{_clip(gen_err)}")
++        test_input = gen_out if gen_out.endswith("\n") else gen_out + "\n"
++
++        exp_out, exp_err, exp_rc, exp_timeout = _run([py, brute_path], test_input, per_test_timeout, cwd)
++        if exp_timeout or exp_rc != 0:
++            return (f"Brute force failed on test {i + 1} (seed {cur_seed}): "
++                    f"{'timed out' if exp_timeout else f'exit code {exp_rc}'}. "
++                    "Keep brute-force sizes small or fix brute_path.\n"
++                    f"--- input ---\n{_clip(test_input)}\n"
++                    f"stderr:\n{_clip(exp_err)}")
++
++        act_out, act_err, act_rc, act_timeout = _run([py, solution_path], test_input, per_test_timeout, cwd)
++        if act_timeout:
++            status = f"timed out after {per_test_timeout}s"
++        elif act_rc != 0:
++            status = f"exit code {act_rc}"
++        elif act_out.split() == exp_out.split():
++            continue
++        else:
++            status = "wrong output"
++
++        report = (
++            f"MISMATCH on test {i + 1} (seed {cur_seed}): {status}\n"
++            f"--- input ---\n{_clip(test_input)}\n"
++            f"--- expected (brute force) ---\n{_clip(exp_out)}\n"
++            f"--- actual (solution) ---\n{_clip(act_out)}\n"
++            f"--- stderr ---\n{_clip(act_err)}"
++        )
++        return report[:MAX_REPORT_CHARS]
++
++    return f"ALL OK {num_tests} tests"

@@ -1,0 +1,375 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1802f2e..a50f826 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,5 @@
+ import argparse
++import ast
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -119,6 +120,23 @@ def _is_test_file(path):
+         return True
+     return False
+ 
++# Runs one class-method sample: argv = [solution_path, method_name, args_literal].
++# Prints the result as a JSON string on a line prefixed with _RESULT_MARK.
++_RESULT_MARK = "__METHOD_RESULT__"
++_METHOD_RUNNER = r'''
++import sys, json, ast, importlib.util
++path, method, args_src = sys.argv[1], sys.argv[2], sys.argv[3]
++spec = importlib.util.spec_from_file_location("candidate_solution", path)
++mod = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(mod)
++args = ast.literal_eval(args_src)
++if not isinstance(args, tuple):
++    args = (args,)
++result = getattr(mod.Solution(), method)(*args)
++out = result if isinstance(result, str) else repr(result)
++sys.stdout.write("__METHOD_RESULT__" + json.dumps(out) + "\n")
++'''
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -190,77 +208,221 @@ class AgenticSystem:
+         """
+         return any(not _is_test_file(f) for f in self._changed_files())
+ 
++    def _is_method_task(self):
++        """
++        True if the task is a class-method task (a `Solution` class to be called)
++        rather than a full program reading stdin. Detected from the problem statement
++        wording or from the starter code committed at base_commit (not agent edits).
++        """
++        if getattr(self, "_method_task_cache", None) is not None:
++            return self._method_task_cache
++        stmt = (self.problem_statement or "").lower()
++        result = bool(re.search(r"do not read (from )?(standard input|stdin)", stmt))
++        if not result:
++            try:
++                files = subprocess.run(
++                    ["git", "-C", self.git_tempdir, "ls-tree", "-r", "--name-only", self.base_commit],
++                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++                ).stdout.decode(errors="replace").splitlines()
++                for f in files:
++                    if not f.endswith(".py") or _is_test_file(f):
++                        continue
++                    content = subprocess.run(
++                        ["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:{f}"],
++                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++                    ).stdout.decode(errors="replace")
++                    if re.search(r"^class\s+Solution\b", content, re.MULTILINE):
++                        result = True
++                        break
++            except Exception:
++                result = False
++        self._method_task_cache = result
++        return result
++
++    def _method_task_note(self):
++        """Extra instruction text for class-method tasks (empty for stdin/program tasks)."""
++        if not self._is_method_task():
++            return ""
++        return ("\nThis is a class-method task: implement the required method inside `class Solution` "
++                "in the solution file. Do NOT add stdin reading, input parsing, or a `__main__` block; "
++                "the grader calls Solution().method(...) directly.\n")
++
++    @staticmethod
++    def _parse_json_array(text):
++        """Find the first JSON array in text (scanning each '[' position). Returns a list or None."""
++        decoder = json.JSONDecoder(strict=False)  # tolerate raw newlines inside strings
++        first_list = None
++        for m in re.finditer(r"\[", text):
++            try:
++                obj, _ = decoder.raw_decode(text, m.start())
++            except Exception:
++                continue
++            if isinstance(obj, list):
++                if obj and all(isinstance(x, dict) for x in obj):
++                    return obj  # prefer an array of sample objects
++                if first_list is None:
++                    first_list = obj
++        return first_list
++
+     def _extract_samples(self):
+         """
+         Ask the LLM to extract the sample inputs/expected outputs from the problem statement.
+-        Returns a list of {"input": str, "output": str} dicts (empty list on failure).
++        For class-method tasks, it also extracts the method name and positional arguments.
++        Returns a list of dicts: {"input", "output"} and, for method tasks, {"method", "args"}.
+         """
++        method_task = self._is_method_task()
++        if method_task:
++            fmt = (
++                '[{"input": "<exact input text as shown>", "output": "<exact expected output text>", '
++                '"method": "<method name of class Solution>", '
++                '"args": "<Python literal tuple of positional arguments, e.g. ([2, 7, 11], 9)>"}, ...]'
++            )
++            extra = (
++                "This is a class-method task: the solution is a method of class Solution. "
++                "For each sample, also return \"method\" (the method name) and \"args\" "
++                "(a Python literal tuple of the positional arguments, written so that "
++                "ast.literal_eval can parse it; use True/False/None for booleans/null, and "
++                "the args tuple must have one element per parameter, with a trailing comma for one argument). "
++                "\"output\" must be the expected return value as written in the statement.\n"
++            )
++        else:
++            fmt = '[{"input": "<exact stdin text>", "output": "<exact expected stdout text>"}, ...]'
++            extra = ""
+         prompt = f"""Extract the sample test cases from the problem statement below.
+ 
+-Return ONLY a JSON array (no prose) of objects with exactly two string keys:
+-[{{"input": "<exact stdin text>", "output": "<exact expected stdout text>"}}, ...]
++Return ONLY a JSON array (no prose) of objects with string keys:
++{fmt}
+ 
+-Copy the sample inputs and outputs exactly, preserving line breaks. If there are no samples, return [].
++{extra}Copy the sample inputs and outputs exactly, preserving line breaks. If there are no samples, return [].
+ 
+ <problem_statement>
+ {self.problem_statement}
+ </problem_statement>
+ """
+-        text = simple_chat(prompt, model=self.code_model, max_tokens=8192, logging=safe_log)
+-        match = re.search(r"\[.*\]", text or "", re.DOTALL)
+-        if not match:
+-            safe_log("[samples] could not find a JSON array in the extraction response.")
+-            return []
+-        try:
+-            data = json.loads(match.group(0))
+-        except Exception as e:
+-            safe_log(f"[samples] JSON parse failed: {e}")
+-            return []
++        data = None
++        for _attempt in range(2):  # one retry if the LLM call fails or returns unparsable text
++            text = simple_chat(prompt, model=self.code_model, max_tokens=8192, logging=safe_log)
++            data = self._parse_json_array(text or "")
++            if data is not None:
++                break
++            safe_log(f"[samples] extraction attempt {_attempt} produced no JSON array.")
+         samples = []
+         if isinstance(data, list):
+             for item in data:
+                 if isinstance(item, dict) and "input" in item and "output" in item:
+-                    samples.append({"input": str(item["input"]), "output": str(item["output"])})
++                    sample = {"input": str(item["input"]), "output": str(item["output"])}
++                    if method_task:
++                        sample["method"] = str(item.get("method") or "")
++                        raw_args = item.get("args")
++                        if isinstance(raw_args, (list, tuple)):
++                            raw_args = repr(tuple(raw_args))
++                        sample["args"] = str(raw_args or "()")
++                    samples.append(sample)
+         return samples
+ 
++    def _run_method_sample(self, solution_path, sample):
++        """
++        Run one class-method sample: import the solution module, call Solution().method(*args)
++        in a subprocess, and return (actual_text, stderr, returncode). Raises TimeoutExpired on timeout.
++        """
++        proc = subprocess.run(
++            ["python3", "-c", _METHOD_RUNNER, solution_path, str(sample["method"]), str(sample["args"])],
++            capture_output=True, text=True, timeout=10, cwd=self.git_tempdir,
++        )
++        actual = ""
++        for line in proc.stdout.splitlines():
++            if line.startswith(_RESULT_MARK):
++                try:
++                    actual = json.loads(line[len(_RESULT_MARK):])
++                except Exception:
++                    actual = line[len(_RESULT_MARK):]
++        return actual, proc.stderr, proc.returncode
++
++    @staticmethod
++    def _method_output_matches(actual, expected):
++        """Compare a method's returned text against the expected output text."""
++        exp = expected.strip()
++        act = actual.strip()
++        if act.split() == exp.split():
++            return True
++        # Accept JSON-style booleans/null in the expected text.
++        exp_py = re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", exp)))
++        if act.split() == exp_py.split():
++            return True
++        try:
++            exp_val = ast.literal_eval(exp_py)
++        except Exception:
++            return False
++        act_py = re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", act)))
++        try:
++            act_val = ast.literal_eval(act_py)
++        except Exception:
++            act_val = act  # plain string result
++        try:
++            return act_val == exp_val
++        except Exception:
++            return False
++
+     def _run_samples(self, solution_path, samples):
+         """
+-        Run the solution with python3 on each sample. Returns (report, all_passed).
+-        The report is raw plain text: input, expected output, actual output, stderr, runtime.
++        Run the solution on each sample. Full-program tasks run via `python3 solution.py`
++        with stdin; class-method tasks import the module and call Solution().method(*args).
++        Returns (report, all_passed). The report is raw plain text.
+         """
+         if not samples:
+             return "No samples were extracted from the problem statement; verify manually with your own tests.", False
+         if not solution_path or not os.path.exists(solution_path):
+             return f"Solution file not found: {solution_path}", False
+ 
++        method_task = self._is_method_task()
+         blocks = []
+         all_passed = True
+         for i, sample in enumerate(samples):
+-            stdin_text = sample["input"]
+-            if stdin_text and not stdin_text.endswith("\n"):
+-                stdin_text += "\n"
+             start = time.time()
+-            try:
+-                proc = subprocess.run(
+-                    ["python3", solution_path],
+-                    input=stdin_text, capture_output=True, text=True, timeout=10,
+-                    cwd=self.git_tempdir,
+-                )
+-                elapsed = time.time() - start
+-                actual = proc.stdout
+-                stderr = proc.stderr
+-                status_note = f"exit code {proc.returncode}"
+-                passed = proc.returncode == 0 and actual.split() == sample["output"].split()
+-            except subprocess.TimeoutExpired:
+-                elapsed = time.time() - start
+-                actual, stderr = "", "TIMEOUT: exceeded 10 seconds"
+-                status_note = "timeout"
+-                passed = False
++            if method_task:
++                input_label = (f"method call: {sample.get('method', '')}{sample.get('args', '()')}\n"
++                               f"(input as written in statement)\n{sample['input']}")
++                if not sample.get("method"):
++                    elapsed = time.time() - start
++                    actual, stderr, status_note = "", "No method name was extracted for this sample.", "no method"
++                    passed = False
++                else:
++                    try:
++                        actual, stderr, rc = self._run_method_sample(solution_path, sample)
++                        elapsed = time.time() - start
++                        status_note = f"exit code {rc}"
++                        passed = rc == 0 and actual != "" and self._method_output_matches(actual, sample["output"])
++                    except subprocess.TimeoutExpired:
++                        elapsed = time.time() - start
++                        actual, stderr = "", "TIMEOUT: exceeded 10 seconds"
++                        status_note = "timeout"
++                        passed = False
++            else:
++                input_label = sample["input"]
++                stdin_text = sample["input"]
++                if stdin_text and not stdin_text.endswith("\n"):
++                    stdin_text += "\n"
++                try:
++                    proc = subprocess.run(
++                        ["python3", solution_path],
++                        input=stdin_text, capture_output=True, text=True, timeout=10,
++                        cwd=self.git_tempdir,
++                    )
++                    elapsed = time.time() - start
++                    actual = proc.stdout
++                    stderr = proc.stderr
++                    status_note = f"exit code {proc.returncode}"
++                    passed = proc.returncode == 0 and actual.split() == sample["output"].split()
++                except subprocess.TimeoutExpired:
++                    elapsed = time.time() - start
++                    actual, stderr = "", "TIMEOUT: exceeded 10 seconds"
++                    status_note = "timeout"
++                    passed = False
+             if not passed:
+                 all_passed = False
+             blocks.append(
+                 f"=== Sample {i + 1} ({'PASS' if passed else 'FAIL'}, {status_note}, time {elapsed:.3f}s) ===\n"
+-                f"--- input ---\n{sample['input']}\n"
++                f"--- input ---\n{input_label}\n"
+                 f"--- expected output ---\n{sample['output']}\n"
+                 f"--- actual output ---\n{actual}\n"
+                 f"--- stderr ---\n{stderr}\n"
+@@ -292,15 +454,16 @@ Copy the sample inputs and outputs exactly, preserving line breaks. If there are
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
++        method_note = self._method_task_note()
+         instruction = f"""{task}
+-
++{method_note}
+ Follow this step-by-step workflow:
+ 1) Inspect the repository: use bash (e.g. `ls -la`, `cat`) and the editor tool to view existing files, and determine which file the solution must be written to (use the file named in the problem statement; if none is named, use the existing solution/entry file in the repo).
+-2) Reason about the algorithm and the complexity needed for the input constraints before writing code.
+-   If the statement allows multiple valid outputs (e.g. "if there are multiple solutions, print any"), do NOT assume any valid output is accepted. Assume the grader compares against the reference output, and choose the lexicographically smallest / first-in-natural-enumeration-order answer as the canonical answer. Design the algorithm so that this canonical answer is produced efficiently at max constraints, controlling tie-breaking explicitly.
++2) Reason about the algorithm and the complexity needed for the input constraints before writing code. Do not ship heuristics (caps, restricted ranges, pruning) validated only on tiny inputs; validate them on medium/large inputs against an exact version, or prove them.
++   If the statement allows multiple valid outputs (e.g. "if there are multiple solutions, print any"), do NOT assume any valid output is accepted. Assume the grader compares against the reference output, and choose the lexicographically smallest / first-in-natural-enumeration-order answer as the canonical answer. Design the algorithm so that this canonical answer is produced efficiently at max constraints, controlling tie-breaking explicitly. If the answer is a single number or otherwise unique, no tie-breaking is needed.
+ 3) Write the implementation to the required file using the editor tool's `create` or `edit` command. The file MUST be written to disk.
+ 4) Run the program on every sample input in the problem statement with bash and compare its output with the expected output. Fix any mismatch and re-run until all samples pass. If the statement allows multiple valid outputs, verify that every sample expected output equals your canonical answer; if it does not, your choice of canonical order is wrong, so revise it.
+-5) For tricky or hard problems, write brute.py that returns the canonical answer by exhaustive enumeration in canonical order, and stress-test solution.py by EXACT output comparison on at least 1000 random small inputs (small value ranges to force duplicates and ties). Only fall back to a validity checker if the exact rule is impossible to match. Fix any differences.
++5) For tricky or hard problems, write a brute-force reference and stress-test solution.py by EXACT output comparison on many random small inputs (small value ranges to force duplicates and ties). Only fall back to a validity checker if the exact rule is impossible to match. Fix any differences.
+ 6) Never end your turn with only text. Replying without writing the solution file to disk counts as FAILURE. Only finish after the solution file has been written and verified.
+ """
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+@@ -349,8 +512,9 @@ Current diff:
+ 
+ Instructions:
+ - Read the report carefully: compare expected vs. actual output, and check stderr and runtime (timeouts mean the algorithm is too slow).
++{method_note}
+ - Fix the solution file with the editor tool (`edit` or `create`, which overwrites).
+-- Write a brute-force implementation that outputs the canonical answer (the lexicographically smallest / first-in-natural-order answer) by exhaustive enumeration, and compare the solution against it by EXACT output comparison on many small random inputs (small value ranges to force duplicates and ties). Do not switch to a validity-only checker unless the canonical rule cannot be matched.
++- Write a brute-force implementation of the problem and compare the solution against it by EXACT output comparison on many small random inputs (small value ranges to force duplicates and ties). If the problem allows multiple valid outputs, the brute force must output the canonical answer (the lexicographically smallest / first-in-natural-order answer). Do not switch to a validity-only checker unless the canonical rule cannot be matched.
+ - Generate a max-size input allowed by the constraints and time the solution on it.
+ - Re-run the solution on all sample inputs with bash and confirm they pass before finishing.
+ - Do not reply with text only; finish only after the fixes are written to disk and verified.
+@@ -358,32 +522,34 @@ Instructions:
+             chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[verify round {round_idx}] repair chat finished.")
+ 
+-        # Canonical stress-test phase: runs even when samples pass, because samples
+-        # cannot distinguish valid-but-different answers from the canonical one.
+-        for canon_idx in range(2):
++        # Assumption audit + multi-scale differential testing phase: runs even when samples
++        # pass, because samples are tiny and cannot expose heuristics that only fail on large inputs.
++        for audit_idx in range(2):
+             solution_path = self._solution_path()
+             if not solution_path:
+-                safe_log("[canonical] no solution file found; skipping canonical stress test.")
++                safe_log("[audit] no solution file found; skipping assumption audit.")
+                 break
+             current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-            canon_msg = f"""{task}
+-
+-Canonical stress-test phase (round {canon_idx + 1}).
++            audit_msg = f"""{task}
+ 
++Assumption audit and multi-scale differential testing (round {audit_idx + 1}).
++{method_note}
+ The solution file is: {solution_path}
+ Current diff:
+ {current_diff if current_diff.strip() else '(empty)'}
+ 
+-Samples may not reveal differences between valid-but-different answers, so the grader is assumed to compare EXACT output against a canonical reference answer. Do the following with bash and the editor tool:
+-- Write a brute-force program /tmp/brute.py that prints the canonical answer by exhaustive enumeration in canonical order (lexicographically smallest / first-in-natural-enumeration-order). If the problem has a unique answer, brute.py simply computes that answer.
+-- Write a random generator /tmp/gen.py producing many small inputs (small value ranges to force duplicates and ties), respecting the input format of the problem.
+-- Run at least 1000 random tests via bash, comparing the solution's stdout to brute.py's stdout EXACTLY (for example with a loop over seeds in a shell script or a Python driver using subprocess). Keep the generated files in /tmp, not in the repository.
+-- If any mismatch occurs, determine whether the solution or the canonical ordering is wrong, fix the solution file with the editor tool, and re-run the tests.
+-- Re-run the solution on all sample inputs and confirm they still pass.
++Small brute-force comparisons cannot reveal heuristics that only fail on large inputs (for example, a cap or a restricted range that was validated only with n <= 150). Do the following with bash and the editor tool:
++(a) Audit assumptions: open the current solution file and enumerate EVERY heuristic, assumption, cap, pruning rule, restricted range, early cutoff, or approximation it relies on. For each one, state whether it is proven correct for all valid inputs. Keep a short list in your reasoning.
++(b) Keep an exact reference: write /tmp/exact.py, a straightforward implementation of the same problem with NO caps, NO pruning, and NO restricted ranges (it may be slow, but it must be correct). Keep it in /tmp, not in the repository.
++(c) Write generators in /tmp for at least three size tiers: tiny (n about 1-9), medium (about 50-500), and large (as big as the exact reference can still handle in reasonable time). Include adversarial distributions: skewed values, many distinct values, all-equal values, extremes of the value range, and sizes at the boundaries of the constraints.
++(d) Run differential tests between solution.py and /tmp/exact.py: hundreds of cases per tier, each run with a timeout (e.g. `timeout 10`), comparing stdout EXACTLY. Use a Python driver or a shell loop. Keep generated files in /tmp.
++(e) If ANY mismatch occurs, fix solution.py with the editor tool so it matches the exact reference. Never weaken or change /tmp/exact.py to match the solution. Remove any heuristic you cannot prove, or validate it against the exact version on medium and large inputs.
++(f) Time solution.py on a max-size input allowed by the constraints, and confirm it is within the time limit.
++(g) Re-run the solution on all sample inputs and confirm they still pass.
+ - Do not reply with text only; finish only after the checks have been run and any fixes are written to disk.
+ """
+-            chat_with_agent(canon_msg, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[canonical round {canon_idx}] canonical stress-test chat finished.")
++            chat_with_agent(audit_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"[audit round {audit_idx}] assumption audit chat finished.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

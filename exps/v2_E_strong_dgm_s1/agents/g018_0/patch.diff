@@ -1,0 +1,324 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e652ed5..0a4708a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,5 +1,7 @@
+ import argparse
++import json
+ import subprocess
++import time
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+@@ -47,7 +49,8 @@ VERIFY_AND_PERF_STEPS = """3. Run solution.py on every sample in the statement a
+    c. Generate them with Python expressions (e.g. `'a'*20000`, `list(range(200000))`) and time them with the bench_solution tool (or bash with `timeout 10 python3 solution.py < big.txt`).
+    d. If any case takes more than about 1s, or the estimated operation count is over about 5*10^7, throw away the heuristic approach and look for a lower-complexity formulation. Do not micro-optimize a bad algorithm.
+    e. Pruning/early-break heuristics do not count as a complexity guarantee; test inputs that defeat them.
+-   f. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
++   f. Performance hints: prefer flat int lists or numpy over dicts and floats; precompute modular indices/tables instead of recomputing them; cap the DP state to the necessary size (do not allocate arrays sized to the worst case when a smaller bound suffices); avoid float('inf') in hot loops; alias hot methods to locals.
++   g. Validate any optimized or pruned solution against a simple brute force on random small inputs, including the heuristic-heavy paths.
+ 6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+ 
+ # Thread-local storage for logger instances
+@@ -157,6 +160,85 @@ class AgenticSystem:
+         non_test = remove_patch_by_files(diff, keyword='test')
+         return any(line.startswith('+') and not line.startswith('+++') for line in non_test.splitlines())
+ 
++    def _timing_gate(self, history):
++        """
++        Bounded (3 rounds) max-size performance gate. Each round: the agent writes gen_max.py,
++        every generated input is run on solution.py with a 2.5s limit, and if any run is too slow
++        the agent is asked to optimize with timings and a cProfile summary.
++        """
++        sol_path = os.path.join(self.git_tempdir, 'solution.py')
++        gen_path = os.path.join(self.git_tempdir, 'gen_max.py')
++        for round in range(3):
++            safe_log(f"Timing gate round {round + 1}/3: requesting gen_max.py")
++            gen_msg = f"""Performance gate round {round + 1}/3 for the solution in {sol_path}.
++
++Phase: write a generator producing max-size inputs per the constraints, with 3+ adversarial variants.
++Write {gen_path} as a standalone Python script that prints to stdout a single JSON array of raw stdin strings (one string per test input). Include: a random max-size input, an all-equal max-size input, and at least 3 adversarial max-size variants (e.g. sorted, reverse-sorted, maximum distinct values, skewed sizes, inputs that defeat early-break/pruning logic). Use the exact input format from the problem statement and max values of the constraints. Keep each input under 5 MB. Write the file with the editor tool, then run it once to confirm it prints valid JSON."""
++            history = chat_with_agent(gen_msg, model=self.code_model, msg_history=history, logging=safe_log)
++            safe_log(f"Timing gate round {round + 1}/3: gen_max.py written={os.path.isfile(gen_path)}")
++
++            if not os.path.isfile(gen_path):
++                safe_log("Timing gate: gen_max.py missing; stopping gate")
++                break
++            gp_stderr = ''
++            try:
++                gp = subprocess.run(['python3', gen_path], cwd=self.git_tempdir, capture_output=True, text=True, timeout=120)
++                gp_stderr = gp.stderr or ''
++                inputs = json.loads(gp.stdout) if gp.returncode == 0 else None
++            except Exception as e:
++                inputs = None
++                safe_log(f"Timing gate: generator failed: {e}")
++            if not isinstance(inputs, list) or not inputs:
++                gen_err = 'generator did not print a non-empty JSON array of strings'
++                safe_log(f"Timing gate round {round + 1}/3: {gen_err}")
++                history = chat_with_agent(
++                    f"gen_max.py must print a single non-empty JSON array of raw stdin strings to stdout. Fix {gen_path} (it failed: {gen_err}; stderr: {gp_stderr[-500:]}). Then re-run it.",
++                    model=self.code_model, msg_history=history, logging=safe_log)
++                continue
++
++            results = []
++            for i, inp in enumerate(inputs):
++                t0 = time.time()
++                try:
++                    r = subprocess.run(['python3', sol_path], input=str(inp), cwd=self.git_tempdir,
++                                       capture_output=True, text=True, timeout=2.5)
++                    status = 'OK' if r.returncode == 0 else 'ERROR'
++                    detail = (r.stderr or '')[-300:] if status == 'ERROR' else ''
++                except subprocess.TimeoutExpired:
++                    status = 'TIMEOUT'
++                    detail = 'killed after 2.5s'
++                results.append((i, time.time() - t0, status, detail))
++            n_bad = sum(1 for r in results if r[2] != 'OK')
++            timing_lines = "\n".join(f"  input#{i}: {el:.3f}s {st} {d}" for i, el, st, d in results)
++            safe_log(f"Timing gate round {round + 1}/3: {len(results) - n_bad}/{len(results)} OK")
++            if n_bad == 0:
++                safe_log("Timing gate passed: all max-size inputs finished within 2.5s")
++                break
++
++            slow_i = max(range(len(results)), key=lambda i: results[i][1])
++            profile = ''
++            try:
++                from tools.perf_gate import _profile
++                profile = _profile(sol_path, str(inputs[slow_i]), self.git_tempdir, n=15)
++            except Exception as e:
++                profile = f'(profile unavailable: {e})'
++            opt_msg = f"""Performance gate round {round + 1}/3 FAILED: some max-size inputs were too slow (limit 2.5s per input).
++
++Timings:
++{timing_lines}
++
++cProfile top 15 (cumtime) for the slowest input #{slow_i}:
++{profile}
++
++Optimize solution.py now:
++1. First run `cp solution.py solution_ref.py` to save the current correct version as the reference.
++2. Optimize: reduce the state space to what is necessary, or lower the constant factor. Prefer flat int lists or numpy over dicts and floats; avoid float('inf') (use a large int sentinel); avoid per-iteration large allocations (preallocate, reuse); alias hot attributes/methods to local variables; precompute modular indices/tables; avoid nested Python loops where a vectorized or lower-complexity formulation exists.
++3. Compare outputs of solution.py and solution_ref.py on 200 random small inputs, and on the max inputs from gen_max.py. Every output must match exactly.
++4. Re-check the optimized solution.py on the max inputs with `python3 solution.py < file` and make sure it runs well under 2 seconds."""
++            history = chat_with_agent(opt_msg, model=self.code_model, msg_history=history, logging=safe_log)
++            safe_log(f"Timing gate round {round + 1}/3: optimization round finished")
++        return history
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -194,8 +276,15 @@ No solution.py exists yet. Do not plan at length. Your next action must be an ed
+                 history = recovered
+ 
+         if self._has_solution_edit():
+-            safe_log("Phase 2: verification and performance steps")
+-            phase2 = f"""Task summary: solve the problem in the repository at {self.git_tempdir}, with the final code in solution.py.
++            safe_log(f"Phase 1/recovery summary: solution edit present, {len(history)} messages in history")
++        else:
++            safe_log("Fallback: writing minimal solution.py programmatically")
++            with open(os.path.join(self.git_tempdir, 'solution.py'), 'w') as f:
++                f.write("import sys\n\nprint(0)\n")
++
++        # Phase 2 always runs (whether phase 1 produced a solution or not).
++        safe_log("Phase 2: verification and performance steps")
++        phase2 = f"""Task summary: solve the problem in the repository at {self.git_tempdir}, with the final code in solution.py.
+ 
+ <problem_description>
+ {self.problem_statement}
+@@ -204,11 +293,11 @@ No solution.py exists yet. Do not plan at length. Your next action must be an ed
+ solution.py now exists. Continue with the following steps:
+ 
+ {VERIFY_AND_PERF_STEPS}"""
+-            history = chat_with_agent(phase2, model=self.code_model, msg_history=history, logging=safe_log)
+-        else:
+-            safe_log("Fallback: writing minimal solution.py programmatically")
+-            with open(os.path.join(self.git_tempdir, 'solution.py'), 'w') as f:
+-                f.write("import sys\n\nprint(0)\n")
++        history = chat_with_agent(phase2, model=self.code_model, msg_history=history, logging=safe_log)
++        safe_log(f"Phase 2 summary: verification/performance pass finished, {len(history)} messages in history")
++
++        # Phase 3: bounded max-size performance gate with optimization rounds.
++        history = self._timing_gate(history)
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/solution.py b/solution.py
+new file mode 100644
+index 0000000..736e15b
+--- /dev/null
++++ b/solution.py
+@@ -0,0 +1,11 @@
++import sys
++
++
++def main():
++    data = sys.stdin.read().split()
++    # Placeholder baseline: echo the number of whitespace-separated tokens.
++    print(len(data))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/perf_gate.py b/tools/perf_gate.py
+new file mode 100644
+index 0000000..c3d5daf
+--- /dev/null
++++ b/tools/perf_gate.py
+@@ -0,0 +1,158 @@
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++
++_GEN_EVAL = r'''
++import json, random, sys
++random.seed(12345)
++print(json.dumps([str(x) for x in (EXPR)]))
++'''
++
++
++def tool_info():
++    return {
++        "name": "perf_gate",
++        "description": """Performance gate for a stdin/stdout Python solution. Runs solution.py on several max-size inputs, each in an isolated subprocess with a hard time limit, and reports per-input wall times and status (OK / TIMEOUT / ERROR). For the slowest input it also returns the top 15 lines of `python -m cProfile -s cumtime` output (hot spots).
++* `max_params` is EITHER a path to a generator script (a Python file that prints a JSON array of input strings to stdout, e.g. random, all-equal and adversarial max-size inputs), OR a Python expression that evaluates to a list of input strings, e.g. `['5\\n' + ' '.join(['1']*200000)]`. Strings are used as raw stdin text.
++* `time_limit` is the per-input timeout in seconds (default 2).
++* Use it after correctness passes to detect slow solutions; it does not change any files.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the stdin/stdout Python solution file (solution.py)."
++                },
++                "mode": {
++                    "type": "string",
++                    "description": "Must be 'stdin' (the solution reads standard input and writes standard output)."
++                },
++                "max_params": {
++                    "type": "string",
++                    "description": "Either a path to a generator script that prints a JSON array of raw stdin strings, or a Python expression evaluating to a list of raw stdin strings."
++                },
++                "time_limit": {
++                    "type": "number",
++                    "description": "Per-input hard timeout in seconds (default 2)."
++                }
++            },
++            "required": ["solution_path", "mode", "max_params"]
++        }
++    }
++
++
++def _clip(s, n=300):
++    s = (s or '').strip()
++    return s if len(s) <= n else s[: n // 2] + " ... " + s[-n // 2:]
++
++
++def _run(cmd, stdin_text, cwd, timeout_s):
++    t0 = time.time()
++    try:
++        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                             text=True, cwd=cwd, start_new_session=True)
++    except Exception as e:
++        return 'ERROR', time.time() - t0, '', f'failed to start: {e}'
++    try:
++        out, err = p.communicate(stdin_text, timeout=timeout_s)
++        el = time.time() - t0
++        if p.returncode != 0:
++            return 'ERROR', el, out, (err or '') + f'\n(exit code {p.returncode})'
++        return 'OK', el, out, err
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(p.pid, signal.SIGKILL)
++        except Exception:
++            p.kill()
++        try:
++            p.communicate(timeout=5)
++        except Exception:
++            pass
++        return 'TIMEOUT', time.time() - t0, '', f'killed after {timeout_s}s'
++
++
++def _load_inputs(max_params, cwd):
++    """Return (inputs, error). max_params is a generator script path or a Python expression."""
++    if os.path.isfile(max_params):
++        try:
++            p = subprocess.run([sys.executable, os.path.abspath(max_params)], cwd=cwd,
++                               capture_output=True, text=True, timeout=120)
++        except subprocess.TimeoutExpired:
++            return None, "generator script timed out after 120s"
++        if p.returncode != 0:
++            return None, f"generator script failed (exit {p.returncode}): {_clip(p.stderr)}"
++        try:
++            data = json.loads(p.stdout)
++        except Exception as e:
++            return None, f"generator output is not a JSON array of strings: {e}; got: {_clip(p.stdout)}"
++    else:
++        script = _GEN_EVAL.replace('(EXPR)', '(' + max_params + ')')
++        try:
++            p = subprocess.run([sys.executable, '-c', script], cwd=cwd,
++                               capture_output=True, text=True, timeout=120)
++        except subprocess.TimeoutExpired:
++            return None, "expression evaluation timed out after 120s"
++        if p.returncode != 0:
++            return None, f"expression failed: {_clip(p.stderr)}"
++        data = json.loads(p.stdout)
++    if not isinstance(data, list) or not data:
++        return None, "no inputs produced (need a non-empty JSON list)"
++    return [str(x) for x in data], None
++
++
++def _profile(path, inp, cwd, n=15, timeout_s=10):
++    """Top-n lines of cProfile output sorted by cumtime for one input (bounded by timeout_s)."""
++    try:
++        p = subprocess.run([sys.executable, '-m', 'cProfile', '-s', 'cumtime', path],
++                           input=inp, cwd=cwd, capture_output=True, text=True, timeout=timeout_s)
++    except subprocess.TimeoutExpired:
++        return f"(profiling killed after {timeout_s}s: the input is too slow to profile fully; optimize the hot loops first)"
++    out = p.stdout or ''
++    idx = out.find('Ordered by')
++    if idx < 0:
++        return "(no cProfile output found) " + _clip(p.stderr)
++    lines = out[idx:].splitlines()
++    # lines[0] is the 'Ordered by' header; keep header + table lines (skip blanks)
++    body = [l for l in lines if l.strip()]
++    return "\n".join(body[:n + 1])
++
++
++def tool_function(solution_path, mode, max_params, time_limit=2):
++    try:
++        time_limit = max(0.1, min(float(time_limit or 2), 60.0))
++    except Exception:
++        time_limit = 2.0
++    path = os.path.abspath(str(solution_path))
++    if not os.path.isfile(path):
++        return f"Error: solution file not found: {path}"
++    if mode != 'stdin':
++        return "Error: mode must be 'stdin' for perf_gate."
++    if not max_params:
++        return "Error: max_params is required (generator script path or Python expression)."
++    cwd = os.path.dirname(path)
++
++    inputs, err = _load_inputs(str(max_params), cwd)
++    if err:
++        return f"Error: {err}"
++
++    rows = []
++    for i, inp in enumerate(inputs):
++        label = f"input#{i} len={len(inp)} head={inp[:20]!r}"
++        status, el, out, errtxt = _run([sys.executable, path], inp, cwd, time_limit)
++        rows.append((i, label, el, status, _clip(out, 80) if status == 'OK' else _clip(errtxt, 200)))
++
++    lines = [f"Perf gate for {path}, time_limit {time_limit}s per input, {len(rows)} inputs",
++             f"{'#':>3}  {'input':<50} {'time(s)':>8}  {'status':<8} output/error"]
++    for i, label, el, status, detail in rows:
++        lines.append(f"{i:>3}  {label:<50} {el:>8.3f}  {status:<8} {detail}")
++    slow = max(rows, key=lambda r: r[2])
++    lines.append(f"Slowest: #{slow[0]} took {slow[2]:.3f}s, status {slow[3]}")
++    n_bad = sum(1 for r in rows if r[3] != 'OK')
++    lines.append(f"Summary: {len(rows) - n_bad}/{len(rows)} OK" + ("" if n_bad == 0 else f", {n_bad} not OK (TIMEOUT/ERROR)"))
++    lines.append("")
++    lines.append(f"cProfile top {15} (cumtime) for slowest input #{slow[0]}:")
++    lines.append(_profile(path, inputs[slow[0]], cwd, n=15, timeout_s=min(10, max(3, int(time_limit * 3)))))
++    return "\n".join(lines)

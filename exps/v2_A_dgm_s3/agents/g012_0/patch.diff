@@ -1,0 +1,160 @@
+diff --git a/llm.py b/llm.py
+index e58aea5..e74eb9d 100644
+--- a/llm.py
++++ b/llm.py
+@@ -195,7 +195,13 @@ def get_response_from_llm(
+         print_debug=False,
+         msg_history=None,
+         temperature=0.7,
++        max_tokens=None,
++        thinking=None,
+ ):
++    """
++    Single-turn LLM call. For Claude models, `max_tokens` overrides MAX_OUTPUT_TOKENS and
++    `thinking` (e.g. {'type': 'disabled'}) is passed through when not None.
++    """
+     if msg_history is None:
+         msg_history = []
+ 
+@@ -211,12 +217,16 @@ def get_response_from_llm(
+                 ],
+             }
+         ]
++        extra = {}
++        if thinking is not None:
++            extra["thinking"] = thinking
+         response = client.messages.create(
+             model=model,
+-            max_tokens=MAX_OUTPUT_TOKENS,
++            max_tokens=max_tokens or MAX_OUTPUT_TOKENS,
+             temperature=temperature,
+             system=system_message,
+             messages=new_msg_history,
++            **extra,
+         )
+         content = _first_text(response)
+         new_msg_history = new_msg_history + [
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 24ac338..44ebd41 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -39,16 +39,26 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+ )
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3
++    logging=None, max_retry=3, max_tokens=4096, thinking=None,
+ ):
++    """
++    Call the model with tools. `max_tokens` sets the output budget; `thinking` (e.g. {'type': 'disabled'})
++    is passed through to the Claude API when not None.
++    """
++    if logging is None:
++        logging = print
+     try:
+         if 'claude' in model:
++            extra = {}
++            if thinking is not None:
++                extra['thinking'] = thinking
+             response = client.messages.create(
+                 model=model,
+                 messages=messages,
+-                max_tokens=4096,
++                max_tokens=max_tokens,
+                 tool_choice=tool_choice,
+                 tools=tools,
++                **extra,
+             )
+         elif model.startswith('o3-'):
+             response = client.responses.create(
+@@ -65,7 +75,8 @@ def get_response_withtools(
+     except Exception as e:
+         logging(f"Error in get_response_withtools: {str(e)}")
+         if max_retry > 0:
+-            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
++            return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1,
++                                          max_tokens=max_tokens, thinking=thinking)
+ 
+         # Hitting the context window limit
+         if 'Input is too long for requested model' in str(e):
+@@ -436,32 +447,28 @@ def chat_with_agent_claude(
+         tools = [convert_tool_info(tool['info'], model=client_model) for tool in all_tools]
+         small_tools = [t for t in tools if t['name'] in ('bash', 'editor')] or tools
+ 
+-        # Attempt configurations for empty responses: changed context, temperature and tools.
+-        # Note: get_response_withtools does not take a temperature; the attempt is varied by
+-        # tool set and by the nudge text instead.
+-        attempt_configs = [
+-            {"tools": tools, "nudge": False},
+-            {"tools": tools, "nudge": True},
+-            {"tools": small_tools, "nudge": True, "short_system": True},
++        # Budget escalation schedule: each entry is tried in order when a response is empty
++        # because the output budget was exhausted by hidden thinking (stop_reason == 'max_tokens').
++        budget_schedule = [
++            {'max_tokens': 8192, 'thinking': None},
++            {'max_tokens': 16384, 'thinking': {'type': 'disabled'}},
++            {'max_tokens': 32000, 'thinking': {'type': 'disabled'}},
+         ]
+         final_response = None
+         response = None
+-        for config_idx, cfg in enumerate(attempt_configs):
++        for config_idx, cfg in enumerate(budget_schedule):
+             if config_idx > 0:
+-                logging(f"Retrying with changed parameters (attempt {config_idx + 1}/{len(attempt_configs)}): "
+-                        f"tools={[t['name'] for t in cfg['tools']]}, nudge={cfg['nudge']}")
+-            cur_tools = cfg["tools"]
+-            cur_history = new_msg_history
+-            if cfg.get("short_system"):
+-                # Keep only the most recent context: the latest user message and the task.
+-                cur_history = [new_msg_history[0]]
++                logging(f"Retrying with escalated budget (attempt {config_idx + 1}/{len(budget_schedule)}): "
++                        f"max_tokens={cfg['max_tokens']}, thinking={cfg['thinking']}")
+             response = get_response_withtools(
+                 client=client,
+                 model=client_model,
+-                messages=sanitize_history(msg_history + cur_history),
++                messages=sanitize_history(msg_history + new_msg_history),
+                 tool_choice={"type": "auto"},
+-                tools=cur_tools,
++                tools=tools,
+                 logging=logging,
++                max_tokens=cfg['max_tokens'],
++                thinking=cfg['thinking'],
+             )
+             # Bounded tool loop
+             for _step in range(200):
+@@ -489,24 +496,21 @@ def chat_with_agent_claude(
+                     tool_choice={"type": "auto"},
+                     tools=tools,
+                     logging=logging,
++                    max_tokens=cfg['max_tokens'],
++                    thinking=cfg['thinking'],
+                 )
+             final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
+             if final_response and final_response.strip():
+                 break
+             _log_empty_response(response, logging)
+-            if cfg["nudge"]:
+-                # Nudge the model once with a user message (the empty assistant turn is not stored).
+-                new_msg_history.append({
+-                    "role": "user",
+-                    "content": [
+-                        {
+-                            "type": "text",
+-                            "text": "Your last response was empty. Call the editor tool now (command=create or command=edit) "
+-                                    "on the target file (the primary source file named in the task) with your complete solution, "
+-                                    "or finish with a summary of the changes you made.",
+-                        }
+-                    ],
+-                })
++            stop_reason = getattr(response, 'stop_reason', None)
++            logging(f"Budget attempt {config_idx + 1} params: max_tokens={cfg['max_tokens']}, "
++                    f"thinking={cfg['thinking']}, stop_reason={stop_reason}")
++            if stop_reason != 'max_tokens':
++                # Not a budget exhaustion; escalating the budget will not help, so stop here.
++                break
++            # stop_reason == 'max_tokens' with no text/tool blocks: budget exhausted, move to next entry.
++            # No nudge message is appended, so no consecutive duplicate user turns accumulate.
+ 
+         if not (final_response and final_response.strip()) and not _response_has_text_or_tool(response, client_model):
+             logging("Model returned empty responses after all retries.")

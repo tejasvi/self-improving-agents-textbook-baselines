@@ -1,0 +1,185 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index b822c07..2cf4db9 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import re
+ import threading
++import traceback
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -94,6 +95,53 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++def _message_text(msg):
++    """Return the concatenated text of a message's content (str or list of blocks)."""
++    content = msg.get('content') if isinstance(msg, dict) else None
++    if isinstance(content, str):
++        return content
++    if not isinstance(content, list):
++        return ''
++    parts = []
++    for block in content:
++        if isinstance(block, dict):
++            if block.get('type') == 'text' and isinstance(block.get('text'), str):
++                parts.append(block['text'])
++        elif getattr(block, 'type', None) == 'text' and isinstance(getattr(block, 'text', None), str):
++            parts.append(block.text)
++    return '\n'.join(parts)
++
++def _has_tool_use(msg):
++    content = msg.get('content') if isinstance(msg, dict) else None
++    if not isinstance(content, list):
++        return False
++    for block in content:
++        btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++        if btype == 'tool_use':
++            return True
++    return False
++
++def _clean_history(msg_history):
++    """
++    Return a sanitized copy of msg_history. Returns [] if it is not a list.
++    Drops assistant messages with no non-empty text and no tool_use blocks,
++    which would otherwise make the next API call invalid or repeat the empty turn.
++    """
++    if not isinstance(msg_history, list):
++        return []
++    cleaned = []
++    for m in msg_history:
++        if isinstance(m, dict) and m.get('role') == 'assistant':
++            if not _message_text(m).strip() and not _has_tool_use(m):
++                continue
++        cleaned.append(m)
++    return cleaned
++
++def _infer_target_file(problem_statement):
++    """Find a backticked source filename in the problem statement; default to solution.py."""
++    match = re.search(r'`([\w./-]+\.(?:py|js|rs|go|cpp|java))`', problem_statement or '')
++    return match.group(1) if match else 'solution.py'
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -141,7 +189,8 @@ class AgenticSystem:
+     def _classify_patch(self):
+         """
+         Classify the current repo diff versus base_commit.
+-        Returns 'empty' (no changes), 'test_only' (only test files changed), or 'ok'.
++        Returns 'empty' (no changes), 'test_only' (only test/scratch files changed,
++        or the target file was not changed/created), or 'ok'.
+         """
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         changed_files = []
+@@ -161,9 +210,57 @@ class AgenticSystem:
+                 return True
+             return any(part in ('tests', 'test', '__tests__') for part in parts[:-1])
+ 
+-        if all(is_test_file(f) for f in changed_files):
+-            return 'test_only'
+-        return 'ok'
++        target = _infer_target_file(self.problem_statement)
++        target_changed = any(
++            f == target or f.replace('\\', '/').endswith('/' + target) for f in changed_files
++        )
++        if target_changed:
++            return 'ok'
++        # Target file missing: only tests, scratch files (brute.py, check.py, ...) or other
++        # side files were touched, which does not count as a solution.
++        return 'test_only'
++
++    def _fallback_direct_write(self):
++        """
++        Deterministic fallback: ask the model once, without tools, for the complete
++        contents of the target file, then write it directly.
++        Returns True if a file was written.
++        """
++        target = _infer_target_file(self.problem_statement)
++        prompt = (
++            f"Problem statement:\n{self.problem_statement}\n\n"
++            f"Output only the complete contents of {target} in one ```python block. "
++            f"No other text."
++        )
++        try:
++            msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        except Exception:
++            safe_log(f"Fallback direct write: LLM call failed:\n{traceback.format_exc()}", level=logging.ERROR)
++            return False
++
++        text = ''
++        if isinstance(msg_history, list):
++            for m in reversed(msg_history):
++                if isinstance(m, dict) and m.get('role') == 'assistant':
++                    text = _message_text(m)
++                    if text.strip():
++                        break
++        blocks = re.findall(r'```(?:python|py)?\s*\n(.*?)```', text, re.DOTALL)
++        if not blocks:
++            safe_log("Fallback direct write: no fenced code block found in model output.")
++            return False
++
++        code = blocks[-1]
++        path = os.path.join(self.git_tempdir, target)
++        try:
++            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++            with open(path, 'w') as f:
++                f.write(code)
++        except Exception:
++            safe_log(f"Fallback direct write: failed to write {path}:\n{traceback.format_exc()}", level=logging.ERROR)
++            return False
++        safe_log(f"Fallback direct write: wrote {len(code)} chars to {path}")
++        return True
+ 
+     def forward(self):
+         """
+@@ -188,19 +285,41 @@ Follow this workflow:
+ 
+ IMPORTANT: Finishing with only a text response and no file edits counts as FAILURE. You must actually edit files with the editor tool."""
+ 
++        target = _infer_target_file(self.problem_statement)
++        retry_msg = (
++            f"Your previous attempt made no usable changes to the target file `{target}`. "
++            f"Your first action MUST be an editor create/edit call writing a full draft of the solution "
++            f"to `{target}` in {self.git_tempdir}. Do not reply with text only. After writing it, "
++            f"run it on the sample input to check it, fix any errors, and finish."
++        )
++
+         msg_history = []
+         msg = instruction
+         for attempt in range(3):
+-            msg_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            try:
++                new_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            except Exception:
++                safe_log(f"Attempt {attempt + 1}: chat_with_agent failed:\n{traceback.format_exc()}", level=logging.ERROR)
++                new_history = []
++            safe_log(f"Attempt {attempt + 1}: returned history type={type(new_history).__name__}, "
++                     f"size={len(new_history) if isinstance(new_history, list) else 'n/a'}")
++            msg_history = _clean_history(new_history)
++
+             classification = self._classify_patch()
+             safe_log(f"Attempt {attempt + 1}: patch classification = {classification}")
+             if classification == 'ok':
+                 break
+-            if classification == 'empty':
+-                msg = ("Your previous attempt made NO file changes. You must now use the editor tool to create/edit "
+-                       "the solution file with a complete implementation, then run it to test.")
+-            else:
+-                msg = ("You only modified test files. Implement the fix in the main source / solution file.")
++
++            # Retry from a fresh history on empty/test-only results; otherwise keep cleaned partial work.
++            if classification in ('empty', 'test_only'):
++                msg_history = []
++            msg = retry_msg
++
++        if self._classify_patch() != 'ok':
++            safe_log("All attempts failed to produce a patch; trying direct-write fallback.")
++            self._fallback_direct_write()
++            safe_log(f"After fallback: patch classification = {self._classify_patch()}")
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

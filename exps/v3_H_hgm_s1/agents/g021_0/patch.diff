@@ -1,0 +1,511 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index fdfb5a5..d13d524 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,495 +1,21 @@
+-import argparse
+-import subprocess
++import json
+ import logging
+-from logging.handlers import RotatingFileHandler
+ import os
+ import re
+-import fnmatch
+-import threading
+-import ast
++import time
+ import traceback
+ 
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from llm import create_client, get_response_from_llm
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
++from llm import create_client, get_response_from_llm, EmptyResponseError
++from llm_withtools import chat_with_agent, CLAUDE_MODEL, OPENAI_MODEL
+ 
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
++logger = logging.getLogger("coding_agent")
+ 
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
++SENTINEL = "# TODO: implement the solution"
++OTHER_CLAUDE_MODEL = "claude-3-5-haiku-20241022"
++SHORT_PROMPT_CHARS = 1500
+ 
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
+ 
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
+-
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+-
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
+-
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    def _is_test_path(self, path):
+-        """
+-        Returns True if the path looks like a test file: test_*.py, *_test.py, *.spec.*,
+-        or lives under a 'tests' / 'test' directory component.
+-        """
+-        norm = path.replace('\\', '/').lower()
+-        parts = norm.split('/')
+-        basename = parts[-1]
+-        if any(p in ('tests', 'test') for p in parts[:-1]):
+-            return True
+-        if fnmatch.fnmatch(basename, 'test_*.py') or fnmatch.fnmatch(basename, '*_test.py'):
+-            return True
+-        if fnmatch.fnmatch(basename, '*.spec.*'):
+-            return True
+-        return False
+-
+-    def _has_source_edits(self):
+-        """
+-        Returns True if the current repo diff touches at least one non-test file.
+-        """
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        changed_paths = []
+-        for line in diff.splitlines():
+-            match = re.match(r'^diff --git a/(.+?) b/(.+)$', line)
+-            if match:
+-                changed_paths.append(match.group(2).strip())
+-        for path in changed_paths:
+-            if not self._is_test_path(path):
+-                return True
+-        return False
+-
+-    def _find_target_file(self):
+-        """
+-        Returns the path (relative to git_tempdir) of the file the agent should write.
+-        Prefers a backticked filename in the problem statement (e.g. `solution.py`);
+-        otherwise the single non-test, non-README tracked file from `git ls-files`.
+-        Returns None if no target can be determined.
+-        """
+-        for name in re.findall(r'`([^`\s]+\.[A-Za-z0-9_]+)`', self.problem_statement or ''):
+-            name = name.strip().lstrip('./')
+-            if name and not os.path.basename(name).lower().startswith('readme') and not self._is_test_path(name):
+-                return name
+-        try:
+-            result = subprocess.run(
+-                ["git", "-C", self.git_tempdir, "ls-files"],
+-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-            )
+-            tracked = result.stdout.decode().splitlines()
+-        except Exception as e:
+-            safe_log(f"[find_target] git ls-files failed: {e}")
+-            return None
+-        candidates = [
+-            f for f in tracked
+-            if not self._is_test_path(f) and not os.path.basename(f).lower().startswith('readme')
+-        ]
+-        if len(candidates) == 1:
+-            return candidates[0]
+-        safe_log(f"[find_target] Could not pick a unique target file among {candidates}")
+-        return None
+-
+-    def _extract_code_block(self, text):
+-        """
+-        Returns the contents of the last ```python fenced block in text, falling back to
+-        any fenced block. Returns None if no fenced block is found.
+-        """
+-        if not text:
+-            return None
+-        matches = re.findall(r'```python[ \t]*\r?\n(.*?)```', text, re.DOTALL)
+-        if not matches:
+-            matches = re.findall(r'```[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)```', text, re.DOTALL)
+-        if not matches:
+-            return None
+-        return matches[-1].rstrip() + "\n"
+-
+-    def _last_assistant_text(self, msg_history):
+-        """
+-        Returns the text of the most recent assistant message in msg_history, or '' if none.
+-        """
+-        for msg in reversed(msg_history or []):
+-            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+-                continue
+-            content = msg.get("content")
+-            if isinstance(content, str):
+-                return content
+-            if isinstance(content, list):
+-                return " ".join(
+-                    c.get("text", "") for c in content if isinstance(c, dict) and isinstance(c.get("text"), str)
+-                )
+-            return ""
++def _extract_code(text):
++    if not text:
+         return ""
+-
+-    def _response_is_empty(self, msg_history):
+-        """
+-        Returns True if the last assistant message has no tool_use blocks and only empty/whitespace text.
+-        """
+-        for msg in reversed(msg_history or []):
+-            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+-                continue
+-            content = msg.get("content")
+-            if isinstance(content, str):
+-                return not content.strip()
+-            if isinstance(content, list):
+-                for c in content:
+-                    if isinstance(c, dict) and c.get("type") == "tool_use":
+-                        return False
+-                text = " ".join(
+-                    c.get("text", "") for c in content if isinstance(c, dict) and isinstance(c.get("text"), str)
+-                )
+-                return not text.strip()
+-            return True
+-        return True
+-
+-    def _build_compact_prompt(self, target):
+-        """
+-        Short prompt: problem statement plus an explicit instruction to write the solution to target.
+-        """
+-        return (
+-            f"Write the complete Python solution for the problem below to {target} using the editor tool now. "
+-            "Then test it on the sample inputs with bash and fix any failures.\n\n"
+-            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
+-        )
+-
+-    def _models_to_try(self):
+-        """
+-        Returns [self.code_model, the other of CLAUDE_MODEL/OPENAI_MODEL], without duplicates.
+-        """
+-        other = OPENAI_MODEL if self.code_model == CLAUDE_MODEL else CLAUDE_MODEL
+-        models = [self.code_model]
+-        if other != self.code_model:
+-            models.append(other)
+-        return models
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        instruction = f"""{task}
+-
+-Follow this workflow step by step:
+-1. Explore the repository: list the files and directories under {self.git_tempdir}. Locate the target file named in the problem statement. If it does not exist, create it.
+-2. DRAFT FIRST: Your very first or second tool call must write a complete draft solution to the target file with the editor tool. Reasoning in prose without a tool call counts as failure; refine afterwards. Do not spend long on derivations before the draft is on disk.
+-3. Plan and refine: analyze the problem statement, identify the input/output format, and decide on an algorithm. Consider whether the task expects a complete program that reads standard input and writes standard output, or a method of a given `Solution` class. Update the draft with the editor tool as you refine it.
+-4. Test on the samples EXACTLY: Extract every sample input/output from the problem statement into files (e.g. /tmp/samples/N.in and N.out). Write a script that runs solution.py on each and diffs stdout against the expected output after whitespace normalization (or use the sample_runner tool). A semantic match is not enough: if the problem says multiple answers are accepted but your output differs from the sample, assume the grader may do an exact compare. Study how the sample answer was likely produced (e.g. which basis vector or bit position, ordering, smallest/largest choice) and adjust your deterministic construction until all samples match exactly, while still verifying validity with your own checker. Only if you cannot reproduce them after a few attempts, keep the valid answer and state why.
+-5. Check edge cases and performance: consider minimum/maximum constraints and degenerate inputs, and make sure the solution is efficient on large inputs (avoid unnecessary quadratic work).
+-6. Finish only once the solution file is saved on disk with your final implementation.
+-
+-IMPORTANT: Responding with text only, without editing files, counts as failure. You must modify the solution file on disk using the editor tool.
+-"""
+-        msg_history = []
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if isinstance(init_edit, list):
+-            msg_history = init_edit
+-        safe_log(f"[forward] Attempt 1: source edits present = {self._has_source_edits()}")
+-
+-        target = self._find_target_file()
+-        safe_log(f"[forward] Target file: {target}")
+-
+-        full_target = os.path.join(self.git_tempdir, target) if target else None
+-        target_desc = full_target if full_target else '(unknown; use the file named in the problem statement)'
+-
+-        # Retries use a FRESH conversation. Escalating ladder:
+-        #   attempt 0: full retry prompt, default model
+-        #   attempt 1: compact prompt, default model
+-        #   attempt 2: compact prompt, alternate model
+-        models = self._models_to_try()
+-        for attempt in range(3):
+-            if self._has_source_edits():
+-                break
+-            if attempt == 0:
+-                previous_plan = self._last_assistant_text(msg_history).strip() or "(no plan text was produced)"
+-                current_contents = ""
+-                if full_target and os.path.exists(full_target):
+-                    with open(full_target, 'r', errors='replace') as f:
+-                        current_contents = f.read()
+-                retry_msg = (
+-                    f"{task}\n"
+-                    f"Previous attempt plan (no files were written):\n{previous_plan}\n\n"
+-                    f"Target file: {target_desc}\n"
+-                    f"Current contents of the target file:\n```\n{current_contents if current_contents.strip() else '(empty)'}\n```\n\n"
+-                    f"Your first action must be an editor tool call that writes the complete solution to "
+-                    f"{target_desc}. "
+-                    "Then run it on the sample inputs with bash. Text-only replies are a failure. "
+-                    "An empty reply is a failure."
+-                )
+-                prompt, model = retry_msg, self.code_model
+-                strategy = "full-retry"
+-            else:
+-                prompt = self._build_compact_prompt(target_desc)
+-                model = self.code_model if attempt == 1 else models[-1]
+-                strategy = "compact"
+-            safe_log(f"[forward] Retry {attempt + 1}: strategy={strategy} model={model} no source edits detected, starting fresh conversation.")
+-            try:
+-                result = chat_with_agent(prompt, model=model, msg_history=[], logging=safe_log)
+-            except Exception as e:
+-                safe_log(f"[forward] Retry {attempt + 1}: chat_with_agent raised: {e!r}\n{traceback.format_exc()}")
+-                result = None
+-            if isinstance(result, list):
+-                msg_history = result
+-            if self._response_is_empty(msg_history):
+-                safe_log(f"[forward] Retry {attempt + 1}: empty assistant reply (raw={self._last_assistant_text(msg_history)!r}) treated as failure.")
+-            safe_log(f"[forward] Retry {attempt + 1}: source edits present = {self._has_source_edits()}")
+-
+-        # Tool-free fallback: ask for the full file content and write it ourselves.
+-        if not self._has_source_edits() and target:
+-            fallback_prompt = (
+-                f"{task}\n"
+-                f"Output ONLY the full contents of {target} in one ```python block. "
+-                "No explanations, no other text."
+-            )
+-            system_msg = "You are an expert competitive programmer. Reply with code only."
+-            for fb_model in models:
+-                if self._has_source_edits():
+-                    break
+-                safe_log(f"[forward] Fallback: model={fb_model}, requesting full file contents without tools.")
+-                content = ""
+-                try:
+-                    fb_client, resolved_model = create_client(fb_model)
+-                    content, _ = get_response_from_llm(
+-                        fallback_prompt,
+-                        client=fb_client,
+-                        model=resolved_model,
+-                        system_message=system_msg,
+-                        msg_history=[],
+-                    )
+-                except Exception as e:
+-                    safe_log(f"[forward] Fallback ({fb_model}) LLM call failed: {e!r}\n{traceback.format_exc()}")
+-                    content = ""
+-                safe_log(f"[forward] Fallback ({fb_model}) raw reply: {content!r}")
+-                if not isinstance(content, str):
+-                    content = str(content) if content is not None else ""
+-                code = self._extract_code_block(content)
+-                if code is None and content.strip():
+-                    try:
+-                        ast.parse(content)
+-                        code = content.strip() + "\n"
+-                    except Exception as e:
+-                        safe_log(f"[forward] Fallback ({fb_model}) raw reply is not valid Python: {e!r}")
+-                if code:
+-                    try:
+-                        os.makedirs(os.path.dirname(full_target) or '.', exist_ok=True)
+-                        with open(full_target, 'w') as f:
+-                            f.write(code)
+-                        safe_log(f"[forward] Fallback ({fb_model}) wrote {len(code)} chars to {full_target}.")
+-                    except Exception as e:
+-                        safe_log(f"[forward] Fallback write failed: {e!r}\n{traceback.format_exc()}")
+-                else:
+-                    safe_log(f"[forward] Fallback ({fb_model}): no usable code found in reply.")
+-            safe_log(f"[forward] Fallback: source edits present = {self._has_source_edits()}")
+-
+-        # Last-resort stub so the patch touches a non-test source file.
+-        if not self._has_source_edits() and full_target:
+-            stub = (
+-                '"""\n' + (self.problem_statement or '').replace('"' * 3, chr(39) * 3) + '\n"""\n'
+-                "import sys\n\n\n"
+-                "def main():\n"
+-                "    data = sys.stdin.read().split()\n"
+-                "    # TODO: implement the solution\n"
+-                "    print()\n\n\n"
+-                'if __name__ == "__main__":\n'
+-                "    main()\n"
+-            )
+-            try:
+-                os.makedirs(os.path.dirname(full_target) or '.', exist_ok=True)
+-                with open(full_target, 'w') as f:
+-                    f.write(stub)
+-                safe_log(f"[forward] Last-resort stub written to {full_target}.")
+-            except Exception as e:
+-                safe_log(f"[forward] Stub write failed: {e!r}\n{traceback.format_exc()}")
+-
+-        if not self._has_source_edits():
+-            safe_log("[forward] Finished without detecting source edits.")
+-            return
+-
+-        # Verification turn: test the draft on the samples and fix it.
+-        verify_msg = (
+-            "A draft solution now exists in the repository. Test it on the sample inputs from the problem statement "
+-            "using bash or the sample_runner tool. If it fails or crashes, fix it with the editor tool and re-test. "
+-            "Report the result."
+-        )
+-        safe_log("[forward] Verification turn after draft.")
+-        result = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        if isinstance(result, list):
+-            msg_history = result
+-
+-        # Post-processing check: ask the agent to confirm exact sample matching.
+-        confirm_msg = (
+-            "Before finishing, confirm the following:\n"
+-            "1. Have all sample inputs from the problem statement been saved to files, and does your solution's stdout "
+-            "match each expected sample output EXACTLY (after whitespace normalization only)? Re-run the check now and show the result.\n"
+-            "2. If any sample differs, even though the answer may be valid under 'any answer accepted', investigate and adjust your "
+-            "deterministic construction (e.g. choice of basis vector/bit position, ordering, smallest/largest choice) so the output matches "
+-            "exactly, while still valid under your own checker.\n"
+-            "3. If after a few attempts you still cannot reproduce a sample exactly, keep the valid answer and explain why.\n"
+-            "End your reply with one line: 'SAMPLE_STATUS: EXACT_MATCH' if all samples match exactly, otherwise 'SAMPLE_STATUS: NOT_MATCHED' followed by the remaining differences and why. "
+-            "Fix any remaining differences using the editor tool."
+-        )
+-        for check_round in range(2):
+-            safe_log(f"[forward] Sample-exact check round {check_round + 1}.")
+-            result = chat_with_agent(confirm_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            if isinstance(result, list):
+-                msg_history = result
+-            # Only stop when the agent's latest reply reports an exact match on all samples.
+-            if self._last_assistant_text(msg_history).count("SAMPLE_STATUS: EXACT_MATCH") > 0:
+-                safe_log("[forward] Agent reported exact sample match.")
+-                break
+-        else:
+-            safe_log("[forward] Sample-exact check finished without confirmed exact match.")
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
+-    main()
++    blocks = re.findall(r"

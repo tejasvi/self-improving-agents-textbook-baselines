@@ -1,0 +1,274 @@
+diff --git a/solution.py b/solution.py
+index a224bea..412ce1b 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,9 +1,156 @@
+-"""Placeholder solution: the substantive changes are in coding_agent.py and tools/edit.py."""
++"""Robustness helpers for the coding agent generation pipeline.
+ 
++These are standalone, dependency-free implementations of the requested
++behaviours so they can be wired into coding_agent.py's AgenticSystem:
+ 
+-def main():
+-    print("See coding_agent.py: continuation retries, direct-generation fallback, forgiving editor.")
++  (a) is_empty_response(msg_history)  - detect empty assistant turns
++  (b) robust_llm_call(...)            - bounded retry/backoff across models
++  (c) extract_code(response)          - defensive code extraction
++  (d) check_solution_state(...)       - compile + stub detection
++  (e) filter_readme_snapshot(...)     - skip README already in the statement
++"""
+ 
++import ast
++import re
++import time
++import traceback
++import logging
+ 
+-if __name__ == "__main__":
+-    main()
++logger = logging.getLogger("coding_agent")
++
++CODE_BLOCK_RE = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.DOTALL)
++
++
++def safe_log(message, level=logging.INFO):
++    """Log without ever raising."""
++    try:
++        logger.log(level, message)
++    except Exception:
++        pass
++
++
++def is_empty_response(msg_history):
++    """True if the last assistant message has no non-empty text and no tool_use blocks."""
++    if not msg_history:
++        return True
++    last = None
++    for msg in reversed(msg_history):
++        if isinstance(msg, dict) and msg.get("role") == "assistant":
++            last = msg
++            break
++    if last is None:
++        return True
++    content = last.get("content")
++    if isinstance(content, str):
++        return content.strip() == ""
++    if not isinstance(content, list):
++        return True
++    for block in content:
++        if isinstance(block, dict):
++            if block.get("type") == "tool_use":
++                return False
++            if block.get("type") == "text" and str(block.get("text", "")).strip():
++                return False
++        elif isinstance(block, str) and block.strip():
++            return False
++    return True
++
++
++def log_empty_response(msg_history, tail=3):
++    """Warn with the raw message tail when an empty response is detected."""
++    tail_items = (msg_history or [])[-tail:]
++    safe_log(f"WARNING: empty LLM response detected. msg_history tail: {tail_items!r}",
++             logging.WARNING)
++
++
++def is_valid_response(text):
++    return isinstance(text, str) and text.strip() != ""
++
++
++def robust_llm_call(prompt, system_message, call_fn, primary_model, other_model):
++    """Bounded (4 attempts) alternating-model call with exponential backoff.
++
++    call_fn(model, prompt, system_message) -> str
++    Models tried in order: primary, other, primary, other.
++    No unbounded loops.
++    """
++    models = [primary_model, other_model, primary_model, other_model]
++    for i in range(4):
++        model = models[i]
++        try:
++            response = call_fn(model, prompt, system_message)
++            if is_valid_response(response):
++                return response
++            safe_log(f"WARNING: attempt {i + 1} with {model} returned empty/invalid response",
++                     logging.WARNING)
++        except Exception:
++            safe_log(f"ERROR: attempt {i + 1} with {model} raised:\n{traceback.format_exc()}",
++                     logging.ERROR)
++        if i < 3:
++            time.sleep(2 ** i)
++    return None
++
++
++def extract_code(response):
++    """Return code from a fenced block; else the whole response if it looks like code."""
++    if not isinstance(response, str) or not response.strip():
++        return None
++    matches = CODE_BLOCK_RE.findall(response)
++    if matches:
++        code = max(matches, key=len).strip()
++        if code:
++            return code + "\n"
++    if "class Solution" in response or "def " in response:
++        return response.strip() + "\n"
++    return None
++
++
++def is_stub_source(source):
++    """True if every function body is only pass / ... / docstring, or no real code exists."""
++    try:
++        tree = ast.parse(source)
++    except SyntaxError:
++        return False
++    funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
++    if not funcs:
++        return False
++    for fn in funcs:
++        for stmt in fn.body:
++            if isinstance(stmt, ast.Pass):
++                continue
++            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
++                    and (stmt.value.value is Ellipsis or isinstance(stmt.value.value, str)):
++                continue
++            return False
++    return True
++
++
++def check_solution_state(path, starter_text=None):
++    """Return (ok, message). Compiles the file and rejects stub solutions."""
++    try:
++        with open(path, "r") as f:
++            content = f.read()
++    except OSError as e:
++        return False, f"could not read {path}: {e}"
++    try:
++        compile(content, path, "exec")
++    except SyntaxError:
++        return False, f"syntax error in {path}:\n{traceback.format_exc()}"
++    if starter_text is not None and content.strip() == starter_text.strip():
++        return False, "solution.py is still a stub"
++    if is_stub_source(content):
++        return False, "solution.py is still a stub"
++    return True, "ok"
++
++
++def filter_readme_snapshot(snapshot_files, problem_statement):
++    """Drop README.md entries whose text is already in the problem statement.
++
++    snapshot_files: dict[name -> text]
++    """
++    result = {}
++    for name, text in snapshot_files.items():
++        if name.lower().endswith("readme.md") and text.strip() and text.strip() in problem_statement:
++            continue
++        result[name] = text
++    return result
+diff --git a/stress_test.py b/stress_test.py
+new file mode 100644
+index 0000000..346b429
+--- /dev/null
++++ b/stress_test.py
+@@ -0,0 +1,102 @@
++import random, ast, re
++import solution as s
++
++def ref_is_empty(msg_history):
++    # brute force: scan all messages from the end for the last assistant turn
++    last = None
++    for m in msg_history:
++        if m.get("role") == "assistant":
++            last = m
++    if last is None:
++        return True
++    c = last.get("content")
++    if isinstance(c, str):
++        return c.strip() == ""
++    blocks = c if isinstance(c, list) else []
++    has_tool = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)
++    has_text = any(isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip() for b in blocks)
++    return not has_tool and not has_text
++
++def ref_is_stub(src):
++    # brute force: list every FunctionDef via ast.walk; stub iff none has a non-trivial stmt
++    tree = ast.parse(src)
++    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
++    if not fns:
++        return False
++    def trivial(st):
++        if isinstance(st, ast.Pass): return True
++        if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
++            v = st.value.value
++            return v is Ellipsis or isinstance(v, str)
++        return False
++    return all(all(trivial(st) for st in f.body) for f in fns)
++
++def rand_blocks(rng):
++    k = rng.randint(0, 3)
++    out = []
++    for _ in range(k):
++        t = rng.choice(["text", "tool_use", "other"])
++        if t == "text":
++            out.append({"type": "text", "text": rng.choice(["", "  ", "hi", " x "])})
++        elif t == "tool_use":
++            out.append({"type": "tool_use", "name": "bash"})
++        else:
++            out.append({"type": "thinking", "text": "t"})
++    return out
++
++def rand_history(rng):
++    h = []
++    for _ in range(rng.randint(0, 4)):
++        role = rng.choice(["user", "assistant"])
++        if rng.random() < 0.3:
++            content = rng.choice(["", "  ", "abc"])
++        else:
++            content = rand_blocks(rng)
++        h.append({"role": role, "content": content})
++    return h
++
++def rand_src(rng):
++    parts = []
++    for i in range(rng.randint(0, 4)):
++        kind = rng.random()
++        name = f"f{i}"
++        if kind < 0.3:
++            parts.append(f"def {name}():\n    pass")
++        elif kind < 0.5:
++            parts.append(f"def {name}():\n    ...")
++        elif kind < 0.6:
++            parts.append(f'def {name}():\n    """doc"""')
++        elif kind < 0.7:
++            parts.append(f"class C{i}:\n    def m(self):\n        return {i}")
++        else:
++            parts.append(f"def {name}(x):\n    return x + {i}")
++    if rng.random() < 0.2:
++        parts.append("X = 1")
++    return "\n".join(parts) + "\n"
++
++def main(n=1000, seed=0):
++    rng = random.Random(seed)
++    fails = 0
++    for i in range(n):
++        h = rand_history(rng)
++        if s.is_empty_response(h) != ref_is_empty(h):
++            fails += 1; print("EMPTY MISMATCH", i, h)
++        src = rand_src(rng)
++        if s.is_stub_source(src) != ref_is_stub(src):
++            fails += 1; print("STUB MISMATCH", i, repr(src))
++        # extract_code: fenced block contents must come back verbatim
++        body = "".join(f"x{j} = {j}\n" for j in range(rng.randint(1, 5)))
++        resp = rng.choice(["", "  ", "prose only", "here\n```python\n" + body + "```\nbye"])
++        got = s.extract_code(resp)
++        if resp.startswith("here"):
++            if got != body:
++                fails += 1; print("EXTRACT MISMATCH", i, repr(got), repr(body))
++        elif resp.strip() == "" or resp == "prose only":
++            if got is not None:
++                fails += 1; print("EXTRACT SHOULD BE NONE", i, repr(resp), repr(got))
++    print(f"cases={n} failures={fails}")
++    return fails
++
++if __name__ == "__main__":
++    import sys
++    raise SystemExit(1 if main(int(sys.argv[1]) if len(sys.argv) > 1 else 1000) else 0)

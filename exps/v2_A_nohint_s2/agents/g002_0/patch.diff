@@ -1,0 +1,139 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index f27534b..c48c558 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,5 @@
+ import argparse
++import re
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -137,6 +138,60 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _has_diff(self):
++        """Return True if the repository has any non-empty diff versus base_commit."""
++        return bool(str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip())
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        """Return the text of the last assistant message ('' if none or empty)."""
++        for msg in reversed(msg_history or []):
++            if msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            if isinstance(content, str):
++                return content.strip()
++            texts = []
++            for block in content or []:
++                if isinstance(block, dict):
++                    text = block.get("text")
++                else:
++                    text = getattr(block, "text", None)
++                if text:
++                    texts.append(text)
++            return "\n".join(texts).strip()
++        return ""
++
++    def _target_file(self):
++        """Pick the target file: a *.py file named in the problem statement, else solution.py."""
++        match = re.search(r'`([\w./]+\.py)`', self.problem_statement or "")
++        name = match.group(1) if match else "solution.py"
++        return os.path.join(self.git_tempdir, name.lstrip("/"))
++
++    def _fallback_write_solution(self):
++        """Ask the model for the full program in a ```python block and write it to the target file."""
++        target = self._target_file()
++        prompt = (
++            "Write the complete, final Python program for the problem below. "
++            "Reply with ONLY the complete program inside a single ```python fenced code block. "
++            "The program must read from standard input and write to standard output "
++            "(or implement the required Solution class if the problem asks for one). "
++            "You may use tools if you need to, but the code block in your final reply is what will be used.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        text = self._last_assistant_text(msg_history)
++        blocks = re.findall(r"```(?:python3?|py)?[ \t]*\n(.*?)```", text, flags=re.DOTALL)
++        if not blocks:
++            safe_log("Fallback: no ```python block found in reply.")
++            return False
++        code = max(blocks, key=len)
++        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
++        with open(target, "w") as f:
++            f.write(code)
++        safe_log(f"Fallback: wrote solution to {target}")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -165,35 +220,43 @@ Never end your turn with only a plan; the task is only complete when the files a
+         instruction = f"{task}\n\nPlease analyze the problem description carefully, then follow the workflow above and make edits to the code files to complete the instruction."
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Ensure that the agent actually wrote something to the repository
+-        for attempt in range(3):
+-            diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-            if diff.strip():
++        # Bounded retries: if no diff, start over with a fresh history and a short imperative prompt
++        for attempt in range(4):
++            if self._has_diff():
+                 break
+-            safe_log(f"No changes detected after attempt {attempt + 1}; re-prompting agent.")
++            last_text = self._last_assistant_text(msg_history)
++            safe_log(f"No changes detected after attempt {attempt + 1} (last reply empty: {not last_text}); retrying with fresh history.")
+             retry_msg = (
+-                f"No changes were made to the repository in {self.git_tempdir}. "
+-                "A plan or description is not a solution. You must implement the solution NOW: "
+-                "use the editor tool to write the complete, working code into the target file immediately, "
+-                "then test it with a brute-force comparison and the problem examples. "
+-                "Do not reply with only a plan; the task is only complete when the files are edited."
++                "Create the target file immediately with a best-effort solution, then refine it afterwards.\n"
++                f"The repository is in {self.git_tempdir}. Use the editor tool to write the complete program "
++                "into the target file now (a file named in the problem statement, or solution.py). "
++                "Do not reply with only a plan.\n\n"
++                f"<problem_description>\n{self.problem_statement}\n</problem_description>"
+             )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++
++        # Last resort: extract the program from a fenced code block and write it to disk
++        if not self._has_diff():
++            safe_log("Retries produced no diff; running fallback extraction.")
++            self._fallback_write_solution()
+ 
+-        # Verification pass once a diff exists
+-        diff = diff_versus_commit(self.git_tempdir, self.base_commit)
+-        if diff.strip():
++        # Sample-based verification once a file exists
++        if self._has_diff():
+             current_edits = self.get_current_edits()[0]["content"][0]["text"]
+-            verify_msg = (
+-                "Now verify your solution before finishing:\n"
+-                "1. Stress-test the solution against your brute-force reference on many random small inputs, and fix any mismatches.\n"
+-                "2. Run the examples from the problem statement and confirm the outputs match exactly.\n"
+-                "3. Check edge cases (minimum sizes, equal values, maximum values) and check speed on maximum-constraint inputs.\n"
+-                "4. Fix any issues you find by editing the files with the editor tool.\n"
+-                "Make sure the final solution is saved in the target file and required imports are present.\n\n"
+-                f"For context, here is the current diff of the repository:\n{current_edits}"
+-            )
+-            chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            for round_idx in range(2):
++                verify_msg = (
++                    "Now verify the solution against the examples before finishing:\n"
++                    "1. Parse each 'Sample Input' / 'Sample Output' block from the problem statement below.\n"
++                    "2. Write each sample input to a scratch file OUTSIDE the repository (e.g. under /tmp) and run the solution on it via bash.\n"
++                    "3. Compare the output with the expected sample output exactly. If anything mismatches, fix the solution with the editor tool and re-run.\n"
++                    "4. Also generate a large maximum-constraint input (outside the repository) and check the solution runs well within the time limit.\n"
++                    "5. Keep the final solution saved in the target file with all required imports.\n"
++                    "Reply with a short summary of which samples passed.\n\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                    f"For context, here is the current diff of the repository:\n{current_edits}"
++                )
++                msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++                current_edits = self.get_current_edits()[0]["content"][0]["text"]
+ 
+ 
+ def main():

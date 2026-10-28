@@ -1,0 +1,909 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ccf5791..61819c1 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,781 +1,43 @@
+-import argparse
+-import ast
+-import subprocess
+-import logging
+-from logging.handlers import RotatingFileHandler
++from typing import List
++
+ import os
+ import re
+-import threading
+-import traceback
+-
+-from llm import create_client, get_response_from_llm
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, last_turn_truncated
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+-
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+-
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
++import sys
++import time
++import tempfile
++import subprocess
+ 
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
++try:
++    from llm import get_response_from_llm as _llm_fn
++except Exception:
++    try:
++        from utils.llm import get_response_from_llm as _llm_fn
++    except Exception:
++        _llm_fn = None
+ 
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
++TIME_LIMIT_SEC = 2.0
++MAX_REPAIRS = 3
++GEN_TIMEOUT_SEC = 20.0
+ 
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+ 
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
++def _ask(prompt):
++    """Call the underlying LLM and return plain text."""
++    if _llm_fn is None:
++        raise RuntimeError("LLM backend is not available")
++    result = _llm_fn(prompt)
++    if isinstance(result, tuple):
++        result = result[0]
++    if not isinstance(result, str):
++        result = str(result)
++    return result
+ 
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+ 
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
++def _extract_code(text):
++    """Return Python code from an LLM response.
+ 
+-def safe_log(message, level=logging.INFO):
++    Accepts fenced blocks with any language tag (preferring python), and falls
++    back to an unfenced response that looks like Python code.
+     """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
+-
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-        # Set by _run_scaling_check: True while the last scaling check reports failure (incomplete).
+-        self._scaling_failed = False
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    def _get_changed_files(self):
+-        """
+-        Return the list of files changed relative to base_commit, including untracked files.
+-        """
+-        changed = set()
+-        commands = [
+-            ["git", "-C", self.git_tempdir, "diff", "--name-only", self.base_commit],
+-            ["git", "-C", self.git_tempdir, "ls-files", "--others", "--exclude-standard"],
+-        ]
+-        for cmd in commands:
+-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+-            for line in result.stdout.decode(errors='replace').splitlines():
+-                line = line.strip()
+-                if line:
+-                    changed.add(line)
+-        return sorted(changed)
+-
+-    def _is_test_file(self, path):
+-        """
+-        Heuristically decide whether a path refers to a test file.
+-        """
+-        test_tokens = {'test', 'tests', 'spec', 'specs', 'conftest'}
+-        normalized = path.replace('\\', '/')
+-        parts = [p for p in normalized.split('/') if p]
+-        if not parts:
+-            return False
+-        # Directory components must match exactly
+-        for part in parts[:-1]:
+-            if part.lower() in test_tokens:
+-                return True
+-        # Filename: split into words on non-alphanumeric characters
+-        filename = parts[-1].lower()
+-        words = re.split(r'[^a-z0-9]+', filename)
+-        return any(w in test_tokens for w in words)
+-
+-    def _is_stub_patch(self):
+-        """
+-        True if the target file is unchanged from base_commit, or if it still contains only
+-        stub bodies (`pass` or `NotImplementedError`).
+-        """
+-        target = self._target_file()
+-        unchanged = subprocess.run(
+-            ["git", "-C", self.git_tempdir, "diff", "--quiet", self.base_commit, "--", target],
+-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-        ).returncode == 0
+-        if unchanged:
+-            return True
+-        path = os.path.join(self.git_tempdir, target)
+-        if not os.path.isfile(path):
+-            return True
+-        try:
+-            with open(path, 'r', errors='replace') as fh:
+-                tree = ast.parse(fh.read())
+-        except Exception:
+-            return False  # Unparseable code is not a recognised stub; let it count as a patch.
+-        bodies = []
+-        for node in ast.walk(tree):
+-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+-                body = [s for s in node.body
+-                        if not (isinstance(s, ast.Expr) and isinstance(getattr(s, 'value', None), ast.Constant)
+-                                and isinstance(s.value.value, str))]  # skip docstrings
+-                bodies.append(body)
+-        if not bodies:
+-            return False
+-        def is_stub(body):
+-            if not body:
+-                return True
+-            if len(body) != 1:
+-                return False
+-            stmt = body[0]
+-            if isinstance(stmt, ast.Pass):
+-                return True
+-            if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+-                exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+-                return isinstance(exc, ast.Name) and exc.id == 'NotImplementedError'
+-            return False
+-        return all(is_stub(b) for b in bodies)
+-
+-    def _has_source_patch(self):
+-        """
+-        True if at least one changed file is not a test file, and the target is not just a stub.
+-        """
+-        changed_source = any(not self._is_test_file(f) for f in self._get_changed_files())
+-        return changed_source and not self._is_stub_patch()
+-
+-    def _target_file(self):
+-        """
+-        Infer the primary source file to edit: first backticked *.py name in the problem
+-        statement that exists in the repo (or is named there), falling back to solution.py.
+-        """
+-        candidates = re.findall(r'`([\w./-]+\.py)`', self.problem_statement or '')
+-        for cand in candidates:
+-            if not cand.startswith('test') and '/test' not in cand and not os.path.basename(cand).startswith('test_'):
+-                return cand
+-        return 'solution.py'
+-
+-    def _text_in_problem(self, text):
+-        """True if the (whitespace-normalised) text is already contained in the problem statement."""
+-        norm = lambda t: re.sub(r'\s+', ' ', t or '').strip().lower()
+-        body = norm(text)
+-        return bool(body) and body in norm(self.problem_statement)
+-
+-    def _snapshot_repo(self, max_files=10, max_file_bytes=8 * 1024, max_listing=200):
+-        """
+-        Deterministically collect the repo file listing (git ls-files) and the contents of
+-        small text files (solution.py, README, starter files), without involving the LLM.
+-        """
+-        try:
+-            result = subprocess.run(
+-                ["git", "-C", self.git_tempdir, "ls-files"],
+-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+-            )
+-            files = [l.strip() for l in result.stdout.decode(errors='replace').splitlines() if l.strip()]
+-        except Exception as e:
+-            files = []
+-            safe_log(f"Snapshot: git ls-files failed: {e}")
+-        listing = files[:max_listing]
+-        listing_text = "\n".join(listing)
+-        if len(files) > max_listing:
+-            listing_text += f"\n... ({len(files) - max_listing} more files not shown)"
+-
+-        # Priority: target file, README, then other small files that look like starters.
+-        target = self._target_file()
+-        def priority(f):
+-            base = os.path.basename(f).lower()
+-            if f == target:
+-                return 0
+-            if base.startswith('readme'):
+-                return 1
+-            if base == 'solution.py':
+-                return 2
+-            if base.endswith('.py') and not self._is_test_file(f):
+-                return 3
+-            return 4
+-        ordered = sorted(files, key=lambda f: (priority(f), f))
+-
+-        contents = []
+-        for f in ordered:
+-            if len(contents) >= max_files:
+-                break
+-            if priority(f) >= 4 and f != target:
+-                continue
+-            path = os.path.join(self.git_tempdir, f)
+-            try:
+-                if not os.path.isfile(path) or os.path.getsize(path) >= max_file_bytes:
+-                    continue
+-                with open(path, 'rb') as fh:
+-                    raw = fh.read()
+-                if b'\0' in raw:
+-                    continue
+-                text = raw.decode('utf-8', errors='replace')
+-            except Exception:
+-                continue
+-            # Skip README files whose content is already in the problem statement.
+-            if os.path.basename(f).lower().startswith('readme') and self._text_in_problem(text):
+-                continue
+-            contents.append(f"--- {f} ---\n{text}")
+-
+-        return f"Repository files (git ls-files):\n{listing_text}\n\n" + "\n\n".join(contents)
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        workflow = """
+-Follow this workflow step by step:
+-1. Explore the repository: list the files and read the relevant code, tests, and any README or specification.
+-2. Identify the primary source file that must be changed. If the task names a file (e.g. solution.py) and it does not exist, create it.
+-3. Implement the solution by actually calling the editor tool (command=create or command=edit) on the source file. Do not only describe the code in text.
+-4. Test it: run the program via bash with the sample inputs from the problem statement and with your own edge cases. For interactive problems, write a small local judge/simulator and run your solution against it.
+-5. Finally verify with `git status` and `git diff` that the source file has actually changed. Fix any problems you find.
+-
+-IMPORTANT RULES:
+-- You MUST make changes using the editor tool. Do not just answer in text.
+-- If the task names an output file such as solution.py, create it.
+-- Responding with text only and no file edits counts as failure.
+-- Modifying only test files does not solve the task; the primary source file must be changed.
+-"""
+-        target = self._target_file()
+-        target_path = os.path.join(self.git_tempdir, target)
+-        snapshot = self._snapshot_repo()
+-        design_phase = f"""
+-DESIGN-FIRST WORKFLOW (follow in this order):
+-A. Design step (before any solution code). Write a short design note to /tmp/design/notes.md (create the directory with bash `mkdir -p /tmp/design`; this path is OUTSIDE the repository). It must contain:
+-   - Constraints: the maximum values of every input size/value parameter from the problem statement.
+-   - Required time complexity: the largest number of basic operations that fits in about 1e8 for those maxima (e.g. N*M = 1e12 is infeasible; N log N or N*sqrt(N) may be needed).
+-   - Planned algorithm: the approach, the key observation, and why it runs within the required complexity. Do NOT plan a brute-force or O(N*M) approach when the maxima make it infeasible; find the algorithm the constraints call for.
+-   - Verification plan: which samples, edge cases, brute force and max-size tests you will run.
+-   Keep the note short (under about 60 lines). Reason through the derivation in visible text if needed.
+-B. Implementation step. Only after the design note is written, implement the algorithm in {target_path} using the editor tool (command=create or command=edit). If the design note cannot be finished, still write a quick, correct-on-small-inputs stub into {target_path} so that the patch is never empty, and then refine it.
+-"""
+-        instruction = (
+-            f"{task}\n{workflow}\n{design_phase}\n"
+-            f"Current repository contents:\n{snapshot}\n\n"
+-            f"After the design note, implement the solution in {target_path} (the primary source file)."
+-        )
+-        msg_history = []
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        safe_log(f"Initial attempt finished. Changed files: {self._get_changed_files()}")
+-
+-        if self._has_source_patch():
+-            safe_log("Source patch detected after initial attempt; skipping retries.")
+-        else:
+-            # Do not reuse a history that may end with an empty assistant turn: escalate with a
+-            # compact prompt, first on the primary model then on the alternate model/API path.
+-            safe_log("No source patch after initial attempt; escalating with a compact prompt.")
+-            msg_history = self._attempt_with_models(self._compact_prompt(), msg_history)
+-
+-        msg_history = self._run_scaling_check(msg_history)
+-        if self._scaling_failed:
+-            # The solution is too slow: escalate with bounded, fresh-context derivation rounds.
+-            msg_history = self._run_derivation_phase()
+-        self._run_verification(msg_history)
+-
+-        # A solution flagged as too slow is not a finished patch: keep the final fallbacks active.
+-        if not self._has_source_patch() or self._scaling_failed:
+-            safe_log("Last-resort attempt: requesting the complete solution as a code block (no tools).")
+-            self._last_resort_write()
+-            safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
+-                     f"source patch: {self._has_source_patch()}")
+-
+-    def _model_usable(self, model):
+-        """True if a client can be created for the model (required API key/SDK present)."""
+-        try:
+-            create_client(model)
+-            return True
+-        except Exception as e:
+-            safe_log(f"Model {model} is not usable: {e}")
+-            return False
+-
+-    def _alternate_model(self):
+-        """
+-        A model that differs from self.code_model and can actually be used. Prefers the model on the
+-        other API path (Claude <-> OpenAI); falls back to another Claude model name when that one is
+-        unavailable or identical to the primary.
+-        """
+-        primary = self.code_model
+-        candidates = [OPENAI_MODEL if primary == CLAUDE_MODEL else CLAUDE_MODEL, CLAUDE_MODEL, "claude-3-5-sonnet-20240620"]
+-        for cand in candidates:
+-            if cand and cand != primary and self._model_usable(cand):
+-                return cand
+-        safe_log(f"No alternate model usable; reusing {primary}.")
+-        return primary
+-
+-    def _compact_prompt(self):
+-        """Short prompt: task, target path and current target file contents only."""
+-        target = self._target_file()
+-        target_path = os.path.join(self.git_tempdir, target)
+-        existing = ''
+-        if os.path.isfile(target_path):
+-            with open(target_path, 'r', errors='replace') as fh:
+-                existing = fh.read()
+-        return (
+-            f"I have uploaded a code repository in the directory {self.git_tempdir}.\n\n"
+-            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-            f"Target file: {target_path}\n"
+-            f"Current contents of the target file:\n```python\n{existing}\n```\n\n"
+-            f"Your very first action must be an editor create/edit call on {target_path} that implements "
+-            f"the full solution. Then finish with a short summary."
+-        )
+-
+-    def _attempt_with_models(self, prompt, fallback_history):
+-        """
+-        Try the compact prompt on [self.code_model, alternate model] in order, stopping as soon as
+-        a real source patch exists. Each attempt uses a fresh message history. Returns the history
+-        of the attempt that produced the patch, or fallback_history if none did.
+-        """
+-        models = [self.code_model, self._alternate_model()]
+-        for model in models:
+-            safe_log(f"Escalation attempt with model {model}.")
+-            history = None
+-            try:
+-                history = chat_with_agent(prompt, model=model, msg_history=[], logging=safe_log)
+-            except Exception as e:
+-                safe_log(f"Escalation with {model} raised: {e}\n{traceback.format_exc()}")
+-            has_patch = self._has_source_patch()
+-            safe_log(f"Escalation with {model} finished. Changed files: {self._get_changed_files()}, "
+-                     f"source patch: {has_patch}")
+-            if has_patch:
+-                return history if history is not None else fallback_history
+-        return fallback_history
+-
+-    def _last_message_text(self, msg_history):
+-        """Return the text of the last assistant message in msg_history, or '' if none."""
+-        for msg in reversed(msg_history or []):
+-            if msg.get("role") != "assistant":
+-                continue
+-            content = msg.get("content")
+-            if isinstance(content, str):
+-                return content
+-            for block in content or []:
+-                text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+-                if text:
+-                    return text
+-            return ""
+-        return ""
+-
+-    def _scaling_check_prompt(self, round_idx, max_rounds):
+-        """Prompt for one scaling-check round; round 0 builds inputs and tests, later rounds redesign."""
+-        target_path = os.path.join(self.git_tempdir, self._target_file())
+-        if round_idx == 0:
+-            return f"""Scaling check (mandatory, before verification). Keep reasoning brief; measure first.
+-
+-1. Re-read the constraints in the problem statement. Write the maximum value of every size/value parameter. If the naive algorithm you implemented costs more than about 1e8 basic operations at those maxima, it is too slow.
+-2. Create /tmp/stress/gen_scale.py that prints ONE max-constraint input and supports the mode argument: `max` (every size at its maximum), `skewed` (one dimension at its maximum and the others tiny), and `equal` (all values equal, maximum sizes). Use `sys.argv[-1]` for the mode.
+-3. Use the `scale_test` tool with solution_cmd="python3 {target_path}", time_limit=2, and inputs = ["$ python3 /tmp/stress/gen_scale.py max", "$ python3 /tmp/stress/gen_scale.py skewed", "$ python3 /tmp/stress/gen_scale.py equal"] (add more if relevant).
+-4. If every input finishes well within the time limit, reply with the sentence "SCALING CHECK PASSED" and a one-line summary of the wall times.
+-5. If any input times out, first run `mkdir -p /tmp/stress && cp {target_path} /tmp/stress/slow.py` to keep the slow version as the reference oracle, then reply with "SCALING CHECK FAILED" and state which input timed out and why its complexity is too high."""
+-        return f"""Scaling redesign round {round_idx + 1} of {max_rounds}. The algorithm's complexity is too high for the constraints; keep the slow version at /tmp/stress/slow.py as an oracle, derive an asymptotically faster algorithm, implement it, and verify it against the oracle on small and medium inputs.
+-
+-1. Copy the current solution to /tmp/stress/slow.py if that file does not exist yet (`cp {target_path} /tmp/stress/slow.py`). Keep /tmp/stress/slow.py unchanged; it is the reference oracle.
+-2. Write the new complexity target in /tmp/design/notes.md: the maxima, the required complexity, and the new algorithm class (for example from O(N*M) to O(N log N) with a data structure, or a monotone/convex-hull/binary-search technique).
+-3. Implement the new algorithm in {target_path} with the editor tool (str_replace or create). Constant-factor tuning alone does not count as a redesign.
+-4. Verify against /tmp/stress/slow.py on many small random inputs and on medium-size inputs using the `stress_test` tool (solution_cmd="python3 {target_path}", brute_cmd="python3 /tmp/stress/slow.py"). Stop only once it reports no mismatches.
+-5. Re-run the `scale_test` tool on the max-size and skewed inputs. If everything now passes, reply with "SCALING CHECK PASSED" and the wall times. If any input still times out, reply with "SCALING CHECK FAILED"."""
+-
+-    def _run_scaling_check(self, msg_history, max_rounds=3):
+-        """
+-        Bounded scaling check: build max/skewed inputs and time the solution (round 0). If any input
+-        times out, run up to max_rounds redesign rounds. Stops as soon as a round reports
+-        "SCALING CHECK PASSED"; otherwise the patch is marked incomplete via the failure marker.
+-        """
+-        if not self._has_source_patch():
+-            safe_log("Scaling check skipped: no source patch present.")
+-            return msg_history
+-        self._scaling_failed = False
+-        prompt = self._scaling_check_prompt(0, max_rounds)
+-        msg_history = self._chat_step(prompt, msg_history)
+-        if "SCALING CHECK PASSED" in self._last_message_text(msg_history):
+-            safe_log("Scaling check passed.")
+-            self._scaling_failed = False
+-        else:
+-            # Redesign is handled by the bounded derivation phase (fresh context per round).
+-            self._scaling_failed = True
+-            safe_log("Scaling check failed; running the derivation phase.")
+-        return msg_history
+-
+-    def _verification_prompt(self, round_idx, max_rounds):
+-        """Build the mandatory stress-test verification prompt for one round."""
+-        target = self._target_file()
+-        target_path = os.path.join(self.git_tempdir, target)
+-        retry_note = ""
+-        if round_idx > 0:
+-            retry_note = (
+-                f"This is verification round {round_idx + 1} of {max_rounds}: the previous round did not finish "
+-                f"with a clean stress test. Re-check the solution from scratch against the brute force.\n\n"
+-            )
+-        scaling_note = ""
+-        if self._scaling_failed:
+-            scaling_note = (
+-                "WARNING: the scaling check FAILED: the current solution times out on max-size or skewed inputs. "
+-                "The task is NOT complete until the algorithm is redesigned to meet the constraints.\n\n"
+-            )
+-        return f"""{retry_note}{scaling_note}Verification phase (mandatory). Do not finish until this is done.
+-
+-The solution at {target_path} passing the sample tests is NOT enough; subtle modelling errors are common. Small random tests alone also miss bugs that only appear at larger sizes, so verify at several size regimes.
+-
+-Order of work: timing and max-size checks come FIRST, then the stress test. If the solution times out on a max-size or skewed input, the algorithm must be redesigned (asymptotically faster), not just have its constants tuned. Do not finish with a solution known to be too slow.
+-
+-1. Create scratch files ONLY under /tmp/stress/ (never inside {self.git_tempdir}):
+-   - /tmp/stress/brute.py: an EXHAUSTIVE search that follows the literal rules of the problem statement directly (e.g. enumerate all choices / all permutations / all subsets / BFS over states). Do NOT re-implement the same idea or formula as the solution; it must be an independent, obviously-correct method. Keep it fast enough for small inputs.
+-   - /tmp/stress/gen.py: takes a size level and a seed as its last two arguments (`python3 gen.py <level> <seed>`, use sys.argv[-2] and sys.argv[-1]), seeds `random` with the seed, and prints ONE random input that respects all the problem's constraints. It must support three levels:
+-       * tiny: very small inputs (n<=8, small values) so the exhaustive brute force can check them.
+-       * medium: n and values in the hundreds (or the largest size at which the brute force or an independent polynomial-time reference is still feasible).
+-       * adversarial: many duplicates, all-equal values, boundary values (min/max sizes, min/max values, answer absent, answer at the edges).
+-     Include edge cases with reasonable probability in every level.
+-   - If the problem has several valid answers (e.g. "print any"), write /tmp/stress/checker.py: `python3 checker.py <input_file> <output_file>` that parses the input and the solution output, verifies validity against the problem rules, and prints `OK` (exit 0) or a short reason (exit 1). Use it via `checker_cmd` instead of comparing outputs to the brute force.
+-   - For medium sizes you need either an independent polynomial-time reference (a different algorithm from the solution, e.g. an O(n^2) or hash/DP method) or the checker. Make sure at least one medium-size comparison actually runs.
+-2. Make sure the solution can be run on stdin/stdout (or, if the task is a `Solution` class method, write a small wrapper in /tmp/stress/ that imports it from {target_path} and calls the method on the parsed input, then prints the result).
+-3. Before any optimisation, copy the currently verified solution to /tmp/stress/best_solution.py (e.g. `cp {target_path} /tmp/stress/best_solution.py`).
+-4. Run the differential stress test with the `stress_test` tool, e.g. solution_cmd="python3 {target_path}", brute_cmd="python3 /tmp/stress/brute.py", generator_cmd="python3 /tmp/stress/gen.py", size_levels=["tiny","medium","adversarial"], num_tests=1000 (or checker_cmd="python3 /tmp/stress/checker.py" for multi-answer problems). Run at least 500 cases (up to 2000) spread over all levels. If the tool is unavailable, write /tmp/stress/stress.py yourself that loops over seeds and levels with subprocess timeouts and compares outputs.
+-5. If there is ANY mismatch (or a timeout/crash):
+-   a. Minimise the failing input by hand until it is tiny, and examine both outputs.
+-   b. Reason explicitly about which modelling assumption of the solution is wrong (for example a wrong cost model, a missed case, an off-by-one, a greedy that is not optimal, or a misread rule). Do not guess blindly; check the brute force first if you suspect it.
+-   c. Fix {target_path} with the editor tool (use str_replace for targeted edits).
+-   d. Rerun the stress test until it reports no mismatches over the full number of cases. After each fix, copy the verified solution again to /tmp/stress/best_solution.py.
+-6. Timing: generate a maximum-size input that respects the constraints (for example via a small script in /tmp/stress/) and time the solution with `time`. If it takes more than about 1 second, optimise the algorithm (not just micro-optimise). Any optimisation must be re-verified with the full stress test (all levels). If the optimised version is not fully verified, restore it with `cp /tmp/stress/best_solution.py {target_path}`.
+-7. Run the sample tests from the problem statement once more.
+-8. Finally run `git -C {self.git_tempdir} status` and `git -C {self.git_tempdir} diff` to confirm that the only changes are to the source file(s) and that no scratch files (brute.py, gen.py, stress.py, timing inputs, __pycache__ or similar) were left in the repository. Delete any that were.
+-
+-When everything is done, end your reply with a short report that includes the stress test summary (number of cases, seeds, result) and the timing of the max-size input. If and only if the stress test passed with zero mismatches, include the exact marker line `STRESS TEST PASSED` in that final reply."""
+-
+-    def _chat_step(self, prompt, msg_history, model=None):
+-        """
+-        One chat step. If the turn was cut off at max_tokens with no output, restart it ONCE from a
+-        fresh history with the same self-contained prompt (no nudges stacked on the old history).
+-        """
+-        model = model or self.code_model
+-        result = chat_with_agent(prompt, model=model, msg_history=msg_history, logging=safe_log)
+-        if last_turn_truncated():
+-            safe_log("Step ended at max_tokens with no output; restarting once with a fresh context.")
+-            result = chat_with_agent(prompt, model=model, msg_history=[], logging=safe_log)
+-        return result
+-
+-    def _derivation_prompt(self, round_idx, max_rounds, notes, oracle_path):
+-        """Prompt for one fresh-context derivation round (no prior chat history is passed in)."""
+-        target_path = os.path.join(self.git_tempdir, self._target_file())
+-        notes_text = notes.strip() if notes and notes.strip() else "(notes file is empty or missing)"
+-        return f"""Derivation round {round_idx + 1} of {max_rounds}. The current solution is too slow for the constraints.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Brute-force oracle (slow but correct): {oracle_path}
+-Target file to write the fast solution to: {target_path}
+-Design notes so far (/tmp/design/notes.md):
+-{notes_text}
+-
+-Rules:
+-- Keep visible reasoning under about 10 sentences per turn. Prefer running code over long reasoning.
+-- Use the `explore_function` tool with oracle_cmd="python3 {oracle_path}" (it reads the parameters on argv or stdin and prints an integer) to study 1-D slices, finite differences, periodicity, linearity and thresholds of the answer over the parameters.
+-- Express each hypothesis as code (a candidate formula or algorithm) and check it against the oracle with explore_function mode='check' or a stress test. Do not argue about a formula in text without testing it.
+-- Append every verified fact (formula, period, threshold, verified complexity) to /tmp/design/notes.md with bash `echo ... >> /tmp/design/notes.md` as soon as it is verified.
+-- Once a candidate matches the oracle on small and medium inputs, implement it in {target_path} with the editor tool and time it on max-size inputs.
+-- Do not leave a solution that is still too slow. If no faster algorithm is found in this round, record the best open hypothesis in the notes file and stop.
+-- Finish with one line starting with "DERIVATION RESULT: " followed by either "FAST SOLUTION VERIFIED" (only if the new solution matches the oracle and runs within about 1 second at max size) or "NOT SOLVED"."""
+-
+-    def _run_derivation_phase(self, max_rounds=3):
+-        """
+-        Bounded derivation phase run when the scaling check fails. Each round starts from a FRESH
+-        message history built from the problem, the notes file and the oracle path. Stops early when
+-        a round reports FAST SOLUTION VERIFIED. Returns the history of the last round.
+-        """
+-        oracle_path = "/tmp/stress/slow.py"
+-        notes_path = "/tmp/design/notes.md"
+-        msg_history = []
+-        for round_idx in range(max_rounds):
+-            notes = ''
+-            try:
+-                if os.path.isfile(notes_path):
+-                    with open(notes_path, 'r', errors='replace') as fh:
+-                        notes = fh.read()
+-            except Exception as e:
+-                safe_log(f"Derivation: could not read notes: {e}")
+-            safe_log(f"Derivation round {round_idx + 1}/{max_rounds} starting with fresh context.")
+-            prompt = self._derivation_prompt(round_idx, max_rounds, notes, oracle_path)
+-            try:
+-                msg_history = self._chat_step(prompt, [])
+-            except Exception as e:
+-                safe_log(f"Derivation round {round_idx + 1} raised: {e}\n{traceback.format_exc()}")
+-                msg_history = []
+-                continue
+-            text = self._last_message_text(msg_history)
+-            if "FAST SOLUTION VERIFIED" in text:
+-                self._scaling_failed = False
+-                safe_log(f"Derivation round {round_idx + 1}/{max_rounds} reports a verified fast solution.")
+-                break
+-            safe_log(f"Derivation round {round_idx + 1}/{max_rounds} finished without a verified fast solution.")
+-        return msg_history
+-
+-    def _run_verification(self, msg_history, max_rounds=2):
+-        """
+-        Mandatory differential-testing phase: a bounded number of rounds (no unbounded loops),
+-        each a chat_with_agent call that reuses the message history. Stops early once the agent
+-        reports the STRESS TEST PASSED marker in its final message.
+-        """
+-        if not self._has_source_patch():
+-            safe_log("Verification skipped: no source patch present.")
+-            return msg_history
+-        if self._scaling_failed:
+-            safe_log("Scaling check failed: patch counts as incomplete; verification still runs.")
+-        for round_idx in range(max_rounds):
+-            safe_log(f"Verification round {round_idx + 1}/{max_rounds} starting.")
+-            prompt = self._verification_prompt(round_idx, max_rounds)
+-            msg_history = self._chat_step(prompt, msg_history)
+-            final_text = self._last_message_text(msg_history)
+-            passed = "STRESS TEST PASSED" in final_text
+-            safe_log(f"Verification round {round_idx + 1}/{max_rounds} finished. "
+-                     f"Marker found: {passed}. Changed files: {self._get_changed_files()}")
+-            if passed:
+-                break
+-        else:
+-            safe_log(f"Verification: marker not found after {max_rounds} rounds. Running finalize round.")
+-            msg_history = self._run_finalize_round(msg_history)
+-        return msg_history
+-
+-    def _run_finalize_round(self, msg_history):
+-        """One short, tool-focused bounded round run when verification did not reach the marker."""
+-        target_path = os.path.join(self.git_tempdir, self._target_file())
+-        prompt = f"""Finalize step (short, tool-focused; keep reasoning brief).
+-
+-1. If /tmp/stress/best_solution.py exists and is the better verified version (the last version that passed the stress test), restore it: `cp /tmp/stress/best_solution.py {target_path}`. Otherwise leave {target_path} as it is.
+-2. Run the sample tests once more on {target_path}.
+-3. Run `git -C {self.git_tempdir} status` and remove any scratch files that ended up inside the repository.
+-4. Report the final status in one short paragraph: which version is in place, the last stress test result (number of cases, seeds, levels), and whether it passed. Include the exact line `STRESS TEST PASSED` only if the last full stress test passed with zero mismatches."""
+-        safe_log("Verification finalize round starting.")
+-        msg_history = self._chat_step(prompt, msg_history)
+-        safe_log(f"Verification finalize round finished. Marker found: "
+-                 f"{'STRESS TEST PASSED' in self._last_message_text(msg_history)}")
+-        return msg_history
+-
+-    def _last_resort_llm(self, model, msg, system_message):
+-        """One tool-free LLM call. Returns the text or '' on any failure (never raises)."""
+-        try:
+-            client, client_model = create_client(model)
+-            content, _ = get_response_from_llm(
+-                msg=msg,
+-                client=client,
+-                model=client_model,
+-                system_message=system_message,
+-                msg_history=[],
+-            )
+-            return content if isinstance(content, str) else ''
+-        except Exception as e:
+-            safe_log(f"Last-resort LLM call with {model} failed: {e}\n{traceback.format_exc()}")
+-            return ''
+-
+-    def _write_target_code(self, target_path, code, source):
+-        os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
+-        with open(target_path, 'w') as fh:
+-            fh.write(code if code.endswith('\n') else code + '\n')
+-        safe_log(f"Last-resort: wrote {os.path.basename(target_path)} from {source}.")
+-
+-    @staticmethod
+-    def _extract_code(content):
+-        """Return the first non-empty fenced code block of the reply, or None."""
+-        match = re.search(r'```(?:python|py)?\s*\n(.*?)```', content or '', re.DOTALL)
+-        if match and match.group(1).strip():
+-            return match.group(1)
++    if not text:
+         return None
+-
+-    def _last_resort_write(self):
+-        """
+-        Tool-free fallback, never raises. Stages, each on the primary model then the alternate:
+-          1. Ask for a short algorithm description (<= 300 words).
+-          2. Ask for the full code given that description.
+-          3. Ask for a simple brute-force solution (correct for small inputs).
+-        If every stage fails, write a constant stub (reads stdin, prints 0) as the very last resort.
+-        """
+-        try:
+-            target = self._target_file()
+-            target_path = os.path.join(self.git_tempdir, target)
+-            existing = ''
+-            if os.path.isfile(target_path):
+-                with open(target_path, 'r', errors='replace') as fh:
+-                    existing = fh.read()
+-            system_message = "You are an expert competitive programmer."
+-            models = [self.code_model, self._alternate_model()]
+-
+-            # Stage 1 + 2: plan, then code from the plan.
+-            plan_prompt = (
+-                f"Problem:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                "Describe the algorithm for a correct and efficient solution in at most 300 words. "
+-                "No code, only the approach and key observations."
+-            )
+-            for model in models:
+-                plan = self._last_resort_llm(model, plan_prompt, system_message).strip()
+-                if not plan:
+-                    safe_log(f"Last-resort: no algorithm description from {model}; trying next model.")
+-                    continue
+-                safe_log(f"Last-resort: algorithm description from {model} ({len(plan.split())} words).")
+-                code_prompt = (
+-                    f"Problem:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                    f"Algorithm to implement:\n{plan}\n\n"
+-                    f"Write the COMPLETE contents of the file `{target}` implementing this algorithm. "
+-                    "It must read stdin and write stdout exactly as the problem requires. "
+-                    "Reply with ONLY the complete file in a single ```python code block."
+-                )
+-                code = self._extract_code(self._last_resort_llm(model, code_prompt, system_message))
+-                if code:
+-                    if 'from typing import List' in existing and 'from typing import List' not in code:
+-                        code = 'from typing import List\n\n' + code
+-                    self._write_target_code(target_path, code, f"{model} (plan + code)")
+-                    return
+-                safe_log(f"Last-resort: no code block from {model} after plan; trying next model.")
+-
+-            # Stage 3: simple brute force, correct for small inputs.
+-            brute_prompt = (
+-                f"Problem:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                f"Write the simplest possible brute-force Python program for `{target}` that is CORRECT "
+-                "for small inputs (exhaustive search, no clever optimisation). It must read stdin and write "
+-                "stdout exactly as the problem requires. Reply with ONLY the complete file in a single ```python code block."
+-            )
+-            for model in models:
+-                code = self._extract_code(self._last_resort_llm(model, brute_prompt, system_message))
+-                if code:
+-                    self._write_target_code(target_path, code, f"{model} (brute force)")
+-                    return
+-                safe_log(f"Last-resort: no brute-force code from {model}; trying next model.")
+-
+-            # Every model failed: clearly logged stub so the patch is at least non-empty.
+-            safe_log("Last-resort: ALL models failed; writing a placeholder stub (reads stdin, prints 0).")
+-            stub = (
+-                "import sys\n\n"
+-                "# PLACEHOLDER written by the last-resort fallback: no model produced a solution.\n"
+-                "_ = sys.stdin.read()\n"
+-                "print(0)\n"
+-            )
+-            self._write_target_code(target_path, stub, "placeholder stub")
+-        except Exception as e:
+-            safe_log(f"Last-resort failed unexpectedly: {e}\n{traceback.format_exc()}")
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
+-    main()
++    blocks = re.findall(r"
+diff --git a/llm.py b/llm.py
+index 1767524..5a420f5 100644
+--- a/llm.py
++++ b/llm.py
+@@ -79,27 +79,76 @@ def _log_response(response, max_tokens, log=print):
+     )
+ 
+ 
++# Appended to the system prompt when retrying with extended thinking disabled.
++NO_THINKING_SYSTEM_NOTE = (
++    "Do not use extended reasoning. Output the requested tool call or answer immediately; "
++    "put any reasoning in at most a few visible sentences."
++)
++# Cap for the non-thinking retry (a visible answer does not need the full budget).
++NO_THINKING_MAX_TOKENS = 8192
++
++
++def _no_thinking_kwargs(kwargs):
++    """Copy of the request kwargs with extended thinking removed and the no-reasoning note appended to system."""
++    call_kwargs = dict(kwargs)
++    call_kwargs.pop("thinking", None)
++    system = call_kwargs.get("system")
++    if isinstance(system, list):
++        call_kwargs["system"] = list(system) + [{"type": "text", "text": NO_THINKING_SYSTEM_NOTE}]
++    elif system:
++        call_kwargs["system"] = f"{system}\n\n{NO_THINKING_SYSTEM_NOTE}"
++    else:
++        call_kwargs["system"] = NO_THINKING_SYSTEM_NOTE
++    return call_kwargs
++
++
++def _is_empty_max_tokens(response) -> bool:
++    """True for a thinking-exhaustion style response: cut off at max_tokens with no text or tool_use block."""
++    return getattr(response, "stop_reason", None) == "max_tokens" and not _has_text_or_tool_block(response)
++
++
+ def _call_with_token_escalation(create_fn, max_tokens_list=(4096, 8192, 16384, 32000), log=print, **kwargs):
+     """
+     Call create_fn(max_tokens=..., **kwargs) (kwargs include model=...). If the response was cut
+-    off at max_tokens with no text/tool_use content, retry the same request with the next larger
+-    max_tokens (bounded by the model cap). When extended thinking is enabled, the thinking budget
+-    is reduced on each retry so that it stays below max_tokens. Never loops unboundedly.
++    off at max_tokens with no text/tool_use content (typically all tokens spent on extended
++    thinking), first retry ONCE with extended thinking disabled, a system note asking for a direct
++    answer, and max_tokens capped at NO_THINKING_MAX_TOKENS. Only if that is still empty, retry with
++    the next larger max_tokens (bounded by the model cap); later escalations also run without
++    thinking. When thinking is enabled, the thinking budget stays below max_tokens. Never loops unboundedly.
+     """
+     cap = _max_tokens_cap(str(kwargs.get("model", "")))
+     budgets = [t for t in max_tokens_list if t <= cap] or [min(max_tokens_list[0], cap)]
+     response = None
++    thinking_disabled = False
+     for idx, max_tokens in enumerate(budgets):
+-        call_kwargs = dict(kwargs)
+-        thinking = call_kwargs.get("thinking")
+-        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+-            # Keep thinking strictly below max_tokens; halve it on each escalation.
+-            budget = max(THINKING_BUDGET_FLOOR, min(thinking.get("budget_tokens", max_tokens // 2), max_tokens // 2))
+-            call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
++        if thinking_disabled:
++            call_kwargs = _no_thinking_kwargs(kwargs)
++        else:
++            call_kwargs = dict(kwargs)
++            thinking = call_kwargs.get("thinking")
++            if isinstance(thinking, dict) and thinking.get("type") == "enabled":
++                # Keep thinking strictly below max_tokens; halve it on each escalation.
++                budget = max(THINKING_BUDGET_FLOOR, min(thinking.get("budget_tokens", max_tokens // 2), max_tokens // 2))
++                call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+         response = create_fn(max_tokens=max_tokens, **call_kwargs)
+         _log_response(response, max_tokens, log=log)
+-        if getattr(response, "stop_reason", None) != "max_tokens" or _has_text_or_tool_block(response):
++        if not _is_empty_max_tokens(response):
+             return response
++
++        if not thinking_disabled:
++            # Strategy 1: retry once without extended thinking (before any larger max_tokens).
++            thinking_disabled = True
++            retry_max = min(max_tokens, NO_THINKING_MAX_TOKENS, cap)
++            log(f"Empty max_tokens response at max_tokens={max_tokens} (thinking exhaustion suspected); "
++                f"retrying once with extended thinking disabled at max_tokens={retry_max}.")
++            response = create_fn(max_tokens=retry_max, **_no_thinking_kwargs(kwargs))
++            _log_response(response, retry_max, log=log)
++            if not _is_empty_max_tokens(response):
++                log("No-thinking retry produced visible output or a tool call.")
++                return response
++            log("No-thinking retry was also empty at max_tokens.")
++
++        # Strategy 2: escalate max_tokens (still without thinking).
+         if idx + 1 < len(budgets):
+             log(f"Empty response at max_tokens={max_tokens}; retrying with max_tokens={budgets[idx + 1]}.")
+         else:

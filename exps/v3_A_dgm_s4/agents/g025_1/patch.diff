@@ -1,0 +1,571 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e6e30ea..5357770 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,457 +1,120 @@
+-import argparse
+-import subprocess
+-import logging
+-from logging.handlers import RotatingFileHandler
++```python
+ import os
+ import re
+-import threading
+-
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+-
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+-
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
+-
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
+-
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
+-
+-
+-MAX_RETRIES = 3
+-
+-def _is_test_path(path):
+-    """
+-    Return True if a repository-relative path looks like a test file.
+-    """
+-    normalized = path.replace('\\', '/')
+-    parts = [p for p in normalized.split('/') if p]
+-    if not parts:
+-        return False
+-    basename = parts[-1]
+-    dirs = parts[:-1]
+-    if any(d in ('tests', 'test') for d in dirs):
+-        return True
+-    if basename.startswith('test_') or '_test.' in basename:
+-        return True
+-    if '.spec.' in basename or 'conftest' in basename:
+-        return True
+-    return False
+-
+-def _classify_patch(diff):
+-    """
+-    Classify a git diff as 'empty', 'tests_only', or 'ok'.
+-    """
+-    if not diff or not diff.strip():
+-        return 'empty'
+-    paths = []
+-    for line in diff.splitlines():
+-        m = re.match(r'^diff --git a/(\S+) b/(\S+)', line)
+-        if m:
+-            paths.append(m.group(2))
+-    if not paths:
+-        return 'empty'
+-    if all(_is_test_path(p) for p in paths):
+-        return 'tests_only'
+-    return 'ok'
+-
+-def _block_has_text(block):
+-    return isinstance(block, dict) and block.get('type') == 'text'
+-
+-def _is_empty_text_block(block):
+-    return _block_has_text(block) and not str(block.get('text') or '').strip()
+-
+-def _has_tool_use(msg):
+-    """
+-    Return True if a message contains a tool_use block (Claude) or tool_calls (OpenAI).
+-    """
+-    content = msg.get('content')
+-    if isinstance(content, list):
+-        for block in content:
+-            if isinstance(block, dict) and block.get('type') in ('tool_use', 'tool_result'):
+-                return True
+-    if msg.get('tool_calls'):
+-        return True
+-    return False
+-
+-def _has_tool_use_in_history(msg_history):
+-    return any(_has_tool_use(m) for m in msg_history if isinstance(m, dict))
+-
+-def _sanitize_history(history):
+-    """
+-    Clean a message history:
+-    - drop assistant messages that contain only empty/whitespace text (no tool_use)
+-    - strip empty text blocks from other messages
+-    - merge consecutive messages with the same role
+-    """
+-    if not history:
+-        return []
+-    cleaned = []
+-    for msg in history:
+-        if not isinstance(msg, dict):
++import subprocess
++import tempfile
++
++MAX_ROUNDS = 5
++MAX_CONTINUATIONS = 3
++SAMPLE_TIMEOUT = 10
++STRESS_TIMEOUT = 120
++
++MAIN_PROMPT = """You are solving a competitive programming problem in Python.
++The final solution must be in solution.py in the current directory. Work through these steps:
++1. Write a quick baseline solution to solution.py early and run it on the sample inputs.
++2. Derive the required time complexity from the constraints (hidden tests include max-size inputs).
++3. Write brute.py: an obviously-correct brute-force solution.
++4. Write a randomized differential test (stress_test.py) that compares brute.py against solution.py on many small random inputs and exits non-zero on any mismatch.
++5. Write a max-constraint input and time solution.py on it. Make sure it runs well within the time limit.
++6. If the efficient approach is not clear, print tables of brute-force results on small inputs to discover the pattern or formula, verify it with the differential test, and only then finalize.
++7. Make sure solution.py reads stdin and writes stdout exactly as the problem requires.
++Never end a turn with an empty message or without a tool call until the solution is verified."""
++
++
++def _extract_samples(problem_statement):
++    """Parse 'Sample Input N' / 'Sample Output N' blocks. Returns list of (inp, out) or None."""
++    if not problem_statement:
++        return None
++    samples = []
++    header_re = re.compile(r'^\s*(Sample Input|Sample Output|Explanation|Constraints|Note)\b', re.I)
++    lines = problem_statement.splitlines()
++    idx = 0
++    while idx < len(lines):
++        m = re.match(r'^\s*Sample Input\s*(\d+)\s*:?\s*$', lines[idx], re.I)
++        if not m:
++            idx += 1
+             continue
+-        content = msg.get('content')
+-        if isinstance(content, str):
+-            if not content.strip():
+-                if msg.get('role') == 'assistant':
+-                    continue
+-                # Skip empty user strings as well; they carry no information
+-                continue
+-            new_msg = dict(msg)
+-        elif isinstance(content, list):
+-            new_blocks = [b for b in content if not _is_empty_text_block(b)]
+-            if not new_blocks:
+-                # Nothing left in this message
+-                continue
+-            if msg.get('role') == 'assistant' and not any(
+-                isinstance(b, dict) and b.get('type') != 'text' for b in new_blocks
+-            ) and all(_block_has_text(b) for b in new_blocks) and not any(
+-                str(b.get('text') or '').strip() for b in new_blocks
+-            ):
+-                continue
+-            new_msg = dict(msg)
+-            new_msg['content'] = new_blocks
+-        else:
+-            new_msg = dict(msg)
+-
+-        if cleaned and cleaned[-1].get('role') == new_msg.get('role'):
+-            prev = cleaned[-1]
+-            prev_content = prev.get('content')
+-            new_content = new_msg.get('content')
+-            if isinstance(prev_content, str) and isinstance(new_content, str):
+-                prev['content'] = prev_content + "\n\n" + new_content
+-            else:
+-                def _as_blocks(c):
+-                    if isinstance(c, list):
+-                        return list(c)
+-                    return [{'type': 'text', 'text': str(c)}]
+-                prev['content'] = _as_blocks(prev_content) + _as_blocks(new_content)
+-        else:
+-            cleaned.append(new_msg)
+-    return cleaned
+-
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+-
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
+-
+-class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
+-        self.problem_statement = problem_statement
+-        self.git_tempdir = git_tempdir
+-        self.base_commit = base_commit
+-        self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
+-
+-    def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        instruction = f"""{task}
+-
+-Follow this workflow:
+-1. Explore the repository with bash and the editor tool (list files, read the relevant source and any stub files).
+-2. Identify the primary source file to modify. If the task asks you to write a solution in a specific file (e.g. a stub `solution.py`), that file is the target.
+-3. Implement the change with the editor tool (create/edit commands). Write the full solution into the target file.
+-4. Run the provided sample inputs/examples with bash and verify the outputs match the expected results.
+-5. Test edge cases and performance (large inputs, boundary values) and refine the solution until it is correct and efficient.
+-6. If a tool or library import fails (e.g. numpy is not installed), recover by using only the Python standard library instead of stopping.
+-
+-Important rules:
+-- The task is NOT complete until a non-test source file has been edited in the repository.
+-- Do not finish with an empty reply. Always make concrete edits with the editor tool.
+-- Do not only modify test files; the main source file must be changed.
+-- If a tool or library error occurs, recover and continue rather than stopping.
+-"""
+-        self._task_instruction = instruction
+-        msg_history = self._run_attempt(instruction, [], "initial")
+-
+-        for attempt in range(MAX_RETRIES):
+-            patch = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-            classification = _classify_patch(patch)
+-            safe_log(f"[forward] attempt {attempt} patch classification: {classification}")
+-            if classification == 'ok':
++        n = m.group(1)
++        inp_lines, out_lines = [], []
++        j = idx + 1
++        while j < len(lines) and not re.match(r'^\s*Sample Output\s*%s\s*:?\s*$' % n, lines[j], re.I):
++            if re.match(r'^\s*Sample Input', lines[j], re.I):
+                 break
+-
+-            if classification == 'empty':
+-                problem = "Your previous attempt produced no changes to the repository."
+-            else:
+-                problem = "Your previous attempt only modified test files; the main source file was not changed."
+-
+-            if attempt == MAX_RETRIES - 1:
+-                corrective = (
+-                    f"{problem} Write your best-effort full solution to the target source file right now "
+-                    f"using the editor tool. Do not reply without editing a non-test source file in {self.git_tempdir}."
+-                )
+-            else:
+-                corrective = (
+-                    f"{problem} The task is not complete until a non-test source file has been edited. "
+-                    f"Use the editor tool now to create or edit the main source file (e.g. the stub solution file) "
+-                    f"in {self.git_tempdir} with a complete implementation of the problem below. "
+-                    f"Then run the sample inputs with bash to verify it. If a library is missing, use only the standard library.\n\n"
+-                    f"<problem_description>\n{self.problem_statement}\n</problem_description>"
+-                )
+-            if not _has_tool_use_in_history(msg_history):
+-                # The model never called a tool: restart from a clean history with the full task
+-                safe_log(f"[forward] attempt {attempt} had no tool use; restarting with fresh history")
+-                corrective = (
+-                    f"{self._task_instruction}\n\n{problem} "
+-                    "Your first action MUST be a tool call: run `ls` in the repo and then create/edit "
+-                    "the target file with the editor tool."
+-                )
+-                msg_history = self._run_attempt(corrective, [], f"retry {attempt + 1} (fresh)")
+-            else:
+-                msg_history = self._run_attempt(corrective, msg_history, f"retry {attempt + 1}")
+-
+-        final_classification = _classify_patch(str(diff_versus_commit(self.git_tempdir, self.base_commit)))
+-        if final_classification in ('empty', 'tests_only'):
+-            safe_log(f"[forward] patch still {final_classification} after retries; using fallback")
+-            self._fallback_write_solution()
+-
+-        final_patch = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        safe_log(f"[forward] final patch classification: {_classify_patch(final_patch)}")
+-
+-    def _run_attempt(self, msg, msg_history, label):
+-        """
+-        Invoke the agent once and return the updated message history.
+-        Returns an empty history if the agent call raised an exception.
+-        """
+-        msg_history = _sanitize_history(msg_history)
+-        safe_log(f"[forward] starting agent pass: {label}")
+-        try:
+-            new_history = chat_with_agent(msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        except Exception:
+-            import traceback
+-            safe_log(f"[forward] agent pass {label} failed:\n{traceback.format_exc()}", level=logging.ERROR)
+-            safe_log(f"[forward] finished agent pass: {label} (failed, history reset)")
+-            return []
+-        if new_history is None:
+-            # Fall back to a fresh history with the task re-stated
+-            new_history = [{
+-                "role": "user",
+-                "content": [{"type": "text", "text": f"{self._task_instruction}\n\n{msg}"}],
+-            }]
+-        new_history = _sanitize_history(new_history)
+-        safe_log(f"[forward] finished agent pass: {label}")
+-        return new_history
+-
+-    def _target_file_from_problem(self):
+-        """
+-        Guess the target source file: a backticked filename in the problem statement,
+-        else an existing stub file from git, else 'solution.py'.
+-        """
+-        m = re.findall(r'`([\w\-./]+\.py)`', self.problem_statement or '')
+-        for candidate in m:
+-            if not _is_test_path(candidate) and not os.path.isabs(candidate) and '..' not in candidate:
+-                return candidate
+-        try:
+-            out = subprocess.run(
+-                ['git', 'ls-files'], cwd=self.git_tempdir,
+-                capture_output=True, text=True, timeout=60,
+-            ).stdout
+-            files = [f for f in out.splitlines() if f.endswith('.py') and not _is_test_path(f)]
+-            for f in files:
+-                if f == 'solution.py':
+-                    return f
+-            if len(files) == 1:
+-                return files[0]
+-        except Exception:
+-            safe_log("[forward] git ls-files failed while locating target file", level=logging.WARNING)
+-        return 'solution.py'
+-
+-    def _fallback_write_solution(self):
+-        """
+-        Last resort: ask the LLM directly (fresh history) for the full target file and write it.
+-        """
+-        target = self._target_file_from_problem()
+-        safe_log(f"[forward] fallback: writing solution to {target}")
+-        prompt = (
+-            "Solve the following competitive programming problem in Python.\n"
+-            "Reply with ONLY the complete contents of the file `" + target + "` inside a single ```python code block. "
+-            "No explanation. The program must read standard input and write standard output "
+-            "(or implement the required Solution class method as described).\n\n"
+-            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
+-        )
++            inp_lines.append(lines[j])
++            j += 1
++        if j >= len(lines) or not re.match(r'^\s*Sample Output\s*%s' % n, lines[j], re.I):
++            idx = j
++            continue
++        j += 1
++        while j < len(lines) and not header_re.match(lines[j]):
++            out_lines.append(lines[j])
++            j += 1
++        inp = "\n".join(inp_lines).strip("\n") + "\n"
++        out = "\n".join(out_lines).strip()
++        samples.append((inp, out))
++        idx = j
++    return samples if samples else None
++
++
++def _normalize_output(text):
++    lines = [ln.rstrip() for ln in text.strip().splitlines()]
++    return "\n".join(lines).strip()
++
++
++def _run_solution_on_samples(git_tempdir, samples, timeout=SAMPLE_TIMEOUT):
++    """Run python3 solution.py on each sample. Returns list of result dicts."""
++    results = []
++    if not samples:
++        return results
++    for i, (inp, expected) in enumerate(samples, 1):
++        entry = {"sample_idx": i, "status": "error", "expected": expected,
++                 "got": "", "stderr": ""}
+         try:
+-            from llm import create_client, get_response_from_llm
+-            client, client_model = create_client(self.code_model)
+-            content, _ = get_response_from_llm(
+-                prompt, client=client, model=client_model,
+-                system_message="You are an expert Python programmer.",
+-                msg_history=[], temperature=0.0,
+-            )
+-        except Exception:
+-            import traceback
+-            safe_log(f"[forward] fallback LLM call failed:\n{traceback.format_exc()}", level=logging.ERROR)
+-            return False
+-
+-        match = re.search(r'```python\s*\n(.*?)```', content or '', re.DOTALL)
+-        if not match:
+-            match = re.search(r'```\s*\n(.*?)```', content or '', re.DOTALL)
+-        code = match.group(1) if match else (content or '')
+-        if not code.strip():
+-            safe_log("[forward] fallback produced no code", level=logging.WARNING)
+-            return False
++            proc = subprocess.run(
++                ["python3", "solution.py"], input=inp, capture_output=True,
++                text=True, cwd=git_tempdir, timeout=timeout)
++            entry["got"] = proc.stdout
++            entry["stderr"] = proc.stderr
++            if proc.returncode != 0:
++                entry["status"] = "error"
++            elif _normalize_output(proc.stdout) == _normalize_output(expected):
++                entry["status"] = "pass"
++            else:
++                entry["status"] = "wrong"
++        except subprocess.TimeoutExpired as e:
++            entry["status"] = "timeout"
++            out = e.stdout
++            if isinstance(out, bytes):
++                out = out.decode(errors="replace")
++            entry["got"] = out or ""
++            entry["stderr"] = "Timed out after %s seconds" % timeout
++        results.append(entry)
++    return results
++
++
++def _run_stress(git_tempdir):
++    """Run agent-written stress_test.py if present. Returns True if exit 0, False otherwise, None if absent."""
++    path = os.path.join(git_tempdir, "stress_test.py")
++    if not os.path.exists(path):
++        return None
++    try:
++        proc = subprocess.run(["python3", "stress_test.py"], cwd=git_tempdir,
++                              capture_output=True, text=True, timeout=STRESS_TIMEOUT)
++        return proc.returncode == 0
++    except subprocess.TimeoutExpired:
++        return False
+ 
+-        path = os.path.join(self.git_tempdir, target)
+-        try:
+-            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+-            with open(path, 'w') as f:
+-                f.write(code if code.endswith('\n') else code + '\n')
+-            safe_log(f"[forward] fallback wrote {len(code)} chars to {path}")
+-            return True
+-        except Exception:
+-            import traceback
+-            safe_log(f"[forward] fallback write failed:\n{traceback.format_exc()}", level=logging.ERROR)
+-            return False
+ 
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
++def _git(git_tempdir, args, input_text=None):
++    return subprocess.run(["git"] + args, cwd=git_tempdir, input=input_text,
++                          capture_output=True, text=True)
+ 
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+ 
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
++def diff_versus_commit(git_tempdir):
++    _git(git_tempdir, ["add", "-A"])
++    proc = _git(git_tempdir, ["diff", "--cached", "HEAD", "--binary"])
++    return proc.stdout
+ 
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+ 
+-if __name__ == "__main__":
+-    main()
++def reset_to_commit(git_tempdir):
++    _git(git_tempdir, ["reset", "--hard

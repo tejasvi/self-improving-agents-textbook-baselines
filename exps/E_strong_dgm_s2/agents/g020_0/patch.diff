@@ -1,0 +1,279 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 085c694..f99599d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,9 +4,11 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import sys
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, filter_patch_by_files
+ from utils.verify_common import file_sha256, load_records, candidate_dir, candidate_path
+@@ -98,6 +100,71 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++import re
++
++_CUT_OFF_PHRASE = 'Your last reply was cut off by the output limit'
++_EMPTY_REPLIES = ('', '(no output)')
++
++
++def _get(obj, key):
++    """Read `key` from a dict block or an SDK object block."""
++    if isinstance(obj, dict):
++        return obj.get(key)
++    return getattr(obj, key, None)
++
++
++def _content_blocks(msg):
++    content = _get(msg, 'content')
++    if content is None:
++        return []
++    if isinstance(content, str):
++        return [{'type': 'text', 'text': content}]
++    return list(content)
++
++
++def _block_text(block):
++    if isinstance(block, str):
++        return block
++    if _get(block, 'type') == 'text':
++        return _get(block, 'text') or ''
++    return ''
++
++
++def _has_tool_blocks(msg):
++    return any(_get(b, 'type') in ('tool_use', 'tool_result') for b in _content_blocks(msg))
++
++
++def _sanitize_history(msg_history):
++    """Drop empty / '(no output)' assistant turns and injected 'cut off' user turns.
++
++    Messages containing tool_use or tool_result blocks are always kept.
++    """
++    cleaned = []
++    for msg in msg_history or []:
++        role = _get(msg, 'role')
++        if _has_tool_blocks(msg):
++            cleaned.append(msg)
++            continue
++        text = "\n".join(_block_text(b) for b in _content_blocks(msg)).strip()
++        if role == 'assistant' and text in _EMPTY_REPLIES:
++            continue
++        if role == 'user' and text.startswith(_CUT_OFF_PHRASE):
++            continue
++        cleaned.append(msg)
++    return cleaned
++
++
++def _made_tool_call(msg_history):
++    """True if the history contains a tool call (tool_use block or '<tool_use>' text marker)."""
++    for msg in msg_history or []:
++        for block in _content_blocks(msg):
++            if _get(block, 'type') == 'tool_use':
++                return True
++            if '<tool_use>' in _block_text(block):
++                return True
++    return False
++
++
+ SUBPROCESS_FUNCS = {'run', 'Popen', 'call', 'check_call', 'check_output'}
+ 
+ 
+@@ -192,18 +259,55 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _added_line_numbers(self, patch):
++        """New-file line numbers of the '+' lines in a single-file unified diff."""
++        added = set()
++        new_no = None
++        for line in patch.splitlines():
++            if line.startswith('@@'):
++                m = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
++                new_no = int(m.group(1)) if m else None
++                continue
++            if new_no is None:
++                continue  # file header lines before the first hunk
++            if line.startswith('diff --git'):
++                new_no = None
++            elif line.startswith('+'):
++                added.add(new_no)
++                new_no += 1
++            elif line.startswith(' '):
++                new_no += 1
++            # '-' and '\\ No newline' lines do not advance the new-file counter
++        return added
++
+     def _has_real_edit(self):
+         """
+-        Returns True only if solution.py gained at least one added line that is
+-        neither blank nor a comment.
++        True only if solution.py gained at least one added line that belongs to a real
++        statement: not blank, not a comment, not a docstring/string-only line, not `pass`,
++        not `...`, not a bare import, and not a def/class header by itself. For starter
++        `Solution` classes the method body must contain real statements (e.g. a return).
++        Edits to other files never count.
+         """
+         patch = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+         filtered = filter_patch_by_files(patch, ['solution.py'])
+-        for line in filtered.splitlines():
+-            if not line.startswith('+') or line.startswith('+++'):
++        added = self._added_line_numbers(filtered)
++        if not added:
++            return False
++        try:
++            with open(self._solution_path(), 'r', errors='replace') as f:
++                tree = ast.parse(f.read())
++        except (OSError, SyntaxError, ValueError):
++            return False
++        for node in ast.walk(tree):
++            if not isinstance(node, ast.stmt):
++                continue
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
++                continue  # headers do not count; their body statements are checked
++            if isinstance(node, (ast.Pass, ast.Import, ast.ImportFrom)):
+                 continue
+-            content = line[1:].strip()
+-            if content and not content.startswith('#'):
++            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
++                continue  # docstring or ellipsis or other bare literal
++            if getattr(node, 'lineno', None) in added:
+                 return True
+         return False
+ 
+@@ -450,6 +554,51 @@ class AgenticSystem:
+                 parts.append(f"first failing stress input: {stress['first_failure']}")
+         return "\n".join(parts) if parts else None
+ 
++    def _fallback_write_solution(self):
++        """Last resort: one tool-free LLM call that returns the full solution.py."""
++        path = self._solution_path()
++        current = ''
++        if os.path.isfile(path):
++            with open(path, 'r', errors='replace') as f:
++                current = f.read()
++        prompt = (
++            "Write a complete, correct Python solution for the problem below.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Current contents of solution.py (may be empty or a stub):\n```python\n{current}\n```\n\n"
++            "Reply with ONLY the complete final solution.py inside a single ```python code block. "
++            "Read input from stdin and write output to stdout exactly as the statement requires "
++            "(if the starter code defines a Solution class, keep that class and method signature). "
++            "Keep it short and correct; prefer a simple algorithm that is certainly right."
++        )
++        safe_log("[fallback] no real edit after retries; calling the LLM directly without tools")
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                prompt, client=client, model=client_model,
++                system_message="You are an expert competitive programmer.", msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"[fallback] LLM call failed: {e}")
++            return False
++        safe_log(f"[fallback] received {len(content or '')} characters")
++        match = re.search(r"```python\s*\n(.*?)```", content or '', re.DOTALL)
++        if not match:
++            safe_log("[fallback] no ```python block found in the reply")
++            return False
++        code = match.group(1)
++        try:
++            ast.parse(code)
++        except (SyntaxError, ValueError) as e:
++            safe_log(f"[fallback] extracted code does not parse: {e}")
++            return False
++        if not sanity_gate(code, getattr(self, '_initial_code', '')):
++            safe_log("[fallback] extracted code failed the sanity gate")
++            return False
++        with open(path, 'w') as f:
++            f.write(code)
++        safe_log(f"[fallback] wrote {len(code)} characters to {path}")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -484,27 +633,62 @@ Within your first few tool calls, write a first-draft solution.py (even brute fo
+         if 'AGENT_VERIFY_STATE' not in os.environ:
+             os.environ['AGENT_VERIFY_STATE'] = os.path.join(
+                 tempfile.gettempdir(), f"agent_verify_state_{uuid.uuid4().hex}.json")
+-        instruction = f"{task}\n\n{method}"
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        if not msg_history:
+-            msg_history = []
+-
+-        # Bounded retry: ensure solution.py contains real code
+-        reminder_text = (
+-            "No solution code has been written to solution.py yet, so the task is not done. "
+-            f"You must call the editor tool right now to create {self.git_tempdir}/solution.py "
+-            "with your best current solution; a brute-force "
+-            "fallback is acceptable. Write your best attempt first, then test and refine it afterwards. "
+-            "Do not reply with an empty message."
++        draft_prompt = (
++            f"{task}\n"
++            "Your first action must be a single editor `create` call that writes a complete, short solution "
++            f"to {self._solution_path()}. No long reasoning or prose first; keep the file short. "
++            "Testing and refinement come after the file exists."
+         )
++        msg_history = chat_with_agent(draft_prompt, model=self.code_model, msg_history=[], logging=safe_log) or []
++        safe_log(f"[forward] draft turn done; tool call made: {_made_tool_call(msg_history)}")
++
++        # Bounded, escalating retries (at most 3 attempts; never loops unboundedly).
+         for attempt in range(3):
+             if self._has_real_edit():
+                 break
+             safe_log(f"[forward] No real edit in solution.py; retry {attempt + 1}/3")
++            if attempt == 0:
++                retry_prompt = (
++                    "No real code has been written to solution.py yet, so the task is not done. "
++                    f"Call the editor tool now with `create` to write a complete solution to {self._solution_path()}. "
++                    "Do not reply with an empty message and do not write long prose; a short brute-force solution is fine.\n\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++                )
++                history_in = _sanitize_history(msg_history)
++            elif attempt == 1:
++                retry_prompt = (
++                    f"Write a complete Python solution to the problem below into {self._solution_path()} "
++                    "using the editor tool (`create`). Do it now.\n\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++                )
++                history_in = []
++            else:
++                retry_prompt = (
++                    f"Write the simplest correct brute-force solution to the problem below into {self._solution_path()} "
++                    "using the editor tool (`create`). Efficiency does not matter yet; correctness does.\n\n"
++                    f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++                )
++                history_in = []
+             msg_history = chat_with_agent(
+-                reminder_text,
++                retry_prompt,
+                 model=self.code_model,
+-                msg_history=msg_history,
++                msg_history=history_in,
++                logging=safe_log,
++            ) or history_in
++            safe_log(f"[forward] retry {attempt + 1}/3 done; real edit: {self._has_real_edit()}")
++
++        if not self._has_real_edit():
++            self._fallback_write_solution()
++
++        if self._has_real_edit():
++            verify_prompt = (
++                "solution.py now contains a first version of the solution. Next, verify and refine it.\n\n"
++                + method
++            )
++            msg_history = chat_with_agent(
++                verify_prompt,
++                model=self.code_model,
++                msg_history=_sanitize_history(msg_history),
+                 logging=safe_log,
+             ) or msg_history
+ 

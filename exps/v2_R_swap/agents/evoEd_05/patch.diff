@@ -1,0 +1,448 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 39bfae0..0bab274 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,188 +1,267 @@
+-import argparse
+-import subprocess
+-import logging
+-from logging.handlers import RotatingFileHandler
+ import os
+-import threading
++import re
++import sys
++import time
+ 
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm_withtools import chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+-# reset_to_commit(git_dname, commit)
+-# apply_patch(git_dname, patch_str)
+-
+-# TEST COMMANDS for different languages
+-# IMPORTANT: TEST COMMAND SHOULD BE RUN UNDER git_tempdir!!
+-NPM_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -e node_modules ] && ln -s /npm-install/node_modules ."],
+-    ["sh", "-c", "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json ."],
+-    ["sed", "-i", "s/\\bxtest(/test(/g", "*.spec.js"],
+-    ["npm", "run", "test"]
+-]
+-
+-CPP_TEST_COMMANDS = [
+-    ["sh", "-c", "set -e"],
+-    ["sh", "-c", "[ ! -d \"build\" ] && mkdir build"],
+-    ["sh", "-c", "cd build"],
+-    ["cmake", "-DEXERCISM_RUN_ALL_TESTS=1", "-G", "Unix Makefiles", ".."],
+-    ["make"],
+-    ["sh", "-c", "cd ../"]
+-]
+-
+-TEST_COMMANDS = {
+-    "python": [["pytest", "-rA", "--tb=long"]],
+-    "rust": [["cargo", "test", "--", "--include-ignored"]],
+-    "go": [["go", "test", "./..."]],
+-    "javascript": NPM_TEST_COMMANDS,
+-    "cpp": CPP_TEST_COMMANDS,
+-    "java": [["./gradlew", "test"]],
+-}
+-
+-# Thread-local storage for logger instances
+-thread_local = threading.local()
+-
+-def get_thread_logger():
+-    """
+-    Get the logger instance specific to the current thread.
+-    Returns None if no logger has been set for this thread.
+-    """
+-    return getattr(thread_local, 'logger', None)
+-
+-def set_thread_logger(logger):
+-    """
+-    Set the logger instance for the current thread.
+-    """
+-    thread_local.logger = logger
+-
+-def setup_logger(log_file='./chat_history.md', level=logging.INFO):
+-    """
+-    Set up a logger with both file and console handlers.
+-    """
+-    # Create logger with a unique name based on thread ID
+-    logger = logging.getLogger(f'AgenticSystem-{threading.get_ident()}')
+-    logger.setLevel(level)
+-    
+-    # Remove existing handlers to avoid duplicates
+-    logger.handlers = []
+-    
+-    # Create formatters
+-    file_formatter = logging.Formatter('%(message)s')
+-    
+-    # Create and set up file handler
+-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+-    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+-    file_handler.setLevel(level)
+-    file_handler.setFormatter(file_formatter)
+-    
+-    # Add handlers to logger
+-    logger.addHandler(file_handler)
+-    
+-    # Store logger in thread-local storage
+-    set_thread_logger(logger)
+-    
+-    return logger
+-
+-def safe_log(message, level=logging.INFO):
+-    """
+-    Thread-safe logging function that ensures messages go to the correct logger.
+-    """
+-    logger = get_thread_logger()
+-    if logger:
+-        logger.log(level, message)
+-    else:
+-        print(f"Warning: No logger found for thread {threading.get_ident()}")
++
++REPORT_PATH = "/tmp/report.txt"
++STRESS_RE = re.compile(r"STRESS_RESULT:\s*pass_rate=([0-9]*\.?[0-9]+)\s*,\s*TIMING=(ok|fail)")
++
+ 
+ class AgenticSystem:
+-    def __init__(
+-            self,
+-            problem_statement,
+-            git_tempdir,
+-            base_commit,
+-            chat_history_file='./chat_history.md',
+-            test_description=None,
+-            self_improve=False,
+-            language='python'
+-        ):
++    def __init__(self, problem_statement, git_tempdir, base_commit, chat_history_file=None,
++                 model=None, max_attempts=3, max_empty_retries=2):
+         self.problem_statement = problem_statement
+         self.git_tempdir = git_tempdir
+         self.base_commit = base_commit
+         self.chat_history_file = chat_history_file
+-        self.test_description = test_description
+-        self.self_improve = self_improve
+-        self.language = language
+-
+-        # Set the code model based on whether self-improvement is enabled
+-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+-
+-        # Initialize logger and store it in thread-local storage
+-        self.logger = setup_logger(chat_history_file)
+-        
+-        # Clear the log file
+-        with open(chat_history_file, 'w') as f:
+-            f.write('')
+-
+-    def get_current_edits(self):
+-        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-        new_msg_history = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {
+-                        "type": "text",
+-                        "text": f"# Current Repo Edits\n{diff}",
+-                    }
+-                ],
+-            }
+-        ]
+-        return new_msg_history
++        self.model = model or os.environ.get("CODING_AGENT_MODEL", "claude-3-5-sonnet-20241022")
++        self.max_attempts = max_attempts
++        self.max_empty_retries = max_empty_retries
++
++    # ------------------------------------------------------------------ logging
++    def _log(self, msg):
++        ts = time.strftime("%H:%M:%S")
++        print(f"[coding_agent {ts}] {msg}", file=sys.stderr, flush=True)
++
++    # ------------------------------------------------------------ agent helpers
++    def _run_agent(self, prompt, history):
++        self._log(f"chat_with_agent call (prompt chars={len(prompt)})")
++        try:
++            new_history = chat_with_agent(prompt, model=self.model, msg_history=history,
++                                          logging=self._log)
++        except Exception as e:  # keep the pipeline alive; the guard will re-prompt
++            self._log(f"chat_with_agent raised: {e!r}")
++            return "", history
++        if new_history is None:
++            new_history = history
++        return self._last_assistant_text(new_history), new_history
++
++    @staticmethod
++    def _content_to_text(content):
++        if content is None:
++            return ""
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            parts = []
++            for part in content:
++                if isinstance(part, dict):
++                    parts.append(str(part.get("text", "")))
++                else:
++                    parts.append(str(part))
++            return "\n".join(parts)
++        return str(content)
++
++    def _last_assistant_text(self, history):
++        for msg in reversed(history or []):
++            if isinstance(msg, dict):
++                if msg.get("role") == "assistant":
++                    return self._content_to_text(msg.get("content"))
++            else:
++                role = getattr(msg, "role", None)
++                if role == "assistant":
++                    return self._content_to_text(getattr(msg, "content", ""))
++        return ""
++
++    # ------------------------------------------------------------- file checks
++    def _solution_path(self):
++        return os.path.join(self.git_tempdir, "solution.py")
++
++    def _solution_ok(self):
++        path = self._solution_path()
++        if not os.path.isfile(path):
++            return False
++        try:
++            with open(path, "r", encoding="utf-8") as f:
++                return f.read().strip() != ""
++        except OSError:
++            return False
++
++    def _clear_report(self):
++        try:
++            if os.path.exists(REPORT_PATH):
++                os.remove(REPORT_PATH)
++        except OSError:
++            pass
++
++    def _read_report(self):
++        try:
++            with open(REPORT_PATH, "r", encoding="utf-8", errors="replace") as f:
++                return f.read()
++        except OSError:
++            return ""
++
++    # ---------------------------------------------------------------- scoring
++    def _evaluate(self, reply):
++        """Harness-side scoring. Raw output is passed through; no error parsing."""
++        solution_ok = self._solution_ok()
++        text = (reply or "") + "\n" + self._read_report()
++        matches = STRESS_RE.findall(text)
++        if matches:
++            pass_rate_str, timing = matches[-1]
++            pass_rate = float(pass_rate_str)
++            timing_ok = timing == "ok"
++        else:
++            pass_rate = 0.0
++            timing_ok = False
++        score = (1 if solution_ok else 0, pass_rate, 1 if timing_ok else 0)
++        perfect = solution_ok and pass_rate >= 1.0 and timing_ok
++        return score, perfect
++
++    def _snapshot_patch(self):
++        try:
++            patch = diff_versus_commit(self.git_tempdir, self.base_commit)
++        except Exception as e:
++            self._log(f"diff_versus_commit failed: {e!r}")
++            return ""
++        return patch or ""
++
++    # ---------------------------------------------------------------- prompts
++    def _build_analysis_prompt(self):
++        return (
++            "## Stage A: Analysis\n"
++            "Restate the problem in your own words. List the constraints, the input/output format, "
++            "and the edge cases (ties, boundaries, minimum and maximum values, empty or trivial cases). "
++            "Design the intended algorithm and state its time and memory complexity. "
++            "Verify that the complexity fits the largest constraints in Python (target: a few seconds).\n"
++        )
++
++    def _build_brute_prompt(self):
++        return (
++            "## Stage B: Brute-force reference\n"
++            f"Write a simple exhaustive reference solution at {self.git_tempdir}/../tmp path is NOT required; "
++            "put it at /tmp/work/brute_force.py (outside the repository). It may be exponential and is only "
++            "meant for tiny inputs. It reads stdin and writes stdout in the exact problem format. "
++            "Run it with the bash tool on every statement sample that is small enough and confirm the outputs "
++            "match the expected sample outputs. If they do not match, fix your understanding of the problem first.\n"
++        )
++
++    def _build_solution_prompt(self):
++        return (
++            "## Stage C: Efficient solution\n"
++            f"Write the efficient solution to {self._solution_path()} . It must read stdin and write stdout "
++            "exactly as the problem requires. If the task is a method of a given Solution class, implement the "
++            "method in solution.py accordingly. Run it on all statement samples with the bash tool and confirm "
++            "every sample matches. Do not leave any other helper files inside the repository.\n"
++        )
+ 
++    def _build_stress_prompt(self):
++        return (
++            "## Stage D: Stress test and timing\n"
++            "1. Write a random generator for small valid inputs in /tmp/work/gen.py. Emphasize ties, equal "
++            "values, boundary values and minimal sizes. Respect every constraint of the statement.\n"
++            "2. Write /tmp/work/compare.py that generates several hundred random cases, runs brute_force.py and "
++            "solution.py on each case (use a timeout per run), and compares outputs. On the first mismatch, "
++            "print the input, the expected output and the actual output, then stop.\n"
++            "3. Generate maximum-size inputs and time solution.py with a timeout of a few seconds.\n"
++            "4. Run everything with the bash tool. Write a raw report of all outputs to /tmp/report.txt.\n"
++            "5. As your final line, print exactly one line of the form:\n"
++            "STRESS_RESULT: pass_rate=<fraction of random cases passed>, TIMING=ok or TIMING=fail\n"
++            "Keep all helper files in /tmp/work so that only solution.py is part of the final patch.\n"
++        )
++
++    def _build_initial_prompt(self):
++        header = (
++            "You are solving a competitive programming task in Python.\n\n"
++            f"## Problem\n{self.problem_statement}\n\n"
++            "Work through the stages below in order, using the bash and file editing tools.\n"
++            "Do not stop until solution.py exists and the stress test has been run.\n\n"
++        )
++        return header + "\n".join([
++            self._build_analysis_prompt(),
++            self._build_brute_prompt(),
++            self._build_solution_prompt(),
++            self._build_stress_prompt(),
++        ])
++
++    def _build_strict_prompt(self):
++        return (
++            "Your previous reply was empty or solution.py is missing or empty. "
++            "Do not explain. Implement /tmp/work/brute_force.py and "
++            f"{self._solution_path()} NOW using the file tools, then run the samples and the stress test "
++            "with the bash tool, and finish with the line "
++            "'STRESS_RESULT: pass_rate=..., TIMING=ok/fail'.\n"
++        )
++
++    def _build_retry_prompt(self, prev_patch, report, best_info):
++        return (
++            "## Retry: the previous attempt did not pass verification\n"
++            f"## Problem\n{self.problem_statement}\n\n"
++            "## Previous patch\n"
++            f"{prev_patch if prev_patch else '(empty)'}\n\n"
++            "## Failure report (raw output)\n"
++            f"{report if report else '(no report file was produced)'}\n\n"
++            f"## Best score so far\n{best_info}\n\n"
++            "Instructions:\n"
++            "1. Reflect on the root cause of the failure. Look at the first mismatch, the expected versus actual "
++            "output, and the timing result.\n"
++            "2. If brute_force.py and solution.py disagree on a small case, the algorithm may be logically wrong. "
++            "In that case re-derive the algorithm from the analysis instead of patching symptoms.\n"
++            "3. If the failure is a small bug, fix it directly in solution.py.\n"
++            "4. If timing failed, reduce the complexity or the constant factor.\n"
++            "5. Re-run the samples, the stress test and the timing run with the bash tool, and finish with the line "
++            "'STRESS_RESULT: pass_rate=..., TIMING=ok/fail'.\n"
++        )
++
++    # ---------------------------------------------------------------- forward
+     def forward(self):
+-        """
+-        The forward function for the AgenticSystem.
+-        """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+-
+-<problem_description>
+-{self.problem_statement}
+-</problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+-"""
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-
+-def main():
+-    parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+-    parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+-    parser.add_argument('--git_dir', required=True, help='Path to git repository directory')
+-    parser.add_argument('--base_commit', required=True, help='Base commit hash to compare against')
+-    parser.add_argument('--chat_history_file', required=True, help='Path to chat history file')
+-    parser.add_argument('--outdir', required=False, default="/dgm/", help='Output directory')
+-    parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
+-    parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
+-    parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+-    args = parser.parse_args()
+-
+-    # Process the repository
+-    agentic_system = AgenticSystem(
+-        problem_statement=args.problem_statement,
+-        git_tempdir=args.git_dir,
+-        base_commit=args.base_commit,
+-        chat_history_file=args.chat_history_file,
+-        test_description=args.test_description,
+-        self_improve=args.self_improve,
+-        language=args.language,
+-    )
+-
+-    # Run the agentic system to try to solve the problem
+-    agentic_system.forward()
+-
+-    # Get code diff and save to model_patch.diff
+-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+-    model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
+-    with open(model_patch_outfile, 'w') as f:
+-        f.write(model_patch)
+-
+-if __name__ == "__main__":
+-    main()
++        best = None  # dict with keys: attempt, score, patch
++        history = []
++        prompt = self._build_initial_prompt()
++
++        for attempt in range(1, self.max_attempts + 1):
++            self._log(f"=== attempt {attempt}/{self.max_attempts} ===")
++            self._clear_report()
++
++            self._log("stage: analysis, brute force, solution, stress test")
++            reply, history = self._run_agent(prompt, history)
++
++            # Empty-response guard, bounded by max_empty_retries.
++            for guard in range(self.max_empty_retries):
++                if reply.strip() and self._solution_ok():
++                    break
++                self._log(f"guard: empty reply or missing solution.py, strict re-prompt {guard + 1}")
++                reply, history = self._run_agent(self._build_strict_prompt(), history)
++
++            if not self._solution_ok():
++                self._log("warning: solution.py is still missing or empty after guard retries")
++
++            score, perfect = self._evaluate(reply)
++            patch = self._snapshot_patch()
++            self._log(f"attempt {attempt} score={score} patch_chars={len(patch)}")
++
++            if best is None or score > best["score"]:
++                best = {"attempt": attempt, "score": score, "patch": patch}
++                self._log(f"new best attempt: {attempt}")
++
++            if perfect:
++                self._log("perfect score reached, stopping early")
++                break
++
++            if attempt == self.max_attempts:
++                break
++
++            report = self._read_report()
++            if not report and reply:
++                report = reply[-4000:]
++            best_info = f"attempt={best['attempt']} score={best['score']}"
++            prompt = self._build_retry_prompt(patch, report, best_info)
++
++        # Finalization: restore the best snapshot if the workspace differs.
++        current = self._snapshot_patch()
++        if best is not None and best["patch"] != current:
++            self._log(f"restoring best attempt {best['attempt']}")
++            try:
++                reset_to_commit(self.git_tempdir, self.base_commit)
++                if best["patch"].strip():
++                    apply_patch(self.git_tempdir, best["patch"])
++            except Exception as e:
++                self._log(f"failed to restore best patch: {e!r}")
++            current = self._snapshot_patch()
++
++        self._log(f"final patch chars={len(current)}")
++        return current

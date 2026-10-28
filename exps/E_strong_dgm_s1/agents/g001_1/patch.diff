@@ -1,0 +1,165 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 20a88ba..3703691 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -137,6 +138,52 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _changed_files(self):
++        """Return the list of file paths changed versus the base commit."""
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        files = []
++        for line in diff.splitlines():
++            m = re.match(r'^diff --git a/(.*) b/(.*)$', line)
++            if m:
++                files.append(m.group(2))
++        return files
++
++    @staticmethod
++    def _is_helper_file(path):
++        """True for test files and helper scripts (brute force, generators, tests dirs)."""
++        parts = path.replace('\\', '/').split('/')
++        base = parts[-1]
++        if any(part in ('tests', 'test') for part in parts[:-1]):
++            return True
++        if base.startswith('test_') or base.endswith('_test.py') or base.endswith('.spec.js') or base.endswith('.test.js'):
++            return True
++        if base in ('brute.py', 'gen.py', 'conftest.py'):
++            return True
++        return False
++
++    def _has_primary_edit(self):
++        """
++        True if at least one changed file is a primary source file (not a test/helper file).
++        If solution.py exists in the repo, it must also contain non-comment code.
++        """
++        try:
++            changed = self._changed_files()
++        except Exception:
++            return False
++        primary = [f for f in changed if not self._is_helper_file(f)]
++        if not primary:
++            return False
++        solution_path = os.path.join(self.git_tempdir, 'solution.py')
++        if os.path.exists(solution_path):
++            with open(solution_path, 'r', encoding='utf-8', errors='replace') as f:
++                has_code = any(
++                    line.strip() and not line.strip().startswith('#')
++                    for line in f
++                )
++            if not has_code:
++                return False
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -151,7 +198,7 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         method = """Work like a careful competitive programmer:
+ 1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
++2. Immediately after reading the statement, write a draft solution.py with the editor tool (command=create), even if it is simple or brute-force, before any extended analysis. No turn may end without an editor call that creates or edits the source file. Keep replies concise to avoid the output limit.
+ 3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+ 4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+ 5. Write brute.py (a simple, obviously-correct brute force) and gen.py (takes an integer seed as sys.argv[1], uses random.seed(seed), and prints one small random valid input to stdout). Then run the `solution_check` tool in stress mode: solution_path=solution.py, brute_path=brute.py, gen_path=gen.py, num_tests of at least 200. Fix every mismatch, crash or timeout it reports, then re-run it until it reports RESULT: OK.
+@@ -163,6 +210,17 @@ The final solution.py is what gets graded; helper files are ignored."""
+         instruction = f"{task}\n\n{method}"
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
++        # Bounded retries if no primary source file was edited
++        retry_prompt = f"""{task}
++
++Your previous attempt ended without editing any source file. In your very next reply call the editor tool (command=create) to write a first-draft solution.py at {self.git_tempdir}/solution.py, even if it is a simple or brute-force solution. Keep your reasoning brief. After the file exists, test it on the samples, then refine it.
++"""
++        for attempt in range(3):
++            if self._has_primary_edit():
++                break
++            safe_log(f"No primary source edit detected; retry {attempt + 1}/3")
++            chat_with_agent(retry_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/tests/test_has_primary_edit.py b/tests/test_has_primary_edit.py
+new file mode 100644
+index 0000000..a533c30
+--- /dev/null
++++ b/tests/test_has_primary_edit.py
+@@ -0,0 +1,67 @@
++import os
++import subprocess
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import coding_agent
++
++
++def _git(repo, *args):
++    subprocess.run(["git", "-C", str(repo), *args], check=True,
++                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def _make_repo(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    _git(repo, "init", "-q")
++    _git(repo, "config", "user.email", "t@example.com")
++    _git(repo, "config", "user.name", "t")
++    (repo / "solution.py").write_text("# placeholder\n")
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-qm", "base")
++    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
++                            stdout=subprocess.PIPE, check=True).stdout.decode().strip()
++    return repo, commit
++
++
++def _agent(repo, commit):
++    agent = coding_agent.AgenticSystem.__new__(coding_agent.AgenticSystem)
++    agent.git_tempdir = str(repo)
++    agent.base_commit = commit
++    return agent
++
++
++def test_has_primary_edit_no_diff(tmp_path):
++    repo, commit = _make_repo(tmp_path)
++    assert _agent(repo, commit)._has_primary_edit() is False
++
++
++def test_has_primary_edit_only_test_and_helper_files(tmp_path):
++    repo, commit = _make_repo(tmp_path)
++    (repo / "brute.py").write_text("print(1)\n")
++    (repo / "gen.py").write_text("print(2)\n")
++    (repo / "test_foo.py").write_text("def test_x(): pass\n")
++    (repo / "tests").mkdir()
++    (repo / "tests" / "check.py").write_text("x = 1\n")
++    assert _agent(repo, commit)._has_primary_edit() is False
++
++
++def test_has_primary_edit_solution_changed(tmp_path):
++    repo, commit = _make_repo(tmp_path)
++    (repo / "solution.py").write_text("print(int(input()) * 2)\n")
++    assert _agent(repo, commit)._has_primary_edit() is True
++
++
++def test_has_primary_edit_placeholder_only_comments_is_false(tmp_path):
++    repo, commit = _make_repo(tmp_path)
++    (repo / "solution.py").write_text("# still a placeholder\n# more comments\n")
++    assert _agent(repo, commit)._has_primary_edit() is False
++
++
++def test_has_primary_edit_other_source_file(tmp_path):
++    repo, commit = _make_repo(tmp_path)
++    (repo / "solution.py").write_text("print('hi')\n")
++    (repo / "main.py").write_text("print('hi')\n")
++    assert _agent(repo, commit)._has_primary_edit() is True

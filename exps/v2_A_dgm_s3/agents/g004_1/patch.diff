@@ -1,0 +1,405 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 1603b8d..c1cbdd9 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,7 @@ import os
+ import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -179,6 +180,72 @@ class AgenticSystem:
+         """
+         return any(not self._is_test_file(f) for f in self._get_changed_files())
+ 
++    def _target_file(self):
++        """
++        Infer the primary source file to edit: first backticked *.py name in the problem
++        statement that exists in the repo (or is named there), falling back to solution.py.
++        """
++        candidates = re.findall(r'`([\w./-]+\.py)`', self.problem_statement or '')
++        for cand in candidates:
++            if not cand.startswith('test') and '/test' not in cand and not os.path.basename(cand).startswith('test_'):
++                return cand
++        return 'solution.py'
++
++    def _snapshot_repo(self, max_files=10, max_file_bytes=8 * 1024, max_listing=200):
++        """
++        Deterministically collect the repo file listing (git ls-files) and the contents of
++        small text files (solution.py, README, starter files), without involving the LLM.
++        """
++        try:
++            result = subprocess.run(
++                ["git", "-C", self.git_tempdir, "ls-files"],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++            )
++            files = [l.strip() for l in result.stdout.decode(errors='replace').splitlines() if l.strip()]
++        except Exception as e:
++            files = []
++            safe_log(f"Snapshot: git ls-files failed: {e}")
++        listing = files[:max_listing]
++        listing_text = "\n".join(listing)
++        if len(files) > max_listing:
++            listing_text += f"\n... ({len(files) - max_listing} more files not shown)"
++
++        # Priority: target file, README, then other small files that look like starters.
++        target = self._target_file()
++        def priority(f):
++            base = os.path.basename(f).lower()
++            if f == target:
++                return 0
++            if base.startswith('readme'):
++                return 1
++            if base == 'solution.py':
++                return 2
++            if base.endswith('.py') and not self._is_test_file(f):
++                return 3
++            return 4
++        ordered = sorted(files, key=lambda f: (priority(f), f))
++
++        contents = []
++        for f in ordered:
++            if len(contents) >= max_files:
++                break
++            if priority(f) >= 4 and f != target:
++                continue
++            path = os.path.join(self.git_tempdir, f)
++            try:
++                if not os.path.isfile(path) or os.path.getsize(path) >= max_file_bytes:
++                    continue
++                with open(path, 'rb') as fh:
++                    raw = fh.read()
++                if b'\0' in raw:
++                    continue
++                text = raw.decode('utf-8', errors='replace')
++            except Exception:
++                continue
++            contents.append(f"--- {f} ---\n{text}")
++
++        return f"Repository files (git ls-files):\n{listing_text}\n\n" + "\n\n".join(contents)
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -229,15 +296,67 @@ IMPORTANT RULES:
+             safe_log(f"Retry attempt {attempt + 1}/3 finished. Changed files: {self._get_changed_files()}")
+ 
+         if not self._has_source_patch():
+-            safe_log("Last-resort attempt: requesting the complete solution via the editor tool.")
+-            last_resort = (
+-                f"Write the complete solution now by calling the editor tool with command=create/edit on the target file "
+-                f"in {self.git_tempdir}. Do not reply with text only."
++            # Fresh conversation: the old history may be stuck (e.g. empty responses or a broken shell).
++            target = self._target_file()
++            snapshot = self._snapshot_repo()
++            fresh_prompt = (
++                f"{task}\n{snapshot}\n\n"
++                f"The repository currently has no source patch. Your very first action must be an editor "
++                f"create/edit call on {os.path.join(self.git_tempdir, target)} (the primary source file) "
++                f"that implements the solution. Then run it via bash on the sample inputs, and finish with a summary."
+             )
+-            msg_history = chat_with_agent(last_resort, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            safe_log(f"Last-resort attempt finished. Changed files: {self._get_changed_files()}, "
++            safe_log(f"Fresh retry with a new message history; target file: {target}")
++            msg_history = chat_with_agent(fresh_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"Fresh retry finished. Changed files: {self._get_changed_files()}, "
++                     f"source patch: {self._has_source_patch()}")
++
++        if not self._has_source_patch():
++            safe_log("Last-resort attempt: requesting the complete solution as a code block (no tools).")
++            self._last_resort_write()
++            safe_log(f"Last-resort finished. Changed files: {self._get_changed_files()}, "
+                      f"source patch: {self._has_source_patch()}")
+ 
++    def _last_resort_write(self):
++        """
++        Tool-free fallback: ask the LLM for the complete target file in a fenced code block,
++        then write it from Python so the patch is never empty.
++        """
++        target = self._target_file()
++        target_path = os.path.join(self.git_tempdir, target)
++        existing = ''
++        if os.path.isfile(target_path):
++            with open(target_path, 'r', errors='replace') as fh:
++                existing = fh.read()
++        prompt = (
++            f"Solve the following problem by writing the COMPLETE contents of the file `{target}`.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Current contents of {target}:\n```python\n{existing}\n```\n\n"
++            f"Reply with ONLY the complete file in a single ```python code block. No other text."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                msg=prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer. Output only code.",
++                msg_history=[],
++            )
++        except Exception as e:
++            safe_log(f"Last-resort LLM call failed: {e}")
++            return
++        match = re.search(r'```(?:python|py)?\s*\n(.*?)```', content or '', re.DOTALL)
++        if not match:
++            safe_log("Last-resort: no code block found in response.")
++            return
++        code = match.group(1)
++        if 'from typing import List' in existing and 'from typing import List' not in code:
++            code = 'from typing import List\n\n' + code
++        os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
++        with open(target_path, 'w') as fh:
++            fh.write(code if code.endswith('\n') else code + '\n')
++        safe_log(f"Last-resort: wrote {target}.")
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 8e238b9..b90a7cd 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -19,6 +19,15 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+             return tools_dict[tool_name]['function'](**tool_input)
+         else:
+             return f"Error: Tool '{tool_name}' not found"
++    except TypeError as e:
++        # Bad arguments (unknown or missing parameters): show the schema so the model can retry correctly.
++        schema = None
++        if tool_name in tools_dict:
++            schema = tools_dict[tool_name]['info'].get('input_schema')
++        return (
++            f"Error: invalid arguments for tool '{tool_name}': {str(e)}. "
++            f"Expected input_schema: {json.dumps(schema)}"
++        )
+     except Exception as e:
+         return f"Error executing tool '{tool_name}': {str(e)}"
+ 
+@@ -375,23 +384,58 @@ def chat_with_agent_claude(
+             logging=logging,
+         )
+ 
+-        # Check for tool use
+-        tool_use = check_for_tool_use(response, model=client_model)
+-        while tool_use:
+-            # Process tool call
+-            tool_name = tool_use['tool_name']
+-            tool_input = tool_use['tool_input']
+-            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++        final_response = None
++        nudged = False
++        # Bounded: at most one nudge for an empty response (no text and no tool call).
++        for _pass in range(2):
++            # Check for tool use
++            tool_use = check_for_tool_use(response, model=client_model)
++            while tool_use:
++                # Process tool call
++                tool_name = tool_use['tool_name']
++                tool_input = tool_use['tool_input']
++                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
++
++                # Get tool response
++                new_msg_history.append({"role": "assistant", "content": response.content})
++                new_msg_history.append({
++                    "role": "user",
++                    "content": [
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": tool_use['tool_id'],
++                            "content": tool_result,
++                        }
++                    ],
++                })
++                response = get_response_withtools(
++                    client=client,
++                    model=client_model,
++                    messages=msg_history + new_msg_history,
++                    tool_choice={"type": "auto"},
++                    tools=tools,
++                    logging=logging,
++                )
++
++                # Check for next tool use
++                tool_use = check_for_tool_use(response, model=client_model)
++
++            # Get final response
++            final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
++            if final_response or nudged:
++                break
+ 
+-            # Get tool response
+-            new_msg_history.append({"role": "assistant", "content": response.content})
++            # Empty text and no tool call: nudge the model once to act.
++            nudged = True
++            logging("Empty assistant response without tool call; nudging the model once.")
++            if response.content:
++                new_msg_history.append({"role": "assistant", "content": response.content})
+             new_msg_history.append({
+                 "role": "user",
+                 "content": [
+                     {
+-                        "type": "tool_result",
+-                        "tool_use_id": tool_use['tool_id'],
+-                        "content": tool_result,
++                        "type": "text",
++                        "text": "You must call a tool or finish with a summary of the changes you made.",
+                     }
+                 ],
+             })
+@@ -403,12 +447,6 @@ def chat_with_agent_claude(
+                 tools=tools,
+                 logging=logging,
+             )
+-
+-            # Check for next tool use
+-            tool_use = check_for_tool_use(response, model=client_model)
+-
+-        # Get final response
+-        final_response = next((block.text for block in response.content if hasattr(block, "text")), None)
+         new_msg_history.append({
+             "role": "assistant",
+             "content": [
+diff --git a/tools/bash.py b/tools/bash.py
+index ba91c0e..022be95 100644
+--- a/tools/bash.py
++++ b/tools/bash.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import os
++import signal
+ 
+ def tool_info():
+     return {
+@@ -18,9 +19,13 @@ def tool_info():
+                 "command": {
+                     "type": "string",
+                     "description": "The bash command to run."
++                },
++                "restart": {
++                    "type": "boolean",
++                    "description": "Optional. Set to true to restart the bash session. Each call already uses a fresh shell, so this only returns a confirmation when no command is given."
+                 }
+             },
+-            "required": ["command"]
++            "required": []
+         }
+     }
+ 
+@@ -37,8 +42,8 @@ class BashSession:
+     async def start(self):
+         if self._started:
+             return
+-        self._process = await asyncio.create_subprocess_shell(
+-            "/bin/bash -i",
++        self._process = await asyncio.create_subprocess_exec(
++            "/bin/bash", "--noprofile", "--norc",
+             preexec_fn=os.setsid,
+             stdin=asyncio.subprocess.PIPE,
+             stdout=asyncio.subprocess.PIPE,
+@@ -47,11 +52,22 @@ class BashSession:
+         )
+         self._started = True
+ 
++    def _kill_group(self):
++        """Kill the whole process group of the shell (including child commands)."""
++        if self._process is None or self._process.returncode is not None:
++            return
++        try:
++            os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
++        except (ProcessLookupError, PermissionError, OSError):
++            try:
++                self._process.kill()
++            except ProcessLookupError:
++                pass
++
+     def stop(self):
+         if not self._started:
+             return
+-        if self._process.returncode is None:
+-            self._process.terminate()
++        self._kill_group()
+         self._process = None
+         self._started = False
+ 
+@@ -65,9 +81,12 @@ class BashSession:
+                 f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+             )
+         
+-        # Send command
++        # Send command. The command runs in a brace group (so cd/export persist in the
++        # shell) with stdin redirected from /dev/null, so it cannot swallow the
++        # pipe-driven input of this shell.
++        wrapped = "{\n" + command + "\n} < /dev/null"
+         self._process.stdin.write(
+-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
++            wrapped.encode() + f"; echo '{self._sentinel}'\n".encode()
+         )
+         await self._process.stdin.drain()
+ 
+@@ -76,21 +95,24 @@ class BashSession:
+             output = ''
+             start_time = asyncio.get_event_loop().time()
+             
+-            while True:
+-                if asyncio.get_event_loop().time() - start_time > self._timeout:
+-                    self._timed_out = True
+-                    raise ValueError(
+-                        f"Timed out: bash has not returned in {self._timeout} seconds and must be restarted."
+-                    )
+-                
++            found = False
++            while not found and asyncio.get_event_loop().time() - start_time <= self._timeout:
+                 await asyncio.sleep(self._output_delay)
+                 # Read from the internal buffer
+                 stdout_data = self._process.stdout._buffer.decode(errors='ignore')
+                 stderr_data = self._process.stderr._buffer.decode(errors='ignore')
+-                
++
+                 if self._sentinel in stdout_data:
+                     output = stdout_data[: stdout_data.index(self._sentinel)]
+-                    break
++                    found = True
++
++            if not found:
++                self._timed_out = True
++                self._kill_group()
++                raise ValueError(
++                    f"Timed out: bash has not returned in {self._timeout} seconds. "
++                    "The shell was killed; the next call will use a fresh shell."
++                )
+ 
+             # Clear buffers
+             self._process.stdout._buffer.clear()
+@@ -130,9 +152,8 @@ def filter_error(error):
+ 
+ async def tool_function_call(command):
+     """Execute a command in the bash shell."""
++    bash_session = BashSession()
+     try:
+-        bash_session = BashSession()
+-
+         if not bash_session._started:
+             await bash_session.start()
+ 
+@@ -146,8 +167,17 @@ async def tool_function_call(command):
+         return result.strip()
+     except Exception as e:
+         return f"Error: {str(e)}"
+-
+-def tool_function(command):
++    finally:
++        bash_session.stop()
++
++def tool_function(command=None, restart=False, **kwargs):
++    if command is None:
++        if restart:
++            return "Bash restarted."
++        return "Error: no command provided. Pass a 'command' string to run."
++    if restart:
++        # Every call already uses a fresh shell, so restart only needs to run the command.
++        pass
+     return asyncio.run(tool_function_call(command))
+ 
+ if __name__ == "__main__":

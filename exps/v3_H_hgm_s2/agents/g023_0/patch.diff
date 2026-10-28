@@ -1,0 +1,407 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2b29901..e54057a 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -174,6 +174,8 @@ class AgenticSystem:
+         self.test_description = test_description
+         self.self_improve = self_improve
+         self.language = language
++        self.attempt_log = []  # hypotheses tried and their refutations, injected into later prompts
++        self._oracle_dir = None
+ 
+         # Set the code model based on whether self-improvement is enabled
+         self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+@@ -552,11 +554,329 @@ Return ONLY the Python code in a single ```python code block.
+             )
+         return "\n".join(blocks), needs_repair
+ 
++    # ------------------------------------------------------------------
++    # Independent oracle + differential testing
++    # ------------------------------------------------------------------
++
++    def _detect_interactive(self):
++        """
++        Keyword check on the problem statement for interactive / judge-protocol problems.
++        """
++        text = (self.problem_statement or "").lower()
++        return any(k in text for k in ("interactive", "interactor", "judge will respond", "flush the output"))
++
++    def _attempt_memory(self):
++        """
++        Text block with previous hypotheses and their refutations, injected into later prompts.
++        """
++        if not self.attempt_log:
++            return "(no earlier attempts)"
++        return "\n\n".join(f"--- earlier attempt {i + 1} ---\n{entry}" for i, entry in enumerate(self.attempt_log))
++
++    @staticmethod
++    def _last_assistant_text(msg_history):
++        """
++        Extract the text of the last assistant message from a chat history (best effort).
++        """
++        for msg in reversed(msg_history or []):
++            if not isinstance(msg, dict) or msg.get("role") != "assistant":
++                continue
++            content = msg.get("content")
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                parts = []
++                for block in content:
++                    if isinstance(block, dict) and isinstance(block.get("text"), str):
++                        parts.append(block["text"])
++                    elif isinstance(block, str):
++                        parts.append(block)
++                if parts:
++                    return "\n".join(parts)
++        return ""
++
++    @staticmethod
++    def _clip(text, limit=1500):
++        text = text or ""
++        if len(text) <= limit:
++            return text
++        return text[:limit] + f"\n... [truncated, {len(text)} chars total]"
++
++    def _build_oracle(self):
++        """
++        Ask a separate agent session, which sees ONLY the problem statement, to write an independent
++        reference in a temp directory outside the repo. Returns the oracle directory, or None on failure.
++        Contract of the files written:
++          - ref.py: reads stdin, prints the exact expected output (naive, definition-level).
++          - gen_small.py SEED: prints one small valid input (deterministic per seed).
++          - checker.py INPUT_FILE ACTUAL_FILE (optional): prints OK or FAIL: reason; used only when many outputs are valid.
++          - judge.py SOLUTION_PATH (interactive problems only): reads the hidden input on stdin (from gen_small),
++            runs the solution as a subprocess, simulates the interactor, prints PASS or FAIL with details.
++          - gen_large.py SEED (optional): prints a large valid input for timing.
++        """
++        oracle_dir = tempfile.mkdtemp(prefix="oracle_", dir="/tmp")
++        interactive = self._detect_interactive()
++        judge_clause = (
++            "- judge.py: the problem is INTERACTIVE. Write judge.py that takes the solution path as argv[1], reads the "
++            "hidden test (the secret input) from stdin, runs the solution as a subprocess with pipes, plays the interactor "
++            "role exactly as the statement describes, enforces the protocol (valid query format, query limits, flushing, "
++            "answer correctness), uses ref logic for the true answer or minimum, and prints a single line starting with "
++            "PASS or FAIL followed by details. Kill the subprocess on timeout (use a bounded timeout, e.g. 5 seconds)."
++            if interactive else
++            "- judge.py is NOT needed (the problem is not interactive)."
++        )
++        prompt = f"""You are building an independent test oracle for the competitive programming problem below.
++You do NOT have access to any solution; derive everything directly from the problem definition.
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++
++Write the following files into the directory {oracle_dir} ONLY (do not touch any other directory, do not create files in any repository).
++Use the editor tool's `create` command to write each file. Do NOT use bash heredocs or `echo >` to write files.
++Use `python3` to test each file with bash after writing it.
++
++- ref.py: a NAIVE, definition-level reference implementation. It reads the whole input from stdin and prints the exact expected output.
++  For a Solution-class task (a method, not stdin), ref.py and gen_small.py use the same stdin shape as the solution harness:
++  gen_small.py prints one line with a Python-literal list of the method arguments, e.g. [[1, 2], 3]; ref.py reads that line and prints repr() of the expected return value.
++  Derive it directly from the definition in the statement (brute-force search, simulation, exhaustive enumeration). Do NOT use a clever closed-form
++  formula, a known trick, or a shortcut: a formula can be wrong even when it matches tiny cases. Correctness is the only goal here; speed is not.
++  If the problem has a unique answer per input, ref.py output must match exactly.
++- gen_small.py: takes one integer SEED as argv[1] and prints ONE small but VALID input to stdout (respecting every constraint of the statement).
++  Use random.Random(SEED) for determinism. Seeds 0..9 should cover corner cases (minimum sizes, equal values, boundary values); larger seeds give random small inputs.
++  The largest inputs it produces should be as large as ref.py can still brute-force within about 1 second, so that the reference covers the largest feasible domain,
++  not only tiny inputs.
++{judge_clause}
++- checker.py (ONLY if the problem allows multiple valid answers): takes INPUT_FILE and ACTUAL_FILE as argv[1] and argv[2] and prints a line starting with OK
++  if the actual output is valid for the input, otherwise FAIL: <reason>. Do not write checker.py for problems with a unique answer.
++- gen_large.py (optional): takes SEED as argv[1] and prints one input at the maximum allowed size for timing.
++
++Verification you must do before finishing:
++1. Run ref.py on the outputs of gen_small.py for seeds 0..30 and make sure it never crashes and always prints an answer.
++2. Sanity-check ref.py by hand on at least one sample from the statement if any is given in the statement.
++3. If judge.py is present, smoke-test it against a deliberately wrong program (e.g. one that prints nothing and exits) written with the editor tool in {oracle_dir}; confirm judge.py prints FAIL and does not hang.
++
++Finish only after all required files exist in {oracle_dir} and pass these checks. Do not reply with text only.
++"""
++        chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++
++        required = ["ref.py", "gen_small.py"] + (["judge.py"] if interactive else [])
++        missing = [f for f in required if not os.path.exists(os.path.join(oracle_dir, f))]
++        if missing:
++            safe_log(f"[oracle] missing files {missing} in {oracle_dir}; differential testing disabled.")
++            return None
++        try:
++            probe = subprocess.run(
++                ["python3", os.path.join(oracle_dir, "gen_small.py"), "0"],
++                capture_output=True, text=True, timeout=20, cwd=oracle_dir,
++            )
++            if probe.returncode != 0 or not probe.stdout.strip():
++                safe_log(f"[oracle] gen_small.py seed 0 failed: {probe.stderr[-1000:]}")
++                return None
++        except subprocess.TimeoutExpired:
++            safe_log("[oracle] gen_small.py seed 0 timed out.")
++            return None
++        safe_log(f"[oracle] built oracle in {oracle_dir} (interactive={interactive}).")
++        return oracle_dir
++
++    def _run_differential(self, solution_path, oracle_dir, n_tests=200, timeout=5, max_failures=3):
++        """
++        Run the solution against the oracle over seeds 0..n_tests-1.
++        - stdin/class problems: expected = ref.py(input), compared by tokens (or checker.py if present).
++        - interactive problems (judge.py present): judge.py(solution) on the generated input must print PASS.
++        Returns (report, n_failures). The report is raw text for the first max_failures cases:
++        input, expected, actual, stderr. Errors are not parsed; the raw text is handed to the agent.
++        """
++        if not solution_path or not os.path.exists(solution_path):
++            return f"Solution file not found: {solution_path}", 1
++
++        def _py(script, args, stdin_text=None, tmo=timeout):
++            try:
++                proc = subprocess.run(
++                    ["python3", os.path.join(oracle_dir, script)] + args,
++                    input=stdin_text, capture_output=True, text=True, timeout=tmo, cwd=oracle_dir,
++                )
++                return proc.returncode, proc.stdout, proc.stderr, False
++            except subprocess.TimeoutExpired as e:
++                def _t(x):
++                    if x is None:
++                        return ""
++                    return x.decode(errors="replace") if isinstance(x, bytes) else x
++                return None, _t(e.stdout), _t(e.stderr), True
++
++        mode, method = self._detect_mode(solution_path)
++        has_judge = os.path.exists(os.path.join(oracle_dir, "judge.py"))
++        has_checker = os.path.exists(os.path.join(oracle_dir, "checker.py"))
++        failures = []
++        n_failures = 0
++        n_skipped = 0
++        for seed in range(n_tests):
++            if n_failures >= max_failures:
++                break
++            rc, inp, gerr, gto = _py("gen_small.py", [str(seed)], tmo=20)
++            if gto or rc != 0 or not inp.strip():
++                n_skipped += 1  # generator problem; not a solution failure
++                continue
++            if has_judge:
++                jrc, jout, jerr, jto = _py("judge.py", [solution_path], stdin_text=inp, tmo=timeout * 3)
++                verdict_lines = [ln for ln in (jout or "").splitlines() if ln.strip()]
++                verdict = verdict_lines[0] if verdict_lines else ""
++                if jto or not verdict.startswith("PASS"):
++                    n_failures += 1
++                    status = "JUDGE TIMEOUT" if jto else "JUDGE OUTPUT"
++                    failures.append(
++                        f"=== Failing case (seed {seed}, {status}) ===\n"
++                        f"--- input ---\n{self._clip(inp)}\n"
++                        f"--- judge output ---\n{self._clip(jout)}\n"
++                        f"--- judge stderr ---\n{self._clip(jerr)}\n"
++                    )
++                continue
++
++            ref_rc, expected, ref_err, ref_to = _py("ref.py", [], stdin_text=inp, tmo=20)
++            if ref_to or ref_rc != 0:
++                n_skipped += 1  # reference problem; do not blame the solution
++                continue
++            res = self._run_candidate(solution_path, mode, method, inp, timeout=timeout, tag=f"diff{seed}")
++            actual = "" if res["timed_out"] else res["stdout"]
++            stderr = ("TIMEOUT: exceeded %ss\n" % timeout) if res["timed_out"] else res["stderr"]
++            if res["timed_out"] or res["returncode"] != 0:
++                ok = False
++            elif has_checker:
++                in_path = os.path.join(oracle_dir, f"_in_{seed}.txt")
++                out_path = os.path.join(oracle_dir, f"_out_{seed}.txt")
++                with open(in_path, "w") as f:
++                    f.write(inp)
++                with open(out_path, "w") as f:
++                    f.write(actual)
++                crc, cout, _, cto = _py("checker.py", [in_path, out_path], tmo=20)
++                first = (cout or "").strip().splitlines()
++                ok = (not cto) and crc == 0 and bool(first) and first[0].startswith("OK")
++            elif mode == "class":
++                ok = self._outputs_match(actual, expected)
++            else:
++                ok = actual.split() == expected.split()
++            if not ok:
++                n_failures += 1
++                failures.append(
++                    f"=== Failing case (seed {seed}, exit code {res['returncode']}) ===\n"
++                    f"--- input ---\n{self._clip(inp)}\n"
++                    f"--- expected output (from ref.py) ---\n{self._clip(expected)}\n"
++                    f"--- actual output ---\n{self._clip(actual)}\n"
++                    f"--- stderr ---\n{self._clip(stderr)}\n"
++                )
++        header = (
++            f"DIFFERENTIAL TEST: {'ALL PASSED' if n_failures == 0 else 'FAILURES FOUND'} "
++            f"(seeds tried: up to {n_tests}, failures collected: {n_failures}, generator/reference skips: {n_skipped})"
++        )
++        return header + "\n\n" + "\n".join(failures), n_failures
++
++    def _run_interactive_perf(self, solution_path, oracle_dir, timeout=3.0):
++        """
++        Interactive problems: time the solution through the oracle's judge (never on plain stdin).
++        Uses gen_large.py seeds when available, else gen_small.py seeds. Returns (report, needs_repair).
++        """
++        gen = "gen_large.py" if os.path.exists(os.path.join(oracle_dir, "gen_large.py")) else "gen_small.py"
++        blocks = []
++        needs_repair = False
++        for seed in range(4):
++            try:
++                g = subprocess.run(["python3", os.path.join(oracle_dir, gen), str(seed)],
++                                   capture_output=True, text=True, timeout=20, cwd=oracle_dir)
++            except subprocess.TimeoutExpired:
++                continue
++            if g.returncode != 0 or not g.stdout.strip():
++                continue
++            try:
++                proc = subprocess.run(["python3", os.path.join(oracle_dir, "judge.py"), solution_path],
++                                      input=g.stdout, capture_output=True, text=True,
++                                      timeout=timeout * 3, cwd=oracle_dir)
++                verdict = (proc.stdout or "").strip().splitlines()
++                status = verdict[0] if verdict else f"NO VERDICT (exit code {proc.returncode})"
++                if not status.startswith("PASS"):
++                    needs_repair = True
++                blocks.append(f"=== Judge case seed {seed} ({gen}) ===\n--- judge output ---\n{self._clip(proc.stdout)}\n"
++                              f"--- stderr ---\n{self._clip(proc.stderr)}\n")
++            except subprocess.TimeoutExpired:
++                needs_repair = True
++                blocks.append(f"=== Judge case seed {seed} ({gen}) ===\nTIMEOUT (exceeded {timeout * 3:g}s)\n")
++        if not blocks:
++            return "No interactive perf cases could be generated.", False
++        return "\n".join(blocks), needs_repair
++
++    def _run_oracle_phase(self, task, max_rounds=3):
++        """
++        Build the oracle, then run differential tests and up to max_rounds repair rounds.
++        Returns the oracle directory (or None when it could not be built).
++        """
++        oracle_dir = None
++        try:
++            oracle_dir = self._build_oracle()
++        except Exception as e:
++            safe_log(f"[oracle] build failed: {e}")
++        if not oracle_dir:
++            return None
++        self._oracle_dir = oracle_dir
++        for round_idx in range(max_rounds + 1):
++            solution_path = self._solution_path()
++            report, n_fail = self._run_differential(solution_path, oracle_dir)
++            safe_log(f"[differential round {round_idx}] solution: {solution_path}\n{report}")
++            if n_fail == 0:
++                safe_log(f"[differential round {round_idx}] no discrepancies; stopping.")
++                break
++            if round_idx == max_rounds:
++                safe_log("[differential] repair budget exhausted with failures remaining.")
++                break
++            current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            repair_msg = f"""{task}
++
++An independent oracle (reference implementation written from the problem definition, not from your solution) disagrees with
++your solution. Raw differential report (first failing cases; expected comes from the reference, actual from your solution):
++
++{report}
++
++Earlier attempts and what refuted them (do not repeat a refuted hypothesis):
++{self._attempt_memory()}
++
++Current diff:
++{current_diff if current_diff.strip() else '(empty)'}
++
++Instructions:
++- The reference is the source of truth for the problem definition. Find the smallest failing input above, trace both programs by hand on it,
++  and identify the exact discrepancy. If the reference itself looks wrong by the statement, fix the reference (files in {oracle_dir}) instead.
++- Do not trust a formula validated only on tiny inputs. Replace it with a correct algorithm whose agreement with the reference holds on the largest domain the brute force covers.
++- Fix the solution file with the editor tool (`edit` or `create`, which overwrites).
++- Re-run the differential test yourself: run the solution on the failing input with bash, and run `python3 {oracle_dir}/gen_small.py SEED` for several seeds to compare against the reference.
++- Do not write helper scripts with bash heredocs; write them with the editor tool.
++- Do not reply with text only; finish only after the fix is on disk and verified.
++"""
++            history = chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            summary = self._clip(self._last_assistant_text(history), 2000)
++            first_fail = report.split("=== Failing case", 2)
++            first_fail_text = ("=== Failing case" + first_fail[1]) if len(first_fail) > 1 else "(see report)"
++            self.attempt_log.append(
++                f"Round {round_idx}: differential failures {n_fail}. First failing case:\n{self._clip(first_fail_text, 800)}\n"
++                f"Agent's stated hypothesis and fix:\n{summary or '(no summary)'}"
++            )
++            safe_log(f"[differential round {round_idx}] repair chat finished.")
++        return oracle_dir
++
++    def _is_framework_file(self, rel_path):
++        """
++        True if rel_path belongs to the agent's own framework (coding_agent.py, the LLM wrappers, tools/,
++        utils/, prompts/). These are never the task's solution, even when they are the only changed files,
++        e.g. when the agent runs inside its own repository.
++        """
++        norm = rel_path.replace('\\', '/').strip().lstrip('./')
++        framework_root = os.path.dirname(os.path.abspath(__file__))
++        if os.path.abspath(self.git_tempdir) != framework_root:
++            return False
++        return norm in ("coding_agent.py", "llm.py", "llm_withtools.py") or norm.split('/')[0] in ("tools", "utils", "prompts")
++
+     def _solution_path(self):
+         """
+         Pick the solution file: a changed non-test file (prefer solution.py), else None.
+         """
+-        candidates = [f for f in self._changed_files() if not _is_test_file(f)]
++        candidates = [f for f in self._changed_files() if not _is_test_file(f) and not self._is_framework_file(f)]
+         if not candidates:
+             return None
+         for f in candidates:
+@@ -583,8 +903,11 @@ Follow this step-by-step workflow:
+ 2) Reason about the algorithm and the complexity needed for the input constraints before writing code. State the time complexity in terms of the constraints before coding and confirm it fits in Python within ~2 seconds.
+ 3) Write the implementation to the required file using the editor tool's `create` or `edit` command. The file MUST be written to disk.
+ 4) Run the program on every sample input in the problem statement with bash and compare its output with the expected output. Fix any mismatch and re-run until all samples pass.
+-5) For tricky or hard problems, also write a brute-force implementation and stress-test the solution against it on many small random inputs; fix any differences.
+-6) Never end your turn with only text. Replying without writing the solution file to disk counts as FAILURE. Only finish after the solution file has been written and verified.
++5) Verify against an independent brute force on the LARGEST domain that brute force can feasibly handle (not only tiny inputs). Write the brute force directly from the problem definition, not from your formula, and stress-test the solution against it on many random inputs; fix any differences. A formula validated only on a tiny domain (e.g. N<=3) must NOT be trusted: check it on a larger domain where the brute force still runs.
++   For problems with multiple valid answers, write a validity checker instead of comparing exact outputs.
++   For interactive problems, the program must be run through a judge that simulates the interactor, not with plain stdin.
++6) Write helper scripts (brute force, generators, checkers, judges) with the editor tool's `create` command. Do NOT use bash heredocs (`cat << EOF`) to write files; the editor tool has no `str_replace` command, so use `create` to overwrite a file.
++7) Never end your turn with only text. Replying without writing the solution file to disk counts as FAILURE. Only finish after the solution file has been written and verified.
+ """
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+         safe_log(f"[attempt 0] initial chat finished; source patch present: {self._has_source_patch()}")
+@@ -610,6 +933,13 @@ This is a strict instruction: immediately use the editor tool (`create` or `edit
+             retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[retry {attempt + 1}] chat finished; source patch present: {self._has_source_patch()}")
+ 
++        # Independent oracle + differential testing (runs even when no samples were extracted).
++        oracle_dir = self._run_oracle_phase(task, max_rounds=3)
++        safe_log(f"[oracle] differential phase finished; oracle dir: {oracle_dir}")
++        if self.attempt_log:
++            # Later prompts (sample and perf repair) also carry the attempt memory.
++            task = task + "\n\nEarlier attempts and refuted hypotheses (do not repeat them):\n" + self._attempt_memory() + "\n"
++
+         # Verification and repair phase: run the samples and have the agent fix failures.
+         samples = self._extract_samples()
+         safe_log(f"[verify] extracted {len(samples)} sample(s).")
+@@ -643,7 +973,33 @@ Instructions:
+ 
+         # Performance phase: generate adversarial max-size inputs, time the solution, and repair if slow.
+         solution_path = self._solution_path()
+-        if solution_path and os.path.exists(solution_path):
++        if oracle_dir and self._detect_interactive() and solution_path and os.path.exists(solution_path):
++            # Interactive problems: time through the judge (plain stdin would only report EOF crashes).
++            for round_idx in range(3):
++                solution_path = self._solution_path()
++                if not solution_path:
++                    break
++                report, needs_repair = self._run_interactive_perf(solution_path, oracle_dir)
++                safe_log(f"[perf round {round_idx}] interactive judge run: {solution_path}\n{report}")
++                if not needs_repair:
++                    break
++                current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++                chat_with_agent(f"""{task}
++
++The solution fails or is too slow when run through the interactive judge. Raw judge report:
++
++{report}
++
++Current diff:
++{current_diff if current_diff.strip() else '(empty)'}
++
++Instructions:
++- Read the judge output; a FAIL line means a protocol or answer violation, TIMEOUT means too slow.
++- Fix the solution with the editor tool, re-check it against the reference in {oracle_dir}, and keep the query count within limits.
++- Do not write helper scripts with bash heredocs; use the editor tool.
++- Do not reply with text only; finish only after the fix is on disk and verified.
++""", model=self.code_model, msg_history=[], logging=safe_log)
++        elif solution_path and os.path.exists(solution_path) and not self._detect_interactive():
+             mode, method = self._detect_mode(solution_path)
+             cases = []
+             try:

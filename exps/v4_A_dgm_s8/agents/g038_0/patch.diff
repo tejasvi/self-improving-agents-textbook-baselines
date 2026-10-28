@@ -1,0 +1,217 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index d2201fb..970f698 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -39,6 +39,8 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++WORK_DIR = "/tmp/work"
++
+ TEST_PATH_SEGMENTS = {"test", "tests", "spec", "specs", "__tests__"}
+ 
+ def _is_test_path(path):
+@@ -188,9 +190,45 @@ class AgenticSystem:
+             return False
+         return any(not _is_test_path(f) for f in changed)
+ 
++    def _current_diff(self):
++        return str(diff_versus_commit(self.git_tempdir, self.base_commit))
++
++    def _run_verification(self, timeout=600):
++        """
++        Run the agent-created checker (/tmp/work/check.sh) with a timeout.
++        Returns (passed: bool, raw_output: str). Raw output is passed to the agent unparsed.
++        """
++        checker = os.path.join(WORK_DIR, "check.sh")
++        if not os.path.exists(checker):
++            return False, f"No checker found at {checker}. The checker script was not created."
++        try:
++            result = subprocess.run(
++                ["bash", checker],
++                cwd=self.git_tempdir,
++                capture_output=True,
++                text=True,
++                timeout=timeout,
++            )
++            output = (result.stdout or "") + (result.stderr or "")
++            passed = result.returncode == 0 and "FAIL" not in output
++            return passed, output
++        except subprocess.TimeoutExpired as e:
++            out = (e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
++            return False, out + f"\nChecker timed out after {timeout} seconds."
++        except Exception as e:
++            return False, f"Failed to run checker: {e}"
++
++    def _list_work_files(self):
++        if not os.path.isdir(WORK_DIR):
++            return "(none)"
++        names = sorted(os.listdir(WORK_DIR))
++        return "\n".join(names) if names else "(none)"
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
++        Runs a bounded number of attempts. Each attempt continues the same conversation,
++        is verified by the checker, and the best-scoring patch is restored at the end.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -202,24 +240,49 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ """
+         instruction = f"""{task}
+ 
+-Please follow this workflow:
+-1. Explore the repository with simple, quick commands (e.g. `ls`, `git status`, `cat` on a specific file). Avoid long-running or complex pipelines such as `find ... | cat $(...)`.
+-2. Read the starter/stub file that needs to be implemented (it may contain only `pass` or a placeholder).
+-3. Implement the solution in the non-test source file using the editor tool. Do not put the solution only in test files.
+-4. Write a small test script (or test file) that checks the examples from the problem statement, and run it. Refine the implementation until the examples pass and the logic is correct for edge cases.
+-5. Make sure your final changes are saved in the source file.
++The task is a competitive programming problem in Python: either a complete program that reads stdin and writes stdout, or a method of a given `Solution` class. Work in these phases:
+ 
+-Important: ending your turn without modifying a source file is a failure. Changing only test files is also a failure. Finishing with no edits counts as failure.
+-"""
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++Phase 1 (within your first ~8 tool calls): Look at the stub source file, then write a CORRECT baseline solution (a brute force is acceptable) into the source file using the editor tool. Never end a turn with the source file unmodified.
++
++Phase 2 (build a test harness in {WORK_DIR}): Create the directory {WORK_DIR} and save a runnable script `{WORK_DIR}/check.sh` that:
++  a. runs the sample inputs/outputs copied from the problem statement against solution.py and compares outputs;
++  b. runs an independent brute-force reference on many random small inputs (include edge cases: minimum/maximum constraints, zeros, negatives, equal start and end values, empty-like cases) and compares with solution.py;
++  c. runs a max-size input and checks it finishes within a few seconds;
++  d. prints `PASS` or `FAIL` on the last line, and prints the failing input with expected and actual output for every failure.
++Run it with `bash {WORK_DIR}/check.sh`.
+ 
+-        # Retry (bounded) until a valid, non-test source patch exists
+-        for attempt in range(3):
+-            if self._patch_is_valid():
++Phase 3: Work on the efficient solution in the source file, iterating until check.sh prints PASS. Keep the brute force as the reference in the harness. Re-run check.sh after every change.
++
++Phase 4: Make sure the final, correct solution is saved in the source file. Changing only test files is a failure.
++
++Practical rules:
++- Write scripts and test files with the editor tool (`create` or `edit`), NOT with bash heredocs. `edit` overwrites an existing file; `create` is for new files only.
++- Keep exploration short. Do not spend many turns gathering data to guess a formula; if you need a formula, verify it against the brute force.
++- Save helper files under {WORK_DIR} so later attempts can reuse them.
++"""
++        history = []
++        attempts = []  # list of dicts: diff, passed, output, valid, score
++        max_attempts = 3
++        current_prompt = instruction
++
++        for attempt in range(max_attempts):
++            history = chat_with_agent(current_prompt, model=self.code_model, msg_history=self._truncate(history), logging=safe_log)
++            history = self._nudge_if_empty(history)
++
++            diff = self._current_diff()
++            valid = self._patch_is_valid()
++            passed, output = self._run_verification()
++            score = (valid, passed)
++            attempts.append({"diff": diff, "valid": valid, "passed": passed, "output": output, "score": score})
++            safe_log(f"[attempt {attempt + 1}] valid={valid} passed={passed}")
++
++            if valid and passed:
+                 break
+-            current_diff = self.get_current_edits()
+-            diff_text = current_diff[0]["content"][0]["text"] if current_diff else ""
+-            follow_up = f"""No valid source patch was found: the repository has no changes, or only test files were changed. This is attempt {attempt + 1} of 3.
++
++            # Build follow-up for the next attempt, continuing from the current state
++            diff_text = diff if diff.strip() else "(empty: no changes yet)"
++            best = self._best_attempt(attempts)
++            current_prompt = f"""Attempt {attempt + 1} of {max_attempts} is not finished: the verification did not pass, or there is no valid non-test source patch.
+ 
+ Original task:
+ {task}
+@@ -227,8 +290,65 @@ Original task:
+ Current repo edits (diff):
+ {diff_text}
+ 
+-Now open the primary source file (the stub containing `pass` or the placeholder for the solution) and implement the solution there using the editor tool. Do not only edit tests. After editing, run a quick check on the problem's examples to verify it works, and then stop."""
+-            init_edit = chat_with_agent(follow_up, model=self.code_model, msg_history=[], logging=safe_log)
++Verification output of {WORK_DIR}/check.sh (raw):
++{output}
++
++Best attempt so far: attempt {attempts.index(best) + 1} (score valid={best['valid']}, passed={best['passed']}).
++
++Files currently in {WORK_DIR}:
++{self._list_work_files()}
++
++Continue from this state rather than restarting. Reuse the existing harness and helper files. Fix the source file so that {WORK_DIR}/check.sh prints PASS, using the editor tool. If check.sh is missing, create it first. When done, make sure the solution is saved in the source file and stop."""
++
++        best = self._best_attempt(attempts)
++        if best is not None and best is not attempts[-1]:
++            safe_log(f"Restoring best attempt (valid={best['valid']}, passed={best['passed']}).")
++            reset_to_commit(self.git_tempdir, self.base_commit)
++            if best["diff"].strip():
++                apply_patch(self.git_tempdir, best["diff"])
++
++    @staticmethod
++    def _best_attempt(attempts):
++        if not attempts:
++            return None
++        # Prefer valid non-test patch, then passing verification; ties go to the later attempt
++        best = attempts[0]
++        for a in attempts[1:]:
++            if a["score"] >= best["score"]:
++                best = a
++        return best
++
++    def _nudge_if_empty(self, history):
++        """If the last assistant message is empty, send a short 'continue' nudge in the same history."""
++        for _ in range(2):
++            last = history[-1] if history else None
++            if last is None or last.get("role") != "assistant":
++                break
++            content = last.get("content")
++            if isinstance(content, list):
++                text = "".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
++            else:
++                text = str(content or "")
++            if text.strip():
++                break
++            history = chat_with_agent("continue", model=self.code_model, msg_history=self._truncate(history), logging=safe_log)
++        return history
++
++    @staticmethod
++    def _truncate(history, keep=20):
++        """Keep roughly the last `keep` messages, starting at a plain user-text message
++        so that tool_use/tool_result pairs are never split."""
++        if len(history) <= keep:
++            return history
++        window = history[-keep:]
++        for i, m in enumerate(window):
++            content = m.get("content")
++            if m.get("role") == "user" and isinstance(content, str):
++                return window[i:]
++            if m.get("role") == "user" and isinstance(content, list) and content \
++                    and all(isinstance(c, dict) and c.get("type") == "text" for c in content):
++                return window[i:]
++        return []
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+diff --git a/tools/edit.py b/tools/edit.py
+index 1a07b22..b6e356a 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -7,7 +7,7 @@ def tool_info():
+         "description": """Custom editing tool for viewing, creating, and editing files\n
+ * State is persistent across command calls and discussions with the user.\n
+ * If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+-* The `create` command cannot be used if the specified `path` already exists as a file.\n
++* The `create` command cannot be used if the specified `path` already exists as a file; use `edit` to overwrite existing files.\n
+ * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+ * The `edit` command overwrites the entire file with the provided `file_text` (creates the file if it does not exist).\n
+ * No partial/line-range edits or partial viewing are supported.""",
+@@ -60,7 +60,10 @@ def validate_path(path: str, command: str) -> Path:
+     elif command == "create":
+         # Path must not exist
+         if path_obj.exists():
+-            raise ValueError(f"Cannot create new file; {path} already exists.")
++            raise ValueError(
++                f"Cannot create new file; {path} already exists. "
++                "Use the 'edit' command to overwrite an existing file."
++            )
+     elif command == "edit":
+         # Path may be missing (it will be created); if it exists it must be a file
+         if path_obj.exists() and path_obj.is_dir():

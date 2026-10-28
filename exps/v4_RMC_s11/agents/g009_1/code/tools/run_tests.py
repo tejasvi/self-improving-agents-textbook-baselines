@@ -1,0 +1,122 @@
+import os
+import subprocess
+import sys
+
+MAX_OUTPUT_CHARS = 2000
+
+
+def tool_info():
+    return {
+        "name": "run_tests",
+        "description": """Run a Python solution program on given test cases and compare its standard output with the expected output.
+
+* Each test case provides an 'input' (fed to the program's stdin) and an 'expected_output' (the exact expected stdout).
+* Comparison ignores leading/trailing whitespace and trailing whitespace on each line.
+* For every test case the tool reports PASS or FAIL, plus the actual output (and stderr / timeout info) for failing cases.
+* The solution is executed with the same Python interpreter, from the directory containing the solution file.
+* Use this tool to verify the solution against the examples in the problem statement and your own edge-case tests.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "solution_path": {
+                    "type": "string",
+                    "description": "Path to the Python solution file (a complete program reading stdin and writing stdout)."
+                },
+                "test_cases": {
+                    "type": "array",
+                    "description": "List of test cases to run.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "Text fed to the program's standard input."
+                            },
+                            "expected_output": {
+                                "type": "string",
+                                "description": "Exact expected text printed to standard output."
+                            }
+                        },
+                        "required": ["input", "expected_output"]
+                    }
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Timeout in seconds for each test case. Defaults to 10."
+                }
+            },
+            "required": ["solution_path", "test_cases"]
+        }
+    }
+
+
+def _normalize(text):
+    lines = [line.rstrip() for line in text.strip().splitlines()]
+    return "\n".join(lines)
+
+
+def _truncate(text):
+    if len(text) > MAX_OUTPUT_CHARS:
+        return text[:MAX_OUTPUT_CHARS] + "\n... [truncated]"
+    return text
+
+
+def tool_function(solution_path, test_cases, timeout=10):
+    if not os.path.isfile(solution_path):
+        return f"Error: solution file not found: {solution_path}"
+    if not isinstance(test_cases, list) or len(test_cases) == 0:
+        return "Error: test_cases must be a non-empty list of objects with 'input' and 'expected_output'."
+    try:
+        timeout = float(timeout) if timeout is not None else 10.0
+    except (TypeError, ValueError):
+        timeout = 10.0
+
+    cwd = os.path.dirname(os.path.abspath(solution_path)) or "."
+    script = os.path.abspath(solution_path)
+    results = []
+    passed = 0
+
+    for idx, case in enumerate(test_cases, start=1):
+        if not isinstance(case, dict) or "input" not in case or "expected_output" not in case:
+            results.append(f"Test {idx}: FAIL (malformed test case, needs 'input' and 'expected_output')")
+            continue
+        test_input = str(case["input"])
+        expected = str(case["expected_output"])
+        try:
+            proc = subprocess.run(
+                [sys.executable, script],
+                input=test_input,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+            )
+        except subprocess.TimeoutExpired:
+            results.append(f"Test {idx}: FAIL (timed out after {timeout} seconds)\nInput:\n{_truncate(test_input)}")
+            continue
+        except Exception as e:
+            results.append(f"Test {idx}: FAIL (failed to execute: {e})")
+            continue
+
+        actual = proc.stdout
+        if proc.returncode != 0:
+            results.append(
+                f"Test {idx}: FAIL (exit code {proc.returncode})\n"
+                f"Input:\n{_truncate(test_input)}\n"
+                f"Stdout:\n{_truncate(actual)}\n"
+                f"Stderr:\n{_truncate(proc.stderr)}"
+            )
+        elif _normalize(actual) == _normalize(expected):
+            passed += 1
+            results.append(f"Test {idx}: PASS")
+        else:
+            results.append(
+                f"Test {idx}: FAIL (output mismatch)\n"
+                f"Input:\n{_truncate(test_input)}\n"
+                f"Expected:\n{_truncate(expected)}\n"
+                f"Actual:\n{_truncate(actual)}\n"
+                f"Stderr:\n{_truncate(proc.stderr)}"
+            )
+
+    summary = f"{passed}/{len(test_cases)} test cases passed."
+    return summary + "\n\n" + "\n\n".join(results)

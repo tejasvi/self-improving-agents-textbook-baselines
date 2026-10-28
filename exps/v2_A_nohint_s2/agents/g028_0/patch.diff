@@ -1,0 +1,247 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index c1c8240..225fbcd 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -11,6 +11,7 @@ import traceback
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ from llm import create_client, get_response_from_llm
++from utils.stress_check import run_stress_check
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -190,15 +191,56 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
+-    def _run_agent(self, prompt, msg_history):
+-        """Run one agent call; on failure log the exception and return the old history."""
++    def _run_agent(self, prompt, msg_history, max_empty_retries=2):
++        """Run one agent call; on failure log the exception and return the old history.
++        If the reply is empty (e.g. max_tokens spent on thinking), send a short follow-up, bounded by max_empty_retries."""
+         try:
+             new_history = chat_with_agent(prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
+             safe_log(f"chat_with_agent returned history of length {len(new_history or [])}")
+-            return new_history
+         except Exception as e:
+             safe_log(f"chat_with_agent failed: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
+             return msg_history
++        for _ in range(max_empty_retries):
++            if not new_history or not _is_empty_assistant_msg(new_history[-1]):
++                break
++            safe_log("Empty assistant reply; sending follow-up.", level=logging.WARNING)
++            try:
++                new_history = chat_with_agent(
++                    "Your last reply was empty. Review the last tool output, fix any reported mismatch, and continue. Keep reasoning brief.",
++                    model=self.code_model, msg_history=_clean_history(new_history), logging=safe_log)
++            except Exception as e:
++                safe_log(f"Empty-reply follow-up failed: {repr(e)}", level=logging.ERROR)
++                break
++        return new_history
++
++    def _verify_loop(self, msg_history, target_path, max_rounds=3):
++        """Bounded verify-and-fix loop: brute force + generator + stress_test, re-checked programmatically."""
++        if not target_path:
++            return msg_history
++        setup_prompt = f"""Now verify the solution against a brute-force reference, following these steps:
++1. Write a simple, obviously-correct brute-force solution to /tmp/brute.py (reads stdin, writes stdout). Derive it from the problem statement, not from your fast solution.
++2. Write a random generator to /tmp/gen.py that takes an integer seed as sys.argv[1] and prints ONE small valid test input to stdout (respect the constraints, keep sizes small).
++3. Write a runnable wrapper /tmp/run_solution that reads stdin and writes stdout using your solution at {target_path}. If the problem is a method of a `Solution` class, write a thin script that imports the class from {target_path}, reads one input from stdin, calls the method, and prints the result. Make the wrapper a Python script at /tmp/run_solution.py.
++4. Call the `stress_test` tool with solution_path=/tmp/run_solution.py, brute_path=/tmp/brute.py, generator_path=/tmp/gen.py (trials around 200).
++Keep your reasoning brief."""
++        msg_history = self._run_agent(setup_prompt, msg_history)
++
++        for round_idx in range(1, max_rounds + 1):
++            passed, report = run_stress_check("/tmp/run_solution.py", "/tmp/brute.py", "/tmp/gen.py")
++            safe_log(f"Verify round {round_idx}: {'PASS' if passed else 'FAIL'}\n{report[:1000]}")
++            if passed:
++                return msg_history
++            fix_prompt = f"""The stress test FAILED. The solution disagrees with the brute force on this input:
++
++{report}
++
++A mismatch means the algorithm is wrong and must be re-derived. Trace the failing input by hand through the brute force and your solution, find the underlying error, and fix the algorithm in {target_path}. Do not special-case this input. Then re-run the sample tests and call the `stress_test` tool again. Keep reasoning brief."""
++            msg_history = self._run_agent(fix_prompt, msg_history)
++
++        passed, report = run_stress_check("/tmp/run_solution.py", "/tmp/brute.py", "/tmp/gen.py")
++        if not passed:
++            safe_log(f"Verify loop exhausted with failure:\n{report[:1000]}", level=logging.WARNING)
++        return msg_history
+ 
+     def _target_file_path(self):
+         """Detect a target filename (e.g. `solution.py`) named in the problem statement."""
+@@ -265,9 +307,10 @@ Follow this workflow strictly. Do not skip steps.
+ 2. DESIGN: Work out a correct algorithm and its complexity against the constraints. Consider edge cases.
+ 3. IMPLEMENT NOW: Immediately write a first working solution to the target file using the editor tool. Write the code first and reason afterwards, keeping comments brief. A simple correct solution is fine at this stage; you can optimize later. Do not only describe a plan in text - the file must be created or edited.
+ 4. SAMPLE TESTS: Extract every sample input/output from the problem statement. Run the solution on each sample via bash (e.g. `echo "..." | python solution.py`, or by calling the method in a small python snippet) and compare the output with the expected output. Fix the solution until all samples pass.
+-5. BRUTE FORCE + STRESS TEST: Write a simple brute-force reference implementation, then write a random generator of small inputs and compare the solution against the brute force over many random cases. Fix any mismatch.
++5. BRUTE FORCE FIRST, THEN STRESS TEST: Write the brute-force reference FIRST, as the source of truth, in a simple obviously-correct form (in /tmp). Then write a random generator of small inputs and compare the solution against the brute force over many random cases (the stress_test tool does this). Any MISMATCH means the algorithm is wrong and must be re-derived, not patched around. Fix any mismatch.
+ 6. PERFORMANCE: Generate a max-constraint input and time the solution with bash (e.g. `time`). If it takes more than about 2 seconds, optimize the algorithm or implementation and re-verify steps 4 and 5.
+ 7. CLEANUP: Keep all temporary test files (brute force, generators, scratch inputs) outside the repository, e.g. in /tmp, or delete them before finishing. The repository should only contain the final solution (plus any files that were already there).
++8. Keep your reasoning short and concise to avoid running out of tokens; a long reasoning pass with no output can end the run with an empty reply.
+ 
+ IMPORTANT:
+ - Never end your turn with only a plan or only code in the reply. You must actually create/edit the solution file with the editor tool before finishing.
+@@ -338,6 +381,7 @@ A backup of the current working solution is saved at {backup_path} (outside the
+ 5. Fix any other issues you find by editing the solution file with the editor tool.
+ 6. Delete temporary test files that are inside the repository (or make sure they live outside it, e.g. in /tmp).
+ When everything passes, briefly summarize the final solution."""
++            msg_history = self._verify_loop(msg_history, target_path)
+             msg_history = self._run_agent(verify_msg, msg_history)
+ 
+ def main():
+diff --git a/tools/stress_test.py b/tools/stress_test.py
+new file mode 100644
+index 0000000..cd29da7
+--- /dev/null
++++ b/tools/stress_test.py
+@@ -0,0 +1,117 @@
++import os
++import subprocess
++import sys
++
++MAX_INPUT_CHARS = 500
++MAX_OUTPUT_CHARS = 500
++STDERR_TAIL_CHARS = 300
++
++
++def tool_info():
++    return {
++        "name": "stress_test",
++        "description": """Compare a solution against a brute-force reference on random inputs.
++
++* solution_path and brute_path are Python scripts that read stdin and write stdout.
++* generator_path is a script that takes an integer seed as argv[1] and prints ONE test input to stdout.
++* For each seed in 0..trials-1 the generator is run, then both the solution and the brute force are run on its output, and their stripped stdout is compared.
++* Returns 'PASS: N trials' if all match, otherwise a compact FAIL report with the failing input, both outputs, and the stderr tail.
++* Timeouts and runtime errors are reported as failures.
++* Use absolute paths. Run this after writing /tmp/brute.py and /tmp/gen.py.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {
++                    "type": "string",
++                    "description": "Path to the solution script (reads stdin, writes stdout)."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference script (reads stdin, writes stdout)."
++                },
++                "generator_path": {
++                    "type": "string",
++                    "description": "Path to the random generator script; takes the seed as argv[1] and prints one test input to stdout."
++                },
++                "trials": {
++                    "type": "integer",
++                    "description": "Number of random seeds to test. Default 200."
++                },
++                "timeout_seconds": {
++                    "type": "integer",
++                    "description": "Per-process timeout in seconds. Default 10."
++                }
++            },
++            "required": ["solution_path", "brute_path", "generator_path"]
++        }
++    }
++
++
++def _tail(text, limit):
++    text = text or ""
++    return text if len(text) <= limit else "..." + text[-limit:]
++
++
++def _head(text, limit):
++    text = text or ""
++    return text if len(text) <= limit else text[:limit] + "..."
++
++
++def _run(script, stdin_text, timeout, args=()):
++    """Run a Python script; returns (stdout, stderr, error_or_None)."""
++    try:
++        proc = subprocess.run(
++            [sys.executable, script, *args],
++            input=stdin_text,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return "", "", f"TIMEOUT after {timeout}s"
++    if proc.returncode != 0:
++        return proc.stdout, proc.stderr, f"RUNTIME ERROR (exit code {proc.returncode})"
++    return proc.stdout, proc.stderr, None
++
++
++def tool_function(solution_path, brute_path, generator_path, trials=200, timeout_seconds=10):
++    try:
++        trials = int(trials)
++        timeout_seconds = int(timeout_seconds)
++    except (TypeError, ValueError):
++        return "ERROR: trials and timeout_seconds must be integers."
++    for label, path in (("solution_path", solution_path), ("brute_path", brute_path), ("generator_path", generator_path)):
++        if not path or not os.path.isfile(path):
++            return f"ERROR: {label} does not exist: {path}"
++    if trials <= 0:
++        return "ERROR: trials must be positive."
++
++    for seed in range(trials):
++        gen_out, gen_err, gen_problem = _run(generator_path, "", timeout_seconds, args=(str(seed),))
++        if gen_problem:
++            return (f"FAIL on seed {seed}: generator {gen_problem}\n"
++                    f"stderr tail: {_tail(gen_err, STDERR_TAIL_CHARS)}")
++        test_input = gen_out
++
++        sol_out, sol_err, sol_problem = _run(solution_path, test_input, timeout_seconds)
++        brute_out, brute_err, brute_problem = _run(brute_path, test_input, timeout_seconds)
++
++        if brute_problem:
++            return (f"FAIL on seed {seed}: brute force {brute_problem} (the reference itself is broken; fix /tmp/brute.py)\n"
++                    f"input: {_head(test_input, MAX_INPUT_CHARS)!r}\n"
++                    f"brute stderr tail: {_tail(brute_err, STDERR_TAIL_CHARS)}")
++
++        if sol_problem:
++            return (f"FAIL on seed {seed}: solution {sol_problem}\n"
++                    f"input: {_head(test_input, MAX_INPUT_CHARS)!r}\n"
++                    f"expected (brute): {_head(brute_out.strip(), MAX_OUTPUT_CHARS)!r}\n"
++                    f"solution stderr tail: {_tail(sol_err, STDERR_TAIL_CHARS)}")
++
++        if sol_out.strip() != brute_out.strip():
++            return (f"FAIL on seed {seed}: output mismatch\n"
++                    f"input: {_head(test_input, MAX_INPUT_CHARS)!r}\n"
++                    f"solution output: {_head(sol_out.strip(), MAX_OUTPUT_CHARS)!r}\n"
++                    f"brute output: {_head(brute_out.strip(), MAX_OUTPUT_CHARS)!r}\n"
++                    f"solution stderr tail: {_tail(sol_err, STDERR_TAIL_CHARS)}")
++
++    return f"PASS: {trials} trials"
+diff --git a/utils/stress_check.py b/utils/stress_check.py
+new file mode 100644
+index 0000000..2bb2cbc
+--- /dev/null
++++ b/utils/stress_check.py
+@@ -0,0 +1,26 @@
++import os
++import sys
++import subprocess
++
++def run_stress_check(solution_path, brute_path, generator_path, trials=200, timeout_seconds=10):
++    """Re-run the stress test outside the agent. Returns (passed: bool, report: str)."""
++    script = (
++        "import sys, json\n"
++        "sys.path.insert(0, sys.argv[1])\n"
++        "from tools.stress_test import tool_function\n"
++        "print(tool_function(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6])))\n"
++    )
++    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    try:
++        proc = subprocess.run(
++            [sys.executable, "-c", script, repo_root, solution_path, brute_path, generator_path,
++             str(trials), str(timeout_seconds)],
++            capture_output=True, text=True,
++            timeout=trials * timeout_seconds * 3 + 60,
++        )
++    except subprocess.TimeoutExpired:
++        return False, "FAIL: stress check overall timeout"
++    report = (proc.stdout or "").strip()
++    if proc.returncode != 0 or not report:
++        return False, f"FAIL: stress check crashed: {(proc.stderr or '')[-500:]}"
++    return report.splitlines()[-1].startswith("PASS"), report

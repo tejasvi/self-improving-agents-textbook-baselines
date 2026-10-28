@@ -1,0 +1,205 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index e856e69..47b14ee 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,8 +3,10 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
++from llm import create_client, get_response_from_llm
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+@@ -134,6 +136,60 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++PLACEHOLDER_MARKERS = ("pass", "Write your solution here")
++STUB_MAX_BYTES = 300
++
++def _find_target_file(git_tempdir, problem_statement):
++    """
++    Pick the primary non-test source file at the repo root that the agent should implement.
++    Priority: a root file named in the problem statement (e.g. `solution.py`), then a tiny
++    tracked file containing a placeholder. Returns a repo-relative path or None.
++    """
++    try:
++        out = subprocess.run(
++            ["git", "-C", git_tempdir, "ls-files"],
++            capture_output=True, text=True, check=False,
++        ).stdout
++    except Exception:
++        return None
++    candidates = [p for p in out.splitlines() if p and "/" not in p and not _is_test_path(p)]
++    if not candidates:
++        return None
++
++    named = set(re.findall(r"`(\w+\.py)`", problem_statement or ""))
++    for path in candidates:
++        if path in named:
++            return path
++
++    for path in candidates:
++        if not path.endswith(".py"):
++            continue
++        full = os.path.join(git_tempdir, path)
++        try:
++            if os.path.getsize(full) >= STUB_MAX_BYTES:
++                continue
++            with open(full, "r", errors="ignore") as f:
++                content = f.read()
++        except OSError:
++            continue
++        if any(marker in content for marker in PLACEHOLDER_MARKERS):
++            return path
++    return None
++
++def _last_assistant_text(msg_history):
++    """Return the text of the last assistant message in a message history (best effort)."""
++    for msg in reversed(msg_history or []):
++        if msg.get("role") != "assistant":
++            continue
++        content = msg.get("content")
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
++            return "\n".join(t for t in texts if t)
++        return ""
++    return ""
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -188,6 +244,44 @@ class AgenticSystem:
+             return False
+         return any(not _is_test_path(f) for f in changed)
+ 
++    def _fallback_write_target(self, target, task):
++        """Last resort: ask the LLM for the full target file contents and write it programmatically."""
++        target_path = os.path.join(self.git_tempdir, target)
++        try:
++            with open(target_path, "r", errors="ignore") as f:
++                current = f.read()
++        except OSError:
++            current = ""
++        prompt = f"""{task}
++
++The solution file `{target}` still has no implementation. Current contents of `{target}`:
++```python
++{current}
++```
++
++Write a complete, correct solution for the problem. Reply with ONLY the full contents of `{target}` in a single ```python fenced code block. No explanations."""
++        try:
++            client, client_model = create_client(self.code_model)
++            content, _ = get_response_from_llm(
++                prompt,
++                client=client,
++                model=client_model,
++                system_message="You are an expert competitive programmer.",
++                msg_history=[],
++                temperature=0.0,
++            )
++        except Exception as e:
++            safe_log(f"Fallback LLM call failed: {e}")
++            return False
++        match = re.search(r"```python\s*\n(.*?)```", content or "", re.DOTALL)
++        if not match:
++            safe_log("Fallback: no ```python block found in LLM response.")
++            return False
++        with open(target_path, "w") as f:
++            f.write(match.group(1))
++        safe_log(f"Fallback: wrote LLM-generated solution to {target_path}")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -200,12 +294,21 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
++        target = _find_target_file(self.git_tempdir, self.problem_statement)
++        if target:
++            target_desc = f"The target source file is `{target}` (in {self.git_tempdir})."
++        else:
++            target_desc = "Identify the primary non-test source file (the stub containing `pass` or a placeholder comment) and treat it as the target."
++        target_name = target or "the primary source file"
++
+         instruction = f"""{task}
+ 
++{target_desc}
++
+ Please follow this workflow:
+-1. Explore the repository with simple, quick commands (e.g. `ls`, `git status`, `cat` on a specific file). Avoid long-running or complex pipelines such as `find ... | cat $(...)`.
+-2. Read the starter/stub file that needs to be implemented (it may contain only `pass` or a placeholder). The task is a competitive programming problem: the solution is either a complete program reading stdin and writing stdout, or a method of a given `Solution` class.
+-3. Implement the solution in the non-test source file using the editor tool. Do not put the solution only in test files.
++1. Quickly look at the repository (e.g. `ls`, `git status`) and read the target stub file. The task is a competitive programming problem: the solution is either a complete program reading stdin and writing stdout, or a method of a given `Solution` class.
++2. Step 1 (before any experiments): open {target_name} and write your best complete candidate solution using the editor tool. Then test and refine. Do not write the solution only in test files.
++3. Only AFTER the candidate is written, run experiments, brute-force checks and stress tests.
+ 4. SAMPLE OUTPUT MATCH (mandatory):
+    (a) Extract every sample input and its expected output from the problem statement. Save each one as /tmp/sample_i.in and /tmp/sample_i.out (i = 1, 2, ...).
+    (b) Run the solution on each sample and diff the actual output against the expected output, e.g. `python solution.py < /tmp/sample_i.in | diff -b - /tmp/sample_i.out` (`diff -b` ignores whitespace differences). Report explicitly, for each sample, whether the output matches exactly.
+@@ -217,27 +320,30 @@ Please follow this workflow:
+ 
+ Important: ending your turn without modifying a source file is a failure. Changing only test files is also a failure. Finishing with no edits counts as failure.
+ """
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Retry (bounded) until a valid, non-test source patch exists
++        # Retry (bounded) until a valid, non-test source patch exists, keeping context across rounds
+         for attempt in range(3):
+             if self._patch_is_valid():
+                 break
+-            current_diff = self.get_current_edits()
+-            diff_text = current_diff[0]["content"][0]["text"] if current_diff else ""
+-            follow_up = f"""No valid source patch was found: the repository has no changes, or only test files were changed. This is attempt {attempt + 1} of 3.
++            diff_text = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            last_text = _last_assistant_text(msg_history)[-1500:]
++            follow_up = f"""No valid source patch was found: the repository has no changes, or only test files were changed. Retry {attempt + 1} of 3.
+ 
+-Original task:
+-{task}
++Target file: {target_name}
++Current repo diff:
++{diff_text if diff_text.strip() else "(empty)"}
+ 
+-Current repo edits (diff):
+-{diff_text}
++Your last message (summary):
++{last_text if last_text.strip() else "(empty)"}
+ 
+-Now open the primary source file (the stub containing `pass` or the placeholder for the solution) and implement the solution there using the editor tool. Do not only edit tests. After editing, run a quick check on the problem's examples to verify it works, and then stop."""
+-            init_edit = chat_with_agent(follow_up, model=self.code_model, msg_history=[], logging=safe_log)
++Your next action MUST be a tool call that edits {target_name} with a full solution. Do not explore. Do not reply with a plan."""
++            msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
+-        # Post-run verification (bounded, max 2 follow-up rounds)
++        # Post-run verification (bounded, max 2 follow-up rounds), only when a valid patch exists
+         for verify_round in range(2):
++            if not self._patch_is_valid():
++                break
+             verify_prompt = f"""Verification round {verify_round + 1} of 2.
+ 
+ Original task:
+@@ -249,7 +355,14 @@ Please re-run the sample check now:
+ - Report whether each sample matches exactly. If any mismatch exists, investigate how the expected output was produced and fix the solution (trying natural variants of the construction), while keeping it valid for all constraints.
+ - Re-run the stress test against the brute-force oracle after any change.
+ Then stop and summarize the results."""
+-            init_edit = chat_with_agent(verify_prompt, model=self.code_model, msg_history=[], logging=safe_log)
++            msg_history = chat_with_agent(verify_prompt, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++        # Last-resort fallback: no valid source patch after retries -> single direct LLM call writes the file
++        if not self._patch_is_valid():
++            if target:
++                self._fallback_write_target(target, task)
++            else:
++                safe_log("Fallback skipped: no target file identified.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

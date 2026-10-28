@@ -1,0 +1,230 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 24760c7..3d4cfdf 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,8 +4,11 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import json
++import re
++import time
+ 
+-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, simple_chat
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -187,6 +190,96 @@ class AgenticSystem:
+         """
+         return any(not _is_test_file(f) for f in self._changed_files())
+ 
++    def _extract_samples(self):
++        """
++        Ask the LLM to extract the sample inputs/expected outputs from the problem statement.
++        Returns a list of {"input": str, "output": str} dicts (empty list on failure).
++        """
++        prompt = f"""Extract the sample test cases from the problem statement below.
++
++Return ONLY a JSON array (no prose) of objects with exactly two string keys:
++[{{"input": "<exact stdin text>", "output": "<exact expected stdout text>"}}, ...]
++
++Copy the sample inputs and outputs exactly, preserving line breaks. If there are no samples, return [].
++
++<problem_statement>
++{self.problem_statement}
++</problem_statement>
++"""
++        text = simple_chat(prompt, model=self.code_model, max_tokens=8192, logging=safe_log)
++        match = re.search(r"\[.*\]", text or "", re.DOTALL)
++        if not match:
++            safe_log("[samples] could not find a JSON array in the extraction response.")
++            return []
++        try:
++            data = json.loads(match.group(0))
++        except Exception as e:
++            safe_log(f"[samples] JSON parse failed: {e}")
++            return []
++        samples = []
++        if isinstance(data, list):
++            for item in data:
++                if isinstance(item, dict) and "input" in item and "output" in item:
++                    samples.append({"input": str(item["input"]), "output": str(item["output"])})
++        return samples
++
++    def _run_samples(self, solution_path, samples):
++        """
++        Run the solution with python3 on each sample. Returns (report, all_passed).
++        The report is raw plain text: input, expected output, actual output, stderr, runtime.
++        """
++        if not samples:
++            return "No samples were extracted from the problem statement; verify manually with your own tests.", False
++        if not solution_path or not os.path.exists(solution_path):
++            return f"Solution file not found: {solution_path}", False
++
++        blocks = []
++        all_passed = True
++        for i, sample in enumerate(samples):
++            stdin_text = sample["input"]
++            if stdin_text and not stdin_text.endswith("\n"):
++                stdin_text += "\n"
++            start = time.time()
++            try:
++                proc = subprocess.run(
++                    ["python3", solution_path],
++                    input=stdin_text, capture_output=True, text=True, timeout=10,
++                    cwd=self.git_tempdir,
++                )
++                elapsed = time.time() - start
++                actual = proc.stdout
++                stderr = proc.stderr
++                status_note = f"exit code {proc.returncode}"
++                passed = proc.returncode == 0 and actual.split() == sample["output"].split()
++            except subprocess.TimeoutExpired:
++                elapsed = time.time() - start
++                actual, stderr = "", "TIMEOUT: exceeded 10 seconds"
++                status_note = "timeout"
++                passed = False
++            if not passed:
++                all_passed = False
++            blocks.append(
++                f"=== Sample {i + 1} ({'PASS' if passed else 'FAIL'}, {status_note}, time {elapsed:.3f}s) ===\n"
++                f"--- input ---\n{sample['input']}\n"
++                f"--- expected output ---\n{sample['output']}\n"
++                f"--- actual output ---\n{actual}\n"
++                f"--- stderr ---\n{stderr}\n"
++            )
++        summary = "ALL SAMPLES PASSED" if all_passed else "SOME SAMPLES FAILED"
++        return f"{summary}\n\n" + "\n".join(blocks), all_passed
++
++    def _solution_path(self):
++        """
++        Pick the solution file: a changed non-test file (prefer solution.py), else None.
++        """
++        candidates = [f for f in self._changed_files() if not _is_test_file(f)]
++        if not candidates:
++            return None
++        for f in candidates:
++            if os.path.basename(f) == "solution.py":
++                return os.path.join(self.git_tempdir, f)
++        return os.path.join(self.git_tempdir, candidates[0])
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -233,6 +326,37 @@ This is a strict instruction: immediately use the editor tool (`create` or `edit
+             retry_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
+             safe_log(f"[retry {attempt + 1}] chat finished; source patch present: {self._has_source_patch()}")
+ 
++        # Verification and repair phase: run the samples and have the agent fix failures.
++        samples = self._extract_samples()
++        safe_log(f"[verify] extracted {len(samples)} sample(s).")
++        for round_idx in range(3):
++            solution_path = self._solution_path()
++            report, all_passed = self._run_samples(solution_path, samples)
++            safe_log(f"[verify round {round_idx}] solution: {solution_path}\n{report}")
++            if all_passed:
++                safe_log(f"[verify round {round_idx}] all samples passed; stopping.")
++                break
++            current_diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++            repair_msg = f"""{task}
++
++The solution has been run against the sample tests from the problem statement, and it did NOT pass. Raw report:
++
++{report}
++
++Current diff:
++{current_diff if current_diff.strip() else '(empty)'}
++
++Instructions:
++- Read the report carefully: compare expected vs. actual output, and check stderr and runtime (timeouts mean the algorithm is too slow).
++- Fix the solution file with the editor tool (`edit` or `create`, which overwrites).
++- Write a brute-force implementation and a random stress test comparing it against the solution on many small inputs. If multiple answers are valid, write a validity checker instead of comparing exact outputs; note that any valid answer is accepted only if the problem says so.
++- Generate a max-size input allowed by the constraints and time the solution on it.
++- Re-run the solution on all sample inputs with bash and confirm they pass before finishing.
++- Do not reply with text only; finish only after the fixes are written to disk and verified.
++"""
++            chat_with_agent(repair_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            safe_log(f"[verify round {round_idx}] repair chat finished.")
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')
+diff --git a/llm_withtools.py b/llm_withtools.py
+index 91fd02e..d28916a 100644
+--- a/llm_withtools.py
++++ b/llm_withtools.py
+@@ -30,7 +30,7 @@ def process_tool_call(tools_dict, tool_name, tool_input):
+ )
+ def get_response_withtools(
+     client, model, messages, tools, tool_choice,
+-    logging=None, max_retry=3, max_tokens=4096
++    logging=None, max_retry=3, max_tokens=16384
+ ):
+     try:
+         if 'claude' in model:
+diff --git a/tests/test_edit_tool.py b/tests/test_edit_tool.py
+index f0782c6..0011c63 100644
+--- a/tests/test_edit_tool.py
++++ b/tests/test_edit_tool.py
+@@ -34,10 +34,11 @@ class TestEditorTool:
+         assert new_file.read_text() == content
+ 
+     def test_create_existing_file(self, sample_file):
+-        """Test attempting to create an already existing file."""
++        """Creating an already existing file overwrites it instead of failing."""
+         result = tool_function("create", str(sample_file), file_text="new content")
+-        assert "Error" in result
+-        assert "already exists" in result
++        assert "Error" not in result
++        assert "overwritten" in result
++        assert sample_file.read_text() == "new content"
+ 
+     def test_edit_file(self, sample_file):
+         """Test editing an existing file."""
+diff --git a/tools/edit.py b/tools/edit.py
+index 244d440..d3e383c 100644
+--- a/tools/edit.py
++++ b/tools/edit.py
+@@ -7,7 +7,7 @@ def tool_info():
+         "description": """Custom editing tool for viewing, creating, and editing files\n
+ * State is persistent across command calls and discussions with the user.\n
+ * If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+-* The `create` command cannot be used if the specified `path` already exists as a file.\n
++* The `create` command overwrites the file if the specified `path` already exists.\n
+ * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
+ * The `edit` command overwrites the entire file with the provided `file_text`.\n
+ * No partial/line-range edits or partial viewing are supported.""",
+@@ -42,7 +42,7 @@ def validate_path(path: str, command: str) -> Path:
+     """
+     Validate the file path for each command:
+       - 'view': path may be a file or directory; must exist.
+-      - 'create': path must not exist (for new file creation).
++      - 'create': path is created, or overwritten if it already exists.
+       - 'edit': path must exist (for overwriting).
+     """
+     path_obj = Path(path)
+@@ -58,9 +58,9 @@ def validate_path(path: str, command: str) -> Path:
+         if not path_obj.exists():
+             raise ValueError(f"The path {path} does not exist.")
+     elif command == "create":
+-        # Path must not exist
+-        if path_obj.exists():
+-            raise ValueError(f"Cannot create new file; {path} already exists.")
++        # Existing files are overwritten (avoids wasted turns on a failed create)
++        if path_obj.is_dir():
++            raise ValueError(f"{path} is a directory and cannot be created as a file.")
+     elif command == "edit":
+         # Path must exist and must be a file
+         if not path_obj.exists():
+@@ -135,7 +135,10 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
+         elif command == "create":
+             if file_text is None:
+                 raise ValueError("Missing required `file_text` for 'create' command.")
++            existed = path_obj.exists()
+             write_file(path_obj, file_text)
++            if existed:
++                return f"File at {path} already existed and has been overwritten with new content."
+             return f"File created successfully at: {path}"
+ 
+         elif command == "edit":

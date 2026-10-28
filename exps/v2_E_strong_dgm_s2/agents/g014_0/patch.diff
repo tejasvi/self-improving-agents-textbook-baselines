@@ -1,0 +1,265 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 11cf35c..4eaa487 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -27,7 +27,9 @@ METHOD_PROMPT = """Work like a careful competitive programmer:
+ 5. Save a maximum-size input allowed by the constraints as max_input.txt in the repository directory, and check that `python3 solution.py < max_input.txt` finishes well under 2 seconds. The harness uses a 3 second limit on max_input.txt.
+ 6. Audit every early return and special-case branch in the final code against inputs where its condition is false but the branch is still reached.
+ 7. Limit exploration: after about 15 tool calls you must have a candidate fast solution in solution.py, and then test it. Do not do open-ended analysis or long experiments.
+-8. Before finishing, run the stress_test tool once more on the final solution.py. The final answer must beat the time limit and must NOT be the brute force. Keep iterating until all checks pass."""
++8. Before finishing, run the stress_test tool once more on the final solution.py. The final answer must beat the time limit and must NOT be the brute force. Keep iterating until all checks pass.
++9. If the problem is interactive (you must query a judge, e.g. "print a query and read the reply"): use a token-based reader (e.g. a generator over sys.stdin tokens, `def tokens(): for line in sys.stdin: yield from line.split()`), not whole-line reads. Wrap the main loop so that unexpected EOF or a non-integer reply does not raise (catch EOFError/ValueError and exit quietly). Since the grader may replay the program as a plain stdin transcript (first line N L R, then extra data lines, then replies), make the program depend only on the first token(s) of each reply, and still print the final answer. Flush stdout after every query. Test with BOTH: (a) a true interactive judge via the interactive_judge tool (flat_replay=false, with a judge module you write that exposes start() and respond()), and (b) a flat-file replay via the interactive_judge tool (flat_replay=true) where all replies and extra hidden-data lines are present in one stdin file. Also append a few junk lines to max_input.txt and make sure the program does not crash on them.
++10. In your final answer, state explicitly which input modes were verified: "interactive mode verified" and/or "flat-transcript mode verified", and which were not tested. Do not claim a mode was verified unless you ran it."""
+ 
+ # reset_to_commit(git_dname, commit)
+ # apply_patch(git_dname, patch_str)
+@@ -400,9 +402,31 @@ class AgenticSystem:
+                         f"max_input (limit {MAX_INPUT_TIMEOUT}s)", max_text, None, status, out))
+                 else:
+                     safe_log(f"_evaluate: max_input ran in {elapsed:.2f}s")
++                    if not out.strip():
++                        max_ok = 0
++                        report.append("[max_input] FAILED: program printed nothing on max_input.txt "
++                                      "(it may have exited on EOF without answering).")
++
++        # 2b. Empty stdout on max_input is suspicious (e.g. program exits on EOF with nothing printed).
++        if os.path.isfile(max_path):
++            try:
++                with open(max_path) as f:
++                    max_text_chk = f.read()
++            except Exception:
++                max_text_chk = ""
++
++            # 2c. Probe: append junk lines to max_input and flag crashes (report only).
++            if max_text_chk.strip():
++                junk = "\n".join(["junk 1 x", "", "999999999999 -1", "??"]) + "\n"
++                st_j, out_j, _ = self._run_solution(max_text_chk.rstrip("\n") + "\n" + junk, MAX_INPUT_TIMEOUT)
++                if st_j == "error" and any(k in out_j for k in ("ValueError", "IndexError", "EOFError")):
++                    report.append("[junk probe] max_input with trailing junk lines CRASHED "
++                                  "(ValueError/IndexError/EOF). Parse only the tokens you need.\n"
++                                  + self._failure_text("junk probe", junk, None, st_j, out_j))
+ 
+         # 3. Optional differential check against brute.py using gen.py.
+         brute_ok = 1
++        brute_ran = False
+         brute_path = os.path.join(self.git_tempdir, 'brute.py')
+         gen_file = None
+         for cand in ('gen.py', 'generator.py'):
+@@ -426,12 +450,19 @@ class AgenticSystem:
+                 else:
+                     report.append(self._failure_text("brute mismatch", inp, bout, sstat, sout))
+                     break  # one counterexample is enough; avoids long repeated timeouts
++            brute_ran = total > 0
+             if total > 0 and agree < total:
+                 brute_ok = 0
+             safe_log(f"_evaluate: differential {agree}/{total} agree")
+ 
+         score = (samples_ok, max_ok, brute_ok)
+-        passed = (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1
++        verified = len(samples) > 0 or brute_ran
++        passed = verified and (samples_ok == len(samples)) and max_ok == 1 and brute_ok == 1
++        if not verified:
++            report.append("[unverified] No parseable samples in the statement and no brute-force agreement "
++                          "was checked, so correctness is UNVERIFIED. Build your own tests: write brute.py and "
++                          "gen.py and run stress_test. For interactive or non-standard protocols, also build a "
++                          "transcript test with the interactive_judge tool (flat_replay=true and false).")
+         if not report:
+             report_text = "All available checks passed."
+         else:
+diff --git a/tools/interactive_judge.py b/tools/interactive_judge.py
+new file mode 100644
+index 0000000..7454ade
+--- /dev/null
++++ b/tools/interactive_judge.py
+@@ -0,0 +1,191 @@
++import importlib.util
++import os
++import subprocess
++import threading
++import time
++import traceback
++
++MAX_QUERIES = 10000
++MAX_OUT_CHARS = 20000
++
++_JUDGE_HELP = (
++    "The judge module must define:\n"
++    "  start(input_text) -> first_line   # string written to the solution's stdin first\n"
++    "  respond(query_line) -> reply      # string written back for each line the solution prints;\n"
++    "                                    # return None when the solution has given its final answer\n"
++    "Optional: verdict(final_output) -> string describing the verdict (e.g. 'AC' or 'WA: ...')."
++)
++
++
++def tool_info():
++    return {
++        "name": "interactive_judge",
++        "description": """Run a solution.py against a user-written interactive judge (a Python module), or replay a pre-built transcript as a flat stdin file.
++
++* Interactive mode (flat_replay=false): the solution is spawned with pipes. The judge module (judge_path) must define start(input_text) -> first_line and respond(query_line) -> reply (return None to signal that the solution has finished). Each line the solution prints is passed to respond(), and its reply is written to the solution's stdin. Reports the transcript, the number of queries, and the verdict.
++* Flat replay mode (flat_replay=true): input_text is piped as ordinary stdin all at once (e.g. the first line, then the hidden data lines and the replies concatenated). Reports the stdout and any crash (non-zero exit, Traceback, ValueError, IndexError, EOF-related errors). Use this to check that the program only depends on the first token(s) of each reply and never crashes on extra tokens or unexpected EOF.
++
++Use both modes for interactive problems. The judge module is a plain Python file you write yourself; """ + _JUDGE_HELP,
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "solution_path": {"type": "string", "description": "Path to the solution Python file to run (e.g. solution.py)."},
++                "judge_path": {"type": "string", "description": "Path to the Python judge module defining start(input_text) and respond(query_line). Ignored in flat_replay mode unless it is needed for start()."},
++                "input_text": {"type": "string", "description": "Interactive mode: the hidden test input passed to judge.start(). Flat replay mode: the full stdin text to pipe to the solution."},
++                "timeout": {"type": "integer", "description": "Time limit in seconds for the whole run (default 5)."},
++                "flat_replay": {"type": "boolean", "description": "If true, pipe input_text as plain stdin in one shot and report crashes instead of running the judge (default false)."}
++            },
++            "required": ["solution_path", "input_text"]
++        }
++    }
++
++
++def _load_judge(judge_path):
++    spec = importlib.util.spec_from_file_location("_user_judge", judge_path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    for name in ("start", "respond"):
++        if not hasattr(mod, name):
++            raise AttributeError(f"judge module has no function {name}()")
++    return mod
++
++
++def _clip(s, n=MAX_OUT_CHARS):
++    s = "" if s is None else str(s)
++    return s if len(s) <= n else s[:n] + "...<clipped>"
++
++
++def _flat_replay(solution_path, input_text, timeout):
++    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
++    start = time.time()
++    try:
++        proc = subprocess.run(["python3", solution_path], input=input_text, capture_output=True,
++                              text=True, timeout=timeout, env=env)
++    except subprocess.TimeoutExpired:
++        return f"FLAT REPLAY: TLE after {timeout}s (no crash signal, but the program is too slow)."
++    except Exception as e:
++        return f"FLAT REPLAY: could not launch solution: {e}"
++    elapsed = time.time() - start
++    err = proc.stderr or ""
++    crash_markers = ("Traceback", "ValueError", "IndexError", "EOFError", "KeyError", "TypeError")
++    crashed = proc.returncode != 0 or any(m in err for m in crash_markers)
++    lines = [
++        f"FLAT REPLAY: {'CRASH' if crashed else 'OK'} (exit={proc.returncode}, {elapsed:.2f}s)",
++        f"stdout:\n{_clip(proc.stdout, 3000)}",
++    ]
++    if err.strip():
++        lines.append(f"stderr tail:\n{_clip('\n'.join(err.strip().splitlines()[-8:]), 1500)}")
++    return "\n".join(lines)
++
++
++def _interactive(solution_path, judge_path, input_text, timeout):
++    try:
++        judge = _load_judge(judge_path)
++    except BaseException:
++        return "Judge failed to load:\n" + traceback.format_exc(limit=5)
++    try:
++        first = judge.start(input_text)
++    except BaseException:
++        return "judge.start() raised:\n" + traceback.format_exc(limit=5)
++    if first is None:
++        first = ""
++    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
++    try:
++        proc = subprocess.Popen(["python3", solution_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
++    except Exception as e:
++        return f"Could not launch solution: {e}"
++
++    # Kill the solution if the whole run exceeds the time limit (unblocks readline).
++    timer = threading.Timer(timeout, lambda: proc.kill())
++    timer.start()
++    transcript = []
++    queries = 0
++    verdict = None
++    final_output = None
++    try:
++        proc.stdin.write(str(first).rstrip("\n") + "\n")
++        proc.stdin.flush()
++        transcript.append(("judge", str(first).rstrip("\n")))
++        for _ in range(MAX_QUERIES):
++            line = proc.stdout.readline()
++            if line == "":  # EOF: solution exited or was killed
++                break
++            q = line.rstrip("\n")
++            transcript.append(("solution", q))
++            queries += 1
++            try:
++                reply = judge.respond(q)
++            except BaseException:
++                verdict = "RE: judge.respond() raised\n" + traceback.format_exc(limit=5)
++                break
++            if reply is None:
++                # Judge considers this the final answer; collect the rest of the output.
++                final_output = q
++                break
++            reply = str(reply).rstrip("\n")
++            transcript.append(("judge", reply))
++            proc.stdin.write(reply + "\n")
++            proc.stdin.flush()
++        else:
++            verdict = f"TLE/limit: more than {MAX_QUERIES} queries"
++        try:
++            proc.stdin.close()
++        except Exception:
++            pass
++        rest = proc.stdout.read()
++        err = proc.stderr.read()
++        proc.wait(timeout=max(1, timeout))
++    except BrokenPipeError:
++        rest, err = "", ""
++        verdict = verdict or "RE: solution closed stdin early (broken pipe)"
++    except Exception as e:
++        rest, err = "", ""
++        verdict = verdict or f"ERROR during interaction: {e}"
++    finally:
++        timer.cancel()
++        if proc.poll() is None:
++            proc.kill()
++
++    timed_out = proc.returncode is not None and proc.returncode < 0
++    if final_output is not None and rest.strip():
++        final_output = (final_output + "\n" + rest).strip()
++    elif final_output is None:
++        final_output = rest.strip()
++    if verdict is None:
++        if proc.returncode != 0:
++            verdict = f"RE: exit code {proc.returncode}"
++        elif timed_out:
++            verdict = "TLE"
++        else:
++            verdict = "finished"
++        if hasattr(judge, "verdict"):
++            try:
++                verdict = f"{verdict}; judge: {judge.verdict(final_output)}"
++            except BaseException:
++                verdict = f"{verdict}; judge.verdict() raised: {traceback.format_exc(limit=3)}"
++    lines = [
++        f"VERDICT: {verdict}",
++        f"queries: {queries}",
++        "transcript:",
++    ]
++    for who, text in transcript:
++        lines.append(f"  {who}: {_clip(text, 300)}")
++    lines.append(f"final output: {_clip(final_output, 1000)}")
++    if err and err.strip():
++        lines.append(f"solution stderr tail:\n{_clip(chr(10).join(err.strip().splitlines()[-8:]), 1500)}")
++    return "\n".join(lines)
++
++
++def tool_function(solution_path, input_text, judge_path=None, timeout=5, flat_replay=False):
++    if not isinstance(solution_path, str) or not os.path.isfile(solution_path):
++        return f"Error: solution file not found: {solution_path}"
++    try:
++        timeout = max(1, int(timeout))
++    except Exception:
++        timeout = 5
++    if flat_replay:
++        return _flat_replay(solution_path, input_text if input_text is not None else "", timeout)
++    if not judge_path or not os.path.isfile(judge_path):
++        return f"Error: judge_path is required for interactive mode and must exist: {judge_path}"
++    return _interactive(solution_path, judge_path, input_text if input_text is not None else "", timeout)

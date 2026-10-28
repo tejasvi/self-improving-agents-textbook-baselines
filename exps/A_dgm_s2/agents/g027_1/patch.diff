@@ -1,0 +1,238 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2c4db4f..2c0bf18 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import re
++import tempfile
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent, chat_text_only
+@@ -382,6 +383,29 @@ class AgenticSystem:
+             return False
+         return not self._last_assistant_text([last]).strip()
+ 
++    def _write_statement_file(self):
++        """
++        Write the problem statement to a temp file outside the repo and return its path.
++        """
++        fd, path = tempfile.mkstemp(prefix='problem_statement_', suffix='.txt')
++        with os.fdopen(fd, 'w', encoding='utf-8') as f:
++            f.write(self.problem_statement or '')
++        return path
++
++    def _run_sample_check(self, statement_path):
++        """
++        Run the sample_check tool directly on the solution file; returns its text output.
++        """
++        try:
++            from tools.sample_check import tool_function as sample_check
++            target = self._pick_target_file()
++            if target is None:
++                return 'MISMATCH: no solution file found for sample check.'
++            command = f"python3 {os.path.join(self.git_tempdir, target)}"
++            return sample_check(statement_path, command, 10)
++        except Exception as e:
++            return f"MISMATCH: sample check failed to run: {e}"
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+@@ -394,9 +418,14 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
++        statement_path = self._write_statement_file()
+         instruction = f"""{task}
+ 
++The problem statement is also saved at {statement_path} (outside the repo) for the sample_check tool.
++
+ Write the solution to the file now. Inspect the starter/source file, then implement the full solution in the non-test source file with the editor tool. Derive the constraints from the problem statement first, and choose an algorithm that fits about 1e8 simple operations in Python within ~2 seconds.
++
++After implementing, run the sample_check tool with statement_path={statement_path} and command set to run your solution (e.g. python3 <solution file>) with a timeout. Every sample must be EXACT MATCH. If any sample is TOLERANCE MATCH ONLY, the hidden grader will likely reject it: make the output text match exactly by trying variants (change the summation order, use math.fsum, use fractions.Fraction or decimal for the final computation, or print with the same number of decimals as the expected output), keeping the variant that is EXACT MATCH on all samples while still meeting the time limit. Fix any MISMATCH before finishing.
+ """
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+@@ -498,14 +527,29 @@ Write the solution to the file now. Inspect the starter/source file, then implem
+             verify_msg = (
+                 "The solution file now exists. Write a brute-force solution, compare your solution against it on "
+                 "tiny random inputs, and fix any mismatch. Then re-state the worst-case time complexity of your "
+-                "solution against the problem constraints, "
+-                "run the max-size benchmark (worst-case input at the maximum constraints, with a timeout, "
+-                "reporting the runtime), and if it exceeds budget, rewrite the algorithm now. "
++                "solution against the problem constraints, run the max-size benchmark (worst-case input, "
++                "with a timeout, reporting the runtime), and if it exceeds budget, rewrite the algorithm now. "
+                 "Do not stop with known performance risks."
+             )
+             safe_log("Source edits present. Running performance verification pass.")
+             msg_history = chat_with_agent(verify_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+ 
++            # Bounded sample-check follow-up (fixed count, no while loop)
++            for check_idx in range(2):
++                check_out = self._run_sample_check(statement_path)
++                if 'TOLERANCE MATCH ONLY' not in check_out and 'MISMATCH' not in check_out:
++                    break
++                safe_log(f"Sample check follow-up {check_idx + 1}/2: tolerance-only or mismatched samples remain.")
++                follow_up = (
++                    "The sample_check tool still reports samples that are not EXACT MATCH:\n"
++                    f"{check_out[-4000:]}\n"
++                    "Fix the solution so every sample is an EXACT MATCH (for TOLERANCE MATCH ONLY, change the "
++                    "summation order, use math.fsum, fractions.Fraction or decimal, or match the expected decimal "
++                    "digits), keeping within the time limit. Re-run sample_check and report the final summary."
++                )
++                msg_history = self._clean_history(msg_history)
++                msg_history = chat_with_agent(follow_up, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
+             # Bounded follow-up checks (fixed count, no while loop)
+             for check_idx in range(2):
+                 last_text = self._last_assistant_text(msg_history)
+diff --git a/tools/sample_check.py b/tools/sample_check.py
+new file mode 100644
+index 0000000..9bc61da
+--- /dev/null
++++ b/tools/sample_check.py
+@@ -0,0 +1,142 @@
++import os
++import re
++import subprocess
++
++_MARKER_RE = re.compile(r'Sample\s+(Input|Output)\s*(\d+)\s*:?', re.IGNORECASE)
++_FENCE_RE = re.compile(r'^\s*```[^\n]*$', re.MULTILINE)
++
++
++def tool_info():
++    return {
++        "name": "sample_check",
++        "description": """Run a solution command on the sample inputs of a problem statement and compare with the expected sample outputs.\n
++* Parses every 'Sample Input k' / 'Sample Output k' pair from the statement file (code fences or plain text are both accepted).
++* Runs the command once per sample input, feeding it on stdin, with a timeout.
++* Reports, for each sample, one of: EXACT MATCH, TOLERANCE MATCH ONLY (with max abs/rel difference), or MISMATCH (includes timeouts and runtime errors).
++* Always prints the expected and actual output verbatim.
++* A TOLERANCE MATCH ONLY result means the text differs (e.g. in float digits) and the hidden grader will likely reject it; make the output exactly match the expected text.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "statement_path": {
++                    "type": "string",
++                    "description": "Path to a file containing the problem statement text (the sample blocks are parsed from it). If the path does not exist, the value is treated as the statement text itself."
++                },
++                "command": {
++                    "type": "string",
++                    "description": "Shell command that runs the solution reading stdin and writing stdout, e.g. 'python3 /work/repo/solution.py'."
++                },
++                "timeout_seconds": {
++                    "type": "integer",
++                    "description": "Per-sample timeout in seconds."
++                }
++            },
++            "required": ["statement_path", "command", "timeout_seconds"]
++        }
++    }
++
++
++def _clean_block(text):
++    text = _FENCE_RE.sub('', text)
++    return text.strip('\n').strip()
++
++
++def parse_samples(statement):
++    """Return list of (index, input_text, output_text) for paired samples, sorted by index."""
++    inputs, outputs = {}, {}
++    matches = list(_MARKER_RE.finditer(statement))
++    for i, m in enumerate(matches):
++        end = matches[i + 1].start() if i + 1 < len(matches) else len(statement)
++        block = _clean_block(statement[m.end():end])
++        idx = int(m.group(2))
++        if m.group(1).lower() == 'input':
++            inputs.setdefault(idx, block)
++        else:
++            outputs.setdefault(idx, block)
++    return [(k, inputs[k], outputs[k]) for k in sorted(inputs) if k in outputs]
++
++
++def _to_float(tok):
++    try:
++        return float(tok)
++    except ValueError:
++        return None
++
++
++def compare_outputs(expected, actual):
++    """Return (status, detail) where status is EXACT MATCH, TOLERANCE MATCH ONLY or MISMATCH."""
++    exp_toks = expected.split()
++    act_toks = actual.split()
++    if exp_toks == act_toks:
++        return 'EXACT MATCH', ''
++    if len(exp_toks) != len(act_toks):
++        return 'MISMATCH', f'token count differs (expected {len(exp_toks)}, actual {len(act_toks)})'
++    max_abs = 0.0
++    max_rel = 0.0
++    for e, a in zip(exp_toks, act_toks):
++        if e == a:
++            continue
++        ef, af = _to_float(e), _to_float(a)
++        if ef is None or af is None:
++            return 'MISMATCH', 'non-numeric token differs'
++        diff = abs(ef - af)
++        max_abs = max(max_abs, diff)
++        denom = abs(ef)
++        max_rel = max(max_rel, diff / denom if denom > 0 else diff)
++    if max_abs <= 1e-6 or max_rel <= 1e-6:
++        return 'TOLERANCE MATCH ONLY', f'(max abs diff {max_abs:.3g}, max rel diff {max_rel:.3g})'
++    return 'MISMATCH', f'(max abs diff {max_abs:.3g}, max rel diff {max_rel:.3g})'
++
++
++def _load_statement(statement_path):
++    if os.path.isfile(statement_path):
++        with open(statement_path, 'r', encoding='utf-8', errors='replace') as f:
++            return f.read()
++    return statement_path
++
++
++def tool_function(statement_path, command, timeout_seconds):
++    try:
++        timeout = int(timeout_seconds)
++    except (TypeError, ValueError):
++        timeout = 10
++    try:
++        statement = _load_statement(statement_path)
++    except Exception as e:
++        return f"Error reading statement: {e}"
++    samples = parse_samples(statement)
++    if not samples:
++        return "No 'Sample Input k' / 'Sample Output k' pairs found in the statement."
++
++    lines = []
++    statuses = []
++    for k, inp, expected in samples:
++        try:
++            proc = subprocess.run(
++                command, shell=True, input=inp + "\n", capture_output=True,
++                text=True, timeout=timeout
++            )
++            actual = proc.stdout
++            run_note = ''
++            if proc.returncode != 0:
++                run_note = f"\nRuntime error: exit code {proc.returncode}\nstderr:\n{proc.stderr.strip()}"
++        except subprocess.TimeoutExpired:
++            actual = ''
++            run_note = f"\nTIMEOUT after {timeout}s"
++        except Exception as e:
++            actual = ''
++            run_note = f"\nFailed to run command: {e}"
++        status, detail = compare_outputs(expected, actual)
++        if run_note:
++            status = 'MISMATCH'
++        statuses.append(status)
++        lines.append(f"=== Sample {k}: {status} {detail}".rstrip())
++        lines.append("--- input ---\n" + inp)
++        lines.append("--- expected output ---\n" + expected)
++        lines.append("--- actual output ---\n" + actual.rstrip('\n') + run_note)
++        lines.append("")
++
++    summary = (f"Summary: {statuses.count('EXACT MATCH')} exact, "
++               f"{statuses.count('TOLERANCE MATCH ONLY')} tolerance-only, "
++               f"{statuses.count('MISMATCH')} mismatch, out of {len(statuses)} samples.")
++    return "\n".join(lines) + summary

@@ -1,0 +1,193 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 7f8c664..ab1ee9d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -4,6 +4,7 @@ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
++import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+@@ -185,32 +186,166 @@ Please follow this workflow:
+         instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.{workflow}"
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        retry_msg = (
+-            "No edits to non-test source files were detected in the repository. "
+-            "You must use the editor tool (create/edit) or bash to write the solution file now. "
+-            "Do not answer with text only. After writing, run it against the sample inputs."
++        stronger = (
++            "\n\nIMPORTANT: Your very first action must be a tool call. Run `ls -la` in the repo "
++            "with bash, then create/edit the solution file with the editor tool. Never reply with empty text."
+         )
+         for attempt in range(3):
+             if self._has_source_edit():
+                 break
+-            safe_log(f"No source edits detected; retry attempt {attempt + 1}/3")
+-            if attempt == 2:
+-                retry_msg_final = retry_msg + (
+-                    " If the task names an output file (e.g. solution.py) and it does not exist, "
+-                    "you must create it."
++            empty = _last_assistant_is_empty(msg_history)
++            safe_log(
++                f"No source edits detected (empty_response={empty}); retry attempt {attempt + 1}/3"
++            )
++            if attempt < 2:
++                # Fresh history with a stronger prompt
++                msg_history = chat_with_agent(
++                    instruction + stronger,
++                    model=self.code_model,
++                    msg_history=[],
++                    logging=safe_log,
+                 )
+-            else:
+-                retry_msg_final = retry_msg
+-            if msg_history:
+-                msg_history = chat_with_agent(retry_msg_final, model=self.code_model, msg_history=msg_history, logging=safe_log)
+             else:
+                 msg_history = chat_with_agent(
+-                    f"{instruction}\n\n{retry_msg_final}",
++                    instruction + stronger + " If the target file (e.g. solution.py) does not exist, create it.",
+                     model=self.code_model,
+                     msg_history=[],
+                     logging=safe_log,
+                 )
+ 
++        if not self._has_source_edit():
++            safe_log("Still no source edits after retries; using deterministic fallback write")
++            self._fallback_write_solution(instruction)
++
++        if self._has_source_edit():
++            self._run_samples(msg_history)
++        else:
++            safe_log("No source edit present even after fallback; giving up")
++
++    def _target_filename(self):
++        m = re.search(r"`(\w+\.py)`", self.problem_statement or "")
++        return m.group(1) if m else "solution.py"
++
++    def _fallback_write_solution(self, instruction):
++        """Ask the model for only the program in a fenced block and write it directly."""
++        prompt = (
++            "Reply with ONLY the complete Python 3 program for solution.py in one ```python fenced block. "
++            "Do not use any tools. The program must read stdin and write stdout.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>"
++        )
++        reply = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        text = _last_assistant_text(reply)
++        m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
++        if not m:
++            safe_log("Fallback: no ```python block found in model reply")
++            return None
++        code = m.group(1)
++        filename = self._target_filename()
++        path = os.path.join(self.git_tempdir, filename)
++        with open(path, 'w') as f:
++            f.write(code)
++        safe_log(f"Fallback: wrote {path}")
++        return path
++
++    @staticmethod
++    def _parse_samples(text):
++        pattern = re.compile(
++            r"Sample Input\s*(\d+)\s*:?\s*\n(.*?)\n\s*Sample Output\s*\1\s*:?\s*\n(.*?)(?=\n\s*Sample Input|\Z)",
++            re.DOTALL,
++        )
++        return [(m.group(2).strip('\n') + '\n', m.group(3).strip()) for m in pattern.finditer(text or "")]
++
++    def _run_samples(self, msg_history, max_rounds=2):
++        """Run the target file on parsed samples; on mismatch ask the model to repair (bounded)."""
++        samples = self._parse_samples(self.problem_statement)
++        if not samples:
++            safe_log("No 'Sample Input/Output' blocks found; skipping sample verification")
++            return
++        path = os.path.join(self.git_tempdir, self._target_filename())
++        for round_idx in range(max_rounds + 1):
++            failure = None
++            for inp, expected in samples:
++                try:
++                    proc = subprocess.run(
++                        ["python3", path], input=inp, capture_output=True, text=True, timeout=10,
++                    )
++                    actual = proc.stdout.strip()
++                    err = proc.stderr.strip()
++                except subprocess.TimeoutExpired:
++                    actual, err = "", "Timeout after 10s"
++                if actual.split() != expected.split():
++                    failure = (inp, expected, actual, err)
++                    break
++            if failure is None:
++                safe_log(f"Sample verification passed on {len(samples)} sample(s)")
++                return
++            if round_idx == max_rounds:
++                safe_log("Sample verification still failing after repair rounds")
++                return
++            inp, expected, actual, err = failure
++            safe_log(f"Sample mismatch; repair round {round_idx + 1}/{max_rounds}")
++            repair = (
++                f"Running `python3 {path}` on a sample input failed.\n"
++                f"Input:\n{inp}\nExpected output:\n{expected}\nActual output:\n{actual}\n"
++                f"Stderr:\n{err}\n"
++                "Fix the file with the editor tool so it produces the expected output, then stop."
++            )
++            msg_history = chat_with_agent(repair, model=self.code_model, msg_history=msg_history, logging=safe_log)
++
++
++def _block_field(block, key):
++    if isinstance(block, dict):
++        return block.get(key)
++    return getattr(block, key, None)
++
++
++def _last_assistant_is_empty(msg_history):
++    """True if the final assistant message has no non-whitespace text and no tool_use blocks."""
++    if not msg_history:
++        return False
++    last = None
++    for msg in msg_history:
++        if isinstance(msg, dict) and msg.get('role') == 'assistant':
++            last = msg
++    if last is None:
++        return False
++    content = last.get('content')
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return content.strip() == ''
++    if not isinstance(content, (list, tuple)):
++        return str(content).strip() == ''
++    for block in content:
++        if _block_field(block, 'type') == 'tool_use':
++            return False
++        text = _block_field(block, 'text')
++        if isinstance(text, str) and text.strip():
++            return False
++    return True
++
++
++def _last_assistant_text(msg_history):
++    """Concatenate text of the last assistant message in msg_history (string or list)."""
++    if isinstance(msg_history, str):
++        return msg_history
++    last = None
++    for msg in msg_history or []:
++        if isinstance(msg, dict) and msg.get('role') == 'assistant':
++            last = msg
++    if last is None:
++        return ""
++    content = last.get('content')
++    if isinstance(content, str):
++        return content
++    parts = []
++    for block in content or []:
++        text = _block_field(block, 'text')
++        if isinstance(text, str):
++            parts.append(text)
++    return "\n".join(parts)
++
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

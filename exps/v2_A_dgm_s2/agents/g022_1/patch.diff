@@ -1,0 +1,211 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index ea5990f..475343f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -182,69 +182,161 @@ class AgenticSystem:
+             return False
+         return any(not self._is_test_path(p) for p in paths)
+ 
++    def _find_target_file(self):
++        """
++        Return the relative path of the most likely target file: solution.py if present,
++        otherwise the first non-test tracked source file. Returns None if nothing is found.
++        """
++        if os.path.exists(os.path.join(self.git_tempdir, 'solution.py')):
++            return 'solution.py'
++        exts = ('.py', '.rs', '.go', '.js', '.cpp', '.java')
++        try:
++            out = subprocess.run(
++                ['git', 'ls-files'], cwd=self.git_tempdir,
++                capture_output=True, text=True, check=False
++            ).stdout
++        except Exception as e:
++            safe_log(f"git ls-files failed: {e}", logging.WARNING)
++            return None
++        for path in out.splitlines():
++            path = path.strip()
++            if not path.endswith(exts):
++                continue
++            if self._is_test_path(path):
++                continue
++            return path
++        return None
++
++    @staticmethod
++    def _last_assistant_is_empty(msg_history):
++        """
++        Return True if the last assistant message has no tool_use blocks and only empty text
++        (or if there is no assistant message at all).
++        """
++        last = None
++        for msg in msg_history or []:
++            if msg.get('role') == 'assistant':
++                last = msg
++        if last is None:
++            return True
++        content = last.get('content', [])
++        if isinstance(content, str):
++            return not content.strip()
++        for block in content or []:
++            btype = block.get('type') if isinstance(block, dict) else getattr(block, 'type', None)
++            if btype == 'tool_use':
++                return False
++            text = block.get('text') if isinstance(block, dict) else getattr(block, 'text', None)
++            if text and str(text).strip():
++                return False
++        return True
++
++    def _fallback_write_solution(self, target_file, problem_statement):
++        """
++        Last resort: one tool-less LLM call asking only for the full Python solution code,
++        then write the extracted code block to the target file.
++        """
++        prompt = (
++            "Write the complete Python solution for the following competitive programming problem. "
++            "Reply with only one Python code block containing the full program or Solution class, "
++            "reading from standard input and writing to standard output if the problem requires it.\n\n"
++            f"<problem_description>\n{problem_statement}\n</problem_description>"
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            response = client.messages.create(
++                model=client_model,
++                max_tokens=4096,
++                messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
++            )
++            text = "".join(getattr(b, 'text', '') or '' for b in response.content)
++        except Exception as e:
++            safe_log(f"Fallback LLM call failed: {e}", logging.WARNING)
++            return False
++        m = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
++        if not m:
++            safe_log("Fallback: no code block found in response.", logging.WARNING)
++            return False
++        code = m.group(1)
++        with open(os.path.join(self.git_tempdir, target_file), 'w') as f:
++            f.write(code)
++        safe_log(f"Fallback wrote solution to {target_file}.")
++        return True
++
+     def forward(self):
+         """
+         The forward function for the AgenticSystem.
+         """
++        target_file = self._find_target_file() or 'solution.py'
++        safe_log(f"Target file: {target_file}")
++
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+-
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        workflow = """
+-
+-Required workflow (follow these steps in order):
+-1. Briefly inspect the repository and locate the stub/target source file (e.g. solution.py or the file containing the placeholder / Solution class). Avoid broad `find` commands over large directories, since they can hang the bash tool; prefer targeted `ls` or `grep` calls.
+-2. Complexity analysis (mandatory, before implementation): list the input constraints (n, value ranges, number of test cases, time limit if given). State the target time complexity and estimate the worst-case operation count of your planned algorithm at maximum constraints. Python executes roughly 1e7 to 5e7 simple operations in a couple of seconds. If your estimate exceeds about 5e7 operations, reject that algorithm and choose a better one (e.g. better data structures, two pointers, binary search over a monotone predicate, prefix sums, DP with lower state count, or a smarter greedy) before writing code.
+-3. IMMEDIATELY write a complete first-draft implementation into the target file using the editor tool, before any experiments or extensive research. Note: the editor `create` command fails on existing files, so use `edit` to modify the target file.
+-4. Write small tests or a local simulator (for interactive problems, a mock judge) under /tmp or in the repo's test location and run them. Also write a simple brute-force reference and compare the solution against it on many small random inputs.
+-5. Performance test (mandatory): write /tmp/bench.py that generates maximum-size random inputs and adversarial inputs (e.g. all-equal values, sorted or reverse-sorted data, worst-case structure) according to the constraints, imports the Solution class from the target file, runs it on each input, and prints the elapsed time with time.perf_counter(). Run it with `timeout 20 python3 /tmp/bench.py` and report the elapsed time. If it exceeds about 2 seconds or times out, optimize the algorithm (go back to step 2 if needed), then re-run the brute-force comparison from step 4 AND the benchmark. Keep the brute-force comparison after optimization. Note: the `benchmark` tool can also run a command with a hard timeout and report wall-clock time.
+-6. Refine the solution file in place based on the results. Keep the solution in the source file, not only in scratch files.
+-7. Before finishing, run `git diff` and verify that the source file is modified and contains your solution. In your final message, report the complexity estimate, the max-size benchmark timing, and whether the brute-force comparison passed.
+-
+-Rules:
+-- Never end your turn without having edited a non-test source file in the repository.
+-- Do not spend most of your steps on exploration; a real attempt in the source file always comes first.
+-- If you are unsure, still write your best-effort complete implementation to the target file.
+-- Never end with an empty message: always finish with a short summary of the changes you made.
+-- Note: the editor `create` command fails for existing files; use `edit` instead.
++        # Phase 1: action-first prompt.
++        phase1 = task + f"""
++Phase 1 (do this first):
++1. Restate the problem to yourself in one or two sentences. Briefly inspect the repository (targeted `ls` only).
++2. Immediately write the full, complete solution to the target file `{target_file}` using the editor tool. This must be your first edit.
++3. Then verify with `git diff` that the source file was modified.
++Do not run long experiments in this phase. Finish with a short summary of what you wrote.
+ """
+-        instruction = f"{task}\n\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction.{workflow}"
+-        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log(f"Initial attempt finished. Valid source patch: {self._has_valid_source_patch()}")
+-
+-        # Fixed-count review pass (no while loop): verify the performance test was actually done.
+-        review_msg = (
+-            "Review: Did you benchmark at maximum constraint sizes? If not, do so now; "
+-            "if the runtime was above 2s, optimize. Confirm that you (1) stated a complexity estimate, "
+-            "(2) ran a max-size random and adversarial benchmark with `timeout 20 python3 /tmp/bench.py`, "
+-            "and (3) re-ran the brute-force comparison after any optimization. "
+-            "Then give a short final summary."
+-        )
+-        safe_log("Review pass 1.")
+-        msg_history = chat_with_agent(review_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-        safe_log("Review pass 1 finished.")
++        safe_log("Phase 1: initial attempt.")
++        msg_history = chat_with_agent(phase1, model=self.code_model, msg_history=[], logging=safe_log)
++        safe_log(f"Phase 1 finished. Last assistant turn empty: {self._last_assistant_is_empty(msg_history)}. "
++                 f"Valid source patch: {self._has_valid_source_patch()}")
+ 
++        # Retry loop (fixed count, no while loop), run before any review pass.
+         for attempt in range(3):
+             if self._has_valid_source_patch():
+                 break
+             safe_log(f"Retry attempt {attempt + 1}: no valid source-code changes detected.")
+-            current_edits = self.get_current_edits()
+-            diff_text = current_edits[0]['content'][0]['text']
+-            retry_msg = (
+-                "No valid source-code changes were detected. The previous turn ended without any edit to a non-test source file "
+-                "(or the turn ended with an empty message).\n\n"
+-                f"{diff_text}\n\n"
+-                "Write your best complete solution to the target file now using the editor tool, then verify with git diff. "
+-                "Do not run further long exploration first. Make sure the source file (not only tests or scratch files) is modified, "
+-                "and finish with a short summary of the changes."
+-            )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            if self._last_assistant_is_empty(msg_history):
++                safe_log(f"Retry attempt {attempt + 1}: last assistant turn was empty; restarting with fresh history.")
++                ls_out = subprocess.run(['ls', '-la'], cwd=self.git_tempdir,
++                                        capture_output=True, text=True, check=False).stdout
++                retry_msg = (
++                    task +
++                    f"\nRepository listing (`ls -la`):\n{ls_out}\n"
++                    f"Your next action MUST be a call to the editor tool that writes the complete solution into {target_file}. "
++                    "Do not reply with text only."
++                )
++                msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            else:
++                diff_text = self.get_current_edits()[0]['content'][0]['text']
++                retry_msg = (
++                    "No valid source-code changes were detected yet.\n\n"
++                    f"{diff_text}\n\n"
++                    f"Write your complete solution to {target_file} now using the editor tool, then verify with git diff. "
++                    "Do not run further long exploration first."
++                )
++                msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+             safe_log(f"Retry attempt {attempt + 1} finished. Valid source patch: {self._has_valid_source_patch()}")
+ 
++        # Phase 2: complexity / brute-force / benchmark steps, only with a valid source patch.
++        if self._has_valid_source_patch():
++            phase2 = """Phase 2 (optimization and verification):
++1. Complexity analysis: list the input constraints, state the target time complexity, and estimate the worst-case operation count at maximum constraints. Python handles roughly 1e7 to 5e7 simple operations; if your estimate is higher, choose a better algorithm.
++2. Write a simple brute-force reference and compare your solution against it on many small random inputs.
++3. Write /tmp/bench.py that generates maximum-size random and adversarial inputs, imports the solution, and times it with time.perf_counter(). Run it with `timeout 20 python3 /tmp/bench.py`. If it is above about 2s, optimize and re-run both the brute-force comparison and the benchmark.
++4. Confirm with `git diff` that the source file contains the final solution. Finish with a short summary, including the complexity estimate, max-size timing, and whether the brute-force comparison passed.
++"""
++            safe_log("Phase 2: optimization and verification.")
++            msg_history = chat_with_agent(phase2, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            safe_log(f"Phase 2 finished. Valid source patch: {self._has_valid_source_patch()}")
++        else:
++            safe_log("Phase 2 skipped: no valid source patch.")
++
++        # Final deterministic fallback.
++        if not self._has_valid_source_patch():
++            safe_log("No valid source patch after retries; running fallback.")
++            self._fallback_write_solution(target_file, self.problem_statement)
++            safe_log(f"Fallback finished. Valid source patch: {self._has_valid_source_patch()}")
++
++
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
+     parser.add_argument('--problem_statement', required=True, help='The problem statement to process')

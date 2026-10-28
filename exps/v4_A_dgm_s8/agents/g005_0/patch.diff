@@ -1,0 +1,152 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 05a1aaa..488c276 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -7,6 +7,7 @@ import threading
+ import re
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
++from llm import create_client, get_response_from_llm
+ from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+ 
+ # reset_to_commit(git_dname, commit)
+@@ -181,13 +182,15 @@ Your task is to make changes to the files in the {self.git_tempdir} directory to
+ Follow this workflow step by step:
+ 1. Explore the repository: look at the directory layout, any existing files, and any file the problem names (e.g. solution.py or a Solution class).
+ 2. Restate the problem and its constraints (input format, output format, limits) in your own words.
+-3. Design an algorithm that meets the constraints.
+-4. Write the implementation to disk in the repository using the editor tool (for example solution.py when the task names one). The task is NOT complete until the implementation file exists on disk. Replying with only text or an empty message is not acceptable.
+-5. Run the implementation with bash on the provided sample inputs and compare against the expected outputs. Fix any mismatch.
+-6. If feasible, write a simple brute-force solution and compare the two on small random inputs to validate correctness. Then optimize if needed and re-test.
+-7. Finally run `git status` and `git diff` to confirm the deliverable file was created or changed. Run `git status` at the end to confirm the file exists.
++3. Check which libraries are available. Use only the Python standard library unless you have verified a package imports successfully (numpy etc. may not be installed; verify with an import check before relying on it).
++4. Write a simple, correct baseline solution to disk EARLY (even O(N^2) or brute force) using the editor tool, before any heavy optimization. The task is NOT complete until the implementation file exists on disk. Replying with only text or an empty message is not acceptable. Code shown only in chat is not saved.
++5. Run the baseline with bash on the provided sample inputs and compare against the expected outputs. Fix any mismatch.
++6. Then improve the solution (optimize if needed), overwrite the file, and re-test on the samples.
++7. If feasible, write a brute-force solution and compare the two on small random inputs to validate correctness.
++8. Never end a turn with an empty message; if your approach is blocked, switch to a fallback approach and still write the file. Always finish with a tool call that writes the file or a final summary after the file is written.
++9. Finally run `git status` and `git diff` to confirm the deliverable file was created or changed. Run `git status` at the end to confirm the file exists.
+ """
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+         for attempt in range(3):
+             status = self._classify_diff()
+@@ -203,17 +206,112 @@ Follow this workflow step by step:
+                 note = "Your previous attempt only changed test files (diff status: test_only); the primary source or deliverable file was not modified. "
+             retry_note = (
+                 note
+-                + "You MUST now create or modify the implementation file using the editor tool. "
+-                "Do not reply with an empty message. First write a simple correct solution, test it on the samples, then optimize."
++                + "You ended without editing any file. Based on what you learned above (e.g. unavailable libraries), "
++                "immediately call the editor tool to write the implementation file with a simple correct solution, then test it. "
++                "Do not reply with an empty message. Code shown only in chat is not saved. "
++                "Use only the Python standard library unless you have verified a package imports successfully."
+             )
+             if attempt == 1:
+                 retry_note += (
+                     " This is the final retry: if the implementation file still does not exist, immediately write a best-effort "
+                     "(even brute-force) solution to the required file so the patch is not empty."
+                 )
+-            retry_instruction = f"{task}\n\n{retry_note}\n\nAfter writing the file, run it on the samples and run `git status` to confirm the file exists."
+-            safe_log(f"Retrying agent (attempt {attempt + 1}) with status {status}")
+-            init_edit = chat_with_agent(retry_instruction, model=self.code_model, msg_history=[], logging=safe_log)
++            retry_instruction = f"{retry_note}\n\nAfter writing the file, run it on the samples and run `git status` to confirm the file exists."
++            safe_log(f"Retrying agent (attempt {attempt + 1}) with status {status}; passing {len(msg_history)} prior messages")
++            msg_history = self._chat_retry(retry_instruction, msg_history)
++
++        if self._classify_diff() != 'ok':
++            safe_log("Diff still not usable after retries; running deterministic fallback writer.")
++            self._fallback_write_solution()
++            safe_log(f"Diff classification after fallback: {self._classify_diff()}")
++
++    def _chat_retry(self, instruction, msg_history):
++        """
++        Continue the conversation with the accumulated history. Falls back to a
++        text summary of the prior history if the returned value is not a history list.
++        """
++        try:
++            new_history = chat_with_agent(instruction, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            if isinstance(new_history, list):
++                return new_history
++            safe_log("chat_with_agent did not return a history list; using a summary instead.")
++        except Exception as e:
++            safe_log(f"Retry chat_with_agent raised an error: {e}", level=logging.WARNING)
++        summary = self._summarize_history(msg_history)
++        try:
++            new_history = chat_with_agent(f"{summary}\n\n{instruction}", model=self.code_model, msg_history=[], logging=safe_log)
++            return new_history if isinstance(new_history, list) else []
++        except Exception as e:
++            safe_log(f"Summary retry raised an error: {e}", level=logging.WARNING)
++            return []
++
++    def _summarize_history(self, msg_history):
++        """Build a compact text summary of prior messages (text blocks only, truncated)."""
++        lines = []
++        for m in msg_history or []:
++            content = m.get('content')
++            if isinstance(content, str):
++                text = content
++            elif isinstance(content, list):
++                text = ' '.join(str(b.get('text', '')) for b in content if isinstance(b, dict))
++            else:
++                text = ''
++            text = text.strip()
++            if text:
++                lines.append(f"[{m.get('role', '?')}] {text[:300]}")
++        return "Summary of earlier work:\n" + "\n".join(lines[-20:])
++
++    def _fallback_target_path(self):
++        """Infer the target file: a backticked filename in the problem, else a placeholder file in the repo, else solution.py."""
++        m = re.search(r'`([\w\-./]+\.[A-Za-z0-9]+)`', self.problem_statement or '')
++        if m:
++            return m.group(1)
++        for root, dirs, files in os.walk(self.git_tempdir):
++            dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', '__pycache__')]
++            for name in files:
++                if not name.endswith('.py') or name.startswith('test') or '_test' in name:
++                    continue
++                path = os.path.join(root, name)
++                try:
++                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
++                        if 'Write your solution' in f.read():
++                            return os.path.relpath(path, self.git_tempdir)
++                except OSError:
++                    continue
++        return 'solution.py'
++
++    def _fallback_write_solution(self):
++        """
++        Deterministic fallback: one tool-less LLM call asking for the full file contents,
++        extracted from a fenced code block and written to the target path.
++        """
++        target_rel = self._fallback_target_path()
++        target = os.path.join(self.git_tempdir, target_rel)
++        safe_log(f"Fallback writer: target path is {target_rel}")
++        system_message = "You are an expert competitive programmer. Output only what is requested."
++        prompt = (
++            "Solve the following problem in Python. Use only the standard library.\n\n"
++            f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++            f"Output ONLY the full final contents of the file `{target_rel}` inside a single ```python code block. "
++            "No explanation outside the code block."
++        )
++        try:
++            client, client_model = create_client(self.code_model)
++            response, _ = get_response_from_llm(prompt, client, client_model, system_message, msg_history=[], temperature=0.0)
++        except Exception as e:
++            safe_log(f"Fallback writer LLM call failed: {e}", level=logging.ERROR)
++            return False
++        safe_log(f"Fallback writer raw response length: {len(response or '')}")
++        match = re.search(r'```(?:python|py)?[ \t]*\n(.*?)```', response or '', re.S)
++        if not match or not match.group(1).strip():
++            safe_log("Fallback writer: no code block found in response; nothing written.", level=logging.ERROR)
++            return False
++        code = match.group(1)
++        os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
++        with open(target, 'w') as f:
++            f.write(code)
++        safe_log(f"Fallback writer: wrote {len(code)} chars to {target}")
++        return True
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

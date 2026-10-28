@@ -1,0 +1,207 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 3a26229..e9f974f 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -139,6 +139,127 @@ def _needs_retry(diff):
+         return "no changed files could be identified in the diff"
+     return None
+ 
++def _gather_repo_context(git_tempdir, max_chars=8000):
++    """
++    Build a compact snapshot of the repository: tracked file list plus contents of
++    small, non-test source files (solution/main files and files containing 'class Solution' first).
++    """
++    files = []
++    try:
++        result = subprocess.run(
++            ["git", "-C", git_tempdir, "ls-files"],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++        )
++        files = [f for f in result.stdout.decode(errors='replace').splitlines() if f.strip()]
++    except Exception:
++        files = []
++    if not files:
++        for root, dirs, names in os.walk(git_tempdir):
++            dirs[:] = [d for d in dirs if d != '.git']
++            for name in names:
++                files.append(os.path.relpath(os.path.join(root, name), git_tempdir))
++
++    candidates = []
++    for f in files:
++        if _is_test_path(f) or f.startswith('.'):
++            continue
++        full = os.path.join(git_tempdir, f)
++        if not os.path.isfile(full) or os.path.getsize(full) > 20000:
++            continue
++        try:
++            with open(full, 'r', encoding='utf-8') as fh:
++                content = fh.read()
++        except Exception:
++            continue
++        name = os.path.basename(f)
++        if name == 'solution.py':
++            rank = 0
++        elif name == 'main.py':
++            rank = 1
++        elif 'class Solution' in content:
++            rank = 2
++        elif f.endswith('.py'):
++            rank = 3
++        else:
++            continue
++        candidates.append((rank, f, content))
++    candidates.sort(key=lambda c: (c[0], c[1]))
++
++    parts = [f"Tracked files:\n" + "\n".join(files[:200])]
++    used = len(parts[0])
++    for _, f, content in candidates:
++        block = f"\n\n--- {f} ---\n{content}"
++        if used + len(block) > max_chars:
++            remaining = max_chars - used
++            if remaining > 200:
++                parts.append(block[:remaining])
++            break
++        parts.append(block)
++        used += len(block)
++    return "".join(parts)[:max_chars]
++
++def _has_tool_use(msg_history):
++    """
++    Return True if the message history contains any tool call (Claude 'tool_use' blocks,
++    OpenAI 'function_call' items, or manual '<tool_use>' text). Logs when none are found.
++    """
++    found = False
++    for msg in msg_history or []:
++        if isinstance(msg, dict):
++            if msg.get('type') in ('function_call', 'function_call_output'):
++                found = True
++                break
++            content = msg.get('content')
++        else:
++            if getattr(msg, 'type', None) == 'function_call' or getattr(msg, 'tool_calls', None):
++                found = True
++                break
++            content = getattr(msg, 'content', None)
++        if isinstance(content, str):
++            if '<tool_use>' in content:
++                found = True
++                break
++            continue
++        for block in content or []:
++            if isinstance(block, dict):
++                btype = block.get('type')
++                text = block.get('text') or ''
++            else:
++                btype = getattr(block, 'type', None)
++                text = getattr(block, 'text', None) or ''
++            if btype == 'tool_use' or (isinstance(text, str) and '<tool_use>' in text):
++                found = True
++                break
++        if found:
++            break
++    if not found:
++        safe_log("The model finished without using any tool (no tool calls in the response).")
++    return found
++
++def _last_assistant_text(msg_history):
++    """
++    Return the text of the last assistant message in msg_history, or '' if none.
++    """
++    for msg in reversed(msg_history or []):
++        if isinstance(msg, dict):
++            role, content = msg.get('role'), msg.get('content')
++        else:
++            role, content = getattr(msg, 'role', None), getattr(msg, 'content', None)
++        if role != 'assistant':
++            continue
++        if isinstance(content, str):
++            return content
++        texts = []
++        for block in content or []:
++            if isinstance(block, dict):
++                if block.get('type') == 'text' and block.get('text'):
++                    texts.append(block['text'])
++            elif getattr(block, 'type', None) == 'text' and getattr(block, 'text', None):
++                texts.append(block.text)
++        if texts:
++            return "\n".join(texts)
++    return ''
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -208,23 +329,65 @@ IMPORTANT: The task is incomplete until a source file has been created or edited
+         init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+         msg_history = init_edit if isinstance(init_edit, list) else []
+ 
++        repo_context = _gather_repo_context(self.git_tempdir)
++        retry_prompts = [
++            "Your previous attempt made no changes to the repository. Your first action must be an editor tool call that creates or edits the solution file. Do not reply with text only.",
++            "No solution file was written last time. Start now: use the editor tool to write the complete solution into the primary solution file (not a test file). Do not reply with text only.",
++            "Still no code on disk. Immediately call the editor tool to create or overwrite solution.py with a full implementation, then test it with bash. Do not reply with text only.",
++        ]
+         for attempt in range(3):
+             diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+             reason = _needs_retry(diff)
+             if reason is None:
+                 safe_log(f"Patch validation passed on attempt {attempt}.")
+                 break
+-            safe_log(f"Patch validation failed on attempt {attempt}: {reason}. Retrying.")
+-            retry_msg = f"""Your previous attempt did not produce a valid fix. Reason: {reason}.
+-
+-Original task:
++            safe_log(f"Patch validation failed on attempt {attempt}: {reason}. Retrying with fresh history.")
++            retry_msg = f"""Original task:
+ {task}
+ 
+-Use the editor tool NOW to create or modify the primary source or solution file (not the test files) with the complete solution, then verify it by running it with bash on the sample inputs. Do not finish until a non-test source file has been changed on disk."""
+-            retry_result = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            msg_history = retry_result if isinstance(retry_result, list) else []
+-        else:
+-            safe_log("Patch validation still failing after maximum retries.")
++Repository snapshot:
++{repo_context}
++
++{retry_prompts[attempt % len(retry_prompts)]}"""
++            retry_result = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            if not _has_tool_use(retry_result):
++                safe_log("Retry finished without any tool call; the next attempt will start from a fresh history.")
++        diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
++        reason = _needs_retry(diff)
++        if reason is None:
++            return
++        safe_log(f"Patch validation still failing after maximum retries: {reason}. Running deterministic fallback.")
++        self._fallback_write_solution(task, repo_context)
++
++    def _fallback_write_solution(self, task, repo_context):
++        """
++        Ask the model for only the full solution file contents and write them to the target file.
++        """
++        target_rel = None
++        for f in re.findall(r'^--- (.+?) ---$', repo_context, flags=re.MULTILINE):
++            if not _is_test_path(f) and f.endswith('.py') and os.path.basename(f) == 'solution.py':
++                target_rel = f
++                break
++        if target_rel is None:
++            target_rel = 'solution.py'
++        target_path = os.path.join(self.git_tempdir, target_rel)
++        fallback_msg = f"""{task}
++
++Repository snapshot:
++{repo_context}
++
++Reply with ONLY the complete contents of `{target_rel}` (a full, working Python implementation including the starter class/method signature shown above) inside a single ```python fenced code block. No other text, no tool calls."""
++        fallback_result = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
++        text = _last_assistant_text(fallback_result)
++        match = re.search(r'```python\s*\n(.*?)```', text, flags=re.DOTALL)
++        if not match:
++            safe_log("Fallback failed: no ```python code block in the model reply.")
++            return
++        code = match.group(1)
++        os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
++        with open(target_path, 'w', encoding='utf-8') as f:
++            f.write(code)
++        safe_log(f"Fallback wrote {len(code)} chars to {target_path}.")
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

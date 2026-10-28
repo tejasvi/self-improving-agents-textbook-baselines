@@ -1,0 +1,169 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5583586..4de2eb0 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+ import os
++import re
+ import threading
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+@@ -93,6 +94,72 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++STUB_CONTENT = "# TODO: implement\nimport sys\n"
++DELIVERABLE_NAME = "solution.py"
++
++
++def _block_field(block, field):
++    """Read a field from a message content block that may be a dict or an SDK object."""
++    if isinstance(block, dict):
++        return block.get(field)
++    return getattr(block, field, None)
++
++
++def _last_assistant_text(msg_history):
++    """Return the concatenated text of the last assistant message ('' if none)."""
++    for msg in reversed(msg_history or []):
++        role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++        if role != 'assistant':
++            continue
++        content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
++        if content is None:
++            return ''
++        if isinstance(content, str):
++            return content
++        parts = []
++        for block in content:
++            if _block_field(block, 'type') == 'text':
++                text = _block_field(block, 'text')
++                if text:
++                    parts.append(text)
++        return ''.join(parts)
++    return ''
++
++
++def _extract_code_block(text):
++    """Return the contents of the last ```python ... ``` block in text, or None."""
++    if not text:
++        return None
++    blocks = re.findall(r"```python[ \t]*\n(.*?)```", text, re.DOTALL)
++    if not blocks:
++        return None
++    return blocks[-1]
++
++
++def _is_empty_response(msg_history):
++    """True when the last assistant message has no non-empty text and no tool_use blocks."""
++    last = None
++    for msg in reversed(msg_history or []):
++        role = msg.get('role') if isinstance(msg, dict) else getattr(msg, 'role', None)
++        if role == 'assistant':
++            last = msg
++            break
++    if last is None:
++        return True
++    content = last.get('content') if isinstance(last, dict) else getattr(last, 'content', None)
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return content.strip() == ''
++    for block in content:
++        if _block_field(block, 'type') == 'tool_use':
++            return False
++        text = _block_field(block, 'text')
++        if text and str(text).strip():
++            return False
++    return True
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -161,24 +228,74 @@ Please follow this workflow carefully:
+ 6. Finish only when all checks pass: the samples produce the expected output, the stress test shows no mismatches against the brute force, and the maximum-size input runs in time. Make sure the final solution is saved in the deliverable file. Helper files (brute.py, stress.py, sample files, big input) may remain in the repository, but the deliverable file must contain the final, complete solution.
+ """
+         instruction = f"{task}{workflow}\nPlease analyze the problem description carefully. Then make edits to the code files to complete the instruction."
++
++        # Seed the deliverable with a stub so the agent always has a concrete file to edit.
++        deliverable = os.path.join(self.git_tempdir, DELIVERABLE_NAME)
++        if not os.path.exists(deliverable):
++            with open(deliverable, 'w') as f:
++                f.write(STUB_CONTENT)
++
++        def has_solution():
++            """True only when the deliverable exists and differs from the stub."""
++            try:
++                with open(deliverable, 'r') as f:
++                    content = f.read()
++            except OSError:
++                return False
++            return content.strip() != STUB_CONTENT.strip()
++
+         msg_history = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+ 
+-        # Ensure the agent actually made file changes; retry a bounded number of times if not.
+-        for attempt in range(3):
+-            if str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip() != '':
+-                break
+-            safe_log(f"[forward] Attempt {attempt + 1}: no file changes detected, re-prompting agent.")
+-            retry_msg = (
++        # Retry a bounded number of times with escalating prompts if no solution was written.
++        retry_prompts = [
++            (
+                 "Your previous attempt made no file changes. You must now create the solution file with a "
+                 "complete implementation, run it on the samples, and fix any failures. "
+                 f"The repository is at {self.git_tempdir}. Write the deliverable file (solution.py or the file "
+                 "the task specifies) now, then test it on the sample inputs with bash, write brute.py and a "
+                 "random comparison script, and benchmark a maximum-size input."
++            ),
++            (
++                "You still have not written a solution. Use the editor tool to write the complete solution "
++                f"to {deliverable} now, then run it on the samples with bash. Do not reply without tool calls."
++            ),
++            (
++                "Final retry. Use the editor tool to write a complete, working Python 3 program to "
++                f"{deliverable}, then run it on the sample inputs with bash."
++            ),
++        ]
++        for attempt in range(3):
++            if has_solution():
++                break
++            safe_log(f"[forward] Attempt {attempt + 1}: no solution written yet, re-prompting agent.")
++            if _is_empty_response(msg_history):
++                safe_log(f"[forward] Attempt {attempt + 1}: empty response, restarting with fresh history.")
++                retry_msg = (
++                    f"Problem statement:\n{self.problem_statement}\n\n"
++                    f"Use the editor tool to write the complete solution to {deliverable}, then run it on the "
++                    "samples with bash."
++                )
++                msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            else:
++                msg_history = chat_with_agent(
++                    retry_prompts[attempt], model=self.code_model, msg_history=msg_history, logging=safe_log
++                )
++
++        # Last resort: ask for bare code and write it to the deliverable.
++        if not has_solution():
++            safe_log("[forward] Still no solution; requesting bare code as a final fallback.")
++            fallback_msg = (
++                "Reply with ONLY a complete Python 3 program in a ```python block. "
++                f"No explanation.\n\nProblem statement:\n{self.problem_statement}"
+             )
+-            msg_history = chat_with_agent(retry_msg, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            fallback_history = chat_with_agent(fallback_msg, model=self.code_model, msg_history=[], logging=safe_log)
++            code = _extract_code_block(_last_assistant_text(fallback_history))
++            if code and code.strip():
++                with open(deliverable, 'w') as f:
++                    f.write(code)
+ 
+-        # Bounded verification round (single pass).
+-        if str(diff_versus_commit(self.git_tempdir, self.base_commit)).strip() != '':
++        # Bounded verification round (single pass), only if a real solution exists.
++        if has_solution():
+             verify_msg = (
+                 "Verification pass: re-run the solution on all sample inputs and compare with the expected outputs. "
+                 "Then re-run the random stress test against brute.py (create them if they do not exist) and the "

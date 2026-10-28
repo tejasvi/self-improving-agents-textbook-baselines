@@ -1,0 +1,382 @@
+diff --git a/attempts/attempts_log.md b/attempts/attempts_log.md
+index 90cd22c..e69de29 100644
+--- a/attempts/attempts_log.md
++++ b/attempts/attempts_log.md
+@@ -1,23 +0,0 @@
+-## Gate round 0
+-- Stages passed: 0/3
+-- First failing stage: samples
+-- Saved as: /dgm/attempts/attempt_0.py
+-
+-## Gate round 1
+-- Stages passed: 0/3
+-- First failing stage: samples
+-- Saved as: /dgm/attempts/attempt_1.py
+-
+-## Gate round 2
+-- Stages passed: 0/3
+-- First failing stage: samples
+-- Saved as: /dgm/attempts/attempt_2.py
+-
+-## Gate round 3
+-- Stages passed: 0/3
+-- First failing stage: samples
+-- Saved as: /dgm/attempts/attempt_3.py
+-
+-## Final
+-- Kept final attempt (0/3 stages)
+-
+diff --git a/tools/compare_candidates.py b/tools/compare_candidates.py
+new file mode 100644
+index 0000000..f04bf81
+--- /dev/null
++++ b/tools/compare_candidates.py
+@@ -0,0 +1,348 @@
++import glob
++import hashlib
++import os
++from collections import Counter
++
++from tools.stress_test import _run, _cmd, _clip
++
++# Per-run time limit for the brute force: if it does not finish in this time the test
++# is kept but marked as "brute unavailable" (candidates are only compared with each other).
++BRUTE_TIMEOUT = 10
++CAND_TIMEOUT = 10
++# Hard cap on the number of generated tests so one call stays bounded.
++MAX_TOTAL_TESTS = 2000
++MAX_SHOWN_DISAGREEMENTS = 5
++DISAGREEMENT_CLIP = 1500
++
++
++def tool_info():
++    return {
++        "name": "compare_candidates",
++        "description": """Differential testing of several candidate solutions against a brute-force reference on a shared test pool. Deterministic; returns a raw report (no error parsing).
++
++* Test pool: (a) every sample input (with its expected output), (b) for each mode in `modes` and each seed in [0, num_tests): `gen_path <seed> <mode>` (or `gen_path <seed>` when no modes are given), (c) every `*.in` file in `extra_cases_dir` (past counterexamples).
++* Each test input is fed to every candidate and to the brute force. The brute force is only trusted if it finishes within 10s and exits with 0; otherwise the test is compared among the candidates only.
++* Report: per-candidate sample passes, passes versus the brute force, crashes/timeouts, agreement with the plurality output; the disagreements (input, each candidate's output, brute output); whether the brute force contradicts the samples; runtime of each candidate on each max-size input; a RANKING line, a BEST line and an ALL_AGREE line.
++* Every disagreeing input is saved into `extra_cases_dir` as a persistent counterexample and re-tested in later calls.
++* Errors are NOT parsed; read the raw output and interpret it yourself.""",
++        "input_schema": {
++            "type": "object",
++            "properties": {
++                "candidate_paths": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Absolute paths of the candidate solution programs (each reads stdin, writes stdout)."
++                },
++                "brute_path": {
++                    "type": "string",
++                    "description": "Path to the brute-force reference program (reads stdin, writes stdout)."
++                },
++                "gen_path": {
++                    "type": "string",
++                    "description": "Path to the generator, run as `gen <seed> <mode>` (or `gen <seed>` when modes is empty); it prints one valid test input to stdout."
++                },
++                "sample_inputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Sample inputs. Each item is either a file path (its contents are used) or the literal input text."
++                },
++                "sample_outputs": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Expected outputs for the sample inputs, in the same order. Each item is either a file path or the literal expected text."
++                },
++                "max_input_paths": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Paths to maximum-size worst-case input files. Used only for timing each candidate."
++                },
++                "extra_cases_dir": {
++                    "type": "string",
++                    "description": "Directory holding persistent counterexample inputs (*.in). Disagreeing inputs are saved here; all *.in files here are re-tested."
++                },
++                "num_tests": {
++                    "type": "integer",
++                    "description": "Number of seeds per generator mode (default 50)."
++                },
++                "time_limit": {
++                    "type": "number",
++                    "description": "Time limit in seconds used to judge the max-size timing (default 2.0)."
++                },
++                "modes": {
++                    "type": "array",
++                    "items": {"type": "string"},
++                    "description": "Generator modes passed as the second argument, e.g. exhaustive_tiny, random_small, edge, adversarial, medium. Empty means the generator is called with the seed only."
++                }
++            },
++            "required": ["candidate_paths", "brute_path", "gen_path"]
++        }
++    }
++
++
++def _norm(s):
++    return " ".join((s or "").split())
++
++
++def _load_text(item):
++    """A string is a file path if it names an existing file, otherwise literal text."""
++    if isinstance(item, str) and os.path.isfile(item):
++        with open(item, "r", encoding="utf-8", errors="replace") as f:
++            return f.read()
++    return "" if item is None else str(item)
++
++
++def _status(r):
++    if r["timeout"]:
++        return f"<<TIMEOUT after {r['elapsed']:.1f}s>>"
++    if r["rc"] != 0:
++        return f"<<CRASH exit={r['rc']}>>"
++    return r["stdout"]
++
++
++def _key(r):
++    """Normalized output for comparison; None when the run timed out or crashed."""
++    if r["timeout"] or r["rc"] != 0:
++        return None
++    return _norm(r["stdout"])
++
++
++def _build_pool(sample_inputs, sample_outputs, gen_cmd, modes, num_tests, extra_cases_dir, notes):
++    """Return a list of dicts: {source, input (str), expected (str or None)}."""
++    pool = []
++    for i, item in enumerate(sample_inputs):
++        exp = _load_text(sample_outputs[i]) if i < len(sample_outputs) else None
++        pool.append({"source": f"sample_{i + 1}", "input": _load_text(item), "expected": exp})
++
++    if gen_cmd is not None:
++        mode_list = [m for m in modes] if modes else [None]
++        for mode in mode_list:
++            for seed in range(num_tests):
++                if len(pool) >= MAX_TOTAL_TESTS:
++                    break
++                args = [str(seed)] if mode is None else [str(seed), str(mode)]
++                g = _run(gen_cmd + args, b"", 10)
++                label = f"gen seed {seed}" + ("" if mode is None else f" mode {mode}")
++                if g["timeout"] or g["rc"] != 0:
++                    notes.append(f"generator failed for {label}: "
++                                 f"{'timeout' if g['timeout'] else 'exit=' + str(g['rc'])} "
++                                 f"stderr={_clip(g['stderr'], 300)}")
++                    continue
++                pool.append({"source": label, "input": g["stdout"], "expected": None})
++
++    if extra_cases_dir and os.path.isdir(extra_cases_dir):
++        for path in sorted(glob.glob(os.path.join(extra_cases_dir, "*.in"))):
++            with open(path, "r", encoding="utf-8", errors="replace") as f:
++                pool.append({"source": f"counterexample {os.path.basename(path)}", "input": f.read(),
++                             "expected": None})
++    return pool
++
++
++def _save_counterexample(extra_cases_dir, text):
++    """Persist a disagreeing input; the file name is a hash of its content (no duplicates)."""
++    if not extra_cases_dir:
++        return None
++    os.makedirs(extra_cases_dir, exist_ok=True)
++    digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:16]
++    path = os.path.join(extra_cases_dir, f"cex_{digest}.in")
++    if not os.path.isfile(path):
++        with open(path, "w", encoding="utf-8") as f:
++            f.write(text)
++        return path
++    return path
++
++
++def tool_function(candidate_paths, brute_path=None, gen_path=None, sample_inputs=None, sample_outputs=None,
++                  max_input_paths=None, extra_cases_dir=None, num_tests=50, time_limit=2.0, modes=None):
++    cands = [p for p in (candidate_paths or []) if p]
++    if not cands:
++        return "Error: no candidate_paths given.\nRANKING: none\nBEST: none\nALL_AGREE: no"
++    try:
++        num_tests = max(1, min(int(num_tests if num_tests is not None else 50), MAX_TOTAL_TESTS))
++    except (TypeError, ValueError):
++        num_tests = 50
++    try:
++        time_limit = float(time_limit if time_limit is not None else 2.0)
++    except (TypeError, ValueError):
++        time_limit = 2.0
++    modes = [str(m) for m in (modes or []) if str(m).strip()]
++    sample_inputs = list(sample_inputs or [])
++    sample_outputs = list(sample_outputs or [])
++    max_input_paths = list(max_input_paths or [])
++
++    notes = []
++    missing_cands = [p for p in cands if not os.path.isfile(p)]
++    cand_cmds = [_cmd(p) if os.path.isfile(p) else None for p in cands]
++    brute_ok_file = bool(brute_path) and os.path.isfile(brute_path)
++    brute_cmd = _cmd(brute_path) if brute_ok_file else None
++    gen_cmd = _cmd(gen_path) if (gen_path and os.path.isfile(gen_path)) else None
++    if not brute_ok_file:
++        notes.append(f"brute force file not found: {brute_path} (all tests compared among candidates only)")
++    if gen_cmd is None:
++        notes.append(f"generator file not found: {gen_path} (only samples and counterexamples are used)")
++
++    pool = _build_pool(sample_inputs, sample_outputs, gen_cmd, modes, num_tests, extra_cases_dir, notes)
++
++    n = len(cands)
++    sample_pass = [0] * n
++    sample_total = 0
++    brute_pass = [0] * n
++    brute_total = 0
++    crashes = [0] * n
++    timeouts = [0] * n
++    agree = [0] * n
++    brute_unavail = 0
++    brute_sample_mismatch = []
++    disagreements = []
++    disagreement_count = 0
++    saved = []
++
++    for t in pool:
++        text = t["input"]
++        data = text.encode("utf-8")
++        runs = [(_run(c, data, CAND_TIMEOUT) if c is not None else
++                 {"timeout": False, "rc": 1, "stdout": "", "stderr": "candidate file missing",
++                  "elapsed": 0.0}) for c in cand_cmds]
++        brute = _run(brute_cmd, data, BRUTE_TIMEOUT) if brute_cmd is not None else None
++        brute_good = brute is not None and not brute["timeout"] and brute["rc"] == 0
++        bkey = _norm(brute["stdout"]) if brute_good else None
++
++        keys = [_key(r) for r in runs]
++        for i, r in enumerate(runs):
++            if r["timeout"]:
++                timeouts[i] += 1
++            elif r["rc"] != 0:
++                crashes[i] += 1
++        if t["expected"] is not None:
++            sample_total += 1
++            ekey = _norm(t["expected"])
++            for i in range(n):
++                if keys[i] is not None and keys[i] == ekey:
++                    sample_pass[i] += 1
++            if brute_good and bkey != ekey:
++                brute_sample_mismatch.append((t["source"], _clip(text, 600), _clip(brute["stdout"], 600),
++                                              _clip(t["expected"], 600)))
++
++        # plurality among candidates that produced an output
++        counts = Counter(k for k in keys if k is not None)
++        plural = counts.most_common(1)[0][0] if counts else None
++        for i in range(n):
++            if keys[i] is not None and keys[i] == plural:
++                agree[i] += 1
++
++        if brute_good:
++            brute_total += 1
++            disagreed = False
++            for i in range(n):
++                if keys[i] == bkey:
++                    brute_pass[i] += 1
++                else:
++                    disagreed = True
++        else:
++            if brute_cmd is not None:
++                brute_unavail += 1
++            disagreed = len(set(keys)) > 1
++
++        if disagreed:
++            disagreement_count += 1
++            path = _save_counterexample(extra_cases_dir, text)
++            if path:
++                saved.append(path)
++            if len(disagreements) < MAX_SHOWN_DISAGREEMENTS:
++                disagreements.append({
++                    "source": t["source"],
++                    "input": _clip(text, DISAGREEMENT_CLIP),
++                    "outs": [_clip(_status(r), DISAGREEMENT_CLIP) for r in runs],
++                    "brute": (_clip(brute["stdout"], DISAGREEMENT_CLIP) if brute_good else
++                              ("<<BRUTE UNAVAILABLE: " + ("not provided" if brute_cmd is None else
++                               ("timeout" if brute["timeout"] else f"exit={brute['rc']}")) + ">>")),
++                    "brute_ok": brute_good,
++                })
++
++    # timing on max-size inputs
++    timing = [[None] * len(max_input_paths) for _ in range(n)]
++    for j, mp in enumerate(max_input_paths):
++        if not os.path.isfile(mp):
++            notes.append(f"max input not found: {mp}")
++            continue
++        with open(mp, "rb") as f:
++            mdata = f.read()
++        for i in range(n):
++            if cand_cmds[i] is None:
++                continue
++            timing[i][j] = _run(cand_cmds[i], mdata, max(5.0, 5.0 * time_limit))
++
++    timing_bad = [False] * n
++    max_time = [0.0] * n
++    for i in range(n):
++        for j, r in enumerate(timing[i]):
++            if r is None:
++                continue
++            max_time[i] = max(max_time[i], r["elapsed"])
++            if r["timeout"] or r["rc"] != 0 or r["elapsed"] > time_limit:
++                timing_bad[i] = True
++
++    fails = [(brute_total - brute_pass[i]) if brute_cmd is not None else disagreement_count for i in range(n)]
++    order = sorted(range(n), key=lambda i: (-sample_pass[i], fails[i], -agree[i],
++                                           1 if timing_bad[i] else 0, max_time[i], i))
++
++    # ---- report ----
++    out = ["=== compare_candidates report ==="]
++    out.append(f"Candidates: {len(cands)} ({', '.join(cands)})")
++    out.append(f"Brute: {brute_path}")
++    out.append(f"Test pool: {len(pool)} inputs (samples {sum(1 for t in pool if t['expected'] is not None)}, "
++               f"generated and counterexamples {sum(1 for t in pool if t['expected'] is None)}); "
++               f"brute verdict available on {brute_total}, unavailable on {brute_unavail}.")
++    out.append(f"Disagreements: {disagreement_count}")
++    for note in notes:
++        out.append(f"NOTE: {note}")
++    for p in missing_cands:
++        out.append(f"NOTE: candidate file missing: {p}")
++    out.append("")
++    out.append("--- per-candidate ---")
++    for i, c in enumerate(cands):
++        bline = (f"passes vs brute {brute_pass[i]}/{brute_total}, fails vs brute {brute_total - brute_pass[i]}"
++                 if brute_cmd is not None else "no brute force")
++        out.append(f"[cand {i}] {c}\n"
++                   f"  samples passed {sample_pass[i]}/{sample_total}; {bline}; "
++                   f"crashes {crashes[i]}; timeouts {timeouts[i]}; agrees with plurality {agree[i]}/{len(pool)}")
++    out.append("")
++    if brute_sample_mismatch:
++        out.append(f"--- BRUTE CONTRADICTS SAMPLES ({len(brute_sample_mismatch)} cases) ---")
++        for src, inp, bo, exp in brute_sample_mismatch[:MAX_SHOWN_DISAGREEMENTS]:
++            out.append(f"{src}\ninput:\n{inp}\nbrute output:\n{bo}\nexpected output:\n{exp}\n")
++    out.append(f"--- disagreements (showing {len(disagreements)} of {disagreement_count}) ---")
++    for k, d in enumerate(disagreements, 1):
++        out.append(f"## disagreement {k}: {d['source']}")
++        out.append(f"input:\n{d['input']}")
++        for i, o in enumerate(d["outs"]):
++            out.append(f"candidate {i} output:\n{o}")
++        out.append(f"brute output{'' if d['brute_ok'] else ' (not trusted)'}:\n{d['brute']}")
++        out.append("")
++    if saved:
++        uniq = sorted(set(saved))
++        out.append(f"Saved {len(uniq)} counterexample file(s) into {extra_cases_dir}:")
++        out.extend(uniq[:MAX_SHOWN_DISAGREEMENTS * 4])
++    out.append("")
++    out.append("--- timing on max inputs ---")
++    if not max_input_paths:
++        out.append("(no max_input_paths given)")
++    for i, c in enumerate(cands):
++        parts = []
++        for j, mp in enumerate(max_input_paths):
++            r = timing[i][j]
++            if r is None:
++                parts.append(f"{mp}: not run")
++            elif r["timeout"]:
++                parts.append(f"{mp}: TIMEOUT after {r['elapsed']:.2f}s")
++            elif r["rc"] != 0:
++                parts.append(f"{mp}: exit={r['rc']} after {r['elapsed']:.2f}s stderr={_clip(r['stderr'], 500)}")
++            else:
++                parts.append(f"{mp}: {r['elapsed']:.2f}s")
++        out.append(f"[cand {i}] " + "; ".join(parts) +
++                   (f"  (over time limit {time_limit:.2f}s)" if timing_bad[i] else ""))
++    out.append("")
++    ranking = " > ".join(f"cand_{i}" for i in order)
++    out.append(f"RANKING: {ranking}")
++    out.append(f"BEST: {cands[order[0]]}")
++    out.append(f"ALL_AGREE: {'yes' if disagreement_count == 0 and not missing_cands else 'no'}")
++    return "\n".join(out)

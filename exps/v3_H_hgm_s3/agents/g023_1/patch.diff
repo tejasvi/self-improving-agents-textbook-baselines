@@ -1,0 +1,150 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 2d133d8..de3646b 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -6,6 +6,9 @@ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+ import ast
++import sys
++import hashlib
++import importlib.util
+ 
+ from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+ from llm import create_client
+@@ -227,6 +230,40 @@ class AgenticSystem:
+             return True
+         return all(isinstance(s, ast.Pass) for s in body)
+ 
++    @staticmethod
++    def _check_imports(text):
++        """
++        Top-level module names imported by text that are not available: not in the standard library
++        (sys.stdlib_module_names on Python 3.10+) and not findable by importlib. Returns a sorted list.
++        """
++        try:
++            tree = ast.parse(text)
++        except SyntaxError:
++            return []
++        names = set()
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Import):
++                for alias in node.names:
++                    names.add(alias.name.split('.')[0])
++            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
++                names.add(node.module.split('.')[0])
++        stdlib = getattr(sys, 'stdlib_module_names', None)
++        missing = []
++        for name in sorted(names):
++            if name == '__future__' or name in sys.builtin_module_names:
++                continue
++            if stdlib is not None:
++                if name in stdlib:
++                    continue
++            else:
++                try:
++                    if importlib.util.find_spec(name) is not None:
++                        continue
++                except (ImportError, ValueError):
++                    pass
++            missing.append(name)
++        return missing
++
+     def _validate_target(self):
+         """
+         Check the target file. Returns (ok, reason).
+@@ -252,6 +289,10 @@ class AgenticSystem:
+             tree = ast.parse(text)
+         except SyntaxError as e:
+             return False, f'{filename} does not parse: {e}'
++        unavailable = self._check_imports(text)
++        if unavailable:
++            return False, (f'imports unavailable module(s): {", ".join(unavailable)}; '
++                           'use only the standard library')
+ 
+         if self._is_method_task(filename):
+             classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Solution']
+@@ -631,7 +672,15 @@ class AgenticSystem:
+         )
+         return resp.choices[0].message.content or ''
+ 
+-    def _direct_completion_fallback(self, task, max_attempts=3):
++    def _file_hash(self, path):
++        """SHA-256 of the file contents, or None if the file is missing."""
++        try:
++            with open(path, 'rb') as f:
++                return hashlib.sha256(f.read()).hexdigest()
++        except OSError:
++            return None
++
++    def _direct_completion_fallback(self, task, max_attempts=4, error_feedback=''):
+         """
+         Non-agentic fallback: a tool-less LLM call that returns the complete target file in one
+         ```python block. The block is written to the target path and re-validated. At most
+@@ -649,8 +698,9 @@ class AgenticSystem:
+             safe_log(f"[fallback] cannot create client: {type(e).__name__}: {e}", level=logging.ERROR)
+             return False
+ 
+-        system_message = "You write complete, correct Python source files. Reply with the full file only."
+-        error_feedback = ''
++        system_message = ("You write complete, correct Python source files. Reply with the full file only. "
++                          "Only the Python standard library is available; numpy and other third-party packages "
++                          "are not installed.")
+         for attempt in range(1, max_attempts + 1):
+             current = ''
+             if os.path.isfile(path):
+@@ -663,7 +713,8 @@ class AgenticSystem:
+                 "Write the complete final content of the target file so that it solves the problem. "
+                 "If the file defines class Solution, keep the class and the method signatures exactly as they are "
+                 "and implement the method bodies. If the problem reads stdin and writes stdout, write a complete "
+-                "program that does so. Put the complete file in a single ```python code block and nothing else."
++                "program that does so. Only the Python standard library is available; numpy and other third-party "
++                "packages are not installed. Put the complete file in a single ```python code block and nothing else."
+             )
+             if error_feedback:
+                 prompt += f"\n\nYour previous attempt was rejected: {error_feedback}\nFix this and return the complete file."
+@@ -686,9 +737,18 @@ class AgenticSystem:
+                 self._ensure_typing_import(path)
+             ok, reason = self._validate_target()
+             safe_log(f"[fallback] attempt {attempt}: validation ok={ok}: {reason}")
+-            if ok:
+-                return True
+-            error_feedback = reason
++            if not ok:
++                error_feedback = reason
++                continue
++            # Static checks passed: run the samples (or the Solution-method examples) on the file.
++            checked = self._direct_sample_check()
++            if checked is None and self._is_method_task(filename):
++                checked = self._direct_example_check()
++            if checked is not None and checked[0]:
++                error_feedback = checked[1][-1500:]
++                safe_log(f"[fallback] attempt {attempt}: sample check failed")
++                continue
++            return True
+         return False
+ 
+     def _verify_and_repair(self, msg_history, task, max_rounds=5):
+@@ -765,7 +825,13 @@ class AgenticSystem:
+                 "ALL SAMPLES EXACT MATCH. Always make the tool call rather than announcing a next step.\n\n"
+                 f"Original task:\n{task}"
+             )
++            target = self._target_path()
++            before = self._file_hash(target) if target else None
+             msg_history = self._safe_chat(repair_prompt, self._sanitize_history(msg_history))
++            if target and self._file_hash(target) == before:
++                # The agent left the file unchanged: use a direct completion with the failing report.
++                safe_log(f"[forward] verify round {rnd}: file unchanged after repair; direct completion repair")
++                self._direct_completion_fallback(task, error_feedback=excerpt[-1500:])
+             final_failed, final_excerpt = True, excerpt
+         else:
+             final_failed, final_excerpt = self._current_verification(msg_history)
+@@ -799,7 +865,7 @@ Follow this workflow:
+ 
+ 10. Performance gate: before coding, count the basic operations at the maximum constraints and state the complexity. Then write at least 2 maximum-size inputs (for example a worst-case no-answer input and a many-distinct-values or many-duplicates input) to /tmp/perf_inputs/ and run perf_check on them; a Python solution must finish within 3s per input.
+ 
+-Environment facts: python3 is available; numpy is NOT installed (check with `python3 -c 'import numpy'` before relying on it). Use only the standard library unless you verify otherwise.
++Environment facts: python3 is available. Only the Python standard library is available; numpy and other third-party packages are not installed (check with `python3 -c 'import numpy'` before relying on it). Use only the standard library unless you verify otherwise.
+ 
+ Keep the required output file complete: a program file must read stdin and write stdout, and a method-style file must keep the `Solution` class and its method signatures. Put your work in the non-test source file.
+ """

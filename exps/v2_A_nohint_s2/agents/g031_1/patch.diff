@@ -1,0 +1,220 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index c1c8240..a225287 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -3,6 +3,7 @@ import subprocess
+ import logging
+ import re
+ import shutil
++import sys
+ from logging.handlers import RotatingFileHandler
+ import os
+ import threading
+@@ -146,6 +147,65 @@ def _clean_history(msg_history):
+     """Drop assistant messages whose content is empty."""
+     return [m for m in (msg_history or []) if not _is_empty_assistant_msg(m)]
+ 
++SAMPLE_PATTERN = re.compile(
++    r'Sample Input\s*(\d+)\s*\n(.*?)\n\s*Sample Output\s*\1\s*\n(.*?)(?=\n\s*Sample Input|\n## |\Z)',
++    re.S,
++)
++STDLIB_NOTE = "Only the Python standard library is available; do not import numpy or other third-party packages."
++
++def _extract_samples(problem_statement):
++    """Return a list of (input_text, expected_output) pairs from 'Sample Input N' / 'Sample Output N' blocks."""
++    samples = []
++    for m in SAMPLE_PATTERN.finditer(problem_statement or ''):
++        sample_in = m.group(2).strip('\n') + '\n'
++        expected = m.group(3).strip()
++        samples.append((sample_in, expected))
++    return samples
++
++def _as_text(value):
++    """TimeoutExpired may carry bytes even when text=True; normalize to str."""
++    if value is None:
++        return ''
++    if isinstance(value, bytes):
++        return value.decode('utf-8', errors='replace')
++    return value
++
++def _run_samples(target_path, samples, max_report_chars=3000):
++    """
++    Run target_path (python -I -S, so site-packages such as numpy are unavailable, as in the grader)
++    on each sample. Returns (all_passed, report). Reports at most the first 3 failures.
++    """
++    if not samples:
++        return True, "No sample tests were found in the problem statement."
++    if not os.path.exists(target_path):
++        return False, f"Solution file {target_path} does not exist."
++    failures = []
++    for i, (sample_in, expected) in enumerate(samples, start=1):
++        if len(failures) >= 3:
++            break  # enough evidence; avoids N * 10s when every sample hangs
++        try:
++            proc = subprocess.run([sys.executable, '-I', '-S', target_path], input=sample_in,
++                                  capture_output=True, text=True, timeout=10)
++        except subprocess.TimeoutExpired as e:
++            out = _as_text(e.stdout)
++            err = _as_text(e.stderr)
++            failures.append(f"Sample {i}: TIMEOUT after 10s\nInput:\n{sample_in}"
++                            f"Expected output:\n{expected}\nStdout:\n{out[:max_report_chars]}\nStderr:\n{err[:max_report_chars]}")
++            continue
++        except OSError as e:
++            failures.append(f"Sample {i}: could not execute ({repr(e)})")
++            continue
++        got = proc.stdout.strip()
++        if proc.returncode == 0 and got == expected:
++            continue
++        failures.append(f"Sample {i}: FAIL (exit code {proc.returncode})\nInput:\n{sample_in}"
++                        f"Expected output:\n{expected}\nStdout:\n{proc.stdout[:max_report_chars]}"
++                        f"\nStderr:\n{proc.stderr[:max_report_chars]}")
++    if not failures:
++        return True, f"All {len(samples)} sample(s) passed."
++    header = f"Sample check failed ({len(samples)} sample(s) total). First failing samples (at most 3 shown):\n"
++    return False, header + "\n".join(failures[:3])
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -207,31 +267,44 @@ class AgenticSystem:
+         return os.path.join(self.git_tempdir, name)
+ 
+     def _direct_code_fallback(self, target_path):
+-        """Last resort: ask the model directly for a ```python block and write it to target_path."""
+-        prompt = ("Reply ONLY with the complete Python program in a ```python block. "
+-                  "It must read standard input and write standard output (or implement the required method).\n\n"
+-                  f"<problem_description>\n{self.problem_statement}\n</problem_description>")
+-        try:
+-            client, client_model = create_client(self.code_model)
+-            content, _ = get_response_from_llm(prompt, client, client_model,
+-                                               system_message="You are an expert competitive programmer.",
+-                                               msg_history=[], temperature=0.0)
+-        except Exception as e:
+-            safe_log(f"Direct code fallback failed: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
+-            return False
+-        match = re.search(r'```python\s*\n(.*?)```', content or '', re.DOTALL)
+-        if not match or not match.group(1).strip():
+-            safe_log("Direct code fallback: no ```python block found in reply", level=logging.ERROR)
+-            return False
+-        try:
+-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+-            with open(target_path, 'w') as f:
+-                f.write(match.group(1))
+-            safe_log(f"Direct code fallback wrote {target_path}")
+-            return True
+-        except OSError as e:
+-            safe_log(f"Direct code fallback failed to write {target_path}: {repr(e)}", level=logging.ERROR)
+-            return False
++        """Last resort: ask the model directly for a ```python block, write it, and check it on the samples (max 2 re-asks)."""
++        samples = _extract_samples(self.problem_statement)
++        base_prompt = ("Reply ONLY with the complete Python program in a ```python block. "
++                       "It must read standard input and write standard output (or implement the required method). "
++                       "Use standard library only (no numpy); no third-party packages.\n\n"
++                       f"<problem_description>\n{self.problem_statement}\n</problem_description>")
++        prompt = base_prompt
++        wrote = False
++        for attempt in range(3):  # 1 initial try + at most 2 re-asks
++            try:
++                client, client_model = create_client(self.code_model)
++                content, _ = get_response_from_llm(prompt, client, client_model,
++                                                   system_message="You are an expert competitive programmer.",
++                                                   msg_history=[], temperature=0.0)
++            except Exception as e:
++                safe_log(f"Direct code fallback failed: {repr(e)}\n{traceback.format_exc()}", level=logging.ERROR)
++                return wrote
++            match = re.search(r'```python\s*\n(.*?)```', content or '', re.DOTALL)
++            if not match or not match.group(1).strip():
++                safe_log("Direct code fallback: no ```python block found in reply", level=logging.ERROR)
++                prompt = base_prompt + "\n\nYour reply had no ```python block. Reply ONLY with the complete program in a ```python block."
++                continue
++            try:
++                os.makedirs(os.path.dirname(target_path), exist_ok=True)
++                with open(target_path, 'w') as f:
++                    f.write(match.group(1))
++                wrote = True
++                safe_log(f"Direct code fallback wrote {target_path}")
++            except OSError as e:
++                safe_log(f"Direct code fallback failed to write {target_path}: {repr(e)}", level=logging.ERROR)
++                return False
++            ok, report = _run_samples(target_path, samples)
++            if ok:
++                return True
++            safe_log(f"Direct code fallback failed samples (attempt {attempt + 1}):\n{report}", level=logging.ERROR)
++            prompt = (base_prompt + f"\n\nYour previous program failed the sample tests. Raw results:\n{report}\n"
++                      "Reply ONLY with the corrected complete program in a ```python block.")
++        return wrote
+ 
+     def _file_is_stub_or_empty(self, target_path, stub_content):
+         """True if the target file is still the stub (or missing), or the repo diff is empty."""
+@@ -257,7 +330,7 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        workflow = """
++        workflow = f"""
+ 
+ Follow this workflow strictly. Do not skip steps.
+ 
+@@ -270,6 +343,7 @@ Follow this workflow strictly. Do not skip steps.
+ 7. CLEANUP: Keep all temporary test files (brute force, generators, scratch inputs) outside the repository, e.g. in /tmp, or delete them before finishing. The repository should only contain the final solution (plus any files that were already there).
+ 
+ IMPORTANT:
++- {STDLIB_NOTE}
+ - Never end your turn with only a plan or only code in the reply. You must actually create/edit the solution file with the editor tool before finishing.
+ - Do not finish until the solution file exists and passes all sample tests.
+ - Avoid infinite loops or waiting on input in your test commands; always provide input and use timeouts (e.g. `timeout 10`).
+@@ -294,15 +368,19 @@ IMPORTANT:
+         escalation_prompts = [
+             (f"Your solution file {target_name} still has not been written (or is still the placeholder stub). "
+              f"Write a brute-force / simple correct solution to {target_name} right now using the editor tool, "
+-             "then run the sample tests from the problem statement via bash. Do not reply with only a plan."),
++             "then run the sample tests from the problem statement via bash. Do not reply with only a plan. "
++             f"{STDLIB_NOTE}"),
+             ("Write the solution file immediately. Simple/brute force is fine.\n\n"
+              f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-             f"Save the Python solution to {target_name} in {self.git_tempdir} using the editor tool now."),
++             f"Save the Python solution to {target_name} in {self.git_tempdir} using the editor tool now. "
++             f"{STDLIB_NOTE}"),
+             (f"Final request: write your best-effort solution to {target_name} now with the editor tool, "
+-             "even if it is incomplete, and make sure the file is saved. Then reply briefly."),
++             "even if it is incomplete, and make sure the file is saved. Then reply briefly. "
++             f"{STDLIB_NOTE}"),
+         ]
+         compact_prompt = (f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                          f"Create the solution file now with the editor tool, saving it to {target_name} in {self.git_tempdir}.")
++                          f"Create the solution file now with the editor tool, saving it to {target_name} in {self.git_tempdir}. "
++                          f"{STDLIB_NOTE}")
+         for attempt, prompt in enumerate(escalation_prompts, start=1):
+             if not self._file_is_stub_or_empty(target_path, stub_content):
+                 break
+@@ -321,6 +399,30 @@ IMPORTANT:
+             safe_log("Escalation did not produce a solution; trying direct code fallback.")
+             self._direct_code_fallback(target_path)
+ 
++        # (c2) Deterministic sample check: run the solution as the grader would (python -I -S) and repair on failure.
++        samples = _extract_samples(self.problem_statement)
++        for repair_round in range(3):
++            ok, report = _run_samples(target_path, samples)
++            if ok:
++                safe_log(f"Sample check passed (round {repair_round}).")
++                break
++            safe_log(f"Sample check failed (round {repair_round}); requesting repair.")
++            repair_prompt = (f"Your solution fails these samples. {STDLIB_NOTE} Raw results:\n{report}\n"
++                             f"Fix {target_name} (in {self.git_tempdir}) with the editor tool, then re-run the samples.")
++            if _history_is_degenerate(msg_history):
++                safe_log("History degenerate before repair; starting fresh conversation.")
++                try:
++                    with open(target_path, 'r') as f:
++                        current_code = f.read()
++                except OSError:
++                    current_code = "(file could not be read)"
++                fresh_prompt = (f"<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
++                                f"Current contents of {target_path}:\n```python\n{current_code}\n```\n\n"
++                                f"{repair_prompt}")
++                msg_history = self._run_agent(fresh_prompt, [])
++            else:
++                msg_history = self._run_agent(repair_prompt, _clean_history(msg_history))
++
+         # (d) Non-stub solution exists: back it up and run stress testing / optimization.
+         if not self._file_is_stub_or_empty(target_path, stub_content):
+             backup_path = "/tmp/solution_backup.py"

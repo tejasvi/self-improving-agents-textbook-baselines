@@ -1,0 +1,395 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index b8a1aa1..6433a1d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -1,4 +1,8 @@
+ import argparse
++import ast
++import json
++import shutil
++import tempfile
+ import subprocess
+ import logging
+ from logging.handlers import RotatingFileHandler
+@@ -93,6 +97,74 @@ def safe_log(message, level=logging.INFO):
+     else:
+         print(f"Warning: No logger found for thread {threading.get_ident()}")
+ 
++SAMPLE_TIMEOUT = 5
++PROGRESS_NONE_REPLIES = ("", "(no output)")
++MAX_ATTEMPTS = 3
++MAX_NUDGES = 2
++
++# Short first-phase prompt: write a complete draft immediately.
++DRAFT_PROMPT = """Work like a careful competitive programmer.
++Step 1 (now): use the editor tool to create solution.py in the repo directory with a complete, working first draft. Keep it simple; efficiency can come later.
++Step 2: reply in at most 3 sentences, then stop. No long analysis yet.
++If the task is a method of a `Solution` class, keep the exact class and method signature from the starter code and add `from typing import *` plus any imports at the top of solution.py."""
++
++# Short second-phase prompt: verify the draft.
++VERIFY_PROMPT = """solution.py now exists. Verify it:
++1. Run it on every sample in the statement and compare the output exactly.
++2. Write brute.py (obviously correct, slow) and gen.py (`python3 gen.py SEED SCALE` prints one valid input; cover tiny, medium n=50-300, large and duplicate-heavy cases).
++3. Run the stress_test tool (solution_cmd='python3 solution.py', generator_cmd='python3 gen.py', reference_cmd='python3 brute.py', plus checker_cmd if several answers are valid). Fix failures in solution.py.
++4. Check max-size timing (must be well under 2 seconds).
++5. Save the samples as a JSON list of {"input": ..., "output": ...} in samples.json.
++6. Finally write STATUS.txt: first line exactly PASS or FAIL, then the failing input and expected vs actual output if FAIL.
++Keep replies short and use the tools."""
++
++# Used once when verification did not pass.
++FIX_PROMPT = """The verification failed. Fix solution.py so the failures below are resolved, rerun the failing tests, and rewrite STATUS.txt (PASS or FAIL on the first line).
++Failures:
++{failures}"""
++
++# Tiny directive for empty or tool-less replies.
++NUDGE_PROMPT = "Call the editor tool now to create solution.py with your best attempt; no analysis."
++
++
++def _nonstub_body(text):
++    """True if the source has at least one executable body line (not just imports/defs/pass)."""
++    for raw in text.splitlines():
++        s = raw.strip()
++        if not s or s.startswith("#") or s.startswith("import ") or s.startswith("from ") \
++                or s == "pass" or s == "...":
++            continue
++        if s.startswith("class ") or s.startswith("def "):
++            # Signature-only lines are not body; one-liners like "def f(): return 1" are.
++            _, _, tail = s.partition(":")
++            if not tail.strip() or tail.strip() == "pass":
++                continue
++        return True
++    return False
++
++
++def _assistant_text(msgs):
++    """Concatenated assistant text across the given messages."""
++    out = []
++    for m in msgs:
++        if m.get("role") != "assistant":
++            continue
++        parts = m.get("content")
++        if isinstance(parts, str):
++            out.append(parts)
++            continue
++        for b in parts or []:
++            t = b.get("text") if isinstance(b, dict) else getattr(b, "text", None)
++            if t:
++                out.append(t)
++    return "".join(out)
++
++
++def _reply_is_empty(msg_history, before_len):
++    """True if the messages added after before_len carry no real assistant text."""
++    return _assistant_text(msg_history[before_len:]).strip() in PROGRESS_NONE_REPLIES
++
++
+ class AgenticSystem:
+     def __init__(
+             self,
+@@ -143,13 +215,10 @@ class AgenticSystem:
+         non-helper, non-test file, and solution.py is not just the untouched starter stub.
+         """
+         diff = str(diff_versus_commit(self.git_tempdir, self.base_commit))
+-
+-        # Split the diff into per-file blocks, keyed by the file path from the "diff --git" header.
+         blocks = {}
+         current = None
+         for line in diff.splitlines():
+             if line.startswith("diff --git"):
+-                # Format: diff --git a/<path> b/<path>
+                 parts = line.split(" b/")
+                 path = parts[-1].strip() if len(parts) > 1 else line
+                 current = path
+@@ -167,7 +236,6 @@ class AgenticSystem:
+                 return True
+             if "tests/" in path or path.startswith("tests/"):
+                 return True
+-            # Input / sample files
+             if name.startswith("input") or name.startswith("sample"):
+                 return True
+             return False
+@@ -182,29 +250,206 @@ class AgenticSystem:
+         if not has_added:
+             return False
+ 
+-        # Stub check for solution.py: must not be only the starter stub (imports/defs/pass).
+         solution_path = os.path.join(self.git_tempdir, "solution.py")
+         if os.path.exists(solution_path):
+             with open(solution_path) as f:
+-                body_lines = []
+-                for raw in f.read().splitlines():
+-                    s = raw.strip()
+-                    if not s or s.startswith("#") or s.startswith("import ") or s.startswith("from ") \
+-                            or s == "pass" or s == "...":
+-                        continue
+-                    if s.startswith("class ") or s.startswith("def "):
+-                        # Signature-only lines are not body; one-liners like "def f(): return 1" are.
+-                        head, _, tail = s.partition(":")
+-                        if not tail.strip() or tail.strip() == "pass":
+-                            continue
+-                    body_lines.append(s)
+-                if not body_lines:
++                if not _nonstub_body(f.read()):
+                     return False
+         return True
+ 
++    def _starter_names(self):
++        """Names of top-level defs/classes in the starter solution.py at base_commit."""
++        out = subprocess.run(["git", "-C", self.git_tempdir, "show", f"{self.base_commit}:solution.py"],
++                             capture_output=True, text=True, check=False)
++        if out.returncode != 0:
++            return set()
++        try:
++            tree = ast.parse(out.stdout)
++        except SyntaxError:
++            return set()
++        names = set()
++        for node in tree.body:
++            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
++                names.add(node.name)
++                if isinstance(node, ast.ClassDef):
++                    names.update(m.name for m in node.body if isinstance(m, ast.FunctionDef))
++        return names
++
++    def _gate(self):
++        """
++        Deterministic check, no LLM: solution.py imports, defines the starter signature, is not a stub,
++        and passes any samples.json / samples.txt the agent saved. Returns a dict.
++        """
++        result = {"ok": False, "error": "", "samples_passed": 0, "samples_total": 0}
++        solution_path = os.path.join(self.git_tempdir, "solution.py")
++        if not os.path.exists(solution_path):
++            result["error"] = "solution.py does not exist"
++            return result
++        with open(solution_path) as f:
++            text = f.read()
++        if not _nonstub_body(text):
++            result["error"] = "solution.py is only the starter stub (no body)"
++            return result
++
++        # Syntax + starter-signature check without executing the module (stdin programs would block).
++        try:
++            tree = ast.parse(text)
++        except SyntaxError as e:
++            result["error"] = f"solution.py has a syntax error: {e}"
++            return result
++        defined = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
++        missing = self._starter_names() - defined
++        if missing:
++            result["error"] = f"solution.py is missing starter definitions: {sorted(missing)}"
++            return result
++
++        # Run saved samples (stdin programs only; method-style samples are checked by the agent).
++        samples = []
++        path = os.path.join(self.git_tempdir, "samples.json")
++        if os.path.exists(path):
++            try:
++                with open(path) as f:
++                    data = json.load(f)
++                samples = [(str(s["input"]), str(s["output"])) for s in data]
++            except Exception as e:
++                result["error"] = f"could not parse samples.json: {e}"
++                return result
++
++        for inp, expected in samples:
++            result["samples_total"] += 1
++            try:
++                run = subprocess.run(["python3", "solution.py"], cwd=self.git_tempdir, input=inp,
++                                     capture_output=True, text=True, timeout=SAMPLE_TIMEOUT)
++            except subprocess.TimeoutExpired:
++                result["error"] = "a sample timed out"
++                continue
++            if run.stdout.split() == expected.split():
++                result["samples_passed"] += 1
++            elif not result["error"]:
++                result["error"] = f"sample mismatch: input={inp[:200]!r} expected={expected[:200]!r} got={run.stdout[:200]!r}"
++
++        result["ok"] = result["samples_passed"] == result["samples_total"] and not result["error"]
++        return result
++
++    def _read_status(self):
++        """Returns ('PASS'|'FAIL'|'MISSING', detail text) from STATUS.txt written by the agent."""
++        path = os.path.join(self.git_tempdir, "STATUS.txt")
++        if not os.path.exists(path):
++            return "MISSING", ""
++        with open(path) as f:
++            text = f.read()
++        first = text.strip().splitlines()[0].strip().upper() if text.strip() else ""
++        if first.startswith("PASS"):
++            return "PASS", text
++        if first.startswith("FAIL"):
++            return "FAIL", text
++        return "MISSING", text
++
++    def _run_attempt(self, attempt_idx, prior_notes):
++        """
++        One staged attempt: draft, nudge if needed, verify, snapshot. Returns a dict with the
++        solution text, gate result, status and a short failure summary.
++        """
++        if attempt_idx > 0:
++            reset_to_commit(self.git_tempdir, self.base_commit)
++
++        msg_history = []
++        draft_text = DRAFT_PROMPT
++        if prior_notes:
++            draft_text += "\n\nEarlier attempts failed:\n" + prior_notes
++        history = chat_with_agent(draft_text, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        msg_history = history
++
++        gate = self._gate()
++        for n in range(MAX_NUDGES):
++            if gate["ok"]:
++                break
++            safe_log(f"[attempt {attempt_idx}] draft gate failed ({gate['error'][:200]}); nudge {n + 1}/{MAX_NUDGES}")
++            before = len(msg_history)
++            msg_history = chat_with_agent(NUDGE_PROMPT, model=self.code_model, msg_history=msg_history, logging=safe_log)
++            if _reply_is_empty(msg_history, before):
++                safe_log(f"[attempt {attempt_idx}] nudge {n + 1} produced no progress")
++            gate = self._gate()
++
++        if not gate["ok"]:
++            safe_log(f"[attempt {attempt_idx}] gate still failing after nudges: {gate['error'][:300]}")
++            return {"attempt": attempt_idx, "gate": gate, "status": "MISSING", "summary": gate["error"][:800],
++                    "solution": self._read_solution()}
++
++        verify_text = VERIFY_PROMPT
++        if prior_notes:
++            verify_text += "\n\nNotes from earlier attempts:\n" + prior_notes
++        msg_history = chat_with_agent(verify_text, model=self.code_model, msg_history=msg_history, logging=safe_log)
++        status, detail = self._read_status()
++        if status != "PASS":
++            msg_history = chat_with_agent(FIX_PROMPT.format(failures=detail[-1500:] or "STATUS.txt missing"),
++                                          model=self.code_model, msg_history=msg_history, logging=safe_log)
++            status, detail = self._read_status()
++        gate = self._gate()
++        return {"attempt": attempt_idx, "gate": gate, "status": status, "summary": detail[-800:],
++                "solution": self._read_solution()}
++
++    def _read_solution(self):
++        path = os.path.join(self.git_tempdir, "solution.py")
++        if not os.path.exists(path):
++            return None
++        with open(path) as f:
++            return f.read()
++
++    def _agreement(self, cands, n_inputs=200):
++        """
++        Pairwise agreement on shared random inputs from gen.py (stdin programs only). Adds
++        cand['agreement'] = number of (input, other-candidate) pairs where outputs match.
++        Without gen.py, every candidate gets 0 and the latest successful attempt wins ties.
++        """
++        gen_path = os.path.join(self.git_tempdir, "gen.py")
++        valid = [c for c in cands if c["gate"]["ok"] and c["solution"] is not None]
++        if not os.path.exists(gen_path) or len(valid) < 2:
++            return
++        outputs = {}
++        with tempfile.TemporaryDirectory() as tmp:
++            shutil.copy(gen_path, os.path.join(tmp, "gen.py"))
++            inputs = []
++            for seed in range(n_inputs):
++                try:
++                    r = subprocess.run(["python3", "gen.py", str(seed), "3"], cwd=tmp,
++                                       capture_output=True, text=True, timeout=SAMPLE_TIMEOUT)
++                except subprocess.TimeoutExpired:
++                    continue
++                if r.returncode == 0 and r.stdout.strip():
++                    inputs.append(r.stdout)
++            for c in valid:
++                prog = os.path.join(tmp, f"cand{c['attempt']}.py")
++                with open(prog, "w") as f:
++                    f.write(c["solution"])
++                outs = []
++                for inp in inputs:
++                    try:
++                        r = subprocess.run(["python3", prog], cwd=tmp, input=inp,
++                                           capture_output=True, text=True, timeout=SAMPLE_TIMEOUT)
++                        outs.append(r.stdout.split() if r.returncode == 0 else None)
++                    except subprocess.TimeoutExpired:
++                        outs.append(None)
++                outputs[c["attempt"]] = outs
++        for c in valid:
++            mine = outputs.get(c["attempt"], [])
++            score = 0
++            for other in valid:
++                if other is c:
++                    continue
++                theirs = outputs.get(other["attempt"], [])
++                score += sum(1 for a, b in zip(mine, theirs) if a is not None and a == b)
++            c["agreement"] = score
++
++    def _score(self, cand):
++        """Higher is better: gate ok, STATUS PASS, sample passes, agreement with other candidates, later attempt."""
++        g = cand["gate"]
++        return (1 if g["ok"] else 0, 1 if cand["status"] == "PASS" else 0,
++                g["samples_passed"], cand.get("agreement", 0), cand["attempt"])
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Staged multi-attempt workflow. Each attempt starts from base_commit with a fresh history.
+         """
+         task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
+ 
+@@ -214,45 +459,24 @@ class AgenticSystem:
+ 
+ Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. FIRST ACTION: before any long analysis, use the editor tool to write a complete working first draft into solution.py (even if unoptimized). Keep replies concise; never end a reply without a tool call until solution.py is implemented and tested. Never stop without having edited the primary source file (solution.py). Then read the statement and constraints and choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Refine solution.py with the editor tool (replace the draft with the efficient version if needed).
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. MANDATORY: write a brute-force reference (brute.py) that is obviously correct, even if slow (e.g. enumerate all pairs/subsets/permutations directly, counting multiplicities exactly as the statement says).
+-5. Write a generator (gen.py) invoked as `python3 gen.py SEED SCALE` that prints one valid input to stdout. The SCALE parameter must control size and cover: tiny inputs (e.g. n<=8, small values), medium inputs (n around 50-300, with both small and large value ranges), large inputs close to the real constraints, and duplicate-heavy cases (many equal values, all-equal, sorted, reversed, values drawn from only a few distinct numbers, and target/X values near the edge of the value range). Make sure the generator only produces inputs that satisfy the constraints.
+-6. If the problem has several valid answers (e.g. "print any valid pair/triple/permutation"), write a validator (checker.py) invoked as `python3 checker.py input_file output_file` that checks every constraint of the output (indices in range, distinctness, the required sum/property, format) and exits with code 0 only if valid. A checker alone is NOT enough for a '-1' / 'impossible' answer: when the checker accepts -1, it must itself perform a full brute-force existence check (feasible on the medium-size inputs) so that a wrong -1 is caught. Do not compare such outputs with the brute force directly.
+-7. Run the stress_test tool with solution_cmd='python3 solution.py', generator_cmd='python3 gen.py', reference_cmd='python3 brute.py' and checker_cmd='python3 checker.py' when there are many valid answers. The brute-force comparison at MEDIUM scale (n 50-300, scales such as [1,2,3,5,8,20,50,100]) is mandatory in every case, even if you also have a checker. Use a few hundred seeds in total and a timeout of a few seconds. The stress_test tool also tests mutated variants of each input (values compressed, few distinct values, sorted, reversed); keep mutations enabled. Read its output: if it warns that outputs are one-sided (e.g. almost always -1) or that medium inputs were not exercised, extend gen.py until the warnings disappear. Fix every failure, then rerun until everything passes. Then run stress_test again with coverage_source='solution.py' (or run coverage_report on the sample and stress-test inputs). For every uncovered line or branch in solution.py, construct a small input that reaches it (add the generator mode if needed), run it, and verify the output with the brute force/checker. Also, always confirm that the output format has the exact number of tokens required by the statement. Do not finish while any reachable branch remains unexecuted. Make the checker verify the exact output format too (e.g. the count of printed numbers and that printed indices are distinct).
+-8. Run the validator (or compare with the reference) on max-size inputs too, not only on small ones, and time the max-size runs: solution.py must finish well under 2 seconds. A fast output that is invalid is still wrong.
+-9. Once all tests pass, re-read solution.py and look for untested branches (edge cases such as n=1, empty results, all-equal values, boundary values, negative numbers, answers that must be -1). Add tests that exercise them. Prefer a simpler, verifiable algorithm over an unverifiable clever one: if a clever algorithm (e.g. FFT/convolution tricks) cannot be validated at medium scale against the brute force or the checker, replace it with a simpler approach that fits the time limit.
+-10. Before declaring done, re-run the stress test on the dangerous scenario categories again: dense values with the target X near the value range, and many duplicates / repeated small values. Both must pass at medium scale.
+-11. Before finishing, write a second independent simple solution (e.g. a hash-based O(n^2) or direct enumeration solution, written separately from solution.py, not copied from it) and diff-test it against solution.py on random inputs with n<=2000 (and on the medium-size generator outputs). Any disagreement means one of them is wrong: find out which one with the brute force and fix it.
+-12. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
+-        safe_log(f"[verify] initial run finished; source edit detected: {self._has_source_edit()}")
+-
+-        retry_note = (
+-            "No change to the primary source file (solution.py) was detected; it is still the starter stub. "
+-            "Do not explore further. Call the editor tool now to write your full solution into "
+-            f"{self.git_tempdir}/solution.py, then run the samples and the stress test."
+-        )
+-        msg_history = init_edit
+-        for attempt in range(3):
+-            if self._has_source_edit():
++        candidates = []
++        prior_notes = ""
++        for attempt_idx in range(MAX_ATTEMPTS):
++            safe_log(f"[forward] attempt {attempt_idx + 1}/{MAX_ATTEMPTS}")
++            cand = self._run_attempt(attempt_idx, prior_notes)
++            safe_log(f"[forward] attempt {attempt_idx + 1} gate={cand['gate']} status={cand['status']}")
++            candidates.append(cand)
++            if cand["gate"]["ok"] and cand["status"] == "PASS":
+                 break
+-            safe_log(f"[verify] retry {attempt + 1}/3: no source edit detected")
+-            msg_history = chat_with_agent(retry_note, model=self.code_model, msg_history=msg_history, logging=safe_log)
+-            safe_log(f"[verify] retry {attempt + 1}/3 finished; source edit detected: {self._has_source_edit()}")
+-
+-        if not self._has_source_edit():
+-            safe_log("[verify] fallback: minimal prompt to write solution.py")
+-            fallback = (
+-                f"Problem statement:\n<problem_description>\n{self.problem_statement}\n</problem_description>\n\n"
+-                f"Working directory: {self.git_tempdir}\n"
+-                "Write the final solution to solution.py with the editor tool; nothing else."
+-            )
+-            chat_with_agent(fallback, model=self.code_model, msg_history=[], logging=safe_log)
+-            safe_log(f"[verify] fallback finished; source edit detected: {self._has_source_edit()}")
++            prior_notes += f"\nAttempt {attempt_idx + 1}: status={cand['status']}, gate error={cand['gate']['error'][:300]}\n{cand['summary'][:400]}"
++
++        self._agreement(candidates)
++        best = max(candidates, key=self._score)
++        safe_log(f"[forward] selected attempt {best['attempt'] + 1} score={self._score(best)}")
++        if best["solution"] is not None:
++            with open(os.path.join(self.git_tempdir, "solution.py"), "w") as f:
++                f.write(best["solution"])
++
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')

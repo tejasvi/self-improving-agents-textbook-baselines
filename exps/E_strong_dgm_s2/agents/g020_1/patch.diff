@@ -1,0 +1,188 @@
+diff --git a/coding_agent.py b/coding_agent.py
+index 5efb6cb..dac167d 100644
+--- a/coding_agent.py
++++ b/coding_agent.py
+@@ -39,6 +39,16 @@ TEST_COMMANDS = {
+     "java": [["./gradlew", "test"]],
+ }
+ 
++# Pipeline constants (all loops are bounded by these)
++K = 3                 # number of independent attempts
++MAX_REFLECT = 3       # max reflection rounds
++COMPARE_TIMEOUT = 900  # seconds allowed for one run of tests/compare.py
++STRATEGY_HINTS = [
++    "aim for the most efficient algorithm that fits the constraints",
++    "prefer the simplest correct formulation, even if it is slower, then make sure it is fast enough",
++    "focus on edge cases, boundary values, and output precision/format",
++]
++
+ # Thread-local storage for logger instances
+ thread_local = threading.local()
+ 
+@@ -137,27 +147,154 @@ class AgenticSystem:
+         ]
+         return new_msg_history
+ 
++    def _run_agent(self, prompt):
++        """Run one fresh agent conversation and return its final text."""
++        msg_history = chat_with_agent(prompt, model=self.code_model, msg_history=[], logging=safe_log)
++        for msg in reversed(msg_history or []):
++            if msg.get('role') != 'assistant':
++                continue
++            content = msg.get('content')
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                texts = [c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text']
++                if texts:
++                    return '\n'.join(texts)
++        return ''
++
++    def _run_compare(self):
++        """Run tests/compare.py and return its raw combined output (no parsing)."""
++        try:
++            proc = subprocess.run(
++                ['python3', 'tests/compare.py'],
++                cwd=self.git_tempdir,
++                capture_output=True,
++                text=True,
++                timeout=COMPARE_TIMEOUT,
++            )
++            return f"exit code: {proc.returncode}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
++        except subprocess.TimeoutExpired as e:
++            out = e.stdout.decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
++            err = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or '')
++            return f"TIMEOUT after {COMPARE_TIMEOUT}s\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
++        except Exception as e:
++            return f"Failed to run compare.py: {e!r}"
++
+     def forward(self):
+         """
+-        The forward function for the AgenticSystem.
++        Multi-attempt, cross-validated solving pipeline.
++        All loops are bounded (K attempts, MAX_REFLECT reflection rounds).
+         """
+-        task = f"""I have uploaded a code repository in the directory {self.git_tempdir}. Help solve the following problem.
++        d = self.git_tempdir
++        task = f"""I have uploaded a code repository in the directory {d}. Help solve the following problem.
+ 
+ <problem_description>
+ {self.problem_statement}
+ </problem_description>
+ 
+-Your task is to make changes to the files in the {self.git_tempdir} directory to address the <problem_description>. I have already taken care of the required dependencies.
++Your task is to make changes to the files in the {d} directory to address the <problem_description>. I have already taken care of the required dependencies.
+ """
+-        method = """Work like a careful competitive programmer:
+-1. Read the statement and constraints. Choose an algorithm whose complexity fits the limits; Python does roughly 10^7 simple operations per second, so aim for well under that.
+-2. Write the solution in solution.py with the editor tool.
+-3. Run it on every sample in the statement and compare with the expected outputs exactly. For a stdin program use `python3 solution.py < sample1.txt`; for a `Solution` class method write a small driver script that calls the method on the sample arguments (add `from typing import *` and any imports you need at the top of solution.py).
+-4. Write a brute-force reference for small inputs and a random small-input generator, then run a stress test of a few hundred cases comparing solution.py with the brute force. Fix every mismatch.
+-5. Generate a maximum-size input and check that solution.py finishes in well under 2 seconds.
+-6. Keep iterating until all checks pass. The final solution.py is what gets graded; helper files are ignored."""
+-        instruction = f"{task}\n\n{method}"
+-        init_edit = chat_with_agent(instruction, model=self.code_model, msg_history=[], logging=safe_log)
++        common_rules = f"""Working conventions:
++- Write solution code to the file named in your instructions. Do not modify solution.py unless told to.
++- Put all helper files (brute force, generators, comparison scripts, scratch files) under {d}/attempts/ or {d}/tests/ only.
++- Use the editor tool for files and bash for running commands. Keep each command bounded in time."""
++
++        # Step A: independent attempts with different strategies.
++        for i, hint in enumerate(STRATEGY_HINTS[:K]):
++            prompt = (
++                f"{task}\n\n{common_rules}\n\n"
++                f"Write your solution to {d}/attempts/sol_{i}.py, do not touch solution.py. "
++                f"hint: {hint}. Verify against the samples.\n"
++                "The solution must be a complete program reading stdin and writing stdout, or a Solution class method, "
++                "matching the statement. Read the statement and constraints carefully and choose an algorithm that fits the limits. "
++                "Run it on every sample in the statement and compare with the expected outputs exactly."
++            )
++            self._run_agent(prompt)
++
++        # Step B: shared test harness, written independently of the candidates.
++        testing_prompt = f"""{task}
++
++{common_rules}
++
++Create a test harness in {d}/tests/ with exactly these files:
++1. {d}/tests/brute.py: an obviously-correct brute-force reference derived directly from the problem statement. Do NOT look at or import any file in {d}/attempts/ or solution.py. It must be slow but simple and correct.
++2. {d}/tests/gen.py: a multi-mode random input generator. It must cover: tiny n (including the minimum allowed), boundary values, all-equal values, sorted and reverse-sorted inputs, random inputs, and max-size inputs (sized for timing only, brute force may be skipped for those). Each call should take a seed and a mode, and print one test input to stdout. Respect the constraints from the statement exactly.
++3. {d}/tests/compare.py: a script that takes no required arguments and does the following:
++   - Discovers candidate files: {d}/solution.py and every file matching {d}/attempts/sol_*.py.
++   - Generates several hundred cases with gen.py (varied seeds and modes) and gets expected outputs from brute.py.
++   - Runs each candidate on each case via subprocess with a per-case timeout (about 5 seconds), feeding the input on stdin.
++   - Compares outputs: if the expected output contains floating-point numbers, compare them with a relative/absolute tolerance (about 1e-6); otherwise compare tokens exactly after stripping trailing whitespace.
++   - Also compares every candidate against every other candidate on each case, so disagreement is detected even where brute force is too slow (skip brute force for large cases if needed).
++   - Prints a compact summary as a single JSON object on the last line of stdout with these top-level keys: "failures" (integer: total failing cases across all candidates, plus candidate-vs-candidate disagreements; 0 means clean), "candidates" (object: per candidate name -> {{"passed", "total", "max_runtime_s", "first_failure": {{"input", "expected", "actual"}} or null}}), and "disagreements" (list of short strings). Truncate long inputs/outputs in the summary. Print the raw details of failures before this line.
++   - Exits quickly if no candidate exists.
++Run compare.py once to make sure the harness itself works (fix the harness if it crashes). Do not modify solution.py in this step."""
++        self._run_agent(testing_prompt)
++
++        # Step C: run the harness and let the agent pick the winner.
++        compare_out = self._run_compare()
++        select_prompt = f"""{task}
++
++{common_rules}
++
++Below is the raw output of the test harness {d}/tests/compare.py run on all candidates.
++<compare_output>
++{compare_out}
++</compare_output>
++
++Choose the best candidate among {d}/solution.py (if it exists) and {d}/attempts/sol_*.py: the one that passes all samples, has no mismatches against brute force or other candidates, and is the fastest. If the harness output is unclear, inspect the candidates and rerun {d}/tests/compare.py. Copy the winning candidate's code to {d}/solution.py (overwrite it), then run {d}/tests/compare.py once more to confirm."""
++        self._run_agent(select_prompt)
++
++        # Step D: bounded reflection rounds.
++        for r in range(MAX_REFLECT):
++            compare_out = self._run_compare()
++            if self._summary_is_clean(compare_out):
++                break
++            reflect_prompt = f"""{task}
++
++{common_rules}
++
++Current state: {d}/solution.py is the chosen solution. Raw output of {d}/tests/compare.py:
++<compare_output>
++{compare_out}
++</compare_output>
++
++Here is the current solution.py:
++<current_code>
++{self._read_file(os.path.join(d, 'solution.py'))}
++</current_code>
++
++Diagnose which of solution/brute is wrong for each failing input, fix, and rerun compare.py; stop when all candidates agree with the brute force and finish within the time limit. If the brute force is wrong, fix {d}/tests/brute.py based on the statement. If the solution is wrong, fix {d}/solution.py. Keep the solution correct against the samples."""
++            self._run_agent(reflect_prompt)
++
++        # Step E: final review for requirements and edge cases not yet covered.
++        final_prompt = f"""{task}
++
++{common_rules}
++
++Final review. Re-read the problem statement and write a checklist of its requirements: output format, precision, constraints (min and max of every value), and degenerate or edge-case inputs (minimum N, extreme values, all-equal, etc.). For each item, check whether {d}/tests/gen.py already covers it. Add the missing cases to {d}/tests/gen.py. Then run {d}/tests/compare.py and fix {d}/solution.py if anything fails (and fix brute.py if brute force is wrong). Ensure {d}/solution.py is the final, correct, fast solution and that it runs on all samples."""
++        self._run_agent(final_prompt)
++
++    @staticmethod
++    def _summary_is_clean(compare_out):
++        """Cheap check: the harness's last JSON line reports zero failures."""
++        import json
++        for line in reversed(compare_out.strip().splitlines()):
++            line = line.strip()
++            if line.startswith('{'):
++                try:
++                    summary = json.loads(line)
++                except ValueError:
++                    return False
++                return summary.get('failures', None) == 0
++        return False
++
++    @staticmethod
++    def _read_file(path):
++        try:
++            with open(path) as f:
++                return f.read()
++        except OSError:
++            return '(solution.py does not exist yet)'
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='Process repository with an agentic system.')
