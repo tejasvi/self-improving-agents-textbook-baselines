@@ -1,10 +1,10 @@
 # Code and data for "Do Self-Improving Coding Agents Beat Textbook Baselines?"
 
 This archive accompanies the paper "Do Self-Improving Coding Agents Beat Textbook Baselines? Evidence from a Darwin
-Gödel Machine Port and Two Published Systems" by Tejasvi S. Tomar (DOI 10.5281/zenodo.23719814,
-https://doi.org/10.5281/zenodo.23719814). Its own DOI is 10.5281/zenodo.23719813
-(https://doi.org/10.5281/zenodo.23719813), and the same files are on GitHub at
-https://github.com/tejasvi/self-improving-agents-textbook-baselines (tag v3). It contains the code of the study, the
+Gödel Machine Port and Two Published Systems" by Tejasvi S. Tomar (DOI 10.5281/zenodo.23720889,
+https://doi.org/10.5281/zenodo.23720889). Its own DOI is 10.5281/zenodo.23720890
+(https://doi.org/10.5281/zenodo.23720890), and the same files are on GitHub at
+https://github.com/tejasvi/self-improving-agents-textbook-baselines (tag v4). It contains the code of the study, the
 three pre-registrations, the change log, the per-task results of every evaluation in the paper, and the scripts that
 compute the paper's numbers from those results.
 
